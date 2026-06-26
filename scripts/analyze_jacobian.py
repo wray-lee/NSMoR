@@ -7,10 +7,13 @@ the continuous integration mechanics of the GRU pathway.
 
 Target: Label.WALK trials (sustained locomotion response).
 
-Epochs relative to TTC:
-  1. Early (Baseline):     TTC - 1000ms
-  2. Transient (Burst):    TTC
-  3. Sustained (Late Walk): TTC + 1000ms
+Epochs relative to detected stimulus onset:
+  1. Early (Baseline):     onset - 1000ms
+  2. Transient (Burst):    onset
+  3. Sustained (Late Walk): onset + 1000ms
+
+Slow-point search: For each epoch, a ±5-frame window is searched to
+find the frame that minimises kinetic energy ||h_{t+1} - h_t||₂.
 
 Hypothesis: During the "Sustained" epoch, eigenvalues should cluster
 near the boundary of the unit circle (Real part ≈ 1), proving the GRU
@@ -65,6 +68,7 @@ EIGENVALUE_COLOR: str = "#1C7ED6"       # Cell Cobalt Blue
 UNIT_CIRCLE_COLOR: str = "#495057"      # Strong Slate Gray
 AXIS_COLOR: str = "#212529"             # Solid dark charcoal
 BACKGROUND_COLOR: str = "#FFFFFF"       # Clean white
+CMAP_HEATMAP: str = "inferno"           # Perceptually uniform heatmap
 
 # ── Typography ─────────────────────────────────────────────────
 FONT_FAMILY: str = "Arial"
@@ -83,23 +87,27 @@ EIGENVALUE_ALPHA: float = 0.6
 EIGENVALUE_SIZE: float = 15.0
 UNIT_CIRCLE_LINEWIDTH: float = 1.5
 UNIT_CIRCLE_LINESTYLE: str = "--"
+HEXBIN_GRIDSIZE: int = 40               # Resolution for hexbin density plot
 
 # ── Epoch definitions ─────────────────────────────────────────
-# Time offsets relative to TTC (in ms)
+# Time offsets relative to stimulus onset (in ms)
 EPOCH_DEFINITIONS: Dict[str, Dict[str, float]] = {
     "early": {
         "offset_ms": -1000.0,
-        "label": "Early (Baseline)\nTTC − 1000 ms",
+        "label": "Early (Baseline)\nonset − 1000 ms",
     },
     "transient": {
         "offset_ms": 0.0,
-        "label": "Transient (Stimulus Burst)\nTTC",
+        "label": "Transient (Stimulus Burst)\nonset",
     },
     "sustained": {
         "offset_ms": 1000.0,
-        "label": "Sustained (Late Walk)\nTTC + 1000 ms",
+        "label": "Sustained (Late Walk)\nonset + 1000 ms",
     },
 }
+
+# ── Slow-point search ────────────────────────────────────────
+SLOW_POINT_RADIUS: int = 5   # ±5 frames around each epoch centre
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -166,16 +174,19 @@ def load_model_from_checkpoint(
 def load_dataset(
     dataset_path: Path,
     batch_size: int = 32,
-) -> Tuple[torch.utils.data.DataLoader, np.ndarray, List[int]]:
+) -> Tuple[torch.utils.data.DataLoader, np.ndarray, List[int], List[np.ndarray]]:
     """
     Load the preprocessed dataset and create a DataLoader.
+
+    Also returns the raw X_seqs so that stimulus onset can be
+    detected dynamically from the sensory channels.
 
     Args:
         dataset_path: Path to ``biomor_dataset.pt``.
         batch_size: Batch size for the DataLoader.
 
     Returns:
-        ``(dataloader, labels, lengths_list)`` tuple.
+        ``(dataloader, labels, lengths_list, X_seqs)`` tuple.
 
     Raises:
         FileNotFoundError: If dataset file does not exist.
@@ -218,40 +229,155 @@ def load_dataset(
     )
 
     lengths_list = [int(l) for l in lengths]
-    return dataloader, labels, lengths_list
+    return dataloader, labels, lengths_list, X_seqs
 
 
 # ═══════════════════════════════════════════════════════════════
-# 3.  GRU State Extraction at Specific Epochs
+# 3.  Dynamic Stimulus Onset Detection
 # ═══════════════════════════════════════════════════════════════
+
+def detect_stimulus_onset_frames(
+    X_seqs: List[np.ndarray],
+    dt_ms: float = 10.0,
+    threshold: float = 1e-6,
+) -> List[int]:
+    """
+    Detect the stimulus onset frame for each trial from the data.
+
+    Scans the sensory channels (visual angle feature 0, wind state
+    feature 1) to find the first frame where *either* channel
+    becomes non-zero.  This replaces the hardcoded
+    ``stim_onset_frame = 200`` with a data-driven anchor.
+
+    For looming trials the visual angle transitions from 0 to a
+    positive value at stimulus onset.  For pure-wind trials the
+    wind channel transitions from 0 to 1.  Both are captured.
+
+    Args:
+        X_seqs: List of arrays, each ``(T_i, 8)``.
+        dt_ms: Frame interval in ms (for logging only).
+        threshold: Absolute value below which a channel is
+            considered zero.
+
+    Returns:
+        List of frame indices (one per sequence).  Falls back to
+        200 when no onset is detected (e.g. fully padded sequences).
+    """
+    default_onset = 200  # Fallback for degenerate sequences
+    onset_frames: List[int] = []
+
+    for i, X in enumerate(X_seqs):
+        T_i = X.shape[0]
+        visual = np.abs(X[:, 0])   # v_vis(t)
+        wind = np.abs(X[:, 1])     # wind(t)
+
+        # First frame where either sensory channel is non-zero
+        nonzero_mask = (visual > threshold) | (wind > threshold)
+        nonzero_indices = np.where(nonzero_mask)[0]
+
+        if len(nonzero_indices) > 0:
+            onset_frames.append(int(nonzero_indices[0]))
+        else:
+            logger.warning(
+                "Trial %d: no non-zero sensory channel detected "
+                "(length=%d). Using default onset frame %d.",
+                i, T_i, default_onset,
+            )
+            onset_frames.append(default_onset)
+
+    # Log statistics
+    onset_arr = np.array(onset_frames)
+    logger.info(
+        "Detected stimulus onset frames: mean=%.1f, std=%.1f, "
+        "min=%d, max=%d (N=%d)",
+        onset_arr.mean(), onset_arr.std(),
+        int(onset_arr.min()), int(onset_arr.max()),
+        len(onset_frames),
+    )
+
+    return onset_frames
+
+
+# ═══════════════════════════════════════════════════════════════
+# 4.  GRU State Extraction at Specific Epochs
+# ═══════════════════════════════════════════════════════════════
+
+def _find_slow_point(
+    gru_hidden: torch.Tensor,
+    window_centre: int,
+    length_i: int,
+    radius: int = SLOW_POINT_RADIUS,
+) -> Tuple[int, torch.Tensor]:
+    """
+    Find the slow-point frame within a ±radius window.
+
+    The slow point is the frame *t* that minimises the kinetic
+    energy  ‖h_{t+1} − h_t‖₂  within the search window.
+
+    Args:
+        gru_hidden: ``(T, H)`` GRU hidden-state trajectory for one trial.
+        window_centre: Centre frame index of the search window.
+        length_i: True (unpadded) sequence length.
+        radius: Search radius in frames.
+
+    Returns:
+        ``(slow_frame, h_slow)`` where *slow_frame* is the index
+        and *h_slow* is the ``(H,)`` hidden state at that frame.
+    """
+    lo = max(0, window_centre - radius)
+    hi = min(length_i - 2, window_centre + radius)  # need t+1 to exist
+
+    if lo > hi:
+        # Degenerate window — fall back to centre clamped to valid range
+        frame = max(0, min(window_centre, length_i - 2))
+        return frame, gru_hidden[frame]
+
+    # Kinetic energy: ||h_{t+1} - h_t||_2 for t in [lo, hi]
+    h_window = gru_hidden[lo:hi + 2]         # (window+1, H)
+    diffs = h_window[1:] - h_window[:-1]     # (window, H)
+    ke = diffs.norm(dim=1)                   # (window,)
+
+    best_local = int(ke.argmin().item())
+    slow_frame = lo + best_local
+    return slow_frame, gru_hidden[slow_frame]
+
 
 def extract_gru_states_at_epochs(
     model: BioMoRCore,
     dataloader: torch.utils.data.DataLoader,
     device: torch.device,
+    onset_frames: List[int],
     target_class: int = Label.WALK.value,
     dt_ms: float = 10.0,
-    stim_onset_frame: int = 200,
 ) -> Dict[str, Tuple[torch.Tensor, torch.Tensor]]:
     """
     Extract GRU hidden states at specific trial epochs for a target class.
 
-    For each trial, extracts the hidden state at three time points
-    relative to TTC (Time-To-Collision / stimulus onset).
+    For each trial, computes epoch frames relative to the
+    **dynamically detected** stimulus onset, then searches a
+    ±``SLOW_POINT_RADIUS`` window for the slow point (minimum
+    kinetic energy).
+
+    The input passed to the Jacobian adapter is the **full sensory
+    encoding** ``e_sensory_t`` (dim H), i.e. the exact vector the
+    GRU cell receives at time *t*.  This captures the partial
+    derivative ∂h_{t+1}/∂h_t holding the GRU input fixed.
 
     Args:
         model: Trained BioMoRCore model.
         dataloader: DataLoader yielding (X, Y, lengths) tuples.
         device: Computation device.
+        onset_frames: Per-trial stimulus onset frame indices
+            (from :func:`detect_stimulus_onset_frames`).
         target_class: Label value to filter by (default: WALK).
         dt_ms: Frame interval in milliseconds.
-        stim_onset_frame: Frame index of stimulus onset.
 
     Returns:
-        Dictionary mapping epoch name to ``(h_states, x_inputs)`` tuples:
-        - ``h_states``: ``(N, H)`` tensor of hidden states.
-        - ``x_inputs``: ``(N, H)`` tensor of corresponding inputs
-          (sensory encoding output).
+        Dictionary mapping epoch name to ``(h_states, x_inputs)``
+        tuples:
+        - ``h_states``: ``(N, H)`` tensor of hidden states at slow points.
+        - ``x_inputs``: ``(N, H)`` tensor of sensory encoding inputs
+          at those same slow points.
 
     Raises:
         ValueError: If no valid states found for any epoch.
@@ -267,22 +393,11 @@ def extract_gru_states_at_epochs(
         name: [] for name in EPOCH_DEFINITIONS
     }
 
-    # ── Compute target frame indices for each epoch ───────────
-    epoch_frames: Dict[str, int] = {}
-    for epoch_name, epoch_def in EPOCH_DEFINITIONS.items():
-        offset_ms = epoch_def["offset_ms"]
-        # Convert offset to frame index relative to stim_onset
-        frame_offset = int(offset_ms / dt_ms)
-        target_frame = stim_onset_frame + frame_offset
-        epoch_frames[epoch_name] = target_frame
-        logger.info(
-            "  Epoch '%s': offset=%.0fms -> frame %d",
-            epoch_name, offset_ms, target_frame,
-        )
-
     model.eval()
 
     with torch.no_grad():
+        global_idx = 0  # Tracks position across batches
+
         for batch_idx, batch in enumerate(dataloader):
             X_batch, _Y_batch, lengths = batch
             X_batch = X_batch.to(device)
@@ -297,48 +412,66 @@ def extract_gru_states_at_epochs(
             gru_hidden = internals["gru_hidden"]
             H = gru_hidden.shape[2]
 
-            # Also get sensory encoding for Jacobian inputs
-            # We need the encoder output, not the raw input
-            sensory_x = X_batch[:, :, :model.sensory_dim]  # (B, T, D)
+            # ── Task 2: Exact input reconstruction ─────────────
+            # The GRU cell receives e_sensory = sensory_encoder(X[:, :, :4]).
+            # We encode the FULL sensory slice so that x_t reflects
+            # the exact input the GRU saw at each frame.
+            sensory_x = X_batch[:, :, :model.sensory_dim]  # (B, T, D_sensory)
             e_sensory = model.sensory_encoder(sensory_x)    # (B, T, H)
 
             for i in range(B):
-                global_idx = batch_idx * B + i
+                if global_idx >= len(dataloader.dataset):
+                    break
 
                 # Check if this trial is of the target class
-                if global_idx < len(dataloader.dataset):
-                    _, _, label_val = dataloader.dataset.sequences[global_idx]
-                    if int(label_val) != target_class:
-                        continue
-                else:
+                _, _, label_val = dataloader.dataset.sequences[global_idx]
+                if int(label_val) != target_class:
+                    global_idx += 1
                     continue
 
                 length_i = int(lengths[i].item())
+                onset_frame = onset_frames[global_idx]
 
-                # Extract states at each epoch
-                for epoch_name, target_frame in epoch_frames.items():
-                    # Check if the target frame is valid for this trial
-                    if target_frame < 0 or target_frame >= length_i:
+                # ── Compute epoch centre frames ────────────────
+                for epoch_name, epoch_def in EPOCH_DEFINITIONS.items():
+                    offset_ms = epoch_def["offset_ms"]
+                    frame_offset = int(offset_ms / dt_ms)
+                    centre_frame = onset_frame + frame_offset
+
+                    # Bounds check (need at least frame+1 for KE)
+                    if centre_frame < 0 or centre_frame >= length_i - 1:
                         logger.debug(
-                            "  Trial %d: epoch '%s' frame %d out of bounds (length=%d), skipping.",
-                            global_idx, epoch_name, target_frame, length_i,
+                            "  Trial %d: epoch '%s' centre frame %d "
+                            "out of bounds (length=%d), skipping.",
+                            global_idx, epoch_name, centre_frame, length_i,
                         )
                         continue
 
-                    # Extract hidden state and input at this frame
-                    h_t = gru_hidden[i, target_frame, :]   # (H,)
-                    x_t = e_sensory[i, target_frame, :]    # (H,)
+                    # ── Task 3: Slow-point search ──────────────
+                    slow_frame, h_slow = _find_slow_point(
+                        gru_hidden[i], centre_frame, length_i,
+                    )
+                    x_slow = e_sensory[i, slow_frame, :]    # (H,)
 
                     # Shape assertions
-                    assert h_t.shape == (H,), (
-                        f"h_t shape {tuple(h_t.shape)} != (H={H},)"
+                    assert h_slow.shape == (H,), (
+                        f"h_slow shape {tuple(h_slow.shape)} != (H={H},)"
                     )
-                    assert x_t.shape == (H,), (
-                        f"x_t shape {tuple(x_t.shape)} != (H={H},)"
+                    assert x_slow.shape == (H,), (
+                        f"x_slow shape {tuple(x_slow.shape)} != (H={H},)"
                     )
 
-                    epoch_states[epoch_name].append(h_t.cpu())
-                    epoch_inputs[epoch_name].append(x_t.cpu())
+                    epoch_states[epoch_name].append(h_slow.cpu())
+                    epoch_inputs[epoch_name].append(x_slow.cpu())
+
+                    logger.debug(
+                        "  Trial %d epoch '%s': centre=%d, slow=%d, "
+                        "Δframe=%d",
+                        global_idx, epoch_name, centre_frame,
+                        slow_frame, slow_frame - centre_frame,
+                    )
+
+                global_idx += 1
 
     # ── Stack into tensors ────────────────────────────────────
     result: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
@@ -358,7 +491,7 @@ def extract_gru_states_at_epochs(
 
         result[epoch_name] = (h_stack, x_stack)
         logger.info(
-            "  Epoch '%s': extracted %d states (shape=%s)",
+            "  Epoch '%s': extracted %d slow-point states (shape=%s)",
             epoch_name, h_stack.shape[0], tuple(h_stack.shape),
         )
 
@@ -369,7 +502,7 @@ def extract_gru_states_at_epochs(
 
 
 # ═══════════════════════════════════════════════════════════════
-# 4.  Jacobian Eigenvalue Computation
+# 5.  Jacobian Eigenvalue Computation
 # ═══════════════════════════════════════════════════════════════
 
 def compute_eigenvalues_at_epochs(
@@ -480,7 +613,7 @@ def compute_eigenvalues_at_epochs(
 
 
 # ═══════════════════════════════════════════════════════════════
-# 5.  Lancet/Cell Publication Figure
+# 6.  Lancet/Cell Publication Figure
 # ═══════════════════════════════════════════════════════════════
 
 def setup_lancet_style() -> None:
@@ -531,9 +664,9 @@ def plot_eigenvalue_spectrum(
     """
     Plot the Jacobian eigenvalue spectrum on the complex plane.
 
-    Creates a subplots(1, 3) figure with one panel per epoch.
-    Each panel shows eigenvalues scattered on the complex plane
-    with a unit circle reference.
+    Creates a ``subplots(1, 3)`` figure with one panel per epoch.
+    Each panel uses a **hexbin density heatmap** to handle massive
+    point overlap, with the unit circle reference overlaid.
 
     Args:
         eigenvalue_results: Dictionary from :func:`compute_eigenvalues_at_epochs`.
@@ -574,19 +707,69 @@ def plot_eigenvalue_spectrum(
             linewidth=UNIT_CIRCLE_LINEWIDTH,
             linestyle=UNIT_CIRCLE_LINESTYLE,
             label="Unit circle",
+            zorder=4,
         )
 
-        # ── Scatter eigenvalues ───────────────────────────────
-        ax.scatter(
-            real_parts, imag_parts,
-            color=EIGENVALUE_COLOR,
-            s=EIGENVALUE_SIZE,
-            alpha=EIGENVALUE_ALPHA,
-            edgecolors="white",
-            linewidths=0.3,
-            label=r"Eigenvalues ($\lambda$)",
-            zorder=3,
-        )
+        # ── Task 4: Density-based spectrum visualization ──────
+        # Use hexbin for density heatmap when many points,
+        # fall back to scatter for small datasets.
+        n_points = len(eigvals_flat)
+
+        if n_points > 200:
+            # Hexbin density heatmap
+            hb = ax.hexbin(
+                real_parts, imag_parts,
+                gridsize=HEXBIN_GRIDSIZE,
+                cmap=CMAP_HEATMAP,
+                mincnt=1,
+                linewidths=0.2,
+                edgecolors="face",
+                alpha=0.85,
+                zorder=3,
+            )
+            # Colour bar
+            cb = fig.colorbar(hb, ax=ax, shrink=0.78, pad=0.02)
+            cb.set_label("Count", fontsize=FONT_SIZE_LEGEND, color=AXIS_COLOR)
+            cb.ax.tick_params(labelsize=FONT_SIZE_LEGEND - 1, colors=AXIS_COLOR)
+            for spine in cb.ax.spines.values():
+                spine.set_color(AXIS_COLOR)
+
+            # Legend entry for hexbin (manual proxy)
+            from matplotlib.patches import Patch
+            hex_proxy = Patch(facecolor=plt.get_cmap(CMAP_HEATMAP)(0.6), label="Density")
+            unit_proxy = plt.Line2D([0], [0], color=UNIT_CIRCLE_COLOR,
+                                    linewidth=UNIT_CIRCLE_LINEWIDTH,
+                                    linestyle=UNIT_CIRCLE_LINESTYLE,
+                                    label="Unit circle")
+            ax.legend(
+                handles=[hex_proxy, unit_proxy],
+                loc="upper left",
+                fontsize=FONT_SIZE_LEGEND,
+                frameon=True,
+                facecolor=BACKGROUND_COLOR,
+                edgecolor=AXIS_COLOR,
+                framealpha=1.0,
+            )
+        else:
+            # Scatter for small datasets
+            ax.scatter(
+                real_parts, imag_parts,
+                color=EIGENVALUE_COLOR,
+                s=EIGENVALUE_SIZE,
+                alpha=EIGENVALUE_ALPHA,
+                edgecolors="white",
+                linewidths=0.3,
+                label=r"Eigenvalues ($\lambda$)",
+                zorder=3,
+            )
+            ax.legend(
+                loc="upper left",
+                fontsize=FONT_SIZE_LEGEND,
+                frameon=True,
+                facecolor=BACKGROUND_COLOR,
+                edgecolor=AXIS_COLOR,
+                framealpha=1.0,
+            )
 
         # ── Reference lines (real=1, imaginary=0) ─────────────
         ax.axvline(
@@ -635,16 +818,6 @@ def plot_eigenvalue_spectrum(
 
         # Grid: ultra-faint major grid lines
         ax.grid(True, alpha=0.15, linestyle="--", linewidth=0.5)
-
-        # Legend
-        ax.legend(
-            loc="upper left",
-            fontsize=FONT_SIZE_LEGEND,
-            frameon=True,
-            facecolor=BACKGROUND_COLOR,
-            edgecolor=AXIS_COLOR,
-            framealpha=1.0,
-        )
 
         # Panel label and epoch title
         ax.set_title(
@@ -699,7 +872,7 @@ def plot_eigenvalue_spectrum(
 
 
 # ═══════════════════════════════════════════════════════════════
-# 6.  Main Analysis Pipeline
+# 7.  Main Analysis Pipeline
 # ═══════════════════════════════════════════════════════════════
 
 def run_jacobian_analysis(
@@ -709,7 +882,6 @@ def run_jacobian_analysis(
     target_class: int = Label.WALK.value,
     batch_size: int = 32,
     dt_ms: float = 10.0,
-    stim_onset_frame: int = 200,
     max_states_per_epoch: int = 100,
 ) -> None:
     """
@@ -722,7 +894,6 @@ def run_jacobian_analysis(
         target_class: Label value to analyze (default: WALK).
         batch_size: Batch size for data loading.
         dt_ms: Frame interval in milliseconds.
-        stim_onset_frame: Frame index of stimulus onset.
         max_states_per_epoch: Maximum states to process per epoch.
     """
     logger.info("=" * 60)
@@ -736,20 +907,25 @@ def run_jacobian_analysis(
     # ── Load model ────────────────────────────────────────────
     model = load_model_from_checkpoint(checkpoint_path, device)
 
-    # ── Load dataset ──────────────────────────────────────────
-    dataloader, labels, lengths_list = load_dataset(dataset_path, batch_size=batch_size)
+    # ── Load dataset (returns raw X_seqs for onset detection) ─
+    dataloader, labels, lengths_list, X_seqs = load_dataset(
+        dataset_path, batch_size=batch_size,
+    )
+
+    # ── Task 1: Dynamic stimulus onset detection ──────────────
+    onset_frames = detect_stimulus_onset_frames(X_seqs, dt_ms=dt_ms)
 
     # ── Initialize FixedPointAdapter ──────────────────────────
     adapter = FixedPointAdapter(model, device=device)
 
-    # ── Extract GRU states at epochs ──────────────────────────
+    # ── Extract GRU states at epochs (slow-point search) ──────
     epoch_data = extract_gru_states_at_epochs(
         model=model,
         dataloader=dataloader,
         device=device,
+        onset_frames=onset_frames,
         target_class=target_class,
         dt_ms=dt_ms,
-        stim_onset_frame=stim_onset_frame,
     )
 
     # ── Compute eigenvalues ───────────────────────────────────
@@ -786,7 +962,7 @@ def run_jacobian_analysis(
 
 
 # ═══════════════════════════════════════════════════════════════
-# 7.  CLI Entry Point
+# 8.  CLI Entry Point
 # ═══════════════════════════════════════════════════════════════
 
 def build_parser() -> argparse.ArgumentParser:
@@ -814,6 +990,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output path for Jacobian spectrum figure.",
     )
     parser.add_argument(
+        "--output_dir",
+        type=str,
+        default=None,
+        help="Output directory (alternative to --output; "
+             "saves as <output_dir>/jacobian_spectrum.png).",
+    )
+    parser.add_argument(
         "--target_class",
         type=int,
         default=1,
@@ -832,12 +1015,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Frame interval in milliseconds.",
     )
     parser.add_argument(
-        "--stim_onset_frame",
-        type=int,
-        default=200,
-        help="Frame index of stimulus onset (default 200 for 2s baseline at 10ms).",
-    )
-    parser.add_argument(
         "--max_states",
         type=int,
         default=100,
@@ -851,14 +1028,19 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
 
+    # Resolve output path: --output_dir takes precedence when provided
+    if args.output_dir is not None:
+        output_path = Path(args.output_dir) / "jacobian_spectrum.png"
+    else:
+        output_path = Path(args.output)
+
     run_jacobian_analysis(
         checkpoint_path=Path(args.checkpoint),
         dataset_path=Path(args.dataset),
-        output_path=Path(args.output),
+        output_path=output_path,
         target_class=args.target_class,
         batch_size=args.batch_size,
         dt_ms=args.dt_ms,
-        stim_onset_frame=args.stim_onset_frame,
         max_states_per_epoch=args.max_states,
     )
 

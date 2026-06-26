@@ -120,7 +120,7 @@ class LIFCell(nn.Module):
     def forward(
         self,
         input_t: torch.Tensor,
-        state: torch.Tensor,
+        state: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Advance the LIF state by one time-step.
@@ -128,10 +128,15 @@ class LIFCell(nn.Module):
         Args:
             input_t: ``(B, H)`` — sensory encoding at time *t*.
             state: ``(B, H)`` — membrane potential V[t-1].
+                If ``None``, initializes to zeros (backward compatible).
 
         Returns:
             ``(spike, new_state)`` where both are ``(B, H)``.
         """
+        # Initialize state if not provided (backward compatible)
+        if state is None:
+            state = self.init_state(input_t.shape[0], input_t.device)
+
         # Leak + input integration:  V = α·V_prev + β·W_in·input
         v_new = self.alpha * state + self.beta * self.W_in(input_t)   # (B, H)
 
@@ -182,11 +187,14 @@ class GRUUnit(nn.Module):
         self,
         x: torch.Tensor,
         lengths: torch.Tensor,
+        h0: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
             x: ``(B, T, H)``
             lengths: ``(B,)`` — true sequence lengths.
+            h0: ``(num_layers, B, H)`` — optional initial hidden state.
+                If ``None``, defaults to zeros (backward compatible).
 
         Returns:
             ``(B, T, H)``
@@ -195,7 +203,7 @@ class GRUUnit(nn.Module):
         packed = pack_padded_sequence(
             x, lengths_cpu, batch_first=True, enforce_sorted=False,
         )
-        packed_out, _ = self.gru(packed)
+        packed_out, _ = self.gru(packed, h0)
         out, _ = pad_packed_sequence(
             packed_out, batch_first=True, total_length=x.shape[1],
         )
@@ -358,7 +366,8 @@ class BioMoRCore(nn.Module):
         *,
         return_internals: bool = False,
         override_gates: Optional[Dict[str, float]] = None,
-    ) -> torch.Tensor | Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        states: Optional[Dict[str, torch.Tensor]] = None,
+    ) -> torch.Tensor | Tuple[torch.Tensor, Dict[str, torch.Tensor]] | Tuple[torch.Tensor, Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
         """
         Forward pass.
 
@@ -374,14 +383,22 @@ class BioMoRCore(nn.Module):
                 ``"g_gru"``.  Example: ``{"g_lif": 0.0, "g_gru": 1.0}``
                 silences the LIF pathway.  Default ``None`` uses natural
                 routing.
+            states: Optional dictionary of recurrent states for
+                autoregressive closed-loop inference.  Keys:
+                ``"lif_v"`` — ``(B, H)`` initial LIF membrane potential,
+                ``"gru_h"`` — ``(num_layers, B, H)`` initial GRU hidden
+                state.  If ``None``, initializes to zeros (backward
+                compatible).  When provided, the updated states are
+                returned as an additional element in the output tuple.
 
         Returns:
-            If ``return_internals=False``:
+            If ``return_internals=False`` and ``states=None``:
                 ``Y_pred``: ``(B, T)``
-            If ``return_internals=True``:
-                ``(Y_pred, internals)`` where *internals* is a dict with
-                keys ``routing_gates``, ``lif_potentials``, ``lif_spikes``,
-                ``gru_hidden``.
+            If ``return_internals=True`` and ``states=None``:
+                ``(Y_pred, internals)``
+            If ``states`` is not None:
+                ``(Y_pred, internals, states_out)`` where ``states_out``
+                contains the updated recurrent states for the next step.
 
         Raises:
             ValueError: If ``X_batch`` feature dim is not 8.
@@ -434,10 +451,19 @@ class BioMoRCore(nn.Module):
         )
 
         # ──────────────────────────────────────────────────────
+        # Step 2b: Extract initial states (autoregressive mode)
+        # ──────────────────────────────────────────────────────
+        lif_state0: Optional[torch.Tensor] = None
+        gru_h0: Optional[torch.Tensor] = None
+        if states is not None:
+            lif_state0 = states.get("lif_v", None)            # (B, H)
+            gru_h0 = states.get("gru_h", None)                # (L, B, H)
+
+        # ──────────────────────────────────────────────────────
         # Step 3: Path A — LIF (step-by-step, respects padding)
         # ──────────────────────────────────────────────────────
         out_lif, lif_potentials, lif_spikes = self._run_lif_path(
-            e_sensory, lengths,
+            e_sensory, lengths, lif_state0=lif_state0,
         )                                                     # (B, T, H) each
 
         # ── LIF output shape assertions ──
@@ -456,7 +482,7 @@ class BioMoRCore(nn.Module):
         # ──────────────────────────────────────────────────────
         # Step 4: Path B — GRU (packed, efficient)
         # ──────────────────────────────────────────────────────
-        out_gru = self.gru_unit(e_sensory, lengths)           # (B, T, H)
+        out_gru = self.gru_unit(e_sensory, lengths, h0=gru_h0)  # (B, T, H)
 
         assert out_gru.shape == (B, T, self.hidden_dim), (
             f"out_gru shape {tuple(out_gru.shape)} != (B={B}, T={T}, H={self.hidden_dim})"
@@ -514,17 +540,32 @@ class BioMoRCore(nn.Module):
             f"y_pred shape {tuple(y_pred.shape)} != (B={B}, T={T})"
         )
 
-        if return_internals:
-            # Reconstruct the gates tensor from (possibly overridden) g_lif, g_gru
-            effective_gates = torch.cat([g_lif, g_gru], dim=-1)  # (B, T, 2)
+        # ──────────────────────────────────────────────────────
+        # Step 8: Build output
+        # ──────────────────────────────────────────────────────
 
-            internals: Dict[str, torch.Tensor] = {
-                "routing_gates": effective_gates,  # (B, T, 2) — may be overridden
-                "natural_gates": gates,            # (B, T, 2) — always natural
-                "lif_potentials": lif_potentials,  # (B, T, H)
-                "lif_spikes": lif_spikes,          # (B, T, H)
-                "gru_hidden": out_gru,             # (B, T, H)
+        # Reconstruct the gates tensor from (possibly overridden) g_lif, g_gru
+        effective_gates = torch.cat([g_lif, g_gru], dim=-1)  # (B, T, 2)
+
+        internals: Dict[str, torch.Tensor] = {
+            "routing_gates": effective_gates,  # (B, T, 2) — may be overridden
+            "natural_gates": gates,            # (B, T, 2) — always natural
+            "lif_potentials": lif_potentials,  # (B, T, H)
+            "lif_spikes": lif_spikes,          # (B, T, H)
+            "gru_hidden": out_gru,             # (B, T, H)
+        }
+
+        # Build updated states for autoregressive mode
+        if states is not None:
+            # LIF: last valid state is already in v_state from _run_lif_path
+            # We need to extract it from potentials at the last valid frame
+            states_out: Dict[str, torch.Tensor] = {
+                "lif_v": lif_potentials[:, -1, :],            # (B, H)
+                "gru_h": out_gru[:, -1:, :].permute(1, 0, 2),  # (1, B, H)
             }
+            return y_pred, internals, states_out
+
+        if return_internals:
             return y_pred, internals
 
         return y_pred
@@ -570,6 +611,7 @@ class BioMoRCore(nn.Module):
         self,
         e_sensory: torch.Tensor,
         lengths: torch.Tensor,
+        lif_state0: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Run the LIF cell step-by-step, masking padded positions.
@@ -577,6 +619,8 @@ class BioMoRCore(nn.Module):
         Args:
             e_sensory: ``(B, T, H)``
             lengths: ``(B,)``
+            lif_state0: ``(B, H)`` — optional initial membrane potential.
+                If ``None``, initializes to zeros (backward compatible).
 
         Returns:
             ``(out_lif, potentials, spikes)`` — each ``(B, T, H)``.
@@ -584,7 +628,10 @@ class BioMoRCore(nn.Module):
         B, T, H = e_sensory.shape
         device = e_sensory.device
 
-        v_state = self.lif_cell.init_state(B, device)         # (B, H)
+        if lif_state0 is not None:
+            v_state = lif_state0                              # (B, H)
+        else:
+            v_state = self.lif_cell.init_state(B, device)     # (B, H)
 
         out_lif = torch.zeros(B, T, H, device=device)
         potentials = torch.zeros(B, T, H, device=device)

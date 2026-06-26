@@ -167,6 +167,19 @@ stage_header "Phase G — Psychophysics & Bayesian Reliability"
 stage_done "Phase G"
 
 # ═════════════════════════════════════════════════════════════
+# Phase H — Autoregressive Closed-Loop Generation
+# ═════════════════════════════════════════════════════════════
+stage_header "Phase H — Autoregressive Closed-Loop Generation"
+
+"${PYTHON}" scripts/simulate_autoregressive.py \
+    --checkpoint "${BEST_MODEL}" \
+    --output_dir "${OUTPUT_DIR}/sim_session" \
+    --dt_ms "${DT_MS}" \
+    || stage_fail "Phase H"
+
+stage_done "Phase H"
+
+# ═════════════════════════════════════════════════════════════
 # Summary
 # ═════════════════════════════════════════════════════════════
 echo -e "${BOLD}${GREEN}══════════════════════════════════════════════════════${RESET}"
@@ -185,4 +198,8 @@ echo "    ${OUTPUT_DIR}/lesion_statistics.csv"
 echo "    ${OUTPUT_DIR}/jacobian_stats.csv"
 echo "    ${OUTPUT_DIR}/integration_summary.json"
 echo "    ${OUTPUT_DIR}/psychophysics_summary.json"
+echo ""
+echo "  Synthetic Session:"
+echo "    ${OUTPUT_DIR}/sim_session/events.csv"
+echo "    ${OUTPUT_DIR}/sim_session/kinematics.csv"
 echo ""

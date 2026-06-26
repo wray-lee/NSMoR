@@ -227,6 +227,22 @@ lif_spikes = internals["lif_spikes"]            # (B, T, H) — spike events
 gru_hidden = internals["gru_hidden"]            # (B, T, H) — GRU hidden states
 ```
 
+### Autoregressive Closed-Loop Inference
+
+The `forward()` method also supports state passing for autoregressive generation.
+Pass a `states` dict to carry LIF membrane potentials and GRU hidden states
+across time steps:
+
+```python
+states = None
+for t in range(T):
+    X_t = X_batch[:, t:t+1, :]  # (B, 1, 8)
+    y_pred, internals, states = model(
+        X_t, lengths=torch.tensor([1]), return_internals=True, states=states,
+    )
+    # y_pred is the predicted velocity — feed back as kinematic input
+```
+
 ### Targeted Partial Weight Freezing
 
 Freeze specific pathways for fine-tuning experiments:
@@ -438,6 +454,7 @@ make pipeline
 | `make jacobian`      | Jacobian eigenvalue spectrum                   |
 | `make integration`   | Multisensory integration window                |
 | `make psychophysics` | Bayesian reliability & cue combination         |
+| `make generate`      | Autoregressive closed-loop trajectory generation|
 | `make test`          | Run full test suite                            |
 | `make clean`         | Remove caches and build artefacts              |
 
@@ -470,6 +487,8 @@ After `make pipeline`, all publication-ready figures (300 DPI, Lancet/Cell aesth
 | `jacobian_stats.csv`            | CSV    |
 | `integration_summary.json`      | JSON   |
 | `psychophysics_summary.json`    | JSON   |
+| `sim_session/events.csv`        | CSV (cercus-compatible)  |
+| `sim_session/kinematics.csv`    | CSV (cercus-compatible)  |
 
 ### Docker & CI/CD
 

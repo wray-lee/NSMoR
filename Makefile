@@ -66,6 +66,10 @@ integration: $(BEST) ## Run multisensory integration window
 psychophysics: $(BEST) ## Run Bayesian reliability analysis
 	$(PYTHON) scripts/simulate_psychophysics.py --checkpoint $(BEST) --output_dir $(OUTPUT)
 
+# ── Autoregressive Generation ────────────────────────────────
+generate: $(BEST) ## Run autoregressive closed-loop generation
+	$(PYTHON) scripts/simulate_autoregressive.py --checkpoint $(BEST) --output_dir $(OUTPUT)/sim_session
+
 # ── Full Pipeline ────────────────────────────────────────────
 pipeline: ## Execute full end-to-end experimental pipeline
 	bash run_pipeline.sh
