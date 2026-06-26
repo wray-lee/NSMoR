@@ -1,0 +1,13 @@
+Metadata-Version: 2.4
+Name: biomor
+Version: 0.1.0
+Summary: Bio-inspired Multi-sensory Object Recognition: Cricket Neural Modeling
+Requires-Python: >=3.10
+Requires-Dist: numpy>=1.24.0
+Requires-Dist: pandas>=2.0.0
+Requires-Dist: torch>=2.0.0
+Requires-Dist: scikit-learn>=1.3.0
+Requires-Dist: scipy>=1.10.0
+Provides-Extra: dev
+Requires-Dist: pytest>=7.0; extra == "dev"
+Requires-Dist: pytest-cov>=4.0; extra == "dev"

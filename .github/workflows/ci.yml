@@ -1,0 +1,42 @@
+# ═══════════════════════════════════════════════════════════════
+# BioMoR — CI/CD Pipeline
+# ═══════════════════════════════════════════════════════════════
+#
+# Triggers on every push and PR to main.
+# Verifies: install → test
+# ═══════════════════════════════════════════════════════════════
+
+name: BioMoR CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test Suite
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10"]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: make install
+
+      - name: Run test suite
+        run: make test

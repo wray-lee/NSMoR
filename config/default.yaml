@@ -1,0 +1,61 @@
+# ═══════════════════════════════════════════════════════════════
+# BioMoR — Default Experiment Configuration
+# ═══════════════════════════════════════════════════════════════
+#
+# Usage:
+#   python train.py --config config/default.yaml
+#   python train.py --config config/default.yaml --lr 5e-4 --freeze lif_cell router
+#
+# All keys are optional; missing values fall back to dataclass defaults.
+# See biomor/config_parser.py for the full schema.
+
+# ── Model architecture ──────────────────────────────────────
+model:
+  sensory_dim: 4          # visual angle, wind, velocity, acceleration
+  mcmc_dim: 4             # MCMC prior probability vector
+  hidden_dim: 64          # shared hidden dimension for LIF + GRU
+  num_gru_layers: 1       # stacked GRU layers
+  dropout: 0.1            # dropout in GRU and decoder
+  lif_alpha: 0.9          # LIF leak factor (higher = slower decay)
+  lif_threshold: 1.0      # LIF spike threshold
+  lif_beta: 0.5           # LIF input scaling
+
+# ── Training hyperparameters ────────────────────────────────
+training:
+  learning_rate: 0.001
+  weight_decay: 0.0
+  num_epochs: 100
+  batch_size: 32
+  grad_clip_norm: 1.0
+  log_interval: 10
+  checkpoint_interval: 10
+  random_seed: 42
+
+# ── Dataset paths ───────────────────────────────────────────
+# Each field is a list of CSV paths; multiple files are concatenated.
+data:
+  train_kinematics:
+    - data/session_0/kinematics.csv
+    - data/session_1/kinematics.csv
+  train_events:
+    - data/session_0/events.csv
+    - data/session_1/events.csv
+  val_kinematics:
+    - data/val/kinematics.csv
+  val_events:
+    - data/val/events.csv
+  test_kinematics: []
+  test_events: []
+
+# ── Fine-tuning strategy ────────────────────────────────────
+# freeze_modules: list of sub-module names to freeze.
+# Valid: sensory_encoder, lif_cell, gru_unit, router, direction_head
+# unfreeze_after_epoch: set >= 0 to unfreeze all at that epoch.
+finetune:
+  freeze_modules: []
+  unfreeze_after_epoch: -1
+
+# ── Checkpoint / output ─────────────────────────────────────
+checkpoint:
+  output_dir: runs/default
+  resume_from: null        # path to .pt checkpoint to resume from
