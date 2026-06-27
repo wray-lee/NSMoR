@@ -1,5 +1,5 @@
 """
-BioMoR Multisensory Integration Window Analysis — Phase 9.
+NSMoR Multisensory Integration Window Analysis — Phase 9.
 
 Generates chronometric curves showing how mechanical wind timing
 modulates the visual looming response. Groups model predictions by
@@ -28,7 +28,7 @@ Usage
 CLI::
 
     python scripts/analyze_integration.py --checkpoint runs/default/best_model.pth
-    python scripts/analyze_integration.py --checkpoint runs/default/best_model.pth --dataset data/processed/biomor_dataset.pt
+    python scripts/analyze_integration.py --checkpoint runs/default/best_model.pth --dataset data/processed/nsmor_dataset.pt
 
 """
 
@@ -45,13 +45,13 @@ import matplotlib.ticker as ticker
 import numpy as np
 import torch
 
-from biomor.biomor_dataloader import (
-    BioMoRDataset,
+from nsmor.nsmor_dataloader import (
+    NSMoRDataset,
     collate_variable_length,
 )
-from biomor.checkpoint import load_checkpoint
-from biomor.config import DEFAULT_FEATURE, Label
-from biomor.model_biomor_core import BioMoRCore
+from nsmor.checkpoint import load_checkpoint
+from nsmor.config import DEFAULT_FEATURE, Label
+from nsmor.model_nsmor_core import NSMoRCore
 
 # ── Logging ────────────────────────────────────────────────────
 logging.basicConfig(
@@ -112,9 +112,9 @@ BASELINE_LINEWIDTH: float = 1.5
 def load_model_from_checkpoint(
     checkpoint_path: Path,
     device: torch.device,
-) -> BioMoRCore:
+) -> NSMoRCore:
     """
-    Load a trained BioMoRCore model from a checkpoint.
+    Load a trained NSMoRCore model from a checkpoint.
 
     Args:
         checkpoint_path: Path to the ``.pth`` checkpoint file.
@@ -137,7 +137,7 @@ def load_model_from_checkpoint(
     model_config = config_dict.get("model", {})
 
     # Build model with saved config
-    model = BioMoRCore(
+    model = NSMoRCore(
         sensory_dim=model_config.get("sensory_dim", 4),
         mcmc_dim=model_config.get("mcmc_dim", 4),
         hidden_dim=model_config.get("hidden_dim", 64),
@@ -174,7 +174,7 @@ def load_dataset(
     Load the preprocessed dataset and create a DataLoader.
 
     Args:
-        dataset_path: Path to ``biomor_dataset.pt``.
+        dataset_path: Path to ``nsmor_dataset.pt``.
         batch_size: Batch size for the DataLoader.
 
     Returns:
@@ -207,7 +207,7 @@ def load_dataset(
 
     # Create dataset and dataloader
     feature_config = dataset.get("feature_config", DEFAULT_FEATURE)
-    bio_dataset = BioMoRDataset(
+    bio_dataset = NSMoRDataset(
         sequences=sequences,
         mcmc_priors=mcmc_priors,
         feature_config=feature_config,
@@ -877,7 +877,7 @@ def run_integration_analysis(
         stim_onset_frame: Frame index of stimulus onset.
     """
     logger.info("=" * 60)
-    logger.info("BioMoR Multisensory Integration Window Analysis (Phase 9)")
+    logger.info("NSMoR Multisensory Integration Window Analysis (Phase 9)")
     logger.info("=" * 60)
 
     # ── Default paths ─────────────────────────────────────────
@@ -988,7 +988,7 @@ def run_integration_analysis(
 def build_parser() -> argparse.ArgumentParser:
     """Build CLI argument parser."""
     parser = argparse.ArgumentParser(
-        description="BioMoR Multisensory Integration Window Analysis",
+        description="NSMoR Multisensory Integration Window Analysis",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
@@ -1000,7 +1000,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dataset",
         type=str,
-        default="data/processed/biomor_dataset.pt",
+        default="data/processed/nsmor_dataset.pt",
         help="Path to preprocessed dataset.",
     )
     parser.add_argument(

@@ -1,5 +1,5 @@
 Metadata-Version: 2.4
-Name: biomor
+Name: nsmor
 Version: 0.1.0
 Summary: Bio-inspired Multi-sensory Object Recognition: Cricket Neural Modeling
 Requires-Python: >=3.10

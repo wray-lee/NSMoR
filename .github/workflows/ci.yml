@@ -1,12 +1,12 @@
 # ═══════════════════════════════════════════════════════════════
-# BioMoR — CI/CD Pipeline
+# NSMoR — CI/CD Pipeline
 # ═══════════════════════════════════════════════════════════════
 #
 # Triggers on every push and PR to main.
 # Verifies: install → test
 # ═══════════════════════════════════════════════════════════════
 
-name: BioMoR CI
+name: NSMoR CI
 
 on:
   push:

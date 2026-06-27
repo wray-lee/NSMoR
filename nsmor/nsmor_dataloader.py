@@ -1,11 +1,11 @@
 """
-BioMoR DataLoader — PyTorch Dataset and DataLoader for the continuous model.
+NSMoR DataLoader — PyTorch Dataset and DataLoader for the continuous model.
 
 Combines Trial-Start anchored sequences with **pre-computed** static MCMC
 priors into a unified DataLoader for downstream recurrent training.
 
 Supports YAML-driven dataset switching via :func:`create_dataloader_from_config`,
-which reads dataset paths from an :class:`~biomor.config_parser.ExperimentConfig`
+which reads dataset paths from an :class:`~nsmor.config_parser.ExperimentConfig`
 and dynamically assembles train / val / test splits.
 
 Per-frame feature layout (``feature_dim = 8``)
@@ -38,16 +38,16 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 
-from biomor.config import DEFAULT_FEATURE, FeatureConfig
+from nsmor.config import DEFAULT_FEATURE, FeatureConfig
 
 
 # ──────────────────────────────────────────────────────────────
 # Dataset
 # ──────────────────────────────────────────────────────────────
 
-class BioMoRDataset(Dataset):
+class NSMoRDataset(Dataset):
     """
-    PyTorch Dataset for BioMoR continuous modelling.
+    PyTorch Dataset for NSMoR continuous modelling.
 
     Each item is a ``(X_seq, Y_seq)`` pair where
 
@@ -199,7 +199,7 @@ def create_dataloader(
     feature_config: FeatureConfig = DEFAULT_FEATURE,
 ) -> DataLoader:
     """
-    Create a :class:`~torch.utils.data.DataLoader` for BioMoR.
+    Create a :class:`~torch.utils.data.DataLoader` for NSMoR.
 
     Args:
         sequences: From :func:`data_extractor.build_sequence_dataset`.
@@ -212,7 +212,7 @@ def create_dataloader(
     Returns:
         A ``DataLoader`` yielding ``(X_batch, Y_batch, lengths)`` tuples.
     """
-    dataset = BioMoRDataset(
+    dataset = NSMoRDataset(
         sequences=sequences,
         mcmc_priors=mcmc_priors,
         feature_config=feature_config,
@@ -270,7 +270,7 @@ def create_dataloader_from_config(
     feature_config: FeatureConfig = DEFAULT_FEATURE,
 ) -> DataLoader:
     """
-    Create a DataLoader from an :class:`~biomor.config_parser.ExperimentConfig`.
+    Create a DataLoader from an :class:`~nsmor.config_parser.ExperimentConfig`.
 
     Reads ``batch_size``, ``shuffle``, and ``num_workers`` from the
     config's ``training`` section.  The *split* parameter selects
@@ -278,7 +278,7 @@ def create_dataloader_from_config(
     the caller passes the actual sequences).
 
     Args:
-        config: An :class:`~biomor.config_parser.ExperimentConfig` instance.
+        config: An :class:`~nsmor.config_parser.ExperimentConfig` instance.
         sequences: Pre-assembled sequence list for this split.
         mcmc_priors: Pre-computed prior matrix.
         split: One of ``"train"``, ``"val"``, ``"test"``.

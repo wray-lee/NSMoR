@@ -1,4 +1,4 @@
-# BOUNDARY — `biomor/analysis/` (Dynamical Systems Sandbox)
+# BOUNDARY — `nsmor/analysis/` (Dynamical Systems Sandbox)
 
 ## Status: 🔓 FREE TO MODIFY
 
@@ -8,7 +8,7 @@ This directory is the **sandbox for dynamical systems analysis tools**. Safe to 
 
 ## Purpose
 
-Provide tools for analyzing the internal dynamics of the BioMoR GRU pathway:
+Provide tools for analyzing the internal dynamics of the NSMoR GRU pathway:
 
 - **Fixed-point analysis** — find equilibrium states of the recurrent dynamics
 - **Jacobian computation** — characterize stability of fixed points
@@ -22,6 +22,7 @@ Provide tools for analyzing the internal dynamics of the BioMoR GRU pathway:
 ### `FixedPointAdapter` (dynamics.py)
 
 **State Extraction:**
+
 ```python
 adapter = FixedPointAdapter(model, device=device)
 
@@ -31,6 +32,7 @@ trajectories = adapter.extract_gru_states(dataloader)
 ```
 
 **Jacobian Computation:**
+
 ```python
 # Single state Jacobian
 h_t = torch.randn(H, requires_grad=True)
@@ -42,6 +44,7 @@ J_batch = adapter.compute_jacobian_batch(h_states, x_inputs)  # (N, H, H)
 ```
 
 **Eigenvalue Analysis:**
+
 ```python
 eigenvalues = torch.linalg.eigvals(J)
 # |eigenvalue| < 1 → stable fixed point
@@ -82,7 +85,7 @@ Output: jacobians [N, H, H]  — Jacobian for each state
 1. **DO** create new analysis tools freely.
 2. **DO** experiment with different fixed-point finders.
 3. **DO** add visualization utilities.
-4. **DO NOT** modify `biomor/model_biomor_core.py` from here — import it instead.
+4. **DO NOT** modify `nsmor/model_nsmor_core.py` from here — import it instead.
 5. **ALWAYS** maintain shape assertions in new functions.
 
 ---
@@ -100,8 +103,9 @@ Output: jacobians [N, H, H]  — Jacobian for each state
 ## Import Pattern
 
 Always import from frozen core — never copy:
+
 ```python
-from biomor.model_biomor_core import BioMoRCore
-from biomor.loss import BioJointLoss
-from biomor.checkpoint import load_checkpoint
+from nsmor.model_nsmor_core import NSMoRCore
+from nsmor.loss import BioJointLoss
+from nsmor.checkpoint import load_checkpoint
 ```

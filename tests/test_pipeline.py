@@ -17,7 +17,7 @@ import pandas as pd
 import pytest
 import torch
 
-from biomor.config import (
+from nsmor.config import (
     DEFAULT_FEATURE,
     DEFAULT_MCMC_TRAINING,
     DEFAULT_THRESHOLD,
@@ -28,26 +28,26 @@ from biomor.config import (
     ThresholdConfig,
     TimeWindowConfig,
 )
-from biomor.pipeline.io import (
+from nsmor.pipeline.io import (
     extract_trial_data,
     load_and_concat_sessions,
 )
-from biomor.pipeline.labeling import assign_ground_truth_labels
-from biomor.data_extractor import (
+from nsmor.pipeline.labeling import assign_ground_truth_labels
+from nsmor.data_extractor import (
     PURE_WIND_PREPEND_FRAMES,
     build_sequence_dataset,
     build_snapshot_dataset,
     extract_mcmc_snapshot,
     extract_trial_sequence,
 )
-from biomor.mcmc_module import (
+from nsmor.mcmc_module import (
     MCMCPriorGenerator,
     MCMCPriorSKLearn,
     MarkovTransitionEstimator,
     train_mcmc,
 )
-from biomor.biomor_dataloader import create_dataloader
-from biomor.model_biomor_core import BioMoR
+from nsmor.nsmor_dataloader import create_dataloader
+from nsmor.model_nsmor_core import NSMoR
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -405,8 +405,8 @@ class TestMCMCModule:
         )
 
 
-class TestBioMoRDataLoader:
-    """Tests for biomor_dataloader."""
+class TestNSMoRDataLoader:
+    """Tests for nsmor_dataloader."""
 
     def test_dataloader_with_priors(self, tmp_path: Path) -> None:
         kin_path, evt_path = _make_synthetic_csvs(tmp_path)
@@ -455,7 +455,7 @@ class TestBioMoRDataLoader:
             break  # one batch is enough
 
     def test_dataloader_requires_priors(self, tmp_path: Path) -> None:
-        """BioMoRDataset raises ValueError when mcmc_priors is None."""
+        """NSMoRDataset raises ValueError when mcmc_priors is None."""
         kin_path, evt_path = _make_synthetic_csvs(tmp_path)
         data = load_and_concat_sessions([kin_path], [evt_path])
 
@@ -467,12 +467,12 @@ class TestBioMoRDataLoader:
             create_dataloader(sequences, mcmc_priors=None, batch_size=2)
 
 
-class TestBioMoRModel:
-    """Tests for the BioMoR Mixture-of-Recursions network."""
+class TestNSMoRModel:
+    """Tests for the NSMoR Mixture-of-Recursions network."""
 
     def test_forward_shape(self) -> None:
         B, T, H = 4, 100, 32
-        model = BioMoR(sensory_dim=4, mcmc_dim=4, hidden_dim=H)
+        model = NSMoR(sensory_dim=4, mcmc_dim=4, hidden_dim=H)
         X_batch = torch.randn(B, T, 8)
         lengths = torch.tensor([100, 80, 50, 20], dtype=torch.int64)
 
@@ -487,7 +487,7 @@ class TestBioMoRModel:
     def test_forward_variable_lengths(self) -> None:
         """Different length sequences produce correct shapes."""
         B, T, H = 2, 60, 16
-        model = BioMoR(sensory_dim=4, mcmc_dim=4, hidden_dim=H)
+        model = NSMoR(sensory_dim=4, mcmc_dim=4, hidden_dim=H)
         X_batch = torch.randn(B, T, 8)
         lengths = torch.tensor([60, 30], dtype=torch.int64)
 
@@ -499,7 +499,7 @@ class TestBioMoRModel:
 
     def test_forward_single_sample(self) -> None:
         """Batch size 1 works correctly."""
-        model = BioMoR(sensory_dim=4, mcmc_dim=4, hidden_dim=16)
+        model = NSMoR(sensory_dim=4, mcmc_dim=4, hidden_dim=16)
         X = torch.randn(1, 50, 8)
         lengths = torch.tensor([50], dtype=torch.int64)
 
@@ -511,7 +511,7 @@ class TestBioMoRModel:
 
     def test_gradient_flow(self) -> None:
         """Gradients flow through both LIF and GRU paths."""
-        model = BioMoR(sensory_dim=4, mcmc_dim=4, hidden_dim=16)
+        model = NSMoR(sensory_dim=4, mcmc_dim=4, hidden_dim=16)
         X = torch.randn(2, 40, 8, requires_grad=True)
         lengths = torch.tensor([40, 20], dtype=torch.int64)
 
@@ -526,7 +526,7 @@ class TestBioMoRModel:
 
     def test_invalid_feature_dim_raises(self) -> None:
         """ValueError when feature dim != 8."""
-        model = BioMoR(sensory_dim=4, mcmc_dim=4, hidden_dim=16)
+        model = NSMoR(sensory_dim=4, mcmc_dim=4, hidden_dim=16)
         X_bad = torch.randn(2, 40, 6)  # wrong dim
         lengths = torch.tensor([40, 20], dtype=torch.int64)
 
@@ -534,7 +534,7 @@ class TestBioMoRModel:
             model(X_bad, lengths)
 
     def test_end_to_end_pipeline(self, tmp_path: Path) -> None:
-        """Full pipeline: CSV → DataLoader → BioMoR forward."""
+        """Full pipeline: CSV → DataLoader → NSMoR forward."""
         kin_path, evt_path = _make_synthetic_csvs(tmp_path)
         data = load_and_concat_sessions([kin_path], [evt_path])
 
@@ -554,7 +554,7 @@ class TestBioMoRModel:
             sequences, mcmc_priors=priors, batch_size=4,
         )
 
-        model = BioMoR(sensory_dim=4, mcmc_dim=4, hidden_dim=32)
+        model = NSMoR(sensory_dim=4, mcmc_dim=4, hidden_dim=32)
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
         criterion = nn.MSELoss()
 
@@ -585,7 +585,7 @@ class TestBioMoRModel:
 
         loader = create_dataloader(sequences, mcmc_priors=priors, batch_size=1)
 
-        model = BioMoR(sensory_dim=4, mcmc_dim=4, hidden_dim=16)
+        model = NSMoR(sensory_dim=4, mcmc_dim=4, hidden_dim=16)
         model.eval()
         for X_batch, Y_batch, lengths in loader:
             with torch.no_grad():

@@ -1,5 +1,5 @@
 """
-YAML + argparse experiment configuration for BioMoR.
+YAML + argparse experiment configuration for NSMoR.
 
 Provides :class:`ExperimentConfig` as the single source of truth for
 all hyperparameters, dataset paths, and fine-tuning strategies.
@@ -14,7 +14,7 @@ CLI::
 
 Python::
 
-    from biomor.config_parser import ExperimentConfig
+    from nsmor.config_parser import ExperimentConfig
     cfg = ExperimentConfig.from_yaml("config/base.yaml")
     print(cfg.model.hidden_dim)
 """
@@ -82,7 +82,7 @@ class FineTuneConfig:
     """Targeted freezing / fine-tuning strategy."""
     freeze_modules: List[str] = field(default_factory=list)
     """List of sub-module names to freeze.  See
-    :meth:`~biomor.model_biomor_core.BioMoRCore.freeze_modules`."""
+    :meth:`~nsmor.model_nsmor_core.NSMoRCore.freeze_modules`."""
 
     unfreeze_after_epoch: int = -1
     """If >= 0, unfreeze all modules at this epoch for full fine-tuning."""
@@ -239,14 +239,14 @@ class ExperimentConfig:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     """
-    Build the default :class:`argparse.ArgumentParser` for BioMoR
+    Build the default :class:`argparse.ArgumentParser` for NSMoR
     training scripts.
 
     Returns:
         Parser with ``--config`` and all CLI override flags.
     """
     parser = argparse.ArgumentParser(
-        description="BioMoR training configuration",
+        description="NSMoR training configuration",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(

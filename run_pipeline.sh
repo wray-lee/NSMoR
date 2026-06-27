@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════
-# BioMoR — Master Pipeline Orchestrator
+# NSMoR — Master Pipeline Orchestrator
 # ═══════════════════════════════════════════════════════════════
 #
-# Deterministic, end-to-end execution of the full BioMoR
+# Deterministic, end-to-end execution of the full NSMoR
 # experimental DAG: ETL → Train → Analysis → Figures.
 #
 # Usage:
@@ -63,7 +63,7 @@ PYTHON="${PYTHON:-python}"
 BEST_MODEL="${RUN_DIR}/best_model.pth"
 
 # ── Preflight checks ────────────────────────────────────────
-echo -e "${BOLD}BioMoR Pipeline Orchestrator${RESET}"
+echo -e "${BOLD}NSMoR Pipeline Orchestrator${RESET}"
 echo -e "  Python  : ${PYTHON}"
 echo -e "  Config  : ${CONFIG}"
 echo -e "  Run Dir : ${RUN_DIR}"

@@ -33,7 +33,7 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(_SCRIPT_DIR)
 sys.path.insert(0, _PROJECT_ROOT)
 
-from biomor.model_biomor_core import BioMoRCore  # noqa: E402
+from nsmor.model_nsmor_core import NSMoRCore  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s")
 logger = logging.getLogger(__name__)
@@ -61,10 +61,10 @@ DPI = 300
 # ===================================================================
 
 def load_checkpoint(ckpt_path: str, device: torch.device):
-    """Load model checkpoint and rebuild BioMoRCore."""
+    """Load model checkpoint and rebuild NSMoRCore."""
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     cfg = ckpt["model_config"]
-    model = BioMoRCore(
+    model = NSMoRCore(
         input_dim=cfg["input_dim"],
         hidden_dim=cfg["hidden_dim"],
         output_dim=cfg["output_dim"],
@@ -76,8 +76,8 @@ def load_checkpoint(ckpt_path: str, device: torch.device):
 
 
 def load_validation_data(device: torch.device):
-    """Load biomor_dataset.pt and return validation split."""
-    dataset_path = os.path.join(_PROJECT_ROOT, "data", "processed", "biomor_dataset.pt")
+    """Load nsmor_dataset.pt and return validation split."""
+    dataset_path = os.path.join(_PROJECT_ROOT, "data", "processed", "nsmor_dataset.pt")
     if not os.path.exists(dataset_path):
         logger.error("Dataset not found: %s", dataset_path)
         sys.exit(1)

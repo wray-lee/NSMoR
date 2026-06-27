@@ -1,5 +1,5 @@
 """
-Centralized configuration for the BioMoR data pipeline.
+Centralized configuration for the NSMoR data pipeline.
 
 All physical constants, thresholds, and dimensional parameters
 are defined here as frozen dataclasses for immutability.

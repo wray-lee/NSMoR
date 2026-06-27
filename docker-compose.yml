@@ -1,39 +1,39 @@
 # ═══════════════════════════════════════════════════════════════
-# BioMoR — Docker Compose Configuration
+# NSMoR — Docker Compose Configuration
 # ═══════════════════════════════════════════════════════════════
 #
 # Reproduce the full paper:
-#   docker compose run --rm biomor pipeline
+#   docker compose run --rm nsmor pipeline
 #
 # Individual targets:
-#   docker compose run --rm biomor test
-#   docker compose run --rm biomor train
-#   docker compose run --rm biomor analyze
-#   docker compose run --rm biomor bash
+#   docker compose run --rm nsmor test
+#   docker compose run --rm nsmor train
+#   docker compose run --rm nsmor analyze
+#   docker compose run --rm nsmor bash
 #
 # GPU passthrough requires NVIDIA Container Toolkit:
 #   https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/
 # ═══════════════════════════════════════════════════════════════
 
 services:
-  biomor:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: biomor
-    stdin_open: true          # -i  (required for interactive shell)
-    tty: true                 # -t  (required for interactive shell)
-    volumes:
-      - ./data:/workspace/data
-      - ./results:/workspace/results
-      - ./runs:/workspace/runs
-      - ./config:/workspace/config
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
-    environment:
-      - NVIDIA_VISIBLE_DEVICES=all
+    nsmor:
+        build:
+            context: .
+            dockerfile: Dockerfile
+        container_name: nsmor
+        stdin_open: true # -i  (required for interactive shell)
+        tty: true # -t  (required for interactive shell)
+        volumes:
+            - ./data:/workspace/data
+            - ./results:/workspace/results
+            - ./runs:/workspace/runs
+            - ./config:/workspace/config
+        deploy:
+            resources:
+                reservations:
+                    devices:
+                        - driver: nvidia
+                          count: 1
+                          capabilities: [gpu]
+        environment:
+            - NVIDIA_VISIBLE_DEVICES=all

@@ -1,5 +1,5 @@
 """
-Bio-Constrained Joint Loss for BioMoR training.
+Bio-Constrained Joint Loss for NSMoR training.
 
 Provides :class:`BioJointLoss`, a custom ``nn.Module`` that combines:
 
@@ -158,7 +158,7 @@ def _test_bio_joint_loss() -> None:
 
     Run::
 
-        python -m biomor.loss
+        python -m nsmor.loss
     """
     print("=" * 60)
     print("BioJointLoss smoke test")

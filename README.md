@@ -1,4 +1,4 @@
-# BioMoR — Data Pipeline & MCMC Module
+# NSMoR — Data Pipeline & MCMC Module
 
 **Bio-inspired Multi-sensory Object Recognition** for cricket neural modelling.
 
@@ -15,7 +15,7 @@ PyTorch DataLoaders for the downstream continuous model.
 ## Project Structure
 
 ```
-biomor/
+nsmor/
 ├── config.py                 # Frozen dataclasses: thresholds, dimensions, windows
 ├── pipeline/
 │   ├── io.py                 # CSV loading, session concatenation, per-trial extraction
@@ -23,7 +23,7 @@ biomor/
 │   └── labeling.py           # Ground truth: Pre_Active, Startle, Walk, NoResponse
 ├── data_extractor.py         # TTC-50ms snapshot + Trial-Start anchored sequences
 ├── mcmc_module.py            # PyTorch nn.Module + sklearn wrapper + Markov estimator
-└── biomor_dataloader.py       # PyTorch Dataset + DataLoader with shape assertions
+└── nsmor_dataloader.py       # PyTorch Dataset + DataLoader with shape assertions
 ```
 
 ---
@@ -54,11 +54,11 @@ create_dataloader()               →  DataLoader yielding (X_batch, Y_batch)
 ## Quick Start
 
 ```python
-from biomor.pipeline.io import load_and_concat_sessions, extract_trial_data
-from biomor.pipeline.labeling import assign_ground_truth_labels
-from biomor.data_extractor import build_snapshot_dataset, build_sequence_dataset
-from biomor.mcmc_module import train_mcmc
-from biomor.biomor_dataloader import create_dataloader
+from nsmor.pipeline.io import load_and_concat_sessions, extract_trial_data
+from nsmor.pipeline.labeling import assign_ground_truth_labels
+from nsmor.data_extractor import build_snapshot_dataset, build_sequence_dataset
+from nsmor.mcmc_module import train_mcmc
+from nsmor.nsmor_dataloader import create_dataloader
 
 # 1. Load data
 data = load_and_concat_sessions(
@@ -94,29 +94,29 @@ for X_batch, Y_batch in loader:
 
 ### Kinematics CSV
 
-| Column         | Type   | Description                      |
-|----------------|--------|----------------------------------|
-| session_id     | str    | Session identifier               |
-| trial_id       | int    | Trial number within session      |
-| time_ms        | float  | Timestamp in milliseconds        |
-| x_pos          | float  | X position (cm)                  |
-| y_pos          | float  | Y position (cm)                  |
-| heading        | float  | Heading angle (degrees)          |
-| velocity       | float  | Velocity (cm/s)                  |
-| acceleration   | float  | Acceleration (cm/s²)             |
-| visual_angle   | float  | Looming visual angle (degrees)   |
-| wind_state     | int    | Wind stimulus (0 or 1)           |
-| l_v_ratio      | float  | Looming l/v ratio                |
+| Column       | Type  | Description                    |
+| ------------ | ----- | ------------------------------ |
+| session_id   | str   | Session identifier             |
+| trial_id     | int   | Trial number within session    |
+| time_ms      | float | Timestamp in milliseconds      |
+| x_pos        | float | X position (cm)                |
+| y_pos        | float | Y position (cm)                |
+| heading      | float | Heading angle (degrees)        |
+| velocity     | float | Velocity (cm/s)                |
+| acceleration | float | Acceleration (cm/s²)           |
+| visual_angle | float | Looming visual angle (degrees) |
+| wind_state   | int   | Wind stimulus (0 or 1)         |
+| l_v_ratio    | float | Looming l/v ratio              |
 
 ### Events CSV
 
-| Column      | Type   | Description                      |
-|-------------|--------|----------------------------------|
-| session_id  | str    | Session identifier               |
-| trial_id    | int    | Trial number                     |
-| time_ms     | float  | Event timestamp (ms)             |
-| event_type  | str    | Event type (see below)           |
-| event_value | float  | Event value                      |
+| Column      | Type  | Description            |
+| ----------- | ----- | ---------------------- |
+| session_id  | str   | Session identifier     |
+| trial_id    | int   | Trial number           |
+| time_ms     | float | Event timestamp (ms)   |
+| event_type  | str   | Event type (see below) |
+| event_value | float | Event value            |
 
 Event types: `trial_start`, `stimulus_onset`, `wind_onset`, `response_detected`, `trial_end`
 
@@ -124,28 +124,28 @@ Event types: `trial_start`, `stimulus_onset`, `wind_onset`, `response_detected`,
 
 ## Per-Frame Feature Layout (dim = 8)
 
-| Index | Symbol          | Description                              |
-|-------|-----------------|------------------------------------------|
-| 0     | v_vis(t)        | Real-time visual angle (degrees)         |
-| 1     | wind(t)         | Wind stimulus state (0 / 1)              |
-| 2     | v_kine(t-1)     | Previous-frame velocity (cm/s)           |
-| 3     | a_kine(t-1)     | Previous-frame acceleration (cm/s²)      |
-| 4     | P_startle       | MCMC prior: P(Startle)                   |
-| 5     | P_walk          | MCMC prior: P(Walk)                      |
-| 6     | P_pre_active    | MCMC prior: P(Pre_Active)                |
-| 7     | P_no_response   | MCMC prior: P(NoResponse)                |
+| Index | Symbol        | Description                         |
+| ----- | ------------- | ----------------------------------- |
+| 0     | v_vis(t)      | Real-time visual angle (degrees)    |
+| 1     | wind(t)       | Wind stimulus state (0 / 1)         |
+| 2     | v_kine(t-1)   | Previous-frame velocity (cm/s)      |
+| 3     | a_kine(t-1)   | Previous-frame acceleration (cm/s²) |
+| 4     | P_startle     | MCMC prior: P(Startle)              |
+| 5     | P_walk        | MCMC prior: P(Walk)                 |
+| 6     | P_pre_active  | MCMC prior: P(Pre_Active)           |
+| 7     | P_no_response | MCMC prior: P(NoResponse)           |
 
 ---
 
 ## MCMC Snapshot Features (dim = 5)
 
-| Index | Name                | Description                              |
-|-------|---------------------|------------------------------------------|
-| 0     | visual_angle        | Instantaneous visual angle at TTC-50ms   |
-| 1     | looming_velocity    | l/v ratio at TTC-50ms                    |
-| 2     | wind_state          | Wind stimulus state (0 / 1)              |
-| 3     | avg_velocity_bg     | Mean |velocity| in preceding 200ms       |
-| 4     | max_acceleration_bg | Max |acceleration| in preceding 200ms    |
+| Index | Name                | Description                            |
+| ----- | ------------------- | -------------------------------------- | ------------ | ------------------ |
+| 0     | visual_angle        | Instantaneous visual angle at TTC-50ms |
+| 1     | looming_velocity    | l/v ratio at TTC-50ms                  |
+| 2     | wind_state          | Wind stimulus state (0 / 1)            |
+| 3     | avg_velocity_bg     | Mean                                   | velocity     | in preceding 200ms |
+| 4     | max_acceleration_bg | Max                                    | acceleration | in preceding 200ms |
 
 ---
 
@@ -156,7 +156,7 @@ To support experimental variants (e.g., a 5.7 s silent baseline for
 pure-wind trials), instantiate a custom config:
 
 ```python
-from biomor.config import TimeWindowConfig
+from nsmor.config import TimeWindowConfig
 
 wind_config = TimeWindowConfig(baseline_duration_ms=5700.0)
 # Pass wind_config to extraction functions
@@ -188,20 +188,20 @@ pytest tests/ -v
 
 ### Modular Architecture (LIF + GRU + Causal Gate)
 
-BioMoR implements a **Mixture-of-Recursions (MoR)** architecture with fully decoupled sub-modules:
+NSMoR implements a **Mixture-of-Recursions (MoR)** architecture with fully decoupled sub-modules:
 
-| Module | Class | Purpose |
-|--------|-------|---------|
-| Sensory Encoder | `SensoryEncoder` | Maps raw 4-D sensory features to hidden representation |
-| LIF Pathway | `LIFCell` | Leaky Integrate-and-Fire spiking neuron for fast, event-driven transients |
-| GRU Pathway | `GRUUnit` | Standard GRU for smooth, continuous temporal integration |
-| Causal Gate | `MoRRouter` | Learned routing network blending LIF/GRU outputs per timestep |
-| Decoder | `DirectionHead` | Final output layer for behavior/direction prediction |
+| Module          | Class            | Purpose                                                                   |
+| --------------- | ---------------- | ------------------------------------------------------------------------- |
+| Sensory Encoder | `SensoryEncoder` | Maps raw 4-D sensory features to hidden representation                    |
+| LIF Pathway     | `LIFCell`        | Leaky Integrate-and-Fire spiking neuron for fast, event-driven transients |
+| GRU Pathway     | `GRUUnit`        | Standard GRU for smooth, continuous temporal integration                  |
+| Causal Gate     | `MoRRouter`      | Learned routing network blending LIF/GRU outputs per timestep             |
+| Decoder         | `DirectionHead`  | Final output layer for behavior/direction prediction                      |
 
 ```python
-from biomor.model_biomor_core import BioMoRCore
+from nsmor.model_nsmor_core import NSMoRCore
 
-model = BioMoRCore(
+model = NSMoRCore(
     sensory_dim=4,
     mcmc_dim=4,
     hidden_dim=64,
@@ -248,7 +248,7 @@ for t in range(T):
 Freeze specific pathways for fine-tuning experiments:
 
 ```python
-model = BioMoRCore()
+model = NSMoRCore()
 
 # Freeze only the LIF pathway and causal gate
 model.freeze_modules(["lif_cell", "router"])
@@ -266,7 +266,7 @@ Valid module names: `sensory_encoder`, `lif_cell`, `gru_unit`, `router`, `direct
 Robust save/load for interrupted training with full state restoration:
 
 ```python
-from biomor.checkpoint import save_checkpoint, load_checkpoint
+from nsmor.checkpoint import save_checkpoint, load_checkpoint
 
 # Save checkpoint
 save_checkpoint(
@@ -290,6 +290,7 @@ checkpoint = load_checkpoint(
 ```
 
 Checkpoint contents:
+
 - `model_state_dict` — full model parameters and buffers
 - `optimizer_state_dict` — optimizer momentum/variance buffers
 - `scheduler_state_dict` — LR scheduler state (optional)
@@ -306,25 +307,25 @@ Single source of truth for all hyperparameters, dataset paths, and fine-tuning s
 ```yaml
 # config/base.yaml
 model:
-  hidden_dim: 64
-  lif_alpha: 0.9
+    hidden_dim: 64
+    lif_alpha: 0.9
 
 training:
-  learning_rate: 0.001
-  batch_size: 32
-  num_epochs: 100
+    learning_rate: 0.001
+    batch_size: 32
+    num_epochs: 100
 
 data:
-  train_kinematics:
-    - data/session_0/kinematics.csv
-    - data/session_1/kinematics.csv
-  train_events:
-    - data/session_0/events.csv
-    - data/session_1/events.csv
+    train_kinematics:
+        - data/session_0/kinematics.csv
+        - data/session_1/kinematics.csv
+    train_events:
+        - data/session_0/events.csv
+        - data/session_1/events.csv
 
 finetune:
-  freeze_modules: ["lif_cell", "router"]
-  unfreeze_after_epoch: -1
+    freeze_modules: ["lif_cell", "router"]
+    unfreeze_after_epoch: -1
 ```
 
 CLI overrides for rapid experimentation:
@@ -337,7 +338,7 @@ python train.py --config config/base.yaml --hidden-dim 128 --epochs 200
 Dynamic dataset combination for mixed experimental conditions:
 
 ```python
-from biomor.biomor_dataloader import combine_datasets, create_dataloader_from_config
+from nsmor.nsmor_dataloader import combine_datasets, create_dataloader_from_config
 
 # Combine pure wind baseline with looming datasets
 wind_seqs = build_sequence_dataset(wind_trials)
@@ -356,12 +357,12 @@ loader = create_dataloader_from_config(
 
 ## Training & Analysis Components
 
-### Bio-Constrained Loss Function (`biomor.loss`)
+### Bio-Constrained Loss Function (`nsmor.loss`)
 
 Custom `nn.Module` that combines masked MSE with biological router regularization:
 
 ```python
-from biomor.loss import BioJointLoss
+from nsmor.loss import BioJointLoss
 
 criterion = BioJointLoss(reduction="mean")
 loss = criterion(
@@ -389,6 +390,7 @@ python scripts/train.py --config config/default.yaml --lr 5e-4 --epochs 200
 ```
 
 Features:
+
 - YAML config + CLI overrides via `config_parser`
 - AdamW optimizer with gradient clipping
 - `return_internals=True` for router gate extraction during training
@@ -396,12 +398,12 @@ Features:
 - Periodic checkpoints (`epoch_X.pth`) at configurable intervals
 - Automatic unfreezing at scheduled epoch
 
-### Dynamical Systems Adapter (`biomor.analysis.dynamics`)
+### Dynamical Systems Adapter (`nsmor.analysis.dynamics`)
 
 Adapter for interfacing GRU states with external fixed-point analysis libraries:
 
 ```python
-from biomor.analysis.dynamics import FixedPointAdapter
+from nsmor.analysis.dynamics import FixedPointAdapter
 
 adapter = FixedPointAdapter(model)
 
@@ -427,15 +429,15 @@ J_batch = adapter.compute_jacobian_batch(h_states, x_inputs)  # (N, H, H)
 
 ## Execution & Reproducibility
 
-BioMoR uses industrial-grade DevOps standards for biological simulations.
+NSMoR uses industrial-grade DevOps standards for biological simulations.
 Every figure in the paper can be reproduced from a fresh clone with a single command.
 
 ### Quick Start
 
 ```bash
 # 1. Clone and install
-git clone https://github.com/<your-org>/biomor.git
-cd biomor
+git clone https://github.com/<your-org>/nsmor.git
+cd nsmor
 make install
 
 # 2. Run the full experimental pipeline (ETL → Train → 5 Analyses)
@@ -444,19 +446,19 @@ make pipeline
 
 ### Individual Stages
 
-| Command              | Description                                    |
-|----------------------|------------------------------------------------|
-| `make data`          | ETL: raw CSVs → processed PyTorch dataset      |
-| `make train`         | Train BioMoR model (100 epochs by default)     |
-| `make analyze`       | Run all 5 analysis scripts sequentially        |
-| `make dynamics`      | Dynamics & manifold visualisation              |
-| `make lesion`        | In-silico lesion (virtual ablation)            |
-| `make jacobian`      | Jacobian eigenvalue spectrum                   |
-| `make integration`   | Multisensory integration window                |
-| `make psychophysics` | Bayesian reliability & cue combination         |
-| `make generate`      | Autoregressive closed-loop trajectory generation|
-| `make test`          | Run full test suite                            |
-| `make clean`         | Remove caches and build artefacts              |
+| Command              | Description                                      |
+| -------------------- | ------------------------------------------------ |
+| `make data`          | ETL: raw CSVs → processed PyTorch dataset        |
+| `make train`         | Train NSMoR model (100 epochs by default)        |
+| `make analyze`       | Run all 5 analysis scripts sequentially          |
+| `make dynamics`      | Dynamics & manifold visualisation                |
+| `make lesion`        | In-silico lesion (virtual ablation)              |
+| `make jacobian`      | Jacobian eigenvalue spectrum                     |
+| `make integration`   | Multisensory integration window                  |
+| `make psychophysics` | Bayesian reliability & cue combination           |
+| `make generate`      | Autoregressive closed-loop trajectory generation |
+| `make test`          | Run full test suite                              |
+| `make clean`         | Remove caches and build artefacts                |
 
 ### Configuration
 
@@ -471,28 +473,28 @@ CONFIG=config/fast.yaml make pipeline
 
 After `make pipeline`, all publication-ready figures (300 DPI, Lancet/Cell aesthetic) are in `results/`:
 
-| File                          | Analysis                        |
-|-------------------------------|---------------------------------|
-| `dynamics_manifold.png`       | Neural state-space trajectories |
-| `lesion_comparison.png`       | Virtual ablation comparison     |
-| `jacobian_spectrum.png`       | Eigenvalue complex plane        |
-| `integration_window.png`      | Chronometric + vigor curves     |
-| `bayesian_reliability.png`    | Psychometric + gate modulation  |
+| File                       | Analysis                        |
+| -------------------------- | ------------------------------- |
+| `dynamics_manifold.png`    | Neural state-space trajectories |
+| `lesion_comparison.png`    | Virtual ablation comparison     |
+| `jacobian_spectrum.png`    | Eigenvalue complex plane        |
+| `integration_window.png`   | Chronometric + vigor curves     |
+| `bayesian_reliability.png` | Psychometric + gate modulation  |
 
 ### Data Outputs
 
-| File                            | Format |
-|---------------------------------|--------|
-| `lesion_statistics.csv`         | CSV    |
-| `jacobian_stats.csv`            | CSV    |
-| `integration_summary.json`      | JSON   |
-| `psychophysics_summary.json`    | JSON   |
-| `sim_session/events.csv`        | CSV (cercus-compatible)  |
-| `sim_session/kinematics.csv`    | CSV (cercus-compatible)  |
+| File                         | Format                  |
+| ---------------------------- | ----------------------- |
+| `lesion_statistics.csv`      | CSV                     |
+| `jacobian_stats.csv`         | CSV                     |
+| `integration_summary.json`   | JSON                    |
+| `psychophysics_summary.json` | JSON                    |
+| `sim_session/events.csv`     | CSV (cercus-compatible) |
+| `sim_session/kinematics.csv` | CSV (cercus-compatible) |
 
 ### Docker & CI/CD
 
-BioMoR provides a hermetic Docker container with GPU passthrough to eliminate
+NSMoR provides a hermetic Docker container with GPU passthrough to eliminate
 all host-OS dependencies. A reviewer can reproduce the entire paper without
 installing PyTorch, CUDA, or Python locally.
 
@@ -504,22 +506,22 @@ installing PyTorch, CUDA, or Python locally.
 #### Reproduce the Paper from a Fresh Clone
 
 ```bash
-git clone https://github.com/<your-org>/biomor.git
-cd biomor
-docker compose run --rm biomor pipeline     # ETL → Train → 5 Analyses
+git clone https://github.com/<your-org>/nsmor.git
+cd nsmor
+docker compose run --rm nsmor pipeline     # ETL → Train → 5 Analyses
 ```
 
 All figures and data outputs persist in the host `results/` directory via bind mounts.
 
 #### Containerised Targets
 
-| Command                                    | Description                          |
-|--------------------------------------------|--------------------------------------|
-| `docker compose run --rm biomor pipeline`  | Full end-to-end experimental pipeline|
-| `docker compose run --rm biomor test`      | Pytest suite                         |
-| `docker compose run --rm biomor train`     | Training engine only                 |
-| `docker compose run --rm biomor analyze`   | All 5 analysis scripts               |
-| `docker compose run --rm biomor bash`      | Interactive shell inside container   |
+| Command                                  | Description                           |
+| ---------------------------------------- | ------------------------------------- |
+| `docker compose run --rm nsmor pipeline` | Full end-to-end experimental pipeline |
+| `docker compose run --rm nsmor test`     | Pytest suite                          |
+| `docker compose run --rm nsmor train`    | Training engine only                  |
+| `docker compose run --rm nsmor analyze`  | All 5 analysis scripts                |
+| `docker compose run --rm nsmor bash`     | Interactive shell inside container    |
 
 #### CI/CD
 

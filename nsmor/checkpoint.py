@@ -1,5 +1,5 @@
 """
-Deterministic checkpoint management for BioMoR training.
+Deterministic checkpoint management for NSMoR training.
 
 Provides :func:`save_checkpoint` and :func:`load_checkpoint` that
 persist and restore all state needed for exact training resumption:

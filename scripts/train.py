@@ -1,5 +1,5 @@
 """
-BioMoR Main Training Engine.
+NSMoR Main Training Engine.
 
 Ties together the full training pipeline:
 
@@ -36,11 +36,11 @@ import torch
 import torch.nn as nn
 
 # ── Project imports ────────────────────────────────────────────
-from biomor.checkpoint import load_checkpoint, save_checkpoint
-from biomor.config import DEFAULT_FEATURE
-from biomor.config_parser import ExperimentConfig
-from biomor.loss import BioJointLoss
-from biomor.model_biomor_core import BioMoRCore
+from nsmor.checkpoint import load_checkpoint, save_checkpoint
+from nsmor.config import DEFAULT_FEATURE
+from nsmor.config_parser import ExperimentConfig
+from nsmor.loss import BioJointLoss
+from nsmor.model_nsmor_core import NSMoRCore
 
 # ── Logging setup ──────────────────────────────────────────────
 logging.basicConfig(
@@ -63,7 +63,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         Configured :class:`argparse.ArgumentParser`.
     """
     parser = argparse.ArgumentParser(
-        description="BioMoR Training Engine",
+        description="NSMoR Training Engine",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
@@ -180,9 +180,9 @@ def build_config(argv: Optional[Sequence[str]] = None) -> Tuple[ExperimentConfig
 # 2.  Model / Optimizer / Loss Factory
 # ═══════════════════════════════════════════════════════════════
 
-def build_model(config: ExperimentConfig) -> BioMoRCore:
+def build_model(config: ExperimentConfig) -> NSMoRCore:
     """
-    Construct a :class:`BioMoRCore` from the experiment config.
+    Construct a :class:`NSMoRCore` from the experiment config.
 
     Args:
         config: Parsed experiment configuration.
@@ -190,7 +190,7 @@ def build_model(config: ExperimentConfig) -> BioMoRCore:
     Returns:
         Instantiated model (on CPU; move to device after).
     """
-    model = BioMoRCore(
+    model = NSMoRCore(
         sensory_dim=config.model.sensory_dim,
         mcmc_dim=config.model.mcmc_dim,
         hidden_dim=config.model.hidden_dim,
@@ -248,13 +248,13 @@ def build_loss() -> BioJointLoss:
 
 def build_dataloaders(
     config: ExperimentConfig,
-    dataset_path: str = "data/processed/biomor_dataset.pt",
+    dataset_path: str = "data/processed/nsmor_dataset.pt",
     val_split: float = 0.2,
 ) -> Tuple[Optional[torch.utils.data.DataLoader], Optional[torch.utils.data.DataLoader]]:
     """
     Build train and validation dataloaders from the prepared dataset.
 
-    Loads the preprocessed dataset from ``biomor_dataset.pt`` (produced
+    Loads the preprocessed dataset from ``nsmor_dataset.pt`` (produced
     by ``scripts/prepare_data.py``), performs a deterministic train/val
     split, and returns two DataLoader instances.
 
@@ -270,8 +270,8 @@ def build_dataloaders(
     Raises:
         FileNotFoundError: If the dataset file does not exist.
     """
-    from biomor.biomor_dataloader import (
-        BioMoRDataset,
+    from nsmor.nsmor_dataloader import (
+        NSMoRDataset,
         collate_variable_length,
     )
 
@@ -354,12 +354,12 @@ def build_dataloaders(
     # ── Create datasets ───────────────────────────────────────
     feature_config = dataset.get("feature_config", DEFAULT_FEATURE)
 
-    train_dataset = BioMoRDataset(
+    train_dataset = NSMoRDataset(
         sequences=train_sequences,
         mcmc_priors=train_priors,
         feature_config=feature_config,
     )
-    val_dataset = BioMoRDataset(
+    val_dataset = NSMoRDataset(
         sequences=val_sequences,
         mcmc_priors=val_priors,
         feature_config=feature_config,
@@ -396,7 +396,7 @@ def build_dataloaders(
 # ═══════════════════════════════════════════════════════════════
 
 def train_one_epoch(
-    model: BioMoRCore,
+    model: NSMoRCore,
     loader: torch.utils.data.DataLoader,
     criterion: BioJointLoss,
     optimizer: torch.optim.Optimizer,
@@ -410,7 +410,7 @@ def train_one_epoch(
     Run one training epoch.
 
     Args:
-        model: The BioMoR model.
+        model: The NSMoR model.
         loader: Training DataLoader yielding ``(X_batch, Y_batch, lengths)``.
         criterion: Loss function.
         optimizer: Optimizer.
@@ -483,7 +483,7 @@ def train_one_epoch(
 
 @torch.no_grad()
 def validate(
-    model: BioMoRCore,
+    model: NSMoRCore,
     loader: torch.utils.data.DataLoader,
     criterion: BioJointLoss,
     device: torch.device,
@@ -493,7 +493,7 @@ def validate(
     Run validation (no gradient computation).
 
     Args:
-        model: The BioMoR model.
+        model: The NSMoR model.
         loader: Validation DataLoader.
         criterion: Loss function.
         device: Device.

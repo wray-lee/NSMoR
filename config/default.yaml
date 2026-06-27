@@ -1,5 +1,5 @@
 # ═══════════════════════════════════════════════════════════════
-# BioMoR — Default Experiment Configuration
+# NSMoR — Default Experiment Configuration
 # ═══════════════════════════════════════════════════════════════
 #
 # Usage:
@@ -7,7 +7,7 @@
 #   python train.py --config config/default.yaml --lr 5e-4 --freeze lif_cell router
 #
 # All keys are optional; missing values fall back to dataclass defaults.
-# See biomor/config_parser.py for the full schema.
+# See nsmor/config_parser.py for the full schema.
 
 # ── Model architecture ──────────────────────────────────────
 model:

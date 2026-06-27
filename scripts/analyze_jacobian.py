@@ -1,5 +1,5 @@
 """
-BioMoR Jacobian Eigenvalue Spectrum Analysis — Phase 8.
+NSMoR Jacobian Eigenvalue Spectrum Analysis — Phase 8.
 
 Computes the Jacobian of the GRU at different trial phases (epochs)
 and plots the eigenvalues on the complex plane (unit circle) to prove
@@ -26,7 +26,7 @@ Usage
 CLI::
 
     python scripts/analyze_jacobian.py --checkpoint runs/default/best_model.pth
-    python scripts/analyze_jacobian.py --checkpoint runs/default/best_model.pth --dataset data/processed/biomor_dataset.pt
+    python scripts/analyze_jacobian.py --checkpoint runs/default/best_model.pth --dataset data/processed/nsmor_dataset.pt
 """
 
 from __future__ import annotations
@@ -41,14 +41,14 @@ import matplotlib.ticker as ticker
 import numpy as np
 import torch
 
-from biomor.analysis.dynamics import FixedPointAdapter
-from biomor.biomor_dataloader import (
-    BioMoRDataset,
+from nsmor.analysis.dynamics import FixedPointAdapter
+from nsmor.nsmor_dataloader import (
+    NSMoRDataset,
     collate_variable_length,
 )
-from biomor.checkpoint import load_checkpoint
-from biomor.config import DEFAULT_FEATURE, Label
-from biomor.model_biomor_core import BioMoRCore
+from nsmor.checkpoint import load_checkpoint
+from nsmor.config import DEFAULT_FEATURE, Label
+from nsmor.model_nsmor_core import NSMoRCore
 
 # ── Logging ────────────────────────────────────────────────────
 logging.basicConfig(
@@ -117,9 +117,9 @@ SLOW_POINT_RADIUS: int = 5   # ±5 frames around each epoch centre
 def load_model_from_checkpoint(
     checkpoint_path: Path,
     device: torch.device,
-) -> BioMoRCore:
+) -> NSMoRCore:
     """
-    Load a trained BioMoRCore model from a checkpoint.
+    Load a trained NSMoRCore model from a checkpoint.
 
     Args:
         checkpoint_path: Path to the ``.pth`` checkpoint file.
@@ -142,7 +142,7 @@ def load_model_from_checkpoint(
     model_config = config_dict.get("model", {})
 
     # Build model with saved config
-    model = BioMoRCore(
+    model = NSMoRCore(
         sensory_dim=model_config.get("sensory_dim", 4),
         mcmc_dim=model_config.get("mcmc_dim", 4),
         hidden_dim=model_config.get("hidden_dim", 64),
@@ -182,7 +182,7 @@ def load_dataset(
     detected dynamically from the sensory channels.
 
     Args:
-        dataset_path: Path to ``biomor_dataset.pt``.
+        dataset_path: Path to ``nsmor_dataset.pt``.
         batch_size: Batch size for the DataLoader.
 
     Returns:
@@ -214,7 +214,7 @@ def load_dataset(
 
     # Create dataset and dataloader
     feature_config = dataset.get("feature_config", DEFAULT_FEATURE)
-    bio_dataset = BioMoRDataset(
+    bio_dataset = NSMoRDataset(
         sequences=sequences,
         mcmc_priors=mcmc_priors,
         feature_config=feature_config,
@@ -343,7 +343,7 @@ def _find_slow_point(
 
 
 def extract_gru_states_at_epochs(
-    model: BioMoRCore,
+    model: NSMoRCore,
     dataloader: torch.utils.data.DataLoader,
     device: torch.device,
     onset_frames: List[int],
@@ -364,7 +364,7 @@ def extract_gru_states_at_epochs(
     derivative ∂h_{t+1}/∂h_t holding the GRU input fixed.
 
     Args:
-        model: Trained BioMoRCore model.
+        model: Trained NSMoRCore model.
         dataloader: DataLoader yielding (X, Y, lengths) tuples.
         device: Computation device.
         onset_frames: Per-trial stimulus onset frame indices
@@ -897,7 +897,7 @@ def run_jacobian_analysis(
         max_states_per_epoch: Maximum states to process per epoch.
     """
     logger.info("=" * 60)
-    logger.info("BioMoR Jacobian Eigenvalue Spectrum Analysis (Phase 8)")
+    logger.info("NSMoR Jacobian Eigenvalue Spectrum Analysis (Phase 8)")
     logger.info("=" * 60)
 
     # ── Device ────────────────────────────────────────────────
@@ -968,7 +968,7 @@ def run_jacobian_analysis(
 def build_parser() -> argparse.ArgumentParser:
     """Build CLI argument parser."""
     parser = argparse.ArgumentParser(
-        description="BioMoR Jacobian Eigenvalue Spectrum Analysis",
+        description="NSMoR Jacobian Eigenvalue Spectrum Analysis",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
@@ -980,7 +980,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dataset",
         type=str,
-        default="data/processed/biomor_dataset.pt",
+        default="data/processed/nsmor_dataset.pt",
         help="Path to preprocessed dataset.",
     )
     parser.add_argument(

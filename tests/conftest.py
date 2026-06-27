@@ -1,5 +1,5 @@
 """
-Pytest fixtures for BioMoR test suite.
+Pytest fixtures for NSMoR test suite.
 
 Provides synthetic tensor fixtures for unit testing loss functions,
 model forward passes, and analysis tools without requiring real data.

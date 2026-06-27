@@ -47,7 +47,7 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(_SCRIPT_DIR)
 sys.path.insert(0, _PROJECT_ROOT)
 
-from biomor.model_biomor_core import BioMoRCore  # noqa: E402
+from nsmor.model_nsmor_core import NSMoRCore  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -269,8 +269,8 @@ def generate_stimulus_paradigm(
 def load_model_from_checkpoint(
     checkpoint_path: Path,
     device: torch.device,
-) -> BioMoRCore:
-    """Load trained BioMoRCore from checkpoint."""
+) -> NSMoRCore:
+    """Load trained NSMoRCore from checkpoint."""
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
 
@@ -280,7 +280,7 @@ def load_model_from_checkpoint(
     config_dict = checkpoint.get("config", {})
     model_config = config_dict.get("model", {})
 
-    model = BioMoRCore(
+    model = NSMoRCore(
         sensory_dim=model_config.get("sensory_dim", 4),
         mcmc_dim=model_config.get("mcmc_dim", 4),
         hidden_dim=model_config.get("hidden_dim", 64),
@@ -362,7 +362,7 @@ class TrialResult:
 
 
 def run_autoregressive_trial(
-    model: BioMoRCore,
+    model: NSMoRCore,
     paradigm: StimulusParadigm,
     mcmc_prior: np.ndarray,
     device: torch.device,
@@ -387,7 +387,7 @@ def run_autoregressive_trial(
        preserving smooth derivatives (no hard clipping).
 
     Args:
-        model: Trained BioMoRCore model (eval mode).
+        model: Trained NSMoRCore model (eval mode).
         paradigm: Stimulus paradigm specification.
         mcmc_prior: ``(4,)`` base MCMC prior vector.
         device: Computation device.

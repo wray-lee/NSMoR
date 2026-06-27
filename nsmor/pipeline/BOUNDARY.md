@@ -1,4 +1,4 @@
-# BOUNDARY — `biomor/pipeline/` (Data Pipeline)
+# BOUNDARY — `nsmor/pipeline/` (Data Pipeline)
 
 ## Status: 🟢 EXTENDABLE
 
@@ -8,9 +8,10 @@ This directory handles the transformation from **raw CSV data** to **PyTorch Dat
 
 ## Purpose
 
-Convert raw experimental data (kinematics CSVs, events CSVs) into structured tensors for the BioMoR model.
+Convert raw experimental data (kinematics CSVs, events CSVs) into structured tensors for the NSMoR model.
 
 **Data Flow:**
+
 ```
 Raw CSVs (kinematics + events)
     ↓

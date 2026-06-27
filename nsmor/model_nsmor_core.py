@@ -1,5 +1,5 @@
 """
-BioMoR Core — Mixture-of-Recursions (MoR) neural network.
+NSMoR Core — Mixture-of-Recursions (MoR) neural network.
 
 Implements a dual-pathway recurrent architecture that combines:
   - **Path A (LIF):** A Leaky Integrate-and-Fire spiking neuron for
@@ -280,7 +280,7 @@ class DirectionHead(nn.Module):
 
 
 # ═══════════════════════════════════════════════════════════════
-# 6.  BioMoR Core Network
+# 6.  NSMoR Core Network
 # ═══════════════════════════════════════════════════════════════
 
 # Valid sub-module names for freeze_modules()
@@ -293,7 +293,7 @@ _FREEZABLE_MODULES = frozenset({
 })
 
 
-class BioMoRCore(nn.Module):
+class NSMoRCore(nn.Module):
     """
     Mixture-of-Recursions (MoR) — dual-pathway recurrent network.
 
@@ -588,7 +588,7 @@ class BioMoRCore(nn.Module):
 
         Example::
 
-            model = BioMoRCore()
+            model = NSMoRCore()
             # Freeze everything except the GRU pathway
             model.freeze_modules([
                 "sensory_encoder", "lif_cell", "router", "direction_head",
@@ -654,7 +654,7 @@ class BioMoRCore(nn.Module):
 # ═══════════════════════════════════════════════════════════════
 
 # Keep the old class name working so existing tests / imports survive.
-BioMoR = BioMoRCore
+NSMoR = NSMoRCore
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -663,14 +663,14 @@ BioMoR = BioMoRCore
 
 def _test_forward_pass() -> None:
     """
-    Verify that ``BioMoRCore.forward`` produces the expected output shapes.
+    Verify that ``NSMoRCore.forward`` produces the expected output shapes.
 
     Run this module directly to execute the test::
 
-        python -m biomor.model_biomor_core
+        python -m nsmor.model_nsmor_core
     """
     print("=" * 60)
-    print("BioMoRCore forward-pass smoke test")
+    print("NSMoRCore forward-pass smoke test")
     print("=" * 60)
 
     B, T, H = 4, 120, 64
@@ -679,7 +679,7 @@ def _test_forward_pass() -> None:
     X_batch = torch.randn(B, T, 8, device=device)
     lengths = torch.tensor([120, 90, 60, 30], dtype=torch.int64, device=device)
 
-    model = BioMoRCore(
+    model = NSMoRCore(
         sensory_dim=4, mcmc_dim=4, hidden_dim=H,
         num_gru_layers=1, dropout=0.1,
         lif_alpha=0.9, lif_threshold=1.0, lif_beta=0.5,
@@ -722,7 +722,7 @@ def _test_forward_pass() -> None:
     print("  freeze_modules: lif_cell + router frozen, encoder trainable")
 
     # ── Gradient flow (unfrozen) ──
-    model2 = BioMoRCore(hidden_dim=H)
+    model2 = NSMoRCore(hidden_dim=H)
     X2 = torch.randn(2, 40, 8, requires_grad=True)
     len2 = torch.tensor([40, 20], dtype=torch.int64)
     Y2 = model2(X2, len2)

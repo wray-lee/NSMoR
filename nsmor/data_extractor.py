@@ -27,7 +27,7 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 
-from biomor.config import (
+from nsmor.config import (
     DEFAULT_FEATURE,
     DEFAULT_TIME_WINDOW,
     FeatureConfig,

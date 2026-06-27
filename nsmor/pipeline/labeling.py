@@ -17,7 +17,7 @@ from typing import Dict, List, Optional
 
 import numpy as np
 
-from biomor.config import DEFAULT_THRESHOLD, Label, ThresholdConfig
+from nsmor.config import DEFAULT_THRESHOLD, Label, ThresholdConfig
 
 
 # ──────────────────────────────────────────────────────────────

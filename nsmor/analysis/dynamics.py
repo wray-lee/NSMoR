@@ -1,7 +1,7 @@
 """
-Dynamical Systems Adapter for BioMoR GRU pathway.
+Dynamical Systems Adapter for NSMoR GRU pathway.
 
-Provides :class:`FixedPointAdapter` for interfacing the BioMoR GRU
+Provides :class:`FixedPointAdapter` for interfacing the NSMoR GRU
 states with external RNN analysis libraries (e.g., Sussillo's
 ``FixedPointFinder``).
 
@@ -24,7 +24,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from biomor.model_biomor_core import BioMoRCore
+from nsmor.model_nsmor_core import NSMoRCore
 
 
 class FixedPointAdapter:
@@ -32,7 +32,7 @@ class FixedPointAdapter:
     Adapter for extracting GRU hidden states and computing Jacobians
     for dynamical systems analysis.
 
-    This class bridges the BioMoR model with external fixed-point
+    This class bridges the NSMoR model with external fixed-point
     analysis tools by:
 
     1. Extracting un-padded GRU hidden-state trajectories from the
@@ -41,7 +41,7 @@ class FixedPointAdapter:
        at specific hidden states.
 
     Args:
-        model: A trained :class:`BioMoRCore` model.
+        model: A trained :class:`NSMoRCore` model.
         device: Device to run computations on.
 
     Example::
@@ -53,7 +53,7 @@ class FixedPointAdapter:
 
     def __init__(
         self,
-        model: BioMoRCore,
+        model: NSMoRCore,
         device: Optional[torch.device] = None,
     ) -> None:
         self.model = model
@@ -306,7 +306,7 @@ def _test_fixed_point_adapter() -> None:
 
     Run::
 
-        python -m biomor.analysis.dynamics
+        python -m nsmor.analysis.dynamics
     """
     print("=" * 60)
     print("FixedPointAdapter smoke test")
@@ -318,7 +318,7 @@ def _test_fixed_point_adapter() -> None:
     device = torch.device("cpu")
 
     # ── Create a minimal model ──
-    model = BioMoRCore(
+    model = NSMoRCore(
         sensory_dim=4, mcmc_dim=4, hidden_dim=H,
         num_gru_layers=1, dropout=0.1,
     ).to(device)

@@ -1,8 +1,8 @@
-# BOUNDARY — `biomor/` (Frozen Core)
+# BOUNDARY — `nsmor/` (Frozen Core)
 
 ## Status: 🔒 FROZEN
 
-This directory contains the **mathematical and architectural core** of BioMoR. All modules here are mathematically verified and stable.
+This directory contains the **mathematical and architectural core** of NSMoR. All modules here are mathematically verified and stable.
 
 **Modifications require explicit user override.** Do not modify without direct instruction.
 
@@ -10,9 +10,10 @@ This directory contains the **mathematical and architectural core** of BioMoR. A
 
 ## Input/Output Contract
 
-### `BioMoRCore` (model_biomor_core.py)
+### `NSMoRCore` (model_nsmor_core.py)
 
 **Forward Pass:**
+
 ```
 Input:  X_batch  [B, T, 8]    — padded feature tensor
         lengths  [B]          — true (unpadded) sequence lengths
@@ -27,6 +28,7 @@ Internals (when return_internals=True):
 ```
 
 **Feature Layout (dim=8):**
+
 ```
 [0] v_vis(t)        — visual angle (degrees)
 [1] wind(t)         — wind state (0/1)
@@ -41,6 +43,7 @@ Internals (when return_internals=True):
 ### `BioJointLoss` (loss.py)
 
 **Forward Pass:**
+
 ```
 Input:  y_pred     [B, T]      — model predictions
         y_true     [B, T]      — ground truth targets
@@ -54,6 +57,7 @@ Output: loss       scalar      — joint loss value
 ### `save_checkpoint` / `load_checkpoint` (checkpoint.py)
 
 **Checkpoint Dictionary:**
+
 ```
 {
     "model_state_dict":      OrderedDict,
@@ -71,13 +75,13 @@ Output: loss       scalar      — joint loss value
 
 ## Sub-modules
 
-| Module | Class | I/O |
-|--------|-------|-----|
-| `SensoryEncoder` | `nn.Module` | `[B, T, 4]` → `[B, T, H]` |
-| `LIFCell` | `nn.Module` | `[B, H]` → `[B, H]` (step-by-step) |
-| `GRUUnit` | `nn.Module` | `[B, T, H]` → `[B, T, H]` (packed) |
-| `MoRRouter` | `nn.Module` | `[B, H+M]` → `[B, 2]` (softmax) |
-| `DirectionHead` | `nn.Module` | `[B, T, H]` → `[B, T]` |
+| Module           | Class       | I/O                                |
+| ---------------- | ----------- | ---------------------------------- |
+| `SensoryEncoder` | `nn.Module` | `[B, T, 4]` → `[B, T, H]`          |
+| `LIFCell`        | `nn.Module` | `[B, H]` → `[B, H]` (step-by-step) |
+| `GRUUnit`        | `nn.Module` | `[B, T, H]` → `[B, T, H]` (packed) |
+| `MoRRouter`      | `nn.Module` | `[B, H+M]` → `[B, 2]` (softmax)    |
+| `DirectionHead`  | `nn.Module` | `[B, T, H]` → `[B, T]`             |
 
 ---
 
@@ -94,6 +98,7 @@ Output: loss       scalar      — joint loss value
 ## Override Protocol
 
 To modify frozen core files:
+
 1. State the specific change needed.
-2. Explain why it cannot be done in `biomor/analysis/` or `scripts/`.
+2. Explain why it cannot be done in `nsmor/analysis/` or `scripts/`.
 3. Wait for explicit user approval before proceeding.

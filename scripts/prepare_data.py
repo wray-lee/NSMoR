@@ -1,8 +1,8 @@
 """
-BioMoR Offline Data Preparation Pipeline (Phase 5 ETL).
+NSMoR Offline Data Preparation Pipeline (Phase 5 ETL).
 
 Ingests raw ``cercus`` CSVs with **hardware-synchronized timestamps**
-(Arduino/Photodiode) and produces a single ``biomor_dataset.pt`` file
+(Arduino/Photodiode) and produces a single ``nsmor_dataset.pt`` file
 ready for training.
 
 Processing Steps
@@ -22,7 +22,7 @@ Processing Steps
 
 Output
 ------
-``data/processed/biomor_dataset.pt`` containing:
+``data/processed/nsmor_dataset.pt`` containing:
     - ``X_seqs``: List of ``np.ndarray (T_i, 8)``
     - ``Y_seqs``: List of ``np.ndarray (T_i,)``
     - ``mcmc_priors``: ``np.ndarray (N, 4)``
@@ -33,8 +33,8 @@ Usage
 -----
 CLI::
 
-    python scripts/prepare_data.py --raw_dir data/raw --output data/processed/biomor_dataset.pt
-    python scripts/prepare_data.py --raw_dir data/raw --output data/processed/biomor_dataset.pt --dt_ms 10.0
+    python scripts/prepare_data.py --raw_dir data/raw --output data/processed/nsmor_dataset.pt
+    python scripts/prepare_data.py --raw_dir data/raw --output data/processed/nsmor_dataset.pt --dt_ms 10.0
 """
 
 from __future__ import annotations
@@ -50,16 +50,16 @@ import pandas as pd
 import torch
 from scipy.signal import savgol_filter
 
-from biomor.config import DEFAULT_FEATURE, DEFAULT_TIME_WINDOW, FeatureConfig, TimeWindowConfig
-from biomor.data_extractor import (
+from nsmor.config import DEFAULT_FEATURE, DEFAULT_TIME_WINDOW, FeatureConfig, TimeWindowConfig
+from nsmor.data_extractor import (
     build_sequence_dataset,
     build_snapshot_dataset,
     PURE_WIND_PREPEND_FRAMES,
 )
-from biomor.mcmc_module import MCMCPriorGenerator, train_mcmc
-from biomor.pipeline.io import EVENT_COLUMNS, KINEMATICS_COLUMNS
-from biomor.pipeline.labeling import assign_ground_truth_labels
-from biomor.pipeline.io import extract_trial_data, load_and_concat_sessions
+from nsmor.mcmc_module import MCMCPriorGenerator, train_mcmc
+from nsmor.pipeline.io import EVENT_COLUMNS, KINEMATICS_COLUMNS
+from nsmor.pipeline.labeling import assign_ground_truth_labels
+from nsmor.pipeline.io import extract_trial_data, load_and_concat_sessions
 
 # ── Logging ────────────────────────────────────────────────────
 logging.basicConfig(
@@ -593,7 +593,7 @@ def prepare_dataset(
         Path to the saved dataset file.
     """
     logger.info("=" * 60)
-    logger.info("BioMoR Data Preparation Pipeline")
+    logger.info("NSMoR Data Preparation Pipeline")
     logger.info("=" * 60)
 
     # ── Step 1: Data Pairing ──────────────────────────────────
@@ -657,7 +657,7 @@ def prepare_dataset(
     logger.info("Labeled %d trials.", len(labeled_trials))
 
     # Log label distribution
-    from biomor.config import Label
+    from nsmor.config import Label
     label_counts = {}
     for info in labeled_trials:
         label = info["label"]
@@ -824,7 +824,7 @@ def prepare_dataset(
 def build_parser() -> argparse.ArgumentParser:
     """Build CLI argument parser."""
     parser = argparse.ArgumentParser(
-        description="BioMoR Offline Data Preparation Pipeline",
+        description="NSMoR Offline Data Preparation Pipeline",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
@@ -836,7 +836,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--output",
         type=str,
-        default="data/processed/biomor_dataset.pt",
+        default="data/processed/nsmor_dataset.pt",
         help="Output path for processed dataset.",
     )
     parser.add_argument(

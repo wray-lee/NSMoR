@@ -1,8 +1,8 @@
 # ═══════════════════════════════════════════════════════════════
-# BioMoR — Makefile
+# NSMoR — Makefile
 # ═══════════════════════════════════════════════════════════════
 #
-# Standardised entry points for the BioMoR research pipeline.
+# Standardised entry points for the NSMoR research pipeline.
 #
 #   make install    — install package + dev dependencies
 #   make test       — run full test suite
@@ -25,7 +25,7 @@ BEST     := $(RUN_DIR)/best_model.pth
 # ── Default target ───────────────────────────────────────────
 help: ## Show available targets
 	@echo ""
-	@echo "  BioMoR — Available Targets"
+	@echo "  NSMoR — Available Targets"
 	@echo "  ─────────────────────────────────────────"
 	@grep -E '^[a-zA-Z_-]+:.*?##' $(MAKEFILE_LIST) | \
 		awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
