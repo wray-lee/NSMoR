@@ -54,6 +54,7 @@ from nsmor.config import DEFAULT_FEATURE, DEFAULT_TIME_WINDOW, FeatureConfig, Ti
 from nsmor.data_extractor import (
     build_sequence_dataset,
     build_snapshot_dataset,
+    extract_trial_sequence,
     PURE_WIND_PREPEND_FRAMES,
 )
 from nsmor.mcmc_module import MCMCPriorGenerator, train_mcmc
@@ -613,38 +614,15 @@ def prepare_dataset(
         len(session_data["events"]),
     )
 
-    # ── Step 3: Hardware Time Alignment ───────────────────────
-    logger.info("[Step 3] Parsing hardware triggers (Arduino/Photodiode)...")
-    hw_triggers = parse_hardware_triggers(session_data["events"])
-    logger.info("Found %d hardware trigger corrections.", len(hw_triggers))
-
-    # Log clock drift statistics
-    log_time_correction_deltas(session_data["events"], hw_triggers)
-
-    # Apply hardware time correction
-    logger.info("Applying hardware time correction...")
-    kin_corrected, evt_corrected = apply_hardware_time_correction(
-        session_data["kinematics"],
-        session_data["events"],
-        hw_triggers,
-        dt_ms=dt_ms,
-    )
-
-    # Rebuild session data with corrected DataFrames
-    corrected_data = {
-        "kinematics": kin_corrected,
-        "events": evt_corrected,
-    }
-
-    # ── Step 4: Per-trial extraction and labeling ─────────────
-    logger.info("[Step 4] Extracting trials and assigning labels...")
+    # ── Step 3: Per-trial extraction and labeling ─────────────
+    logger.info("[Step 3] Extracting trials and assigning labels...")
 
     # Get unique session/trial pairs
-    trial_groups = kin_corrected.groupby(["session_id", "trial_id"])
+    trial_groups = session_data["kinematics"].groupby(["session_id",    "trial_id"])
     trials = []
     for (session_id, trial_id), _ in trial_groups:
         try:
-            trial = extract_trial_data(corrected_data, session_id, trial_id)
+            trial = extract_trial_data(session_data, session_id, trial_id)
             trials.append(trial)
         except ValueError as e:
             logger.warning("Skipping trial: %s", e)
@@ -664,8 +642,8 @@ def prepare_dataset(
         label_counts[label.name] = label_counts.get(label.name, 0) + 1
     logger.info("Label distribution: %s", label_counts)
 
-    # ── Step 5: MCMC Prior Generation ────────────────────────
-    logger.info("[Step 5] Training MCMC prior generator...")
+    # ── Step 4: MCMC Prior Generation ────────────────────────
+    logger.info("[Step 4] Training MCMC prior generator...")
 
     snapshots, snapshot_labels = build_snapshot_dataset(
         labeled_trials,
@@ -696,10 +674,11 @@ def prepare_dataset(
     )
     logger.info("Generated MCMC priors: %s", mcmc_priors.shape)
 
-    # ── Step 6: Sequence Extraction with Visual Physics Reconstruction ──
-    logger.info("[Step 6] Extracting continuous sequences with visual physics reconstruction...")
+    # ── Step 5: Sequence Extraction with Visual Physics Reconstruction ──
+    logger.info("[Step 5] Extracting continuous sequences with visual physics reconstruction...")
 
     sequences = []
+    valid_indices = []
     for info in labeled_trials:
         try:
             trial_data = info["trial_data"]
@@ -755,12 +734,15 @@ def prepare_dataset(
                 l_v_ratio,
                 bool(np.all(np.abs(visual_angle_recon) < 1e-8)),
             )
+            valid_indices.append(i)
+            sequences.append((X_seq, Y_seq, int(info["label"])))
 
         except (ValueError, KeyError) as e:
             logger.warning("Skipping trial: %s", e)
             continue
 
     logger.info("Extracted %d sequences with reconstructed visual features.", len(sequences))
+    mcmc_priors = mcmc_priors[valid_indices]
 
     # Unpack sequences
     X_seqs = [seq[0] for seq in sequences]
@@ -774,7 +756,7 @@ def prepare_dataset(
         f"labels={len(labels)}, lengths={len(lengths)}"
     )
     assert len(X_seqs) == len(mcmc_priors), (
-        f"Sequence/prior count mismatch: {len(X_seqs)} vs {len(mcmc_priors)}"
+        f"Sequence/prior count mismatch: Seq={len(X_seqs)} vs Priors={len(mcmc_priors)}"
     )
 
     for i, (x, y) in enumerate(zip(X_seqs, Y_seqs)):
