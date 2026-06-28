@@ -55,6 +55,7 @@ from nsmor.data_extractor import (
     build_sequence_dataset,
     build_snapshot_dataset,
     extract_trial_sequence,
+    extract_mcmc_snapshot,
     PURE_WIND_PREPEND_FRAMES,
 )
 from nsmor.mcmc_module import MCMCPriorGenerator, train_mcmc
@@ -678,23 +679,33 @@ def prepare_dataset(
     logger.info("[Step 5] Extracting continuous sequences with visual physics reconstruction...")
 
     sequences = []
-    valid_indices = []
+    aligned_priors = []
+
     for info in labeled_trials:
         try:
             trial_data = info["trial_data"]
             stimulus_onset_ms = info["stimulus_onset_ms"]
 
-            # Extract l/v ratio from trial data (use median of l_v_ratio array)
+            # 1. 强制同步提取快照与预测先验，确保与序列绝对对齐
+            snap = extract_mcmc_snapshot(
+                trial_data,
+                stimulus_onset_ms,
+                ttc_offset_ms=time_config.ttc_offset_ms,
+                time_config=time_config,
+                feature_config=feature_config,
+            )
+            prior = mcmc_model.predict_proba(snap.reshape(1, -1))[0]
+
+            # 2. 提取并计算 l/v ratio
             l_v_ratio_raw = trial_data.get("l_v_ratio", np.array([0.0]))
             if isinstance(l_v_ratio_raw, np.ndarray) and len(l_v_ratio_raw) > 0:
-                # Use the maximum l/v ratio during stimulus period
                 l_v_ratio = float(np.nanmax(l_v_ratio_raw))
                 if np.isnan(l_v_ratio) or np.isinf(l_v_ratio):
                     l_v_ratio = 0.0
             else:
                 l_v_ratio = 0.0
 
-            # Reconstruct visual features
+            # 3. 重构视觉特征
             visual_angle_recon, l_v_recon = reconstruct_trial_visual_features(
                 trial_data=trial_data,
                 stimulus_onset_ms=stimulus_onset_ms,
@@ -702,28 +713,16 @@ def prepare_dataset(
                 dt_ms=dt_ms,
             )
 
-            # Extract sequence with the original function
+            # 4. 提取序列并覆盖特征
             X_seq, Y_seq = extract_trial_sequence(
                 trial_data,
                 feature_config=feature_config,
             )
-
-            # ── Inject reconstructed visual features into X_seq ──
-            # X_seq[:, 0] = v_vis(t) — reconstructed visual angle
-            # X_seq[:, 1] = wind(t)  — keep original wind state
-            n_frames = X_seq.shape[0]
-            assert len(visual_angle_recon) == n_frames, (
-                f"Visual angle length {len(visual_angle_recon)} != "
-                f"X_seq frames {n_frames}"
-            )
-
-            # Overwrite visual angle column with reconstructed values
             X_seq[:, 0] = visual_angle_recon
 
-            # Optionally store l/v ratio in a metadata dict (not in X_seq)
-            # The l/v ratio is already embedded in the visual angle computation
-
+            # 若以上均未报错，则同时将 prior 和 sequence 入库
             sequences.append((X_seq, Y_seq, int(info["label"])))
+            aligned_priors.append(prior)
 
             logger.debug(
                 "Trial %s/%d: reconstructed θ(t) range [%.2f°, %.2f°], "
@@ -734,15 +733,15 @@ def prepare_dataset(
                 l_v_ratio,
                 bool(np.all(np.abs(visual_angle_recon) < 1e-8)),
             )
-            valid_indices.append(i)
-            sequences.append((X_seq, Y_seq, int(info["label"])))
 
         except (ValueError, KeyError) as e:
             logger.warning("Skipping trial: %s", e)
             continue
 
+
+    mcmc_priors = np.array(aligned_priors)
     logger.info("Extracted %d sequences with reconstructed visual features.", len(sequences))
-    mcmc_priors = mcmc_priors[valid_indices]
+
 
     # Unpack sequences
     X_seqs = [seq[0] for seq in sequences]
@@ -786,7 +785,6 @@ def prepare_dataset(
         "lengths": lengths,
         "feature_config": feature_config,
         "time_config": time_config,
-        "hw_triggers": hw_triggers,
     }
 
     torch.save(dataset, output_path)
