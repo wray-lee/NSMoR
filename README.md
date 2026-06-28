@@ -139,11 +139,11 @@ Event types: `trial_start`, `stimulus_onset`, `wind_onset`, `response_detected`,
 
 ## MCMC Snapshot Features (dim = 5)
 
-| Index | Name                | Description                            |
+| Index | Name                | Description                            |              |                    |
 | ----- | ------------------- | -------------------------------------- | ------------ | ------------------ |
-| 0     | visual_angle        | Instantaneous visual angle at TTC-50ms |
-| 1     | looming_velocity    | l/v ratio at TTC-50ms                  |
-| 2     | wind_state          | Wind stimulus state (0 / 1)            |
+| 0     | visual_angle        | Instantaneous visual angle at TTC-50ms |              |                    |
+| 1     | looming_velocity    | l/v ratio at TTC-50ms                  |              |                    |
+| 2     | wind_state          | Wind stimulus state (0 / 1)            |------------  | ------------------ |
 | 3     | avg_velocity_bg     | Mean                                   | velocity     | in preceding 200ms |
 | 4     | max_acceleration_bg | Max                                    | acceleration | in preceding 200ms |
 
