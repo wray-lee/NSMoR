@@ -54,8 +54,8 @@ logger = logging.getLogger(__name__)
 # ── High-contrast categorical color mapping ──
 # STRICTLY REJECT pale, desaturated, or pastel palettes
 LANCET_COLORS: Dict[int, str] = {
-    Label.STARTLE.value: "#C92A2A",      # Lancet Crimson Red — urgent reflex
-    Label.WALK.value: "#1C7ED6",         # Cell Cobalt Blue — continuous locomotion
+    Label.ESCAPE.value: "#C92A2A",      # Lancet Crimson Red — urgent reflex
+    Label.PREWALK.value: "#1C7ED6",         # Cell Cobalt Blue — continuous locomotion
     Label.PRE_ACTIVE.value: "#495057",   # Strong Slate Gray — baseline activity
     Label.NO_RESPONSE.value: "#000000",  # Absolute Jet Black — non-responsive control
 }
@@ -66,16 +66,16 @@ GATE_LIF_COLOR: str = "#C92A2A"   # Lancet Crimson Red for g_lif(t)
 
 # Label display names
 LABEL_NAMES: Dict[int, str] = {
-    Label.STARTLE.value: "Startle",
-    Label.WALK.value: "Walk",
+    Label.ESCAPE.value: "Startle",
+    Label.PREWALK.value: "Prewalk",
     Label.PRE_ACTIVE.value: "Pre-Active",
     Label.NO_RESPONSE.value: "No Response",
 }
 
 # Marker styles per label
 LABEL_MARKERS: Dict[int, str] = {
-    Label.STARTLE.value: "^",    # Triangle up (urgency)
-    Label.WALK.value: "o",       # Circle (locomotion)
+    Label.ESCAPE.value: "^",    # Triangle up (urgency)
+    Label.PREWALK.value: "o",       # Circle (locomotion)
     Label.PRE_ACTIVE.value: "s", # Square (baseline)
     Label.NO_RESPONSE.value: "D", # Diamond (control)
 }
@@ -166,6 +166,7 @@ def load_model_from_checkpoint(
 def load_dataset(
     dataset_path: Path,
     batch_size: int = 32,
+    max_seq_len: Optional[int] = 1000,
 ) -> Tuple[torch.utils.data.DataLoader, np.ndarray]:
     """
     Load the preprocessed dataset and create a DataLoader.
@@ -206,6 +207,7 @@ def load_dataset(
         sequences=sequences,
         mcmc_priors=mcmc_priors,
         feature_config=feature_config,
+        max_seq_len=max_seq_len,
     )
 
     dataloader = torch.utils.data.DataLoader(
@@ -338,8 +340,8 @@ def extract_routing_gates(
                 break
 
             X_batch, Y_batch, lengths = batch
-            X_batch = X_batch.to(device)
-            lengths = lengths.to(device)
+            X_batch = X_batch.to(device).contiguous()
+            lengths = lengths.to(device).contiguous()
 
             # Forward pass with internals
             _, internals = model(X_batch, lengths, return_internals=True)
@@ -739,6 +741,7 @@ def run_analysis(
     dataset_path: Path,
     output_path: Path,
     batch_size: int = 32,
+    max_seq_len: Optional[int] = 1000,
     n_representative: int = 5,
 ) -> None:
     """
@@ -763,7 +766,7 @@ def run_analysis(
     model = load_model_from_checkpoint(checkpoint_path, device)
 
     # ── Load dataset ──────────────────────────────────────────
-    dataloader, labels = load_dataset(dataset_path, batch_size=batch_size)
+    dataloader, labels = load_dataset(dataset_path, batch_size=batch_size, max_seq_len=max_seq_len)
 
     # ── Panel A: Extract and reduce ───────────────────────────
     trajectories_3d, all_labels, pca = extract_and_reduce(
@@ -826,6 +829,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Batch size for data loading.",
     )
     parser.add_argument(
+        "--max_seq_len",
+        type=int,
+        default=1000,
+        help="Crop sequences longer than this (cuDNN compatibility). 0 = disable.",
+    )
+    parser.add_argument(
         "--n_representative",
         type=int,
         default=5,
@@ -839,11 +848,13 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
 
+    max_seq_len = args.max_seq_len if args.max_seq_len > 0 else None
     run_analysis(
         checkpoint_path=Path(args.checkpoint),
         dataset_path=Path(args.dataset),
         output_path=Path(args.output),
         batch_size=args.batch_size,
+        max_seq_len=max_seq_len,
         n_representative=args.n_representative,
     )
 

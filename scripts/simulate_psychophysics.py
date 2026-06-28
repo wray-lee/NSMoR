@@ -24,6 +24,7 @@ import os
 import sys
 
 import numpy as np
+import pandas as pd
 import torch
 
 # ---------------------------------------------------------------------------
@@ -63,11 +64,17 @@ DPI = 300
 def load_checkpoint(ckpt_path: str, device: torch.device):
     """Load model checkpoint and rebuild NSMoRCore."""
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-    cfg = ckpt["model_config"]
+    config_dict = ckpt.get("config", {})
+    cfg = config_dict.get("model", {})
     model = NSMoRCore(
-        input_dim=cfg["input_dim"],
-        hidden_dim=cfg["hidden_dim"],
-        output_dim=cfg["output_dim"],
+        sensory_dim=cfg.get("sensory_dim", 4),
+        mcmc_dim=cfg.get("mcmc_dim", 4),
+        hidden_dim=cfg.get("hidden_dim", 64),
+        num_gru_layers=cfg.get("num_gru_layers", 1),
+        dropout=cfg.get("dropout", 0.1),
+        lif_alpha=cfg.get("lif_alpha", 0.9),
+        lif_threshold=cfg.get("lif_threshold", 1.0),
+        lif_beta=cfg.get("lif_beta", 0.5),
     ).to(device)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
@@ -75,25 +82,52 @@ def load_checkpoint(ckpt_path: str, device: torch.device):
     return model
 
 
-def load_validation_data(device: torch.device):
+def load_validation_data(device: torch.device, max_seq_len: int = 1000):
     """Load nsmor_dataset.pt and return validation split."""
     dataset_path = os.path.join(_PROJECT_ROOT, "data", "processed", "nsmor_dataset.pt")
     if not os.path.exists(dataset_path):
         logger.error("Dataset not found: %s", dataset_path)
         sys.exit(1)
 
-    data = torch.load(dataset_path, map_location=device, weights_only=False)
+    data = torch.load(dataset_path, map_location="cpu", weights_only=False)
     X_seqs = data["X_seqs"]
     Y_seqs = data["Y_seqs"]
     lengths = data["lengths"]
+    mcmc_priors = data.get("mcmc_priors", None)
 
-    n_total = X_seqs.shape[0]
+    n_total = len(X_seqs)
     n_val = int(n_total * 0.2)
     split = n_total - n_val
 
-    X_val = X_seqs[split:]
-    Y_val = Y_seqs[split:]
-    lengths_val = lengths[split:]
+    # Use DataLoader with collate_variable_length for proper padding
+    from nsmor.nsmor_dataloader import NSMoRDataset, collate_variable_length
+    from nsmor.config import DEFAULT_FEATURE
+
+    sequences = [(X_seqs[i], Y_seqs[i], 0) for i in range(split, n_total)]
+    feature_config = data.get("feature_config", DEFAULT_FEATURE)
+    val_priors = mcmc_priors[split:] if mcmc_priors is not None else None
+
+    val_dataset = NSMoRDataset(
+        sequences=sequences,
+        mcmc_priors=val_priors if val_priors is not None else np.ones((len(sequences), 4)) * 0.25,
+        feature_config=feature_config,
+        max_seq_len=max_seq_len,
+    )
+
+    # Create a single batch with all validation data
+    val_loader = torch.utils.data.DataLoader(
+        val_dataset,
+        batch_size=len(val_dataset),
+        shuffle=False,
+        num_workers=0,
+        collate_fn=collate_variable_length,
+    )
+
+    X_val, Y_val, lengths_val = next(iter(val_loader))
+
+    X_val = X_val.to(device).contiguous()
+    Y_val = Y_val.to(device).contiguous()
+    lengths_val = lengths_val.to(device).contiguous()
 
     logger.info("Validation data loaded: %d trials", X_val.shape[0])
     return X_val, Y_val, lengths_val
@@ -116,28 +150,52 @@ def detect_wind_onset_frame(x_seq: torch.Tensor) -> int | None:
     return int(indices[0].item())
 
 
-def find_multisensory_ttc0(X_seqs: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
-    """Return boolean mask for trials matching multisensory_ttc_0 condition."""
+def find_multisensory_ttc0(
+    X_seqs: torch.Tensor,
+    lengths: torch.Tensor,
+    raw_dir: str = "data/raw",
+) -> torch.Tensor:
+    """Return boolean mask for trials matching multisensory_ttc_0ms condition.
+
+    Uses events files to determine trial type and target_ttc_ms.
+    """
+    import json
+    from pathlib import Path
+
     B, T, _ = X_seqs.shape
-    dt_ms = 10.0
-    tolerance_frames = int(50.0 / dt_ms)  # ±50 ms
-
     mask = torch.zeros(B, dtype=torch.bool, device=X_seqs.device)
-    for i in range(B):
-        L = int(lengths[i].item())
-        x_i = X_seqs[i, :L]
 
-        has_visual = (x_i[:, 0].abs() > 1e-6).any().item()
-        if not has_visual:
-            continue
+    # Load trial info from events files
+    trial_info = []
+    events_files = sorted(Path(raw_dir).rglob("*_events.csv"))
+    for evt_path in events_files:
+        df = pd.read_csv(evt_path)
+        for _, row in df.iterrows():
+            event_type = str(row.get('event_type', row.get('event_name', '')))
+            if event_type == 'trial_start':
+                details_str = str(row.get('event_value', row.get('details', '{}')))
+                try:
+                    details = json.loads(details_str)
+                except:
+                    details = {}
+                trial_info.append({
+                    'type': details.get('type', 'unknown'),
+                    'target_ttc_ms': details.get('target_ttc_ms'),
+                })
 
-        wind_frame = detect_wind_onset_frame(x_i)
-        if wind_frame is None:
-            continue
+    # Use validation split (last 20%)
+    n_total = len(trial_info)
+    n_val = min(B, int(n_total * 0.2))
+    split = n_total - n_val
+    val_info = trial_info[split:split + B]
 
-        delta_frames = wind_frame - STIM_ONSET_FRAME
-        if abs(delta_frames) <= tolerance_frames:
-            mask[i] = True
+    # Mark trials with target_ttc_ms ≈ 0
+    for i, info in enumerate(val_info):
+        if i >= B:
+            break
+        if info['type'] == 'looming_wind' and info['target_ttc_ms'] is not None:
+            if abs(info['target_ttc_ms']) < 50:
+                mask[i] = True
 
     return mask
 
@@ -344,6 +402,12 @@ def main() -> None:
         default=os.path.join(_PROJECT_ROOT, "results"),
         help="Directory for output figures and JSON.",
     )
+    parser.add_argument(
+        "--max_seq_len",
+        type=int,
+        default=1000,
+        help="Crop sequences longer than this (cuDNN compatibility). 0 = disable.",
+    )
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -352,14 +416,15 @@ def main() -> None:
 
     # --- Load model & data ---
     model = load_checkpoint(args.checkpoint, device)
-    X_val, Y_val, lengths_val = load_validation_data(device)
+    max_seq_len = args.max_seq_len if args.max_seq_len > 0 else None
+    X_val, Y_val, lengths_val = load_validation_data(device, max_seq_len=max_seq_len)
 
-    # --- Filter to multisensory_ttc_0 ---
+    # --- Filter to multisensory_ttc_0ms ---
     ttc0_mask = find_multisensory_ttc0(X_val, lengths_val)
     n_ttc0 = ttc0_mask.sum().item()
-    logger.info("multisensory_ttc_0 trials found: %d / %d", n_ttc0, X_val.shape[0])
+    logger.info("multisensory_ttc_0ms trials found: %d / %d", n_ttc0, X_val.shape[0])
     if n_ttc0 == 0:
-        logger.error("No multisensory_ttc_0 trials found. Aborting.")
+        logger.error("No multisensory_ttc_0ms trials found. Aborting.")
         sys.exit(1)
 
     X_ttc0 = X_val[ttc0_mask]

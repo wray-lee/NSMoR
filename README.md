@@ -143,7 +143,7 @@ Event types: `trial_start`, `stimulus_onset`, `wind_onset`, `response_detected`,
 | ----- | ------------------- | -------------------------------------- | ------------ | ------------------ |
 | 0     | visual_angle        | Instantaneous visual angle at TTC-50ms |              |                    |
 | 1     | looming_velocity    | l/v ratio at TTC-50ms                  |              |                    |
-| 2     | wind_state          | Wind stimulus state (0 / 1)            |------------  | ------------------ |
+| 2     | wind_state          | Wind stimulus state (0 / 1)            | ------------ | ------------------ |
 | 3     | avg_velocity_bg     | Mean                                   | velocity     | in preceding 200ms |
 | 4     | max_acceleration_bg | Max                                    | acceleration | in preceding 200ms |
 
@@ -181,6 +181,8 @@ pytest tests/ -v
 - PyTorch ≥ 2.0
 - scikit-learn ≥ 1.3
 - SciPy ≥ 1.10
+- tqdm
+- matplotlib
 
 ---
 
@@ -448,6 +450,7 @@ make pipeline
 
 | Command              | Description                                      |
 | -------------------- | ------------------------------------------------ |
+| `make load`          | Preload raw CSVs                                 |
 | `make data`          | ETL: raw CSVs → processed PyTorch dataset        |
 | `make train`         | Train NSMoR model (100 epochs by default)        |
 | `make analyze`       | Run all 5 analysis scripts sequentially          |

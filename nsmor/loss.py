@@ -18,28 +18,35 @@ Shape legend
 
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
 import torch.nn as nn
 
 
 class BioJointLoss(nn.Module):
     """
-    Bio-constrained joint loss with masked MSE and router regularization.
+    Bio-constrained joint loss with masked MSE and conditional router
+    regularization.
 
     The loss is computed as:
 
     .. math::
 
         \\mathcal{L} = \\text{MaskedMSE}(y_{\\text{pred}},\\, y_{\\text{true}})
-        + \\lambda \\cdot \\frac{1}{N} \\sum_{b,t} g_{\\text{gru}}(b,t) \\cdot \\text{mask}(b,t)
+        + \\lambda \\cdot \\frac{1}{N} \\sum_{b,t}
+          g_{\\text{gru}}(b,t) \\cdot \\text{mask}(b,t)
+          \\cdot \\text{jerk\\_mask}(b,t)
 
     where :math:`N = \\sum_b \\text{lengths}(b)` is the total number of
     valid time-steps across the batch, and :math:`g_{\\text{gru}}` is the
     GRU routing gate (index 1 of the routing gate vector).
 
-    The regularization term encourages the router to use the LIF pathway
-    more when the stimulus is reliable (sudden onset), preventing the
-    GRU from monopolizing the pathway blend.
+    When a ``jerk_mask`` is provided, the :math:`\\lambda` regularization
+    penalty is applied **only** to time-steps where the sensory input's
+    absolute first-order derivative exceeds a threshold (i.e., during
+    sudden-change / transient intervals).  During steady-state intervals
+    the GRU pathway is free to track smoothly without penalty.
 
     Args:
         reduction: How to aggregate the MSE across valid timesteps.
@@ -49,12 +56,19 @@ class BioJointLoss(nn.Module):
     Example::
 
         criterion = BioJointLoss()
+        # Compute jerk mask from sensory velocity (B, T)
+        velocity = sensory[:, :, 2]  # e.g., velocity channel
+        jerk_mask = (velocity.diff(dim=1).abs() > threshold).float()
+        # Pad to match T (first frame has no diff)
+        jerk_mask = torch.cat([torch.zeros(B, 1), jerk_mask], dim=1)
+
         loss = criterion(
             y_pred=predictions,      # (B, T)
             y_true=targets,          # (B, T)
             lengths=lengths,         # (B,)
             g_gru=g_gru,             # (B, T, 1)
             lambda_reg=0.01,
+            jerk_mask=jerk_mask,     # (B, T) — optional
         )
     """
 
@@ -73,6 +87,7 @@ class BioJointLoss(nn.Module):
         lengths: torch.Tensor,
         g_gru: torch.Tensor,
         lambda_reg: float = 0.01,
+        jerk_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Compute the bio-constrained joint loss.
@@ -83,6 +98,14 @@ class BioJointLoss(nn.Module):
             lengths: ``(B,)`` — true (unpadded) sequence lengths.
             g_gru: ``(B, T, 1)`` — GRU routing gate from model internals.
             lambda_reg: Weight for the router regularization term.
+            jerk_mask: ``(B, T)`` — optional sudden-change mask.
+                Values are 1.0 where the sensory input's absolute
+                first-order derivative exceeds a threshold, 0.0
+                otherwise.  When provided, the :math:`\\lambda`
+                penalty applies **only** to those transient
+                time-steps; steady-state steps receive zero penalty.
+                When ``None``, the penalty applies uniformly to all
+                valid (non-padded) steps (backward compatible).
 
         Returns:
             Scalar loss tensor.
@@ -115,6 +138,10 @@ class BioJointLoss(nn.Module):
         assert g_gru.shape == (B, T, 1), (
             f"g_gru shape {tuple(g_gru.shape)} != (B={B}, T={T}, 1)"
         )
+        if jerk_mask is not None:
+            assert jerk_mask.shape == (B, T), (
+                f"jerk_mask shape {tuple(jerk_mask.shape)} != (B={B}, T={T})"
+            )
 
         # ── Build padding mask ────────────────────────────────
         # mask[i, t] = 1 if t < lengths[i], else 0
@@ -133,13 +160,19 @@ class BioJointLoss(nn.Module):
         else:
             mse_loss = masked_errors.sum()                         # scalar
 
-        # ── Router regularization ─────────────────────────────
-        # Penalize high g_gru on valid time-steps.
+        # ── Router regularization (conditional on jerk_mask) ──
         # Squeeze last dim: (B, T, 1) → (B, T)
         g_gru_sq = g_gru.squeeze(-1)                              # (B, T)
-        reg_raw = (g_gru_sq * mask).sum()                          # scalar
 
-        N = mask.sum().clamp(min=1.0)                              # scalar
+        if jerk_mask is not None:
+            # Penalize g_gru only on sudden-change (transient) time-steps
+            reg_raw = (g_gru_sq * mask * jerk_mask).sum()          # scalar
+            N = (mask * jerk_mask).sum().clamp(min=1.0)            # scalar
+        else:
+            # Backward compatible: penalize on all valid time-steps
+            reg_raw = (g_gru_sq * mask).sum()                      # scalar
+            N = mask.sum().clamp(min=1.0)                          # scalar
+
         reg_loss = lambda_reg * (reg_raw / N)                      # scalar
 
         # ── Total loss ────────────────────────────────────────

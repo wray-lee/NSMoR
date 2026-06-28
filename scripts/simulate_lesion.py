@@ -156,6 +156,7 @@ def load_model_from_checkpoint(
 def load_dataset(
     dataset_path: Path,
     batch_size: int = 32,
+    max_seq_len: Optional[int] = 1000,
 ) -> Tuple[torch.utils.data.DataLoader, np.ndarray, List[int]]:
     """
     Load the preprocessed dataset and create a DataLoader.
@@ -197,6 +198,7 @@ def load_dataset(
         sequences=sequences,
         mcmc_priors=mcmc_priors,
         feature_config=feature_config,
+        max_seq_len=max_seq_len,
     )
 
     dataloader = torch.utils.data.DataLoader(
@@ -243,8 +245,8 @@ def run_ablation_condition(
     with torch.no_grad():
         for batch_idx, batch in enumerate(dataloader):
             X_batch, Y_batch, lengths = batch
-            X_batch = X_batch.to(device)
-            lengths = lengths.to(device)
+            X_batch = X_batch.to(device).contiguous()
+            lengths = lengths.to(device).contiguous()
 
             # Forward pass with override
             Y_pred = model(X_batch, lengths, override_gates=override_gates)
@@ -812,6 +814,7 @@ def run_lesion_experiment(
     target_class: int = 0,
     target_classes: Optional[List[int]] = None,
     batch_size: int = 32,
+    max_seq_len: Optional[int] = 1000,
     dt_ms: float = 10.0,
     stim_onset_frame: int = 200,
 ) -> None:
@@ -824,7 +827,7 @@ def run_lesion_experiment(
         output_path: Path to save the ablation figure.
         stats_output_path: Path to save the statistics CSV. If None,
             defaults to ``results/lesion_statistics.csv``.
-        target_class: Label value to plot in the figure (default 0 = STARTLE).
+        target_class: Label value to plot in the figure (default 0 = ESCAPE).
         target_classes: List of label values to include in statistics CSV.
             If None, defaults to all classes [0, 1, 2, 3].
         batch_size: Batch size for data loading.
@@ -850,7 +853,7 @@ def run_lesion_experiment(
     model = load_model_from_checkpoint(checkpoint_path, device)
 
     # ── Load dataset ──────────────────────────────────────────
-    dataloader, labels, lengths_list = load_dataset(dataset_path, batch_size=batch_size)
+    dataloader, labels, lengths_list = load_dataset(dataset_path, batch_size=batch_size, max_seq_len=max_seq_len)
 
     # ── Run ablation ──────────────────────────────────────────
     results = run_full_ablation(model, dataloader, device)
@@ -939,7 +942,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--target_class",
         type=int,
         default=0,
-        help="Label value to plot in figure (0=STARTLE, 1=WALK, 2=PRE_ACTIVE, 3=NO_RESPONSE).",
+        help="Label value to plot in figure (0=ESCAPE, 1=WALK, 2=PRE_ACTIVE, 3=NO_RESPONSE).",
     )
     parser.add_argument(
         "--target_classes",
@@ -953,6 +956,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=32,
         help="Batch size for data loading.",
+    )
+    parser.add_argument(
+        "--max_seq_len",
+        type=int,
+        default=1000,
+        help="Crop sequences longer than this (cuDNN compatibility). 0 = disable.",
     )
     parser.add_argument(
         "--dt_ms",
@@ -974,6 +983,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
 
+    max_seq_len = args.max_seq_len if args.max_seq_len > 0 else None
     run_lesion_experiment(
         checkpoint_path=Path(args.checkpoint),
         dataset_path=Path(args.dataset),
@@ -982,6 +992,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         target_class=args.target_class,
         target_classes=args.target_classes,
         batch_size=args.batch_size,
+        max_seq_len=max_seq_len,
         dt_ms=args.dt_ms,
         stim_onset_frame=args.stim_onset_frame,
     )

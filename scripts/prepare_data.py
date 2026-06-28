@@ -687,10 +687,16 @@ def prepare_dataset(
             stimulus_onset_ms = info["stimulus_onset_ms"]
 
             # 1. 提取快照
+            # For baseline_visual trials, stimulus_onset_ms may be 0,
+            # making snapshot_time negative. Clamp to trial start.
+            ttc_offset = time_config.ttc_offset_ms
+            if stimulus_onset_ms + ttc_offset < trial_data["time_ms"][0]:
+                ttc_offset = trial_data["time_ms"][0] - stimulus_onset_ms
+
             snap = extract_mcmc_snapshot(
                 trial_data,
                 stimulus_onset_ms,
-                ttc_offset_ms=time_config.ttc_offset_ms,
+                ttc_offset_ms=ttc_offset,
                 time_config=time_config,
                 feature_config=feature_config,
             )
@@ -704,33 +710,71 @@ def prepare_dataset(
             else:
                 l_v_ratio = 0.0
 
-            # 3. 重构视觉特征
-            visual_angle_recon, l_v_recon = reconstruct_trial_visual_features(
-                trial_data=trial_data,
-                stimulus_onset_ms=stimulus_onset_ms,
-                l_v_ratio=l_v_ratio,
-                dt_ms=dt_ms,
-            )
-
-            # 4. 提取序列并覆盖特征
+            # 3. 提取序列
             X_seq, Y_seq = extract_trial_sequence(
                 trial_data,
                 feature_config=feature_config,
             )
-            X_seq[:, 0] = visual_angle_recon
+
+            # 4. 处理视觉特征：优先使用原始数据，否则重构
+            raw_visual_angle = trial_data.get("visual_angle", None)
+            has_raw_visual = (
+                raw_visual_angle is not None
+                and isinstance(raw_visual_angle, np.ndarray)
+                and len(raw_visual_angle) > 0
+                and np.any(np.abs(raw_visual_angle) > 1e-6)
+            )
+
+
+            if has_raw_visual:
+                # 使用原始 visual_angle（已由实验设备记录）
+                visual_angle_to_use = raw_visual_angle
+                l_v_to_use = trial_data.get("l_v_ratio", np.zeros_like(raw_visual_angle))
+                if isinstance(l_v_to_use, np.ndarray) and len(l_v_to_use) > 0:
+                    l_v_to_use = l_v_to_use
+                else:
+                    l_v_to_use = np.zeros_like(raw_visual_angle)
+            else:
+                # 重构视觉特征（纯风试验或缺失数据）
+                visual_angle_to_use, l_v_to_use = reconstruct_trial_visual_features(
+                    trial_data=trial_data,
+                    stimulus_onset_ms=stimulus_onset_ms,
+                    l_v_ratio=l_v_ratio,
+                    dt_ms=dt_ms,
+                )
+
+            # 确保长度匹配
+            n_frames = X_seq.shape[0]
+            if len(visual_angle_to_use) < n_frames:
+                # 填充到匹配长度
+                padded = np.zeros(n_frames, dtype=np.float64)
+                padded[:len(visual_angle_to_use)] = visual_angle_to_use
+                visual_angle_to_use = padded
+            elif len(visual_angle_to_use) > n_frames:
+                visual_angle_to_use = visual_angle_to_use[:n_frames]
+
+            if len(l_v_to_use) < n_frames:
+                padded = np.zeros(n_frames, dtype=np.float64)
+                padded[:len(l_v_to_use)] = l_v_to_use
+                l_v_to_use = padded
+            elif len(l_v_to_use) > n_frames:
+                l_v_to_use = l_v_to_use[:n_frames]
+
+            X_seq[:, 0] = visual_angle_to_use
 
             # 同步入库：保证 sequences 和 valid_snaps 绝对对齐
             sequences.append((X_seq, Y_seq, int(info["label"])))
             valid_snaps.append(snap)
 
             logger.debug(
-                "Trial %s/%d: reconstructed θ(t) range [%.2f°, %.2f°], "
-                "l/v=%.4f, is_pure_wind=%s",
+                "Trial %s/%d: θ(t) range [%.2f°, %.2f°], "
+                "l/v=%.4f, is_pure_wind=%s, has_raw_visual=%s",
                 info["session_id"], info["trial_id"],
-                float(np.min(visual_angle_recon)),
-                float(np.max(visual_angle_recon)),
+                float(np.min(visual_angle_to_use)),
+                float(np.max(visual_angle_to_use)),
                 l_v_ratio,
-                bool(np.all(np.abs(visual_angle_recon) < 1e-8)),
+                bool(np.all(np.abs(visual_angle_to_use) < 1e-6)),
+                has_raw_visual,
             )
 
         except (ValueError, KeyError) as e:

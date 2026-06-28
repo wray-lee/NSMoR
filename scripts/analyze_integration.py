@@ -43,6 +43,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 import numpy as np
+import pandas as pd
 import torch
 
 from nsmor.nsmor_dataloader import (
@@ -78,10 +79,10 @@ ERROR_BAR_COLOR: str = "#1C7ED6"        # Match line color
 CONDITION_DISPLAY_NAMES: Dict[str, str] = {
     "visual_only": "Visual-Only",
     "wind_only": "Wind-Only",
-    "multisensory_ttc_minus_373": "Wind at TTC−373ms",
-    "multisensory_ttc_minus_119": "Wind at TTC−119ms",
-    "multisensory_ttc_0": "Wind at TTC",
-    "multisensory_ttc_plus_200": "Wind at TTC+200ms",
+    "multisensory_ttc_-373ms": "Wind at TTC−373ms",
+    "multisensory_ttc_-119ms": "Wind at TTC−119ms",
+    "multisensory_ttc_0ms": "Wind at TTC",
+    "multisensory_ttc_+200ms": "Wind at TTC+200ms",
     "multisensory_other": "Other Multisensory",
 }
 
@@ -169,7 +170,8 @@ def load_model_from_checkpoint(
 def load_dataset(
     dataset_path: Path,
     batch_size: int = 32,
-) -> Tuple[torch.utils.data.DataLoader, np.ndarray, List[int], np.ndarray]:
+    max_seq_len: Optional[int] = 1000,
+) -> Tuple[torch.utils.data.DataLoader, np.ndarray, List[int], np.ndarray, List[Dict]]:
     """
     Load the preprocessed dataset and create a DataLoader.
 
@@ -178,8 +180,9 @@ def load_dataset(
         batch_size: Batch size for the DataLoader.
 
     Returns:
-        ``(dataloader, labels, lengths_list, X_seqs)`` tuple.
+        ``(dataloader, labels, lengths_list, X_seqs, trial_info_list)`` tuple.
         X_seqs is the raw feature array for wind onset detection.
+        trial_info_list contains trial type info from events.
 
     Raises:
         FileNotFoundError: If dataset file does not exist.
@@ -211,6 +214,7 @@ def load_dataset(
         sequences=sequences,
         mcmc_priors=mcmc_priors,
         feature_config=feature_config,
+        max_seq_len=max_seq_len,
     )
 
     dataloader = torch.utils.data.DataLoader(
@@ -222,7 +226,40 @@ def load_dataset(
     )
 
     lengths_list = [int(l) for l in lengths]
-    return dataloader, labels, lengths_list, X_seqs
+
+    # Load trial info from events files
+    trial_info_list = _load_trial_info_from_events(dataset_path.parent.parent / "raw")
+
+    return dataloader, labels, lengths_list, X_seqs, trial_info_list
+
+
+def _load_trial_info_from_events(raw_dir: Path) -> List[Dict]:
+    """
+    Load trial type info from events CSV files.
+
+    Returns list of dicts with keys: type, target_ttc_ms, lv_ratio_ms
+    """
+    import json
+    trial_info = []
+
+    events_files = sorted(raw_dir.rglob("*_events.csv"))
+    for evt_path in events_files:
+        df = pd.read_csv(evt_path)
+        for _, row in df.iterrows():
+            event_type = str(row.get('event_type', row.get('event_name', '')))
+            if event_type == 'trial_start':
+                details_str = str(row.get('event_value', row.get('details', '{}')))
+                try:
+                    details = json.loads(details_str)
+                except:
+                    details = {}
+                trial_info.append({
+                    'type': details.get('type', 'unknown'),
+                    'target_ttc_ms': details.get('target_ttc_ms'),
+                    'lv_ratio_ms': details.get('lv_ratio_ms'),
+                })
+
+    return trial_info
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -327,13 +364,13 @@ def classify_wind_condition(
         # Classify into specific multisensory conditions
         # Use tolerance bins for known experimental conditions
         if abs(delta_t_ms - (-373.0)) < 50.0:
-            return "multisensory_ttc_minus_373", delta_t_ms
+            return "multisensory_ttc_-373ms", delta_t_ms
         elif abs(delta_t_ms - (-119.0)) < 50.0:
-            return "multisensory_ttc_minus_119", delta_t_ms
+            return "multisensory_ttc_-119ms", delta_t_ms
         elif abs(delta_t_ms - 0.0) < 50.0:
-            return "multisensory_ttc_0", delta_t_ms
+            return "multisensory_ttc_0ms", delta_t_ms
         elif abs(delta_t_ms - 200.0) < 50.0:
-            return "multisensory_ttc_plus_200", delta_t_ms
+            return "multisensory_ttc_+200ms", delta_t_ms
         else:
             return "multisensory_other", delta_t_ms
 
@@ -343,14 +380,19 @@ def classify_wind_condition(
 
 def group_trials_by_condition(
     X_seqs: np.ndarray,
+    trial_info_list: List[Dict],
     stim_onset_frame: int = 200,
     dt_ms: float = 10.0,
 ) -> Dict[str, List[int]]:
     """
     Group trial indices by their experimental condition.
 
+    Uses trial info from events files for classification when available,
+    falls back to kinematics-based detection.
+
     Args:
         X_seqs: List of feature arrays, each ``(T_i, 8)``.
+        trial_info_list: List of trial info dicts from events.
         stim_onset_frame: Frame index of visual stimulus onset.
         dt_ms: Frame interval in milliseconds.
 
@@ -360,9 +402,38 @@ def group_trials_by_condition(
     condition_groups: Dict[str, List[int]] = {}
 
     for i, x_seq in enumerate(X_seqs):
-        condition, _ = classify_wind_condition(
-            x_seq, stim_onset_frame, dt_ms
-        )
+        # Try to use trial info from events
+        if i < len(trial_info_list):
+            info = trial_info_list[i]
+            trial_type = info.get('type', 'unknown')
+            target_ttc_ms = info.get('target_ttc_ms')
+
+            if trial_type == 'baseline_visual':
+                condition = 'visual_only'
+            elif trial_type == 'baseline_wind':
+                condition = 'wind_only'
+            elif trial_type == 'looming_wind' and target_ttc_ms is not None:
+                # Classify based on target_ttc_ms
+                if abs(target_ttc_ms - (-373)) < 50:
+                    condition = 'multisensory_ttc_-373ms'
+                elif abs(target_ttc_ms - (-119)) < 50:
+                    condition = 'multisensory_ttc_-119ms'
+                elif abs(target_ttc_ms) < 50:
+                    condition = 'multisensory_ttc_0ms'
+                elif abs(target_ttc_ms - 200) < 50:
+                    condition = 'multisensory_ttc_+200ms'
+                else:
+                    condition = f'multisensory_ttc_{target_ttc_ms:+.0f}ms'
+            else:
+                # Fall back to kinematics-based detection
+                condition, _ = classify_wind_condition(
+                    x_seq, stim_onset_frame, dt_ms
+                )
+        else:
+            # Fall back to kinematics-based detection
+            condition, _ = classify_wind_condition(
+                x_seq, stim_onset_frame, dt_ms
+            )
 
         if condition not in condition_groups:
             condition_groups[condition] = []
@@ -547,19 +618,19 @@ def create_integration_figure(
     # We need conditions with known wind onset times
     plot_conditions = [
         "visual_only",
-        "multisensory_ttc_minus_373",
-        "multisensory_ttc_minus_119",
-        "multisensory_ttc_0",
-        "multisensory_ttc_plus_200",
+        "multisensory_ttc_-373ms",
+        "multisensory_ttc_-119ms",
+        "multisensory_ttc_0ms",
+        "multisensory_ttc_+200ms",
     ]
 
     # X-axis values: Wind onset time relative to TTC (ms)
     delta_t_mapping: Dict[str, float] = {
         "visual_only": 0.0,  # Reference point (no wind)
-        "multisensory_ttc_minus_373": -373.0,
-        "multisensory_ttc_minus_119": -119.0,
-        "multisensory_ttc_0": 0.0,
-        "multisensory_ttc_plus_200": 200.0,
+        "multisensory_ttc_-373ms": -373.0,
+        "multisensory_ttc_-119ms": -119.0,
+        "multisensory_ttc_0ms": 0.0,
+        "multisensory_ttc_+200ms": 200.0,
     }
 
     # Collect plot data
@@ -813,10 +884,10 @@ def export_integration_summary(
     delta_t_mapping: Dict[str, Optional[float]] = {
         "visual_only": None,
         "wind_only": None,
-        "multisensory_ttc_minus_373": -373.0,
-        "multisensory_ttc_minus_119": -119.0,
-        "multisensory_ttc_0": 0.0,
-        "multisensory_ttc_plus_200": 200.0,
+        "multisensory_ttc_-373ms": -373.0,
+        "multisensory_ttc_-119ms": -119.0,
+        "multisensory_ttc_0ms": 0.0,
+        "multisensory_ttc_+200ms": 200.0,
         "multisensory_other": None,
     }
 
@@ -860,6 +931,7 @@ def run_integration_analysis(
     output_path: Path,
     summary_path: Optional[Path] = None,
     batch_size: int = 32,
+    max_seq_len: Optional[int] = 1000,
     dt_ms: float = 10.0,
     stim_onset_frame: int = 200,
 ) -> None:
@@ -892,8 +964,8 @@ def run_integration_analysis(
     model = load_model_from_checkpoint(checkpoint_path, device)
 
     # ── Load dataset ──────────────────────────────────────────
-    dataloader, labels, lengths_list, X_seqs = load_dataset(
-        dataset_path, batch_size=batch_size
+    dataloader, labels, lengths_list, X_seqs, trial_info_list = load_dataset(
+        dataset_path, batch_size=batch_size, max_seq_len=max_seq_len,
     )
 
     # ── Run model inference ───────────────────────────────────
@@ -903,8 +975,8 @@ def run_integration_analysis(
     with torch.no_grad():
         for batch_idx, batch in enumerate(dataloader):
             X_batch, _Y_batch, lengths = batch
-            X_batch = X_batch.to(device)
-            lengths = lengths.to(device)
+            X_batch = X_batch.to(device).contiguous()
+            lengths = lengths.to(device).contiguous()
 
             Y_pred = model(X_batch, lengths)
 
@@ -921,7 +993,7 @@ def run_integration_analysis(
     logger.info("-" * 60)
     logger.info("Grouping trials by experimental condition...")
     condition_groups = group_trials_by_condition(
-        X_seqs, stim_onset_frame, dt_ms
+        X_seqs, trial_info_list, stim_onset_frame, dt_ms
     )
 
     # ── Extract metrics per condition ─────────────────────────
@@ -1022,6 +1094,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Batch size for data loading.",
     )
     parser.add_argument(
+        "--max_seq_len",
+        type=int,
+        default=1000,
+        help="Crop sequences longer than this (cuDNN compatibility). 0 = disable.",
+    )
+    parser.add_argument(
         "--dt_ms",
         type=float,
         default=10.0,
@@ -1041,12 +1119,14 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
 
+    max_seq_len = args.max_seq_len if args.max_seq_len > 0 else None
     run_integration_analysis(
         checkpoint_path=Path(args.checkpoint),
         dataset_path=Path(args.dataset),
         output_path=Path(args.output),
         summary_path=Path(args.summary),
         batch_size=args.batch_size,
+        max_seq_len=max_seq_len,
         dt_ms=args.dt_ms,
         stim_onset_frame=args.stim_onset_frame,
     )

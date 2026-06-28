@@ -42,6 +42,11 @@ install: ## Install package in editable mode with dev deps
 test: ## Run full test suite with verbose output
 	$(PYTHON) -m pytest tests/ -v
 
+# ── Pre Data loading ─────────────────────────────────────────
+load:
+	$(PYTHON) scripts/pre_load_data.py $(RAW)
+	$(PYTHON) scripts/pre_load_adapt.py $(RAW)
+
 # ── Data Preparation ─────────────────────────────────────────
 data: ## Run ETL pipeline (prepare_data.py)
 	$(PYTHON) scripts/prepare_data.py --raw_dir $(RAW) --output $(DATA)
@@ -54,16 +59,16 @@ train: ## Run training engine (train.py)
 analyze: dynamics lesion jacobian integration psychophysics ## Run all analysis scripts
 
 dynamics: $(BEST) ## Run dynamics & manifold analysis
-	$(PYTHON) scripts/analyze_dynamics.py --checkpoint $(BEST) --output_dir $(OUTPUT)
+	$(PYTHON) scripts/analyze_dynamics.py --checkpoint $(BEST) --output $(OUTPUT)/mechanism_analysis.png
 
 lesion: $(BEST) ## Run in-silico lesion analysis
-	$(PYTHON) scripts/simulate_lesion.py --checkpoint $(BEST) --output_dir $(OUTPUT)
+	$(PYTHON) scripts/simulate_lesion.py --checkpoint $(BEST) --output $(OUTPUT)/ablation_kinematics.png
 
 jacobian: $(BEST) ## Run Jacobian eigenvalue spectrum
-	$(PYTHON) scripts/analyze_jacobian.py --checkpoint $(BEST) --output_dir $(OUTPUT)
+	$(PYTHON) scripts/analyze_jacobian.py --checkpoint $(BEST) --output $(OUTPUT)/jacobian_spectrum.png
 
 integration: $(BEST) ## Run multisensory integration window
-	$(PYTHON) scripts/analyze_integration.py --checkpoint $(BEST) --output_dir $(OUTPUT)
+	$(PYTHON) scripts/analyze_integration.py --checkpoint $(BEST) --output $(OUTPUT)/integration_window.png
 
 psychophysics: $(BEST) ## Run Bayesian reliability analysis
 	$(PYTHON) scripts/simulate_psychophysics.py --checkpoint $(BEST) --output_dir $(OUTPUT)

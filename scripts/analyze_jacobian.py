@@ -5,7 +5,7 @@ Computes the Jacobian of the GRU at different trial phases (epochs)
 and plots the eigenvalues on the complex plane (unit circle) to prove
 the continuous integration mechanics of the GRU pathway.
 
-Target: Label.WALK trials (sustained locomotion response).
+Target: Label.PREWALK trials (sustained locomotion response).
 
 Epochs relative to detected stimulus onset:
   1. Early (Baseline):     onset - 1000ms
@@ -174,6 +174,7 @@ def load_model_from_checkpoint(
 def load_dataset(
     dataset_path: Path,
     batch_size: int = 32,
+    max_seq_len: Optional[int] = 1000,
 ) -> Tuple[torch.utils.data.DataLoader, np.ndarray, List[int], List[np.ndarray]]:
     """
     Load the preprocessed dataset and create a DataLoader.
@@ -218,6 +219,7 @@ def load_dataset(
         sequences=sequences,
         mcmc_priors=mcmc_priors,
         feature_config=feature_config,
+        max_seq_len=max_seq_len,
     )
 
     dataloader = torch.utils.data.DataLoader(
@@ -347,7 +349,7 @@ def extract_gru_states_at_epochs(
     dataloader: torch.utils.data.DataLoader,
     device: torch.device,
     onset_frames: List[int],
-    target_class: int = Label.WALK.value,
+    target_class: int = Label.ESCAPE.value,
     dt_ms: float = 10.0,
 ) -> Dict[str, Tuple[torch.Tensor, torch.Tensor]]:
     """
@@ -400,8 +402,8 @@ def extract_gru_states_at_epochs(
 
         for batch_idx, batch in enumerate(dataloader):
             X_batch, _Y_batch, lengths = batch
-            X_batch = X_batch.to(device)
-            lengths = lengths.to(device)
+            X_batch = X_batch.to(device).contiguous()
+            lengths = lengths.to(device).contiguous()
 
             B, T, _ = X_batch.shape
 
@@ -430,7 +432,10 @@ def extract_gru_states_at_epochs(
                     continue
 
                 length_i = int(lengths[i].item())
-                onset_frame = onset_frames[global_idx]
+
+                # Detect onset from the ACTUAL batch data (after cropping)
+                wind_channel = X_batch[i, :length_i, 1].cpu().numpy()
+                onset_frame = int(np.argmax(wind_channel > 0.5)) if np.any(wind_channel > 0.5) else 0
 
                 # ── Compute epoch centre frames ────────────────
                 for epoch_name, epoch_def in EPOCH_DEFINITIONS.items():
@@ -879,8 +884,9 @@ def run_jacobian_analysis(
     checkpoint_path: Path,
     dataset_path: Path,
     output_path: Path,
-    target_class: int = Label.WALK.value,
+    target_class: int = Label.ESCAPE.value,
     batch_size: int = 32,
+    max_seq_len: Optional[int] = 1000,
     dt_ms: float = 10.0,
     max_states_per_epoch: int = 100,
 ) -> None:
@@ -909,7 +915,7 @@ def run_jacobian_analysis(
 
     # ── Load dataset (returns raw X_seqs for onset detection) ─
     dataloader, labels, lengths_list, X_seqs = load_dataset(
-        dataset_path, batch_size=batch_size,
+        dataset_path, batch_size=batch_size, max_seq_len=max_seq_len,
     )
 
     # ── Task 1: Dynamic stimulus onset detection ──────────────
@@ -999,14 +1005,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--target_class",
         type=int,
-        default=1,
-        help="Label value to analyze (0=STARTLE, 1=WALK, 2=PRE_ACTIVE, 3=NO_RESPONSE).",
+        default=0,
+        help="Label value to analyze (0=ESCAPE, 1=PREWALK, 2=PRE_ACTIVE, 3=NO_RESPONSE).",
     )
     parser.add_argument(
         "--batch_size",
         type=int,
         default=32,
         help="Batch size for data loading.",
+    )
+    parser.add_argument(
+        "--max_seq_len",
+        type=int,
+        default=1000,
+        help="Crop sequences longer than this (cuDNN compatibility). 0 = disable.",
     )
     parser.add_argument(
         "--dt_ms",
@@ -1034,12 +1046,14 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     else:
         output_path = Path(args.output)
 
+    max_seq_len = args.max_seq_len if args.max_seq_len > 0 else None
     run_jacobian_analysis(
         checkpoint_path=Path(args.checkpoint),
         dataset_path=Path(args.dataset),
         output_path=output_path,
         target_class=args.target_class,
         batch_size=args.batch_size,
+        max_seq_len=max_seq_len,
         dt_ms=args.dt_ms,
         max_states_per_epoch=args.max_states,
     )

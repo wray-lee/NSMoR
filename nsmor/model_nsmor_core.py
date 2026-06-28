@@ -75,20 +75,29 @@ class SensoryEncoder(nn.Module):
 
 class LIFCell(nn.Module):
     """
-    Leaky Integrate-and-Fire recurrent neuron.
+    Leaky Integrate-and-Fire recurrent neuron with surrogate gradients.
 
     Dynamics (per time-step *t*)::
 
         V[t] = α · V[t-1] + β · W_in · E_sensory[t]     (leaky integration)
 
         if V[t] > V_threshold:
-            spike = V[t]          (fire)
+            spike = 1.0           (fire — binary)
             V[t] -= V_threshold   (soft reset)
         else:
-            spike = 0             (silent)
+            spike = 0.0           (silent)
 
-    The output is the *spike* (the membrane potential when it fires,
-    zero otherwise), making the pathway sparse and event-driven.
+    The output is a **strictly binary** spike signal (0.0 or 1.0).
+    During the backward pass, a surrogate gradient flows through
+    ``sigmoid(V - V_threshold)`` so that BPTT receives continuous
+    gradient information despite the discrete forward activation.
+
+    Surrogate trick::
+
+        spike = spike_mask − σ(V−θ).detach() + σ(V−θ)
+
+    Forward  → ``spike_mask`` (binary 0/1, sigmoid terms cancel).
+    Backward → gradient flows only through ``σ(V−θ)``.
 
     Input:  ``(B, H)`` at each step
     Output: ``(B, H)`` at each step
@@ -140,9 +149,10 @@ class LIFCell(nn.Module):
         # Leak + input integration:  V = α·V_prev + β·W_in·input
         v_new = self.alpha * state + self.beta * self.W_in(input_t)   # (B, H)
 
-        # Spike detection: fires where V > threshold
-        spike_mask = (v_new > self.v_threshold).float()               # (B, H)
-        spike = spike_mask * v_new                                    # (B, H)
+        # Spike detection with surrogate gradient for BPTT
+        spike_mask = (v_new > self.v_threshold).float()               # (B, H) binary
+        sig = torch.sigmoid(v_new - self.v_threshold)                 # (B, H) smooth
+        spike = spike_mask - sig.detach() + sig                       # (B, H) binary fwd, smooth bwd
 
         # Soft reset: subtract threshold where spike occurred
         v_new = v_new - spike_mask * self.v_threshold                 # (B, H)
@@ -228,10 +238,15 @@ class MoRRouter(nn.Module):
     Per-time-step routing network that blends LIF and GRU outputs.
 
     Takes the concatenation of ``[E_sensory(t), MCMC_Prior(t)]`` and
-    produces a 2-D routing vector ``[g_lif, g_gru]`` via softmax.
+    produces a 2-D routing vector ``[g_lif, g_gru]`` via **sigmoid**
+    (independent activation, not softmax).
+
+    Unlike softmax, sigmoid allows both gates to saturate near 1
+    (dual-channel activation) or both to approach 0 (full silence),
+    breaking the zero-sum competition between pathways.
 
     Input:  ``(B, H + M)`` at each step
-    Output: ``(B, 2)`` — soft routing weights
+    Output: ``(B, 2)`` — independent routing weights in [0, 1]
     """
 
     def __init__(self, hidden_dim: int = 64, mcmc_dim: int = 4) -> None:
@@ -249,11 +264,11 @@ class MoRRouter(nn.Module):
             mcmc_prior: ``(B, M)``
 
         Returns:
-            ``(B, 2)`` — ``[g_lif, g_gru]`` with softmax along dim=-1.
+            ``(B, 2)`` — ``[g_lif, g_gru]`` independently in [0, 1].
         """
         combined = torch.cat([e_sensory, mcmc_prior], dim=-1)  # (B, H+M)
         logits = self.gate(combined)                            # (B, 2)
-        return F.softmax(logits, dim=-1)                        # (B, 2)
+        return torch.sigmoid(logits)                            # (B, 2)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -413,6 +428,10 @@ class NSMoRCore(nn.Module):
             ValueError: If ``X_batch`` feature dim is not 8.
             AssertionError: If tensor shapes are inconsistent.
         """
+        # Ensure contiguous memory for cuDNN compatibility
+        X_batch = X_batch.contiguous()
+        lengths = lengths.contiguous()
+
         expected_dim = self.sensory_dim + self.mcmc_dim
         if X_batch.shape[-1] != expected_dim:
             raise ValueError(

@@ -18,8 +18,8 @@ from typing import ClassVar, Tuple
 
 class Label(IntEnum):
     """Discrete behavioral labels for cricket trials."""
-    STARTLE = 0
-    WALK = 1
+    ESCAPE = 0
+    PREWALK = 1
     PRE_ACTIVE = 2
     NO_RESPONSE = 3
 
@@ -65,22 +65,29 @@ class ThresholdConfig:
     """
     Velocity and latency thresholds for behavioral classification.
 
-    These thresholds define the boundaries between behavioral categories.
+    Standardized criteria for cricket escape behavior:
+    - **Escape**: Post-stimulus sustained speed > 50 mm/s for 250ms,
+      with pre-stimulus speed < 10 mm/s.
+    - **Prewalk**: Pre-stimulus speed > 10 mm/s for 1s AND
+      post-stimulus sustained speed > 50 mm/s for 250ms.
+    - **No Response**: Post-stimulus sustained speed ≤ 50 mm/s for 250ms.
     """
-    startle_velocity_threshold: float = 5.0
-    """Peak velocity (cm/s) above which a response is classified as Startle."""
+    escape_velocity_threshold: float = 5.0
+    """Post-stimulus sustained velocity (cm/s) for escape classification.
+    50 mm/s = 5.0 cm/s."""
 
-    walk_velocity_threshold: float = 1.0
-    """Sustained velocity (cm/s) above which a response is classified as Walk."""
+    escape_sustained_ms: float = 250.0
+    """Duration (ms) that velocity must remain above threshold for escape."""
+
+    prewalk_velocity_threshold: float = 1.0
+    """Pre-stimulus velocity (cm/s) for prewalk classification.
+    10 mm/s = 1.0 cm/s."""
+
+    prewalk_sustained_ms: float = 1000.0
+    """Duration (ms) that pre-stimulus velocity must remain above threshold."""
 
     pre_active_velocity_threshold: float = 0.5
     """Velocity (cm/s) during baseline that indicates spontaneous activity."""
-
-    startle_latency_max_ms: float = 500.0
-    """Maximum time (ms) after stimulus onset for a Startle response."""
-
-    walk_latency_max_ms: float = 2000.0
-    """Maximum time (ms) after stimulus onset for a Walk response."""
 
 
 # ──────────────────────────────────────────────────────────────
@@ -127,7 +134,7 @@ class FeatureConfig:
     """Number of behavioral classes."""
 
     label_names: ClassVar[Tuple[str, ...]] = (
-        "Startle", "Walk", "Pre_Active", "NoResponse",
+        "Escape", "Prewalk", "Pre_Active", "NoResponse",
     )
     """Human-readable label names in Label enum order."""
 

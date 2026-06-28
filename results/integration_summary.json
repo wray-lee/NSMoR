@@ -1,0 +1,138 @@
+{
+  "analysis": "Multisensory Integration Window",
+  "phase": 9,
+  "description": "Chronometric and vigor curves showing wind timing modulation of visual looming response predictions.",
+  "conditions": {
+    "multisensory_ttc_-225ms": {
+      "display_name": "multisensory_ttc_-225ms",
+      "delta_t_ms": null,
+      "latency_to_peak_ms": {
+        "mean": 4659.722222222223,
+        "sem": 304.7852629288829,
+        "n": 36
+      },
+      "peak_velocity_cms": {
+        "mean": 1.3647369510597653,
+        "sem": 0.08658245540717958,
+        "n": 36
+      }
+    },
+    "multisensory_ttc_0ms": {
+      "display_name": "Wind at TTC",
+      "delta_t_ms": 0.0,
+      "latency_to_peak_ms": {
+        "mean": 4715.694444444444,
+        "sem": 242.32460138797904,
+        "n": 72
+      },
+      "peak_velocity_cms": {
+        "mean": 1.3958010085754924,
+        "sem": 0.06142000310930395,
+        "n": 72
+      }
+    },
+    "multisensory_ttc_-119ms": {
+      "display_name": "Wind at TTC−119ms",
+      "delta_t_ms": -119.0,
+      "latency_to_peak_ms": {
+        "mean": 5212.777777777777,
+        "sem": 268.73894209553674,
+        "n": 36
+      },
+      "peak_velocity_cms": {
+        "mean": 1.1211660156647365,
+        "sem": 0.07239194295978586,
+        "n": 36
+      }
+    },
+    "multisensory_ttc_-261ms": {
+      "display_name": "multisensory_ttc_-261ms",
+      "delta_t_ms": null,
+      "latency_to_peak_ms": {
+        "mean": 5256.111111111111,
+        "sem": 361.6686460471901,
+        "n": 36
+      },
+      "peak_velocity_cms": {
+        "mean": 1.2162012308835983,
+        "sem": 0.07978047027805055,
+        "n": 36
+      }
+    },
+    "multisensory_ttc_+200ms": {
+      "display_name": "Wind at TTC+200ms",
+      "delta_t_ms": 200.0,
+      "latency_to_peak_ms": {
+        "mean": 4918.888888888889,
+        "sem": 323.7666001697203,
+        "n": 36
+      },
+      "peak_velocity_cms": {
+        "mean": 1.0851831916305754,
+        "sem": 0.0726994485891619,
+        "n": 36
+      }
+    },
+    "multisensory_ttc_-308ms": {
+      "display_name": "multisensory_ttc_-308ms",
+      "delta_t_ms": null,
+      "latency_to_peak_ms": {
+        "mean": 5416.388888888889,
+        "sem": 238.50361463529543,
+        "n": 36
+      },
+      "peak_velocity_cms": {
+        "mean": 1.0518453104628458,
+        "sem": 0.06997497598386872,
+        "n": 36
+      }
+    },
+    "multisensory_ttc_-373ms": {
+      "display_name": "Wind at TTC−373ms",
+      "delta_t_ms": -373.0,
+      "latency_to_peak_ms": {
+        "mean": 4315.0,
+        "sem": 391.30075500080187,
+        "n": 36
+      },
+      "peak_velocity_cms": {
+        "mean": 1.3110330551862717,
+        "sem": 0.09022120251999215,
+        "n": 36
+      }
+    },
+    "visual_only": {
+      "display_name": "Visual-Only",
+      "delta_t_ms": null,
+      "latency_to_peak_ms": {
+        "mean": 4390.277777777777,
+        "sem": 378.83399857185054,
+        "n": 36
+      },
+      "peak_velocity_cms": {
+        "mean": 1.425709952910741,
+        "sem": 0.09371284642859541,
+        "n": 36
+      }
+    },
+    "wind_only": {
+      "display_name": "Wind-Only",
+      "delta_t_ms": null,
+      "latency_to_peak_ms": {
+        "mean": 4271.111111111111,
+        "sem": 251.25837277643237,
+        "n": 72
+      },
+      "peak_velocity_cms": {
+        "mean": 1.4976500537660387,
+        "sem": 0.06093175309856511,
+        "n": 72
+      }
+    }
+  },
+  "baseline_reference": {
+    "condition": "visual_only",
+    "latency_mean_ms": 4390.277777777777,
+    "peak_velocity_mean_cms": 1.425709952910741
+  }
+}

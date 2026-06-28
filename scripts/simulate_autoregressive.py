@@ -431,10 +431,10 @@ def run_autoregressive_trial(
         for t in range(T):
             # Construct input tensor X_t: (1, 1, 8)
             sensory = torch.tensor(
-                [[v_vis[t], wind[t], v_kine_prev, a_kine_prev]],
+                [[[v_vis[t], wind[t], v_kine_prev, a_kine_prev]]],
                 dtype=torch.float32,
                 device=device,
-            )                                               # (1, 4)
+            )                                               # (1, 1, 4)
             X_t = torch.cat(
                 [sensory, mcmc_tensor.unsqueeze(0).unsqueeze(0)],
                 dim=-1,
@@ -456,8 +456,8 @@ def run_autoregressive_trial(
 
             # Build states from internals for next step
             states = {
-                "lif_v": internals["lif_potentials"][:, -1, :],
-                "gru_h": internals["gru_hidden"][:, -1:, :].permute(1, 0, 2),
+                "lif_v": internals["lif_potentials"][:, -1, :].contiguous(),
+                "gru_h": internals["gru_hidden"][:, -1:, :].permute(1, 0, 2).contiguous(),
             }
 
             # Soft-gain velocity scaling (preserves derivative continuity)

@@ -212,6 +212,10 @@ class FixedPointAdapter:
         x_t_seq = x_t.detach().unsqueeze(1)                       # (1, 1, D)
         h_t_input = h_leaf.unsqueeze(0)                            # (1, 1, H) — num_layers=1
 
+        # Temporarily set GRU to training mode for cuDNN backward
+        prev_mode = self._gru_cell.training
+        self._gru_cell.train()
+
         # GRU forward: output (1, 1, H), h_n (1, 1, H)
         output, _ = self._gru_cell(x_t_seq, h_t_input)            # (1, 1, H)
         h_next = output.squeeze(0).squeeze(0)                       # (H,)
@@ -230,6 +234,9 @@ class FixedPointAdapter:
 
             # The gradient ∂h_next[i]/∂h_leaf is now in h_leaf.grad
             jacobian[i, :] = h_leaf.grad.detach()
+
+        # Restore previous mode
+        self._gru_cell.train(prev_mode)
 
         return jacobian
 
@@ -269,14 +276,23 @@ class FixedPointAdapter:
             f"x_inputs shape {tuple(x_inputs.shape)} != (N={N}, D={D})"
         )
 
+        # ── Create leaf tensor with requires_grad ──
+        h_leaf = h_states.detach().clone().requires_grad_(True)
+
         # ── Forward pass for all states ──
         x_seq = x_inputs.unsqueeze(1)                              # (N, 1, D)
-        h_input = h_states.unsqueeze(1)                            # (N, 1, H)
+        h_input = h_leaf.unsqueeze(1)                              # (N, 1, H)
 
         # GRU expects (batch, seq_len, input_size) and
         # (num_layers, batch, hidden_size) — we need to transpose h_input
         h_input_gru = h_input.permute(1, 0, 2)                     # (1, N, H)
+
+        # Temporarily set GRU to training mode for cuDNN backward
+        prev_mode = self._gru_cell.training
+        self._gru_cell.train()
         output, _ = self._gru_cell(x_seq, h_input_gru)            # (N, 1, H)
+        self._gru_cell.train(prev_mode)
+
         h_next = output.squeeze(1)                                 # (N, H)
 
         # ── Compute Jacobians ──
@@ -284,14 +300,14 @@ class FixedPointAdapter:
 
         for i in range(H):
             # Zero gradients
-            if h_states.grad is not None:
-                h_states.grad.zero_()
+            if h_leaf.grad is not None:
+                h_leaf.grad.zero_()
 
             # Backpropagate for the i-th component of all h_next
             h_next[:, i].sum().backward(retain_graph=True)
 
             # Collect gradients: (N, H)
-            jacobians[:, i, :] = h_states.grad.detach()
+            jacobians[:, i, :] = h_leaf.grad.detach()
 
         return jacobians
 

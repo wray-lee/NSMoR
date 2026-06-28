@@ -1,14 +1,18 @@
 """
 Ground truth labeling and filtering.
 
-Implements the traditional pipeline for classifying trials into
-behavioral categories based on velocity thresholds and event timing.
+Implements standardized criteria for cricket escape behavior:
 
-Label assignment order (first match wins):
-  1. Pre_Active  — high spontaneous velocity during baseline
-  2. Startle     — peak velocity > threshold within startle latency
-  3. Walk        — sustained velocity > threshold within walk latency
-  4. NoResponse  — none of the above
+**Escape**
+- Walking speed was < 10 mm/s when the airflow was applied.
+- The maximum walking speed was > 50 mm/s for 250-ms periods after the airflow stimulus onset.
+
+**Prewalk**
+- The maximum walking speed exceeded 10 mm/s for 1-s periods just before the airflow stimulus onset.
+- The maximum walking speed was > 50 mm/s for 250-ms periods after the airflow stimulus onset.
+
+**No Response**
+- The maximum walking speed was ≤ 50 mm/s for 250-ms periods after the airflow stimulus onset.
 """
 
 from __future__ import annotations
@@ -47,37 +51,34 @@ def find_event_time(
 
 
 # ──────────────────────────────────────────────────────────────
-# Pre-active detection
+# Sustained speed check
 # ──────────────────────────────────────────────────────────────
 
-def is_pre_active(
+def _check_sustained_speed(
     velocity: np.ndarray,
     time_ms: np.ndarray,
-    baseline_end_ms: float,
-    config: ThresholdConfig = DEFAULT_THRESHOLD,
+    start_ms: float,
+    duration_ms: float,
+    threshold: float,
 ) -> bool:
     """
-    Check whether a trial has high spontaneous activity during baseline.
-
-    A trial is *pre-active* if the maximum absolute velocity in the
-    window ``[trial_start, baseline_end_ms)`` exceeds the configured
-    threshold.
+    Check if velocity remains above threshold for a sustained period.
 
     Args:
-        velocity: 1-D velocity time series (cm / s).
+        velocity: 1-D velocity time series (cm/s).
         time_ms: 1-D timestamps (ms).
-        baseline_end_ms: End of the baseline period (ms).
-        config: Threshold configuration.
+        start_ms: Start of the check window (ms).
+        duration_ms: Duration to check (ms).
+        threshold: Velocity threshold (cm/s).
 
     Returns:
-        ``True`` if the trial should be labelled :attr:`Label.PRE_ACTIVE`.
+        True if max velocity in window exceeds threshold.
     """
-    baseline_mask = time_ms < baseline_end_ms
-    if not np.any(baseline_mask):
+    end_ms = start_ms + duration_ms
+    mask = (time_ms >= start_ms) & (time_ms < end_ms)
+    if not np.any(mask):
         return False
-
-    max_baseline_velocity = np.max(np.abs(velocity[baseline_mask]))
-    return bool(max_baseline_velocity > config.pre_active_velocity_threshold)
+    return bool(np.max(np.abs(velocity[mask])) > threshold)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -93,40 +94,48 @@ def classify_response(
     """
     Classify the behavioral response after stimulus onset.
 
-    Priority: Startle > Walk > NoResponse.
+    Criteria (from standard cricket escape behavior protocol):
+    1. Check post-stimulus: max speed > 50 mm/s for 250ms
+       - If NO → No Response
+       - If YES → check pre-stimulus
+         - If pre-stimulus speed > 10 mm/s for 1s → Prewalk
+         - Else → Escape
 
     Args:
-        velocity: 1-D velocity time series (cm / s).
+        velocity: 1-D velocity time series (cm/s).
         time_ms: 1-D timestamps (ms).
         stimulus_onset_ms: Time of stimulus onset (ms).
         config: Threshold configuration.
 
     Returns:
-        One of :attr:`Label.STARTLE`, :attr:`Label.WALK`,
-        or :attr:`Label.NO_RESPONSE`.
+        One of Label.ESCAPE, Label.PREWALK, or Label.NO_RESPONSE.
     """
-    post_mask = time_ms > stimulus_onset_ms
-    if not np.any(post_mask):
+    # ── Check post-stimulus sustained speed (>50 mm/s for 250ms) ──
+    post_stim_250ms = _check_sustained_speed(
+        velocity, time_ms,
+        start_ms=stimulus_onset_ms,
+        duration_ms=config.escape_sustained_ms,
+        threshold=config.escape_velocity_threshold,
+    )
+
+    if not post_stim_250ms:
+        # No escape response
         return Label.NO_RESPONSE
 
-    post_velocity = velocity[post_mask]
-    post_time = time_ms[post_mask]
+    # ── Post-stimulus escape detected ──
+    # Check if pre-stimulus speed > 10 mm/s for 1s (Prewalk)
+    pre_stim_start = stimulus_onset_ms - config.prewalk_sustained_ms
+    pre_stim_1s = _check_sustained_speed(
+        velocity, time_ms,
+        start_ms=pre_stim_start,
+        duration_ms=config.prewalk_sustained_ms,
+        threshold=config.prewalk_velocity_threshold,
+    )
 
-    # ── Startle: high peak velocity within short latency window ──
-    startle_end = stimulus_onset_ms + config.startle_latency_max_ms
-    startle_mask = post_time <= startle_end
-    if np.any(startle_mask):
-        if np.max(np.abs(post_velocity[startle_mask])) > config.startle_velocity_threshold:
-            return Label.STARTLE
-
-    # ── Walk: sustained velocity within extended window ──
-    walk_end = stimulus_onset_ms + config.walk_latency_max_ms
-    walk_mask = post_time <= walk_end
-    if np.any(walk_mask):
-        if np.mean(np.abs(post_velocity[walk_mask])) > config.walk_velocity_threshold:
-            return Label.WALK
-
-    return Label.NO_RESPONSE
+    if pre_stim_1s:
+        return Label.PREWALK
+    else:
+        return Label.ESCAPE
 
 
 # ──────────────────────────────────────────────────────────────
@@ -182,3 +191,33 @@ def assign_ground_truth_labels(
         })
 
     return labeled
+
+
+def is_pre_active(
+    velocity: np.ndarray,
+    time_ms: np.ndarray,
+    baseline_end_ms: float,
+    config: ThresholdConfig = DEFAULT_THRESHOLD,
+) -> bool:
+    """
+    Check whether a trial has high spontaneous activity during baseline.
+
+    A trial is *pre-active* if the maximum absolute velocity in the
+    window ``[trial_start, baseline_end_ms)`` exceeds the configured
+    threshold.
+
+    Args:
+        velocity: 1-D velocity time series (cm / s).
+        time_ms: 1-D timestamps (ms).
+        baseline_end_ms: End of the baseline period (ms).
+        config: Threshold configuration.
+
+    Returns:
+        ``True`` if the trial should be labelled :attr:`Label.PRE_ACTIVE`.
+    """
+    baseline_mask = time_ms < baseline_end_ms
+    if not np.any(baseline_mask):
+        return False
+
+    max_baseline_velocity = np.max(np.abs(velocity[baseline_mask]))
+    return bool(max_baseline_velocity > config.pre_active_velocity_threshold)
