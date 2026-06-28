@@ -65,6 +65,7 @@ class NSMoRDataset(Dataset):
         sequences: List[Tuple[np.ndarray, np.ndarray, int]],
         mcmc_priors: np.ndarray,
         feature_config: FeatureConfig = DEFAULT_FEATURE,
+        max_seq_len: Optional[int] = None,
     ) -> None:
         """
         Args:
@@ -86,6 +87,7 @@ class NSMoRDataset(Dataset):
             )
 
         self.feature_config = feature_config
+        self.max_seq_len = max_seq_len
         self.sequences = list(sequences)  # defensive copy
 
         n = len(sequences)
@@ -115,6 +117,9 @@ class NSMoRDataset(Dataset):
         """
         Return ``(X_seq, Y_seq)`` for trial *idx*.
 
+        If the sequence exceeds ``max_seq_len``, a random contiguous
+        crop of length ``max_seq_len`` is extracted (data augmentation).
+
         Shape assertions are enforced on every access.
 
         Returns:
@@ -122,6 +127,12 @@ class NSMoRDataset(Dataset):
             Y_seq: ``(seq_len,)``
         """
         X_seq, Y_seq, _label = self.sequences[idx]
+
+        # ── Crop long sequences (random window for augmentation) ──
+        if self.max_seq_len is not None and X_seq.shape[0] > self.max_seq_len:
+            start = np.random.randint(0, X_seq.shape[0] - self.max_seq_len + 1)
+            X_seq = X_seq[start : start + self.max_seq_len]
+            Y_seq = Y_seq[start : start + self.max_seq_len]
 
         X_tensor = torch.as_tensor(X_seq, dtype=torch.float32)
         Y_tensor = torch.as_tensor(Y_seq, dtype=torch.float32)
@@ -197,6 +208,7 @@ def create_dataloader(
     shuffle: bool = True,
     num_workers: int = 0,
     feature_config: FeatureConfig = DEFAULT_FEATURE,
+    max_seq_len: Optional[int] = None,
 ) -> DataLoader:
     """
     Create a :class:`~torch.utils.data.DataLoader` for NSMoR.
@@ -208,6 +220,9 @@ def create_dataloader(
         shuffle: Shuffle trials each epoch.
         num_workers: Parallel data-loading workers.
         feature_config: Feature dimension constants.
+        max_seq_len: If set, crop sequences longer than this to a
+            random window of this length (data augmentation).
+            Recommended for cuDNN compatibility with very long sequences.
 
     Returns:
         A ``DataLoader`` yielding ``(X_batch, Y_batch, lengths)`` tuples.
@@ -216,6 +231,7 @@ def create_dataloader(
         sequences=sequences,
         mcmc_priors=mcmc_priors,
         feature_config=feature_config,
+        max_seq_len=max_seq_len,
     )
     return DataLoader(
         dataset,

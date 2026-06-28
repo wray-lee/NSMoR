@@ -59,6 +59,7 @@ class TrainingConfig:
     log_interval: int = 10
     checkpoint_interval: int = 10
     random_seed: int = 42
+    max_seq_len: Optional[int] = 1000  # crop sequences longer than this (cuDNN compat)
 
 
 @dataclass

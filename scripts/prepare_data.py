@@ -675,18 +675,18 @@ def prepare_dataset(
     )
     logger.info("Generated MCMC priors: %s", mcmc_priors.shape)
 
-    # ── Step 5: Sequence Extraction with Visual Physics Reconstruction ──
+# ── Step 5: Sequence Extraction with Visual Physics Reconstruction ──
     logger.info("[Step 5] Extracting continuous sequences with visual physics reconstruction...")
 
     sequences = []
-    aligned_priors = []
+    valid_snaps = []  # 仅收集快照输入，不在循环内推理
 
     for info in labeled_trials:
         try:
             trial_data = info["trial_data"]
             stimulus_onset_ms = info["stimulus_onset_ms"]
 
-            # 1. 强制同步提取快照与预测先验，确保与序列绝对对齐
+            # 1. 提取快照
             snap = extract_mcmc_snapshot(
                 trial_data,
                 stimulus_onset_ms,
@@ -694,7 +694,6 @@ def prepare_dataset(
                 time_config=time_config,
                 feature_config=feature_config,
             )
-            prior = mcmc_model.predict_proba(snap.reshape(1, -1))[0]
 
             # 2. 提取并计算 l/v ratio
             l_v_ratio_raw = trial_data.get("l_v_ratio", np.array([0.0]))
@@ -720,9 +719,9 @@ def prepare_dataset(
             )
             X_seq[:, 0] = visual_angle_recon
 
-            # 若以上均未报错，则同时将 prior 和 sequence 入库
+            # 同步入库：保证 sequences 和 valid_snaps 绝对对齐
             sequences.append((X_seq, Y_seq, int(info["label"])))
-            aligned_priors.append(prior)
+            valid_snaps.append(snap)
 
             logger.debug(
                 "Trial %s/%d: reconstructed θ(t) range [%.2f°, %.2f°], "
@@ -738,8 +737,9 @@ def prepare_dataset(
             logger.warning("Skipping trial: %s", e)
             continue
 
+    # 5. 批量推理：一次性处理所有快照，原生输出 (N, 4) 矩阵，彻底规避降维风险
+    mcmc_priors = mcmc_model.predict_proba(np.array(valid_snaps))
 
-    mcmc_priors = np.array(aligned_priors)
     logger.info("Extracted %d sequences with reconstructed visual features.", len(sequences))
 
 

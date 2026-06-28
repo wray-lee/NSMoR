@@ -14,6 +14,8 @@
 # ═══════════════════════════════════════════════════════════════
 
 PYTHON   ?= python
+RAW	 ?= data/raw
+DATA	 ?= data/processed/nsmor_dataset.pt
 EPOCHS   ?= 100
 CONFIG   ?= config/default.yaml
 RUN_DIR  ?= runs/default
@@ -42,7 +44,7 @@ test: ## Run full test suite with verbose output
 
 # ── Data Preparation ─────────────────────────────────────────
 data: ## Run ETL pipeline (prepare_data.py)
-	$(PYTHON) scripts/prepare_data.py
+	$(PYTHON) scripts/prepare_data.py --raw_dir $(RAW) --output $(DATA)
 
 # ── Training ─────────────────────────────────────────────────
 train: ## Run training engine (train.py)

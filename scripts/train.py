@@ -34,6 +34,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
+from tqdm import tqdm
 
 # ── Project imports ────────────────────────────────────────────
 from nsmor.checkpoint import load_checkpoint, save_checkpoint
@@ -81,6 +82,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Override batch size from config.",
+    )
+    parser.add_argument(
+        "--max_seq_len",
+        type=int,
+        default=None,
+        help="Crop sequences longer than this (cuDNN compatibility). 0 = disable.",
     )
     parser.add_argument(
         "--lr",
@@ -160,6 +167,8 @@ def build_config(argv: Optional[Sequence[str]] = None) -> Tuple[ExperimentConfig
     # ── Apply CLI overrides ───────────────────────────────────
     if args.batch_size is not None:
         config.training.batch_size = args.batch_size
+    if getattr(args, "max_seq_len", None) is not None:
+        config.training.max_seq_len = args.max_seq_len if args.max_seq_len > 0 else None
     if args.lr is not None:
         config.training.learning_rate = args.lr
     if args.epochs is not None:
@@ -354,15 +363,19 @@ def build_dataloaders(
     # ── Create datasets ───────────────────────────────────────
     feature_config = dataset.get("feature_config", DEFAULT_FEATURE)
 
+    max_seq_len = getattr(config.training, "max_seq_len", None)
+
     train_dataset = NSMoRDataset(
         sequences=train_sequences,
         mcmc_priors=train_priors,
         feature_config=feature_config,
+        max_seq_len=max_seq_len,
     )
     val_dataset = NSMoRDataset(
         sequences=val_sequences,
         mcmc_priors=val_priors,
         feature_config=feature_config,
+        max_seq_len=max_seq_len,
     )
 
     # ── Create dataloaders ────────────────────────────────────
@@ -427,12 +440,13 @@ def train_one_epoch(
     total_loss = 0.0
     n_batches = 0
 
+    pbar = tqdm(loader, desc=f"Epoch {epoch + 1}", leave=False, dynamic_ncols=True)
     for batch_idx, batch in enumerate(loader):
         # Unpack batch — expect (X, Y, lengths) from collate_variable_length
         x_batch, y_batch, lengths = batch
-        x_batch = x_batch.to(device)
-        y_batch = y_batch.to(device)
-        lengths = lengths.to(device)
+        x_batch = x_batch.to(device).contiguous()
+        y_batch = y_batch.to(device).contiguous()
+        lengths = lengths.to(device).contiguous()
 
         # ── Forward pass (with internals for routing gates) ──
         y_pred, internals = model(x_batch, lengths, return_internals=True)
@@ -466,12 +480,8 @@ def train_one_epoch(
         n_batches += 1
 
         # ── Logging ──
-        if (batch_idx + 1) % log_interval == 0:
-            avg_so_far = total_loss / n_batches
-            logger.info(
-                "  [Epoch %d] batch %d/%d  loss=%.6f",
-                epoch + 1, batch_idx + 1, len(loader), avg_so_far,
-            )
+        pbar.update(1)
+        pbar.set_postfix({"loss": f"{loss.item():.4f}"})
 
     avg_loss = total_loss / max(n_batches, 1)
     return avg_loss
@@ -506,11 +516,12 @@ def validate(
     total_loss = 0.0
     n_batches = 0
 
+    pbar = tqdm(loader, desc="Validation", leave=False, dynamic_ncols=True)
     for batch in loader:
         x_batch, y_batch, lengths = batch
-        x_batch = x_batch.to(device)
-        y_batch = y_batch.to(device)
-        lengths = lengths.to(device)
+        x_batch = x_batch.to(device).contiguous()
+        y_batch = y_batch.to(device).contiguous()
+        lengths = lengths.to(device).contiguous()
 
         y_pred, internals = model(x_batch, lengths, return_internals=True)
         g_gru = internals["routing_gates"][:, :, 1:2]
@@ -525,6 +536,7 @@ def validate(
 
         total_loss += loss.item()
         n_batches += 1
+        pbar.set_postfix({"val_loss": f"{loss.item():.4f}"})
 
     avg_loss = total_loss / max(n_batches, 1)
     return avg_loss
@@ -559,9 +571,15 @@ def train(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info("Device: %s", device)
     logger.info("lambda_reg: %.4f", lambda_reg)
+    if config.training.max_seq_len is not None:
+        logger.info("max_seq_len: %d (sequences will be cropped)", config.training.max_seq_len)
 
     # ── Build components ──────────────────────────────────────
     model = build_model(config).to(device)
+
+    for m in model.modules():
+        if isinstance(m, nn.RNNBase):
+            m.flatten_parameters()
     optimizer = build_optimizer(model, config)
     criterion = build_loss()
     train_loader, val_loader = build_dataloaders(config)

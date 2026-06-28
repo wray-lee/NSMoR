@@ -199,7 +199,16 @@ class GRUUnit(nn.Module):
         Returns:
             ``(B, T, H)``
         """
-        lengths_cpu = lengths.clamp(min=1).cpu()
+        # Ensure contiguous memory for CUDNN compatibility
+        x = x.contiguous()
+        if h0 is not None:
+            h0 = h0.contiguous()
+
+        # Enforce contiguous memory layout for GRU internal weights
+        self.gru.flatten_parameters()
+
+        # Ensure lengths tensor is strictly contiguous on CPU
+        lengths_cpu = lengths.clamp(min=1).cpu().contiguous()
         packed = pack_padded_sequence(
             x, lengths_cpu, batch_first=True, enforce_sorted=False,
         )
@@ -560,8 +569,8 @@ class NSMoRCore(nn.Module):
             # LIF: last valid state is already in v_state from _run_lif_path
             # We need to extract it from potentials at the last valid frame
             states_out: Dict[str, torch.Tensor] = {
-                "lif_v": lif_potentials[:, -1, :],            # (B, H)
-                "gru_h": out_gru[:, -1:, :].permute(1, 0, 2),  # (1, B, H)
+                "lif_v": lif_potentials[:, -1, :].contiguous(),            # (B, H)
+                "gru_h": out_gru[:, -1:, :].permute(1, 0, 2).contiguous(),  # (1, B, H)
             }
             return y_pred, internals, states_out
 

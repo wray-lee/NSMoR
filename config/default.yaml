@@ -30,6 +30,7 @@ training:
   log_interval: 10
   checkpoint_interval: 10
   random_seed: 42
+  max_seq_len: 1000        # crop sequences longer than this (cuDNN compatibility)
 
 # ── Dataset paths ───────────────────────────────────────────
 # Each field is a list of CSV paths; multiple files are concatenated.
