@@ -602,6 +602,63 @@ import torch.nn as nn
 
 
 # ═══════════════════════════════════════════════════════════════
+# CLI Override Tests (Flaw #2: regression guard for build_config)
+# ═══════════════════════════════════════════════════════════════
+
+class TestCLIOverrides:
+    """Verify that build_config correctly applies CLI overrides."""
+
+    def test_freeze_modules_override(self):
+        """--freeze lif_cell router sets config.finetune.freeze_modules."""
+        from scripts.train import build_config
+        config, _ = build_config(["--freeze", "lif_cell", "router"])
+        assert config.finetune.freeze_modules == ["lif_cell", "router"]
+
+    def test_lr_override(self):
+        """--lr 5e-4 sets training.learning_rate."""
+        from scripts.train import build_config
+        config, _ = build_config(["--lr", "5e-4"])
+        assert config.training.learning_rate == 5e-4
+
+    def test_epochs_override(self):
+        """--epochs 200 sets training.num_epochs."""
+        from scripts.train import build_config
+        config, _ = build_config(["--epochs", "200"])
+        assert config.training.num_epochs == 200
+
+    def test_hidden_dim_override(self):
+        """--hidden_dim 128 sets model.hidden_dim."""
+        from scripts.train import build_config
+        config, _ = build_config(["--hidden_dim", "128"])
+        assert config.model.hidden_dim == 128
+
+    def test_batch_size_override(self):
+        """--batch_size 64 sets training.batch_size."""
+        from scripts.train import build_config
+        config, _ = build_config(["--batch_size", "64"])
+        assert config.training.batch_size == 64
+
+    def test_output_dir_override(self):
+        """--output_dir runs/test sets checkpoint.output_dir."""
+        from scripts.train import build_config
+        config, _ = build_config(["--output_dir", "runs/test"])
+        assert config.checkpoint.output_dir == "runs/test"
+
+    def test_lambda_reg(self):
+        """--lambda_reg 0.05 returns lambda_reg=0.05."""
+        from scripts.train import build_config
+        _, lambda_reg = build_config(["--lambda_reg", "0.05"])
+        assert lambda_reg == 0.05
+
+    def test_unfreeze_after_epoch_in_config(self):
+        """unfreeze_after_epoch field exists in FineTuneConfig."""
+        from nsmor.config_parser import FineTuneConfig
+        cfg = FineTuneConfig()
+        assert hasattr(cfg, "unfreeze_after_epoch")
+        assert cfg.unfreeze_after_epoch == -1
+
+
+# ═══════════════════════════════════════════════════════════════
 # Entry point
 # ═══════════════════════════════════════════════════════════════
 

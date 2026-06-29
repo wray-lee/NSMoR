@@ -16,8 +16,6 @@ Python::
 
 from __future__ import annotations
 
-import argparse
-from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
@@ -112,6 +110,9 @@ class FineTuneConfig:
     freeze_modules: List[str] = field(default_factory=list)
     """List of sub-module names to freeze.  See
     :meth:`~nsmor.model_nsmor_core.NSMoRCore.freeze_modules`."""
+
+    unfreeze_after_epoch: int = -1
+    """If >= 0, unfreeze all modules at this epoch for full fine-tuning."""
 
 
 @dataclass

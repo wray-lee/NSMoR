@@ -126,6 +126,7 @@ def load_model_from_checkpoint(
     # Extract config from checkpoint
     config_dict = checkpoint.get("config", {})
     model_config = config_dict.get("model", {})
+    finetune_config = config_dict.get("finetune", {})
 
     # Build model with ALL saved parameters (fills defaults for missing)
     params = _extract_model_params(model_config)
@@ -134,6 +135,13 @@ def load_model_from_checkpoint(
     # Load state dict
     model.load_state_dict(checkpoint["model_state_dict"])
     model = model.to(device)
+
+    # Restore freeze state from checkpoint config
+    freeze_modules = finetune_config.get("freeze_modules", [])
+    if freeze_modules:
+        logger.info("Restoring frozen modules: %s", freeze_modules)
+        model.freeze_modules(freeze_modules)
+
     model.eval()
 
     param_count = sum(p.numel() for p in model.parameters())
