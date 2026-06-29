@@ -503,6 +503,11 @@ class LIFCell(nn.Module):
 
         # Input projection
         self.W_in = nn.Linear(hidden_dim, hidden_dim, bias=True)
+        # CF8 fix: Small positive bias for baseline excitability.
+        # Ensures neurons have a slight tendency to accumulate toward
+        # threshold even with zero-mean input, preventing initial silence.
+        # 0.01 is small enough to not dominate learned weights (~0.07).
+        nn.init.constant_(self.W_in.bias, 0.01)
 
     def forward(
         self,
@@ -746,7 +751,15 @@ class LIFCell(nn.Module):
         raw_spike = (v_new > v_thresh_new).float()           # (B, H) binary
         spike_mask = raw_spike * (1.0 - in_abs_refract)      # (B, H) binary
         # Surrogate gradient (straight-through estimator)
-        sig = torch.sigmoid(v_new - v_thresh_new)            # (B, H) smooth
+        # CF8 fix: Sharpened sigmoid (sharpness=4.0) raises peak gradient
+        # from 0.25 to 1.0 (4x improvement), recovering gradient signal
+        # in the LIF pathway.  Fixed constant (not learnable) for:
+        # - Biological plausibility (Na+ channel kinetics are fixed)
+        # - Backward compatibility (no new nn.Parameter in state_dict)
+        # - Numerical stability (no drift/NaN risk)
+        # Ref: surrogate gradient sharpness in spiking neural networks.
+        _SHARPNESS = 4.0
+        sig = torch.sigmoid(_SHARPNESS * (v_new - v_thresh_new))  # (B, H) smooth
         spike = spike_mask - sig.detach() + sig              # (B, H) binary fwd, smooth bwd
 
         # ── 7b. Update spike history for lateral inhibition ──

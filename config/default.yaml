@@ -20,9 +20,10 @@ model:
   lif_threshold: 0.5      # LIF spike threshold
   lif_beta: 2.0           # LIF input scaling
 
-  # ----gpu memory optimization----
-  lif_tbptt_steps: 0     # truncated BPTT window (0=full BPTT, risky for long seqs)
-  # -------------------------------
+  # CF8 fix: TBPTT=64 prevents gradient collapse along recurrence.
+  # Full BPTT (0) causes (0.9)^1000 = 1.75e-46 gradient attenuation.
+  # TBPTT=64 caps attenuation at (0.9)^64 = 0.0013 (manageable).
+  lif_tbptt_steps: 64    # truncated BPTT window (0=full BPTT, risky for long seqs)
 
 # ── Training hyperparameters ────────────────────────────────
 training:
@@ -42,9 +43,9 @@ loss:
   target_rate: 0.05         # target mean firing rate for sparsity L1
   lambda_energy: 0.001        # ATP metabolic cost (0 disables)
   lambda_sparse: 0.005        # population sparsity L1 (0 disables)
-  lambda_jerk: 0.001          # temporal coherence / jerk penalty (0 disables)
+  lambda_jerk: 0.005         # temporal coherence / jerk penalty (0 disables)
   jerk_threshold: 0.1       # sudden-change jerk mask threshold
-  warmup_epochs: 5          # cosine warmup for bio-loss terms (0 disables)
+  warmup_epochs: 20          # cosine warmup for bio-loss terms (0 disables)
 
 # ── Dataset paths ───────────────────────────────────────────
 # Each field is a list of CSV paths; multiple files are concatenated.

@@ -484,8 +484,8 @@ def compute_warmup_factor(epoch: int, warmup_epochs: int) -> float:
     S-curve), preventing the gradient shock that can destabilize
     Adam's moment estimates.
 
-    Note: ``lambda_reg`` is NOT scaled by this factor -- only
-    ``lambda_energy``, ``lambda_sparse``, and ``lambda_jerk`` are.
+    Note: ``lambda_reg`` is NOW also scaled by this factor (CF8 fix),
+    along with ``lambda_energy``, ``lambda_sparse``, and ``lambda_jerk``.
 
     Args:
         epoch: Current epoch number (0-indexed).
@@ -529,16 +529,17 @@ def train_one_epoch(
         criterion: Loss function.
         optimizer: Optimizer.
         device: Device to train on.
-        lambda_reg: Router regularization weight.  NOT scaled by
-            annealing_factor (active from epoch 0).
+        lambda_reg: Router regularization weight.  NOW scaled by
+            annealing_factor (CF8 fix) to prevent premature router
+            forcing before LIF pathway stabilizes.
         lambda_energy: ATP metabolic cost weight (base value before
             annealing).
         lambda_sparse: Population sparsity L1 weight (base value).
         lambda_jerk: Temporal coherence weight (base value).
         annealing_factor: Scaling factor for lambda_energy, lambda_sparse,
-            and lambda_jerk.  Typically equals the warmup factor from
-            ``compute_warmup_factor(epoch, warmup_epochs)``.  Default 1.0
-            (no annealing).  lambda_reg is NOT affected.
+            lambda_jerk, and lambda_reg (CF8 fix).  Typically equals the
+            warmup factor from ``compute_warmup_factor(epoch, warmup_epochs)``.
+            Default 1.0 (no annealing).
         grad_clip_norm: Max gradient norm for clipping.
         log_interval: Log every N batches.
         epoch: Current epoch number (for logging).
@@ -930,7 +931,11 @@ def train(
     for epoch in range(start_epoch, config.training.num_epochs):
         t0 = time.time()
 
-        # ── Warmup factor for bio-loss terms (lambda_reg NOT scaled) ──
+        # ── Warmup factor for bio-loss terms AND lambda_reg ──
+        # CF8 fix: lambda_reg is now also scaled by warmup_factor.
+        # During early epochs, the LIF pathway needs to stabilize
+        # (via sharpened surrogate gradient and TBPTT) before the
+        # router regularization pressure for LIF routing ramps up.
         warmup_factor = compute_warmup_factor(epoch, warmup_epochs)
 
         # ── Unfreeze if scheduled ─────────────────────────────
@@ -949,7 +954,7 @@ def train(
             criterion=criterion,
             optimizer=optimizer,
             device=device,
-            lambda_reg=lambda_reg,
+            lambda_reg=lambda_reg * warmup_factor,
             lambda_energy=config.loss.lambda_energy,
             lambda_sparse=config.loss.lambda_sparse,
             lambda_jerk=config.loss.lambda_jerk,
