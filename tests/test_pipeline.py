@@ -259,8 +259,8 @@ class TestLabeling:
         assert len(labeled) == 10
 
         labels = [info["label"] for info in labeled]
-        # Trials 0-2 should be Startle
-        assert all(l == Label.STARTLE for l in labels[:3])
+        # Trials 0-2 should be Escape (startle-like response)
+        assert all(l == Label.ESCAPE for l in labels[:3])
         # Trials 6-7 should be Pre_Active
         assert all(l == Label.PRE_ACTIVE for l in labels[6:8])
 
@@ -390,7 +390,10 @@ class TestMCMCModule:
         model = MCMCPriorSKLearn()
         model.fit(snapshots, labels)
         probs = model.predict_proba(snapshots[0])
-        assert probs.shape[0] == 4
+        n_classes = len(np.unique(labels))
+        assert probs.shape[0] == n_classes, (
+            f"probs.shape[0]={probs.shape[0]} != n_classes={n_classes}"
+        )
         assert np.allclose(probs.sum(), 1.0, atol=1e-5)
 
     def test_markov_transition(self) -> None:

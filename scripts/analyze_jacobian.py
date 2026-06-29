@@ -49,6 +49,7 @@ from nsmor.nsmor_dataloader import (
 from nsmor.checkpoint import load_checkpoint
 from nsmor.config import DEFAULT_FEATURE, Label
 from nsmor.model_nsmor_core import NSMoRCore
+from nsmor.model_utils import load_model_from_checkpoint as _shared_load_model
 
 # ── Logging ────────────────────────────────────────────────────
 logging.basicConfig(
@@ -118,53 +119,12 @@ def load_model_from_checkpoint(
     checkpoint_path: Path,
     device: torch.device,
 ) -> NSMoRCore:
+    """Load trained NSMoRCore from checkpoint.
+
+    Delegates to the shared :func:`nsmor.model_utils.load_model_from_checkpoint`
+    which guarantees all biophysical parameters are restored.
     """
-    Load a trained NSMoRCore model from a checkpoint.
-
-    Args:
-        checkpoint_path: Path to the ``.pth`` checkpoint file.
-        device: Device to load the model onto.
-
-    Returns:
-        Loaded model in eval mode.
-
-    Raises:
-        FileNotFoundError: If checkpoint does not exist.
-    """
-    if not checkpoint_path.exists():
-        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-
-    logger.info("Loading checkpoint from %s", checkpoint_path)
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-
-    # Extract config from checkpoint
-    config_dict = checkpoint.get("config", {})
-    model_config = config_dict.get("model", {})
-
-    # Build model with saved config
-    model = NSMoRCore(
-        sensory_dim=model_config.get("sensory_dim", 4),
-        mcmc_dim=model_config.get("mcmc_dim", 4),
-        hidden_dim=model_config.get("hidden_dim", 64),
-        num_gru_layers=model_config.get("num_gru_layers", 1),
-        dropout=model_config.get("dropout", 0.1),
-        lif_alpha=model_config.get("lif_alpha", 0.9),
-        lif_threshold=model_config.get("lif_threshold", 1.0),
-        lif_beta=model_config.get("lif_beta", 0.5),
-    )
-
-    # Load state dict
-    model.load_state_dict(checkpoint["model_state_dict"])
-    model = model.to(device)
-    model.eval()
-
-    param_count = sum(p.numel() for p in model.parameters())
-    logger.info(
-        "Model loaded: %s parameters, hidden_dim=%d",
-        f"{param_count:,}", model.hidden_dim,
-    )
-
-    return model
+    return _shared_load_model(checkpoint_path, device)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -618,6 +578,114 @@ def compute_eigenvalues_at_epochs(
 
 
 # ═══════════════════════════════════════════════════════════════
+# 5b. Full System Jacobian (CF5: LIF + GRU + Router)
+# ═══════════════════════════════════════════════════════════════
+
+def compute_full_system_eigenvalues(
+    model: NSMoRCore,
+    adapter: FixedPointAdapter,
+    dataloader: torch.utils.data.DataLoader,
+    device: torch.device,
+    onset_frames: List[int],
+    target_class: int = Label.ESCAPE.value,
+    dt_ms: float = 10.0,
+    max_states_per_epoch: int = 100,
+) -> Dict[str, np.ndarray]:
+    """
+    Compute eigenvalues of the full MoR system Jacobian (CF5 fix).
+
+    Unlike :func:`compute_eigenvalues_at_epochs` which only computes
+    the GRU pathway Jacobian, this function computes the Jacobian of
+    the blended output ``h_out = g_lif * LIF + g_gru * GRU`` with
+    respect to the sensory input, capturing LIF, GRU, and Router
+    contributions.
+
+    Since the Jacobian is (H, F) (non-square), we compute SVD singular
+    values rather than eigenvalues.  The singular values characterize
+    the system's sensitivity to sensory input perturbations.
+
+    Args:
+        model: Trained NSMoRCore model.
+        adapter: FixedPointAdapter instance.
+        dataloader: DataLoader yielding (X, Y, lengths) tuples.
+        device: Computation device.
+        onset_frames: Per-trial stimulus onset frame indices.
+        target_class: Label value to filter by.
+        dt_ms: Frame interval in milliseconds.
+        max_states_per_epoch: Maximum states to process per epoch.
+
+    Returns:
+        Dictionary mapping epoch name to singular value array (N, min(H,F)).
+    """
+    logger.info("Computing FULL SYSTEM Jacobian (LIF + GRU + Router)...")
+
+    epoch_results: Dict[str, np.ndarray] = {}
+    model.eval()
+
+    # CF5.2 fix: Do NOT wrap in torch.no_grad() — the Jacobian computation
+    # requires gradient tracking.  Use torch.enable_grad() explicitly to
+    # ensure gradients are computed even if the outer context has no_grad.
+    global_idx = 0
+    for batch_idx, batch in enumerate(dataloader):
+        X_batch, _Y_batch, lengths = batch
+        X_batch = X_batch.to(device).contiguous()
+        lengths = lengths.to(device).contiguous()
+        B, T, F_dim = X_batch.shape
+
+        for i in range(B):
+            if global_idx >= len(dataloader.dataset):
+                break
+            _, _, label_val = dataloader.dataset.sequences[global_idx]
+            if int(label_val) != target_class:
+                global_idx += 1
+                continue
+
+            length_i = int(lengths[i].item())
+            wind_channel = X_batch[i, :length_i, 1].cpu().numpy()
+            onset_frame = int(np.argmax(wind_channel > 0.5)) if np.any(wind_channel > 0.5) else 0
+
+            for epoch_name, epoch_def in EPOCH_DEFINITIONS.items():
+                offset_ms = epoch_def["offset_ms"]
+                frame_offset = int(offset_ms / dt_ms)
+                centre_frame = onset_frame + frame_offset
+
+                if centre_frame < 0 or centre_frame >= length_i - 1:
+                    continue
+
+                # Use the full model input at this frame
+                X_t = X_batch[i, centre_frame:centre_frame+1, :].unsqueeze(0)  # (1, 1, F)
+                len_t = torch.tensor([1], dtype=torch.int64, device=device)
+
+                try:
+                    # CF5.2: Enable gradients for Jacobian computation
+                    with torch.enable_grad():
+                        J_full, _ = adapter.compute_full_system_jacobian(X_t, len_t)
+                    # J_full: (H, F) — compute SVD singular values
+                    svd = torch.linalg.svd(J_full.detach(), compute_uv=False)
+                    svals = svd.cpu().numpy()
+
+                    if epoch_name not in epoch_results:
+                        epoch_results[epoch_name] = []
+                    epoch_results[epoch_name].append(svals)
+                except Exception as e:
+                    # CF5.2 fix: Log at WARNING level, not DEBUG
+                    logger.warning("  Full Jacobian failed for trial %d epoch %s: %s",
+                                   global_idx, epoch_name, e)
+
+            global_idx += 1
+
+    # Stack results
+    result: Dict[str, np.ndarray] = {}
+    for epoch_name, sval_list in epoch_results.items():
+        if sval_list:
+            result[epoch_name] = np.stack(sval_list, axis=0)  # (N, min(H,F))
+            logger.info("  Epoch '%s': %d full system singular values",
+                        epoch_name, len(sval_list))
+
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════
 # 6.  Lancet/Cell Publication Figure
 # ═══════════════════════════════════════════════════════════════
 
@@ -889,6 +957,7 @@ def run_jacobian_analysis(
     max_seq_len: Optional[int] = 1000,
     dt_ms: float = 10.0,
     max_states_per_epoch: int = 100,
+    full_system: bool = False,
 ) -> None:
     """
     Run the full Jacobian eigenvalue spectrum analysis.
@@ -935,26 +1004,51 @@ def run_jacobian_analysis(
     )
 
     # ── Compute eigenvalues ───────────────────────────────────
-    eigenvalue_results = compute_eigenvalues_at_epochs(
-        adapter=adapter,
-        epoch_data=epoch_data,
-        device=device,
-        max_states_per_epoch=max_states_per_epoch,
-    )
+    if full_system:
+        # CF5 fix: Compute FULL system Jacobian (LIF + GRU + Router)
+        logger.info("Computing FULL SYSTEM Jacobian (CF5: LIF + GRU + Router)...")
+        eigenvalue_results = compute_full_system_eigenvalues(
+            model=model,
+            adapter=adapter,
+            dataloader=dataloader,
+            device=device,
+            onset_frames=onset_frames,
+            target_class=target_class,
+            dt_ms=dt_ms,
+            max_states_per_epoch=max_states_per_epoch,
+        )
+    else:
+        # Default: GRU-only Jacobian (backward compatible)
+        eigenvalue_results = compute_eigenvalues_at_epochs(
+            adapter=adapter,
+            epoch_data=epoch_data,
+            device=device,
+            max_states_per_epoch=max_states_per_epoch,
+        )
 
     # ── Log hypothesis verification ───────────────────────────
     logger.info("-" * 60)
     logger.info("Hypothesis Verification:")
     for epoch_name, eigvals in eigenvalue_results.items():
-        magnitudes = np.abs(eigvals.flatten())
-        real_parts = np.real(eigvals.flatten())
-        near_unity = np.mean(np.abs(magnitudes - 1.0) < 0.1) * 100
-        near_real_one = np.mean(np.abs(real_parts - 1.0) < 0.1) * 100
+        if full_system:
+            # Full system: singular values (real, non-negative)
+            svals = eigvals.flatten()
+            logger.info(
+                "  %s: σ_mean=%.4f, σ_max=%.4f, σ_rank(>0.01)=%d",
+                epoch_name, np.mean(svals), np.max(svals),
+                int(np.sum(svals > 0.01)),
+            )
+        else:
+            # GRU-only: complex eigenvalues
+            magnitudes = np.abs(eigvals.flatten())
+            real_parts = np.real(eigvals.flatten())
+            near_unity = np.mean(np.abs(magnitudes - 1.0) < 0.1) * 100
+            near_real_one = np.mean(np.abs(real_parts - 1.0) < 0.1) * 100
 
-        logger.info(
-            "  %s: |λ|_mean=%.4f, %%near|λ|=1: %.1f%%, %%nearRe(λ)=1: %.1f%%",
-            epoch_name, np.mean(magnitudes), near_unity, near_real_one,
-        )
+            logger.info(
+                "  %s: |λ|_mean=%.4f, %%near|λ|=1: %.1f%%, %%nearRe(λ)=1: %.1f%%",
+                epoch_name, np.mean(magnitudes), near_unity, near_real_one,
+            )
 
     # ── Create figure ─────────────────────────────────────────
     plot_eigenvalue_spectrum(
@@ -1032,6 +1126,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=100,
         help="Maximum states to process per epoch.",
     )
+    parser.add_argument(
+        "--full_system",
+        action="store_true",
+        default=False,
+        help="Compute full system Jacobian (LIF + GRU + Router) instead "
+             "of GRU-only.  CF5 fix: captures the complete MoR dynamics.",
+    )
     return parser
 
 
@@ -1056,6 +1157,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         max_seq_len=max_seq_len,
         dt_ms=args.dt_ms,
         max_states_per_epoch=args.max_states,
+        full_system=args.full_system,
     )
 
 

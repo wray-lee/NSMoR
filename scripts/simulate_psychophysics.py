@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import sys
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -34,7 +35,7 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(_SCRIPT_DIR)
 sys.path.insert(0, _PROJECT_ROOT)
 
-from nsmor.model_nsmor_core import NSMoRCore  # noqa: E402
+from nsmor.model_utils import load_model_from_checkpoint  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s")
 logger = logging.getLogger(__name__)
@@ -62,24 +63,16 @@ DPI = 300
 # ===================================================================
 
 def load_checkpoint(ckpt_path: str, device: torch.device):
-    """Load model checkpoint and rebuild NSMoRCore."""
-    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-    config_dict = ckpt.get("config", {})
-    cfg = config_dict.get("model", {})
-    model = NSMoRCore(
-        sensory_dim=cfg.get("sensory_dim", 4),
-        mcmc_dim=cfg.get("mcmc_dim", 4),
-        hidden_dim=cfg.get("hidden_dim", 64),
-        num_gru_layers=cfg.get("num_gru_layers", 1),
-        dropout=cfg.get("dropout", 0.1),
-        lif_alpha=cfg.get("lif_alpha", 0.9),
-        lif_threshold=cfg.get("lif_threshold", 1.0),
-        lif_beta=cfg.get("lif_beta", 0.5),
-    ).to(device)
-    model.load_state_dict(ckpt["model_state_dict"])
-    model.eval()
-    logger.info("Loaded checkpoint: %s", ckpt_path)
-    return model
+    """Load model checkpoint with ALL biophysical parameters.
+
+    Delegates to the shared :func:`nsmor.model_utils.load_model_from_checkpoint`
+    which guarantees every biophysical parameter is reconstructed from
+    the saved config (refractory periods, synaptic delay, STP, lateral
+    inhibition, dendritic compartmentalization, neuromodulatory gain,
+    sensory noise).  The original local implementation only forwarded
+    8 of 21 parameters, silently using defaults for the rest.
+    """
+    return load_model_from_checkpoint(Path(ckpt_path), device)
 
 
 def load_validation_data(device: torch.device, max_seq_len: int = 1000):
@@ -176,7 +169,7 @@ def find_multisensory_ttc0(
                 details_str = str(row.get('event_value', row.get('details', '{}')))
                 try:
                     details = json.loads(details_str)
-                except:
+                except (json.JSONDecodeError, KeyError, ValueError):
                     details = {}
                 trial_info.append({
                     'type': details.get('type', 'unknown'),

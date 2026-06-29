@@ -48,6 +48,7 @@ _PROJECT_ROOT = os.path.dirname(_SCRIPT_DIR)
 sys.path.insert(0, _PROJECT_ROOT)
 
 from nsmor.model_nsmor_core import NSMoRCore  # noqa: E402
+from nsmor.model_utils import load_model_from_checkpoint as _shared_load_model  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -270,35 +271,12 @@ def load_model_from_checkpoint(
     checkpoint_path: Path,
     device: torch.device,
 ) -> NSMoRCore:
-    """Load trained NSMoRCore from checkpoint."""
-    if not checkpoint_path.exists():
-        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+    """Load trained NSMoRCore from checkpoint.
 
-    logger.info("Loading checkpoint from %s", checkpoint_path)
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-
-    config_dict = checkpoint.get("config", {})
-    model_config = config_dict.get("model", {})
-
-    model = NSMoRCore(
-        sensory_dim=model_config.get("sensory_dim", 4),
-        mcmc_dim=model_config.get("mcmc_dim", 4),
-        hidden_dim=model_config.get("hidden_dim", 64),
-        num_gru_layers=model_config.get("num_gru_layers", 1),
-        dropout=model_config.get("dropout", 0.1),
-        lif_alpha=model_config.get("lif_alpha", 0.9),
-        lif_threshold=model_config.get("lif_threshold", 1.0),
-        lif_beta=model_config.get("lif_beta", 0.5),
-    )
-
-    model.load_state_dict(checkpoint["model_state_dict"])
-    model = model.to(device)
-    model.eval()
-
-    param_count = sum(p.numel() for p in model.parameters())
-    logger.info("Model loaded: %s parameters, hidden_dim=%d",
-                f"{param_count:,}", model.hidden_dim)
-    return model
+    Delegates to the shared :func:`nsmor.model_utils.load_model_from_checkpoint`
+    which guarantees all biophysical parameters are restored.
+    """
+    return _shared_load_model(checkpoint_path, device)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -445,20 +423,19 @@ def run_autoregressive_trial(
             # Forward pass with state tracking
             if states is None:
                 # First call: model initializes recurrent states from zeros
-                y_pred, internals = model(
-                    X_t, lengths_t, return_internals=True,
+                y_pred, internals, states = model(
+                    X_t, lengths_t, return_internals=True, states={},
                 )
             else:
                 # Subsequent calls: pass states for temporal continuity
+                # states_out from the model contains ALL recurrent state
+                # components: lif_v, lif_i_syn, lif_refract, lif_w_adapt,
+                # gru_h, and (when STP enabled) lif_x_resource, lif_u_facil.
+                # We propagate states_out directly to avoid discarding any
+                # component (Critical Flaw 1 fix).
                 y_pred, internals, states = model(
                     X_t, lengths_t, return_internals=True, states=states,
                 )
-
-            # Build states from internals for next step
-            states = {
-                "lif_v": internals["lif_potentials"][:, -1, :].contiguous(),
-                "gru_h": internals["gru_hidden"][:, -1:, :].permute(1, 0, 2).contiguous(),
-            }
 
             # Soft-gain velocity scaling (preserves derivative continuity)
             v_adjusted = y_pred.item() * gain

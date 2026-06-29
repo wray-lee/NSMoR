@@ -37,6 +37,7 @@ from nsmor.nsmor_dataloader import (
 from nsmor.checkpoint import load_checkpoint
 from nsmor.config import DEFAULT_FEATURE, Label
 from nsmor.model_nsmor_core import NSMoRCore
+from nsmor.model_utils import load_model_from_checkpoint as _shared_load_model
 
 # ── Logging ────────────────────────────────────────────────────
 logging.basicConfig(
@@ -110,53 +111,12 @@ def load_model_from_checkpoint(
     checkpoint_path: Path,
     device: torch.device,
 ) -> NSMoRCore:
+    """Load trained NSMoRCore from checkpoint.
+
+    Delegates to the shared :func:`nsmor.model_utils.load_model_from_checkpoint`
+    which guarantees all biophysical parameters are restored.
     """
-    Load a trained NSMoRCore model from a checkpoint.
-
-    Args:
-        checkpoint_path: Path to the ``.pth`` checkpoint file.
-        device: Device to load the model onto.
-
-    Returns:
-        Loaded model in eval mode.
-
-    Raises:
-        FileNotFoundError: If checkpoint does not exist.
-    """
-    if not checkpoint_path.exists():
-        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-
-    logger.info("Loading checkpoint from %s", checkpoint_path)
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-
-    # Extract config from checkpoint
-    config_dict = checkpoint.get("config", {})
-    model_config = config_dict.get("model", {})
-
-    # Build model with saved config
-    model = NSMoRCore(
-        sensory_dim=model_config.get("sensory_dim", 4),
-        mcmc_dim=model_config.get("mcmc_dim", 4),
-        hidden_dim=model_config.get("hidden_dim", 64),
-        num_gru_layers=model_config.get("num_gru_layers", 1),
-        dropout=model_config.get("dropout", 0.1),
-        lif_alpha=model_config.get("lif_alpha", 0.9),
-        lif_threshold=model_config.get("lif_threshold", 1.0),
-        lif_beta=model_config.get("lif_beta", 0.5),
-    )
-
-    # Load state dict
-    model.load_state_dict(checkpoint["model_state_dict"])
-    model = model.to(device)
-    model.eval()
-
-    param_count = sum(p.numel() for p in model.parameters())
-    logger.info(
-        "Model loaded: %s parameters, hidden_dim=%d",
-        f"{param_count:,}", model.hidden_dim,
-    )
-
-    return model
+    return _shared_load_model(checkpoint_path, device)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -284,6 +244,9 @@ def extract_and_reduce(
         explained_var[0] * 100, explained_var[1] * 100, explained_var[2] * 100,
         sum(explained_var) * 100,
     )
+    # CF3: Log per-component explained variance with cumulative sums
+    from nsmor.analysis.uq import log_pca_variance
+    log_pca_variance(explained_var, logger.info)
 
     # ── Transform trajectories ────────────────────────────────
     trajectories_3d = []

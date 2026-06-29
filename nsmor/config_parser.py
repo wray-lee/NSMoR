@@ -26,7 +26,7 @@ import sys
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Union
 
 import yaml
 
@@ -46,6 +46,40 @@ class ModelConfig:
     lif_alpha: float = 0.9
     lif_threshold: float = 1.0
     lif_beta: float = 0.5
+    # Refractory periods & synaptic dynamics (Hodgkin & Huxley 1952)
+    lif_abs_refract_steps: int = 0   # absolute refractory period (timesteps; 0=disabled)
+    lif_rel_refract_steps: int = 0   # relative refractory decay length (timesteps; 0=disabled)
+    lif_tau_syn: float = 0.0         # synaptic time constant (dt units; 0=disabled)
+    lif_v_rest: float = 0.0          # resting membrane potential (0=disabled)
+    lif_v_reset: Optional[float] = None  # fixed reset potential (None=v_rest, standard AdEx)
+
+    # Spike-frequency adaptation (AdEx model, Brette & Gerstner 2005)
+    lif_tau_w: float = 0.0       # adaptation time constant (dt units; 0=disabled)
+    lif_b_adapt: float = 0.0     # spike-triggered adaptation increment (0=disabled)
+
+    # Short-Term Plasticity (Tsodyks-Markram model)
+    # Ref: Tsodyks, Pawelzik & Markram 1998, Neural Computation.
+    # When lif_tau_fac=0 AND lif_tau_rec=0, STP is fully disabled
+    # (backward compatible: no extra parameters, no extra state).
+    lif_tau_fac: float = 0.0     # facilitation time constant (dt units; 0=disabled)
+    lif_tau_rec: float = 0.0     # recovery (depression) time constant (dt units; 0=disabled)
+    lif_U_stp_init: float = 0.5  # baseline utilization (U in TM model; only used when STP enabled)
+
+    # Lateral inhibition (Ritzmann & Camhi 1978)
+    # Inhibitory interneuron pool strength. 0 disables.
+    lif_lateral_inhibition: float = 0.0
+
+    # Dendritic compartmentalization (London & Hausser 2005)
+    # Time constant for visual-input dendritic IIR filter. 0 disables.
+    lif_dendritic_tau: float = 0.0
+
+    # Neuromodulatory gain on GRU pathway (Rillich & Stevenson 2011)
+    # Octopamine-like arousal scaling. 0 disables.
+    gru_neuromod_gain: float = 0.0
+
+    # Neural noise injection (Douglass et al. 1993)
+    # Gaussian noise std during training. 0 disables.
+    sensory_noise_std: float = 0.0
 
 
 @dataclass
@@ -97,6 +131,27 @@ class CheckpointConfig:
     """Path to a checkpoint file to resume from."""
 
 
+@dataclass
+class LossConfig:
+    """BioJointLoss hyperparameters and regularization schedule."""
+    reduction: str = "mean"
+    """MSE reduction mode: 'mean' or 'sum'."""
+    target_rate: float = 0.05
+    """Target mean firing rate for population sparsity L1 loss."""
+    lambda_reg: float = 0.01
+    """Router regularization weight (NOT warmup-scaled)."""
+    lambda_energy: float = 0.0
+    """ATP metabolic cost weight (Attwell & Laughlin 2001). 0 disables."""
+    lambda_sparse: float = 0.0
+    """Population sparsity L1 weight (Olshausen & Field 1996). 0 disables."""
+    lambda_jerk: float = 0.0
+    """Temporal coherence (jerk penalty) weight (Gabbiani et al. 1999). 0 disables."""
+    jerk_threshold: float = 0.1
+    """Threshold for sudden-change jerk mask (unused when mask=None)."""
+    warmup_epochs: int = 0
+    """Linear warmup epoch count for lambda_energy, lambda_sparse, lambda_jerk."""
+
+
 # ═══════════════════════════════════════════════════════════════
 # Top-level config
 # ═══════════════════════════════════════════════════════════════
@@ -131,6 +186,7 @@ class ExperimentConfig:
 
     model: ModelConfig = field(default_factory=ModelConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
+    loss: LossConfig = field(default_factory=LossConfig)
     data: DataPaths = field(default_factory=DataPaths)
     finetune: FineTuneConfig = field(default_factory=FineTuneConfig)
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
@@ -178,6 +234,8 @@ class ExperimentConfig:
             cfg.model = _update_dataclass(cfg.model, raw["model"])
         if "training" in raw:
             cfg.training = _update_dataclass(cfg.training, raw["training"])
+        if "loss" in raw:
+            cfg.loss = _update_dataclass(cfg.loss, raw["loss"])
         if "data" in raw:
             cfg.data = _update_dataclass(cfg.data, raw["data"])
         if "finetune" in raw:

@@ -115,6 +115,26 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=0.01,
         help="Router regularization weight for BioJointLoss.",
     )
+    parser.add_argument(
+        "--lambda_energy",
+        type=float,
+        default=0.0,
+        help="ATP metabolic cost weight. Penalizes mean firing rate "
+             "(Attwell & Laughlin 2001). 0 disables.",
+    )
+    parser.add_argument(
+        "--lambda_sparse",
+        type=float,
+        default=0.0,
+        help="Population sparsity L1 weight. Encourages target firing "
+             "rate (Olshausen & Field 1996). 0 disables.",
+    )
+    parser.add_argument(
+        "--target_rate",
+        type=float,
+        default=0.05,
+        help="Target mean firing rate for sparsity L1 loss (default: 0.05).",
+    )
 
     # ── Fine-tuning ───────────────────────────────────────────
     parser.add_argument(
@@ -208,6 +228,20 @@ def build_model(config: ExperimentConfig) -> NSMoRCore:
         lif_alpha=config.model.lif_alpha,
         lif_threshold=config.model.lif_threshold,
         lif_beta=config.model.lif_beta,
+        lif_abs_refract_steps=config.model.lif_abs_refract_steps,
+        lif_rel_refract_steps=config.model.lif_rel_refract_steps,
+        lif_tau_syn=config.model.lif_tau_syn,
+        lif_v_rest=config.model.lif_v_rest,
+        lif_v_reset=config.model.lif_v_reset,
+        lif_tau_w=config.model.lif_tau_w,
+        lif_b_adapt=config.model.lif_b_adapt,
+        lif_tau_fac=config.model.lif_tau_fac,
+        lif_tau_rec=config.model.lif_tau_rec,
+        lif_U_stp_init=config.model.lif_U_stp_init,
+        lif_lateral_inhibition=config.model.lif_lateral_inhibition,
+        lif_dendritic_tau=config.model.lif_dendritic_tau,
+        gru_neuromod_gain=config.model.gru_neuromod_gain,
+        sensory_noise_std=config.model.sensory_noise_std,
     )
     param_count = sum(p.numel() for p in model.parameters())
     logger.info("Model initialized — %s parameters", f"{param_count:,}")
@@ -241,14 +275,21 @@ def build_optimizer(
     return optimizer
 
 
-def build_loss() -> BioJointLoss:
+def build_loss(config: ExperimentConfig) -> BioJointLoss:
     """
     Construct the bio-constrained joint loss function.
 
+    Args:
+        config: Parsed experiment configuration. Uses
+            ``config.loss.reduction`` and ``config.loss.target_rate``.
+
     Returns:
-        Configured :class:`BioJointLoss` with mean reduction.
+        Configured :class:`BioJointLoss`.
     """
-    return BioJointLoss(reduction="mean")
+    return BioJointLoss(
+        reduction=config.loss.reduction,
+        target_rate=config.loss.target_rate,
+    )
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -408,6 +449,30 @@ def build_dataloaders(
 # 4.  Training Loop
 # ═══════════════════════════════════════════════════════════════
 
+def compute_warmup_factor(epoch: int, warmup_epochs: int) -> float:
+    """
+    Compute the warmup scaling factor for bio-loss regularization terms.
+
+    During warmup (``epoch < warmup_epochs``), the factor ramps linearly
+    from ``1/warmup_epochs`` to ``1.0``.  After warmup, the factor is
+    exactly ``1.0``.
+
+    Note: ``lambda_reg`` is NOT scaled by this factor -- only
+    ``lambda_energy``, ``lambda_sparse``, and ``lambda_jerk`` are.
+
+    Args:
+        epoch: Current epoch number (0-indexed).
+        warmup_epochs: Total warmup epoch count.  0 disables warmup
+            (factor is always 1.0).
+
+    Returns:
+        Scaling factor in (0, 1] during warmup, 1.0 after.
+    """
+    if warmup_epochs > 0 and epoch < warmup_epochs:
+        return float(epoch + 1) / float(warmup_epochs)
+    return 1.0
+
+
 def train_one_epoch(
     model: NSMoRCore,
     loader: torch.utils.data.DataLoader,
@@ -415,6 +480,10 @@ def train_one_epoch(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     lambda_reg: float = 0.01,
+    lambda_energy: float = 0.0,
+    lambda_sparse: float = 0.0,
+    lambda_jerk: float = 0.0,
+    annealing_factor: float = 1.0,
     grad_clip_norm: float = 1.0,
     log_interval: int = 10,
     epoch: int = 0,
@@ -428,7 +497,16 @@ def train_one_epoch(
         criterion: Loss function.
         optimizer: Optimizer.
         device: Device to train on.
-        lambda_reg: Router regularization weight.
+        lambda_reg: Router regularization weight.  NOT scaled by
+            annealing_factor (active from epoch 0).
+        lambda_energy: ATP metabolic cost weight (base value before
+            annealing).
+        lambda_sparse: Population sparsity L1 weight (base value).
+        lambda_jerk: Temporal coherence weight (base value).
+        annealing_factor: Scaling factor for lambda_energy, lambda_sparse,
+            and lambda_jerk.  Typically equals the warmup factor from
+            ``compute_warmup_factor(epoch, warmup_epochs)``.  Default 1.0
+            (no annealing).  lambda_reg is NOT affected.
         grad_clip_norm: Max gradient norm for clipping.
         log_interval: Log every N batches.
         epoch: Current epoch number (for logging).
@@ -441,7 +519,7 @@ def train_one_epoch(
     n_batches = 0
 
     pbar = tqdm(loader, desc=f"Epoch {epoch + 1}", leave=False, dynamic_ncols=True)
-    for batch_idx, batch in enumerate(loader):
+    for batch_idx, batch in enumerate(pbar):
         # Unpack batch — expect (X, Y, lengths) from collate_variable_length
         x_batch, y_batch, lengths = batch
         x_batch = x_batch.to(device).contiguous()
@@ -454,6 +532,7 @@ def train_one_epoch(
         # ── Extract g_gru from routing gates ──
         # routing_gates: (B, T, 2) — index 1 is g_gru
         g_gru = internals["routing_gates"][:, :, 1:2]           # (B, T, 1)
+        lif_spikes = internals["lif_spikes"]                    # (B, T, H)
 
         # ── Compute loss ──
         loss = criterion(
@@ -462,6 +541,11 @@ def train_one_epoch(
             lengths=lengths,
             g_gru=g_gru,
             lambda_reg=lambda_reg,
+            lif_spikes=lif_spikes,
+            lambda_energy=lambda_energy,
+            lambda_sparse=lambda_sparse,
+            lambda_jerk=lambda_jerk,
+            annealing_factor=annealing_factor,
         )
 
         # ── Backward pass ──
@@ -498,6 +582,9 @@ def validate(
     criterion: BioJointLoss,
     device: torch.device,
     lambda_reg: float = 0.01,
+    lambda_energy: float = 0.0,
+    lambda_sparse: float = 0.0,
+    lambda_jerk: float = 0.0,
 ) -> float:
     """
     Run validation (no gradient computation).
@@ -508,6 +595,16 @@ def validate(
         criterion: Loss function.
         device: Device.
         lambda_reg: Router regularization weight.
+        lambda_energy: ATP metabolic cost weight (full value, NOT annealed).
+        lambda_sparse: Population sparsity L1 weight (full value).
+        lambda_jerk: Temporal coherence weight (full value).
+
+    Note:
+        Validation uses FULL lambda values (no annealing_factor).
+        This is intentional: annealing would bias best_model selection
+        toward early epochs where bio-loss is artificially suppressed,
+        producing a lower val_loss that doesn't reflect true performance.
+        See CF1 fix in train() for details.
 
     Returns:
         Average validation loss.
@@ -517,7 +614,7 @@ def validate(
     n_batches = 0
 
     pbar = tqdm(loader, desc="Validation", leave=False, dynamic_ncols=True)
-    for batch in loader:
+    for batch in pbar:
         x_batch, y_batch, lengths = batch
         x_batch = x_batch.to(device).contiguous()
         y_batch = y_batch.to(device).contiguous()
@@ -525,6 +622,7 @@ def validate(
 
         y_pred, internals = model(x_batch, lengths, return_internals=True)
         g_gru = internals["routing_gates"][:, :, 1:2]
+        lif_spikes = internals["lif_spikes"]
 
         loss = criterion(
             y_pred=y_pred,
@@ -532,6 +630,10 @@ def validate(
             lengths=lengths,
             g_gru=g_gru,
             lambda_reg=lambda_reg,
+            lif_spikes=lif_spikes,
+            lambda_energy=lambda_energy,
+            lambda_sparse=lambda_sparse,
+            lambda_jerk=lambda_jerk,
         )
 
         total_loss += loss.item()
@@ -581,7 +683,7 @@ def train(
         if isinstance(m, nn.RNNBase):
             m.flatten_parameters()
     optimizer = build_optimizer(model, config)
-    criterion = build_loss()
+    criterion = build_loss(config)
     train_loader, val_loader = build_dataloaders(config)
 
     if train_loader is None:
@@ -628,8 +730,14 @@ def train(
 
     history = {"train_loss": [], "val_loss": []}
 
+    # ── Bio-loss warmup schedule ─────────────────────────────
+    warmup_epochs = config.loss.warmup_epochs
+
     for epoch in range(start_epoch, config.training.num_epochs):
         t0 = time.time()
+
+        # ── Warmup factor for bio-loss terms (lambda_reg NOT scaled) ──
+        warmup_factor = compute_warmup_factor(epoch, warmup_epochs)
 
         # ── Unfreeze if scheduled ─────────────────────────────
         if (
@@ -648,6 +756,10 @@ def train(
             optimizer=optimizer,
             device=device,
             lambda_reg=lambda_reg,
+            lambda_energy=config.loss.lambda_energy,
+            lambda_sparse=config.loss.lambda_sparse,
+            lambda_jerk=config.loss.lambda_jerk,
+            annealing_factor=warmup_factor,
             grad_clip_norm=config.training.grad_clip_norm,
             log_interval=config.training.log_interval,
             epoch=epoch,
@@ -655,6 +767,11 @@ def train(
         history["train_loss"].append(train_loss)
 
         # ── Validate ──────────────────────────────────────────
+        # CF1 fix: Validation uses FULL lambda values (no warmup scaling).
+        # Warmup only applies to training gradients.  If validation also
+        # scaled by warmup_factor, best_model selection would be biased
+        # toward early epochs where bio-loss is artificially suppressed,
+        # producing a lower val_loss that doesn't reflect true performance.
         val_loss = float("inf")
         if val_loader is not None:
             val_loss = validate(
@@ -663,6 +780,9 @@ def train(
                 criterion=criterion,
                 device=device,
                 lambda_reg=lambda_reg,
+                lambda_energy=config.loss.lambda_energy,
+                lambda_sparse=config.loss.lambda_sparse,
+                lambda_jerk=config.loss.lambda_jerk,
             )
             history["val_loss"].append(val_loss)
 

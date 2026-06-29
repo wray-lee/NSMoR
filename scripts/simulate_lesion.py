@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import csv
 import logging
+import math
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -40,6 +41,7 @@ from nsmor.nsmor_dataloader import (
 from nsmor.checkpoint import load_checkpoint
 from nsmor.config import DEFAULT_FEATURE, Label
 from nsmor.model_nsmor_core import NSMoRCore
+from nsmor.model_utils import load_model_from_checkpoint as _shared_load_model
 
 # ── Logging ────────────────────────────────────────────────────
 logging.basicConfig(
@@ -100,53 +102,12 @@ def load_model_from_checkpoint(
     checkpoint_path: Path,
     device: torch.device,
 ) -> NSMoRCore:
+    """Load trained NSMoRCore from checkpoint.
+
+    Delegates to the shared :func:`nsmor.model_utils.load_model_from_checkpoint`
+    which guarantees all biophysical parameters are restored.
     """
-    Load a trained NSMoRCore model from a checkpoint.
-
-    Args:
-        checkpoint_path: Path to the ``.pth`` checkpoint file.
-        device: Device to load the model onto.
-
-    Returns:
-        Loaded model in eval mode.
-
-    Raises:
-        FileNotFoundError: If checkpoint does not exist.
-    """
-    if not checkpoint_path.exists():
-        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-
-    logger.info("Loading checkpoint from %s", checkpoint_path)
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-
-    # Extract config from checkpoint
-    config_dict = checkpoint.get("config", {})
-    model_config = config_dict.get("model", {})
-
-    # Build model with saved config
-    model = NSMoRCore(
-        sensory_dim=model_config.get("sensory_dim", 4),
-        mcmc_dim=model_config.get("mcmc_dim", 4),
-        hidden_dim=model_config.get("hidden_dim", 64),
-        num_gru_layers=model_config.get("num_gru_layers", 1),
-        dropout=model_config.get("dropout", 0.1),
-        lif_alpha=model_config.get("lif_alpha", 0.9),
-        lif_threshold=model_config.get("lif_threshold", 1.0),
-        lif_beta=model_config.get("lif_beta", 0.5),
-    )
-
-    # Load state dict
-    model.load_state_dict(checkpoint["model_state_dict"])
-    model = model.to(device)
-    model.eval()
-
-    param_count = sum(p.numel() for p in model.parameters())
-    logger.info(
-        "Model loaded: %s parameters, hidden_dim=%d",
-        f"{param_count:,}", model.hidden_dim,
-    )
-
-    return model
+    return _shared_load_model(checkpoint_path, device)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -342,6 +303,7 @@ def average_trajectories_by_class(
     target_class: int,
     dt_ms: float = 10.0,
     max_time_ms: float = 5000.0,
+    stim_onset_frame: int = 200,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Average velocity trajectories across trials of a specific class.
@@ -384,8 +346,10 @@ def average_trajectories_by_class(
         y_pred = y_preds[trial_idx]
         y_true = y_trues[trial_idx]
 
-        # Find stimulus onset frame (approximate: frame 200 for 2s baseline at 10ms)
-        stim_frame = min(200, len(y_pred) // 4)  # Heuristic
+        # CF2 fix: Use stim_onset_frame parameter instead of hardcoded
+        # heuristic.  The hardcoded min(200, len//4) assumed a fixed
+        # 2s baseline, which fails for different datasets.
+        stim_frame = min(stim_onset_frame, len(y_pred) - 1)
 
         # Extract post-stimulus portion
         post_stim_pred = y_pred[stim_frame:]
@@ -549,41 +513,47 @@ def export_lesion_statistics_csv(
     logger.info("Exporting lesion statistics to CSV...")
     logger.info("=" * 60)
 
-    # ── Collect all rows ──────────────────────────────────────
+    # ── Collect per-trial rows (CF3 fix) ───────────────────────
+    # ANOVA requires per-trial observations, not aggregated means.
+    # Each row is one trial: Class, Condition, Trial_ID, Peak_Velocity,
+    # Latency_to_Peak, MSE.
     csv_rows: List[Dict[str, str]] = []
 
     for target_class in target_classes:
-        # Get class name
         try:
             class_name = Label(target_class).name
         except ValueError:
             class_name = f"Class_{target_class}"
 
         for condition_name, (y_preds, y_trues, trial_labels) in results.items():
-            try:
-                metrics = extract_scalar_metrics(
-                    y_preds=y_preds,
-                    y_trues=y_trues,
-                    trial_labels=trial_labels,
-                    target_class=target_class,
-                    dt_ms=dt_ms,
-                    stim_onset_frame=stim_onset_frame,
-                )
+            class_indices = [i for i, l in enumerate(trial_labels) if l == target_class]
+            if not class_indices:
+                continue
+
+            for trial_idx in class_indices:
+                pred = y_preds[trial_idx]
+                true = y_trues[trial_idx]
+                n = min(len(pred), len(true))
+
+                if n <= stim_onset_frame:
+                    continue
+
+                post_pred = pred[stim_onset_frame:n]
+                post_true = true[stim_onset_frame:n]
+
+                v_max = float(np.max(np.abs(post_true)))
+                peak_frame = int(np.argmax(np.abs(post_true)))
+                t_max = float(peak_frame * dt_ms)
+                mse = float(np.mean((post_pred - post_true) ** 2))
 
                 csv_rows.append({
                     "Class": class_name,
                     "Condition": CONDITION_NAMES[condition_name],
-                    "Peak_Velocity_cms": f"{metrics['Peak_Velocity_cms']:.4f}",
-                    "Latency_to_Peak_ms": f"{metrics['Latency_to_Peak_ms']:.2f}",
-                    "Mean_MSE": f"{metrics['Mean_MSE']:.6f}",
+                    "Trial_ID": str(trial_idx),
+                    "Peak_Velocity_cms": f"{v_max:.4f}",
+                    "Latency_to_Peak_ms": f"{t_max:.2f}",
+                    "MSE": f"{mse:.6f}",
                 })
-
-            except ValueError as e:
-                logger.warning(
-                    "Skipping class %s, condition %s: %s",
-                    class_name, condition_name, e,
-                )
-                continue
 
     if not csv_rows:
         raise ValueError("No valid statistics could be computed for any class/condition.")
@@ -591,7 +561,7 @@ def export_lesion_statistics_csv(
     # ── Write CSV ─────────────────────────────────────────────
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    fieldnames = ["Class", "Condition", "Peak_Velocity_cms", "Latency_to_Peak_ms", "Mean_MSE"]
+    fieldnames = ["Class", "Condition", "Trial_ID", "Peak_Velocity_cms", "Latency_to_Peak_ms", "MSE"]
 
     with open(output_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -600,16 +570,14 @@ def export_lesion_statistics_csv(
 
     logger.info("Saved %d rows to %s", len(csv_rows), output_path)
 
-    # ── Log summary table ─────────────────────────────────────
+    # ── Log summary (first 10 rows) ──────────────────────────
     logger.info("-" * 80)
-    logger.info("%-15s %-25s %-15s %-15s %-12s",
-                "Class", "Condition", "V_max (cm/s)", "T_max (ms)", "MSE")
-    logger.info("-" * 80)
-    for row in csv_rows:
+    logger.info("Per-trial data: %d rows exported (showing first 10):", len(csv_rows))
+    for row in csv_rows[:10]:
         logger.info(
-            "%-15s %-25s %-15s %-15s %-12s",
-            row["Class"], row["Condition"],
-            row["Peak_Velocity_cms"], row["Latency_to_Peak_ms"], row["Mean_MSE"],
+            "  %s | %s | trial=%s | V_max=%s | T_max=%s | MSE=%s",
+            row["Class"], row["Condition"], row["Trial_ID"],
+            row["Peak_Velocity_cms"], row["Latency_to_Peak_ms"], row["MSE"],
         )
     logger.info("-" * 80)
 
@@ -664,6 +632,7 @@ def create_ablation_figure(
     target_class: int,
     output_path: Path,
     dt_ms: float = 10.0,
+    stim_onset_frame: int = 200,
 ) -> None:
     """
     Create the Lancet/Cell ablation comparison figure.
@@ -703,6 +672,7 @@ def create_ablation_figure(
                 trial_labels=trial_labels,
                 target_class=target_class,
                 dt_ms=dt_ms,
+                stim_onset_frame=stim_onset_frame,
             )
         except ValueError as e:
             logger.warning("Skipping condition %s: %s", condition_name, e)
@@ -858,26 +828,86 @@ def run_lesion_experiment(
     # ── Run ablation ──────────────────────────────────────────
     results = run_full_ablation(model, dataloader, device)
 
-    # ── Log comparative statistics ────────────────────────────
+    # ── Log comparative statistics with UQ ──────────────────────
+    from nsmor.analysis.uq import bootstrap_ci, cohens_d
+
     logger.info("-" * 60)
     logger.info("Comparative Statistics (for plotting class):")
+    condition_mse_arrays: Dict[str, np.ndarray] = {}
+
     for condition_name, (y_preds, y_trues, trial_labels) in results.items():
         class_indices = [i for i, l in enumerate(trial_labels) if l == target_class]
         if not class_indices:
             continue
 
-        # Compute MSE for this class
-        mse_sum = 0.0
-        n_total = 0
+        # Compute per-trial MSE for this class
+        per_trial_mse: List[float] = []
         for idx in class_indices:
             pred = y_preds[idx]
             true = y_trues[idx]
             n = min(len(pred), len(true))
-            mse_sum += np.sum((pred[:n] - true[:n]) ** 2)
-            n_total += n
+            mse_i = float(np.mean((pred[:n] - true[:n]) ** 2))
+            per_trial_mse.append(mse_i)
 
-        mse = mse_sum / max(n_total, 1)
-        logger.info("  %s: MSE = %.4f", CONDITION_NAMES[condition_name], mse)
+        mse_arr = np.array(per_trial_mse)
+        condition_mse_arrays[condition_name] = mse_arr
+
+        # Bootstrap 95% CI for mean MSE
+        mse_mean, ci_lo, ci_hi = bootstrap_ci(mse_arr, np.mean, n_bootstrap=1000)
+        logger.info(
+            "  %s: MSE = %.4f [95%% CI: %.4f, %.4f] (n=%d)",
+            CONDITION_NAMES[condition_name], mse_mean, ci_lo, ci_hi, len(mse_arr),
+        )
+
+    # CF3 fix: Paired Cohen's d between intact and each lesioned condition.
+    # Paired because the same trials are measured under different conditions.
+    # CF4 fix: Holm-Bonferroni correction for multiple comparisons.
+    if "intact" in condition_mse_arrays:
+        intact_mse = condition_mse_arrays["intact"]
+        logger.info("-" * 60)
+        logger.info("Effect Size (Paired Cohen's d vs Intact):")
+
+        # Collect p-values for Holm-Bonferroni correction
+        from nsmor.analysis.uq import holm_bonferroni
+        from scipy import stats as sp_stats
+        p_values: Dict[str, float] = {}
+        effect_sizes: Dict[str, Tuple[float, str]] = {}
+
+        for cond_name, cond_mse in condition_mse_arrays.items():
+            if cond_name == "intact":
+                continue
+            n = min(len(cond_mse), len(intact_mse))
+            d = cohens_d(cond_mse[:n], intact_mse[:n], paired=True)
+            magnitude = "negligible"
+            if abs(d) >= 0.8:
+                magnitude = "large"
+            elif abs(d) >= 0.5:
+                magnitude = "medium"
+            elif abs(d) >= 0.2:
+                magnitude = "small"
+            effect_sizes[cond_name] = (d, magnitude)
+
+            # Paired t-test for p-value
+            try:
+                _, p_val = sp_stats.ttest_rel(cond_mse[:n], intact_mse[:n])
+                # CF1 fix: guard against NaN p-values (e.g., zero variance)
+                if math.isnan(float(p_val)):
+                    p_val = 1.0
+                p_values[cond_name] = float(p_val)
+            except ValueError:
+                p_values[cond_name] = 1.0
+
+        # Apply Holm-Bonferroni correction
+        corrected = holm_bonferroni(p_values)
+
+        for cond_name in effect_sizes:
+            d, magnitude = effect_sizes[cond_name]
+            adj_p, sig = corrected.get(cond_name, (1.0, False))
+            sig_marker = "*" if sig else "n.s."
+            logger.info(
+                "  %s vs Intact: d = %.3f (%s), p = %.4f (corrected), %s",
+                CONDITION_NAMES[cond_name], d, magnitude, adj_p, sig_marker,
+            )
 
     # ── Export statistics CSV ──────────────────────────────────
     try:
@@ -897,6 +927,7 @@ def run_lesion_experiment(
         target_class=target_class,
         output_path=output_path,
         dt_ms=dt_ms,
+        stim_onset_frame=stim_onset_frame,
     )
 
     logger.info("=" * 60)
