@@ -17,9 +17,12 @@ model:
   num_gru_layers: 1       # stacked GRU layers
   dropout: 0.1            # dropout in GRU and decoder
   lif_alpha: 0.9          # LIF leak factor (higher = slower decay)
-  lif_threshold: 1.0      # LIF spike threshold
-  lif_beta: 0.5           # LIF input scaling
-  lif_tbptt_steps: 64     # truncated BPTT window (0=full BPTT, risky for long seqs)
+  lif_threshold: 0.5      # LIF spike threshold
+  lif_beta: 2.0           # LIF input scaling
+
+  # ----gpu memory optimization----
+  lif_tbptt_steps: 0     # truncated BPTT window (0=full BPTT, risky for long seqs)
+  # -------------------------------
 
 # ── Training hyperparameters ────────────────────────────────
 training:
@@ -37,11 +40,11 @@ training:
 loss:
   reduction: mean           # MSE reduction: 'mean' or 'sum'
   target_rate: 0.05         # target mean firing rate for sparsity L1
-  lambda_energy: 0.0        # ATP metabolic cost (0 disables)
-  lambda_sparse: 0.0        # population sparsity L1 (0 disables)
-  lambda_jerk: 0.0          # temporal coherence / jerk penalty (0 disables)
+  lambda_energy: 0.001        # ATP metabolic cost (0 disables)
+  lambda_sparse: 0.005        # population sparsity L1 (0 disables)
+  lambda_jerk: 0.001          # temporal coherence / jerk penalty (0 disables)
   jerk_threshold: 0.1       # sudden-change jerk mask threshold
-  warmup_epochs: 0          # cosine warmup for bio-loss terms (0 disables)
+  warmup_epochs: 5          # cosine warmup for bio-loss terms (0 disables)
 
 # ── Dataset paths ───────────────────────────────────────────
 # Each field is a list of CSV paths; multiple files are concatenated.
