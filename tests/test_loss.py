@@ -20,6 +20,45 @@ from nsmor.loss import BioJointLoss
 
 
 # ═══════════════════════════════════════════════════════════════
+# Fixtures (inlined from deleted conftest.py)
+# ═══════════════════════════════════════════════════════════════
+
+@pytest.fixture
+def batch_size() -> int:
+    """Default batch size."""
+    return 4
+
+
+@pytest.fixture
+def seq_len() -> int:
+    """Default sequence length."""
+    return 100
+
+
+@pytest.fixture
+def y_batch(batch_size: int, seq_len: int) -> torch.Tensor:
+    """Synthetic ground truth target tensor. Shape: ``(B, T)``."""
+    torch.manual_seed(43)
+    return torch.randn(batch_size, seq_len)
+
+
+@pytest.fixture
+def lengths(batch_size: int, seq_len: int) -> torch.Tensor:
+    """Synthetic sequence lengths with variable padding. Shape: ``(B,)``."""
+    return torch.tensor(
+        [seq_len, seq_len - 10, seq_len - 25, seq_len - 50],
+        dtype=torch.int64,
+    )
+
+
+@pytest.fixture
+def g_gru(batch_size: int, seq_len: int) -> torch.Tensor:
+    """Synthetic GRU routing gate values. Shape: ``(B, T, 1)``."""
+    torch.manual_seed(44)
+    return torch.rand(batch_size, seq_len, 1)
+
+
+# ═══════════════════════════════════════════════════════════════
 # Test class
 # ═══════════════════════════════════════════════════════════════
 

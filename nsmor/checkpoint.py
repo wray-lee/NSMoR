@@ -30,7 +30,6 @@ def save_checkpoint(
     path: Union[str, Path],
     *,
     scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
-    extra_state: Optional[Dict[str, Any]] = None,
 ) -> Path:
     """
     Save a deterministic training checkpoint.
@@ -46,7 +45,6 @@ def save_checkpoint(
     * ``cuda_rng_state`` — ``torch.cuda.get_rng_state_all()`` if CUDA is
       available, so GPU-side stochasticity is also restored
     * ``config`` — the parsed experiment configuration dict
-    * ``extra_state`` — any additional caller-defined state
 
     Args:
         model: The model to checkpoint.
@@ -56,7 +54,6 @@ def save_checkpoint(
         config: Experiment configuration dictionary.
         path: File path for the checkpoint (typically ``.pt``).
         scheduler: Optional LR scheduler.
-        extra_state: Optional dict of additional state to persist.
 
     Returns:
         The resolved :class:`~pathlib.Path` of the saved file.
@@ -78,9 +75,6 @@ def save_checkpoint(
 
     if torch.cuda.is_available():
         state["cuda_rng_state"] = torch.cuda.get_rng_state_all()
-
-    if extra_state is not None:
-        state["extra_state"] = extra_state
 
     torch.save(state, path)
     return path
@@ -117,7 +111,7 @@ def load_checkpoint(
 
     Returns:
         The full checkpoint dictionary.  The caller can inspect
-        ``epoch``, ``loss``, ``config``, and any ``extra_state``.
+        ``epoch``, ``loss``, and ``config``.
 
     Raises:
         FileNotFoundError: If *path* does not exist.
@@ -147,22 +141,3 @@ def load_checkpoint(
         torch.cuda.set_rng_state_all(checkpoint["cuda_rng_state"])
 
     return checkpoint
-
-
-# ═══════════════════════════════════════════════════════════════
-# Convenience: resume from directory
-# ═══════════════════════════════════════════════════════════════
-
-def find_latest_checkpoint(directory: Union[str, Path]) -> Optional[Path]:
-    """
-    Find the most recently modified ``.pt`` file in *directory*.
-
-    Returns ``None`` if no checkpoint files exist.
-    """
-    directory = Path(directory)
-    checkpoints = sorted(
-        directory.glob("*.pt"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
-    return checkpoints[0] if checkpoints else None

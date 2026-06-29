@@ -102,20 +102,11 @@ class FeatureConfig:
     These define the exact shape of all tensors in the pipeline.
     """
     # --- MCMC snapshot features (5D) ---
-    snapshot_visual_angle_dim: int = 1
-    snapshot_looming_velocity_dim: int = 1
-    snapshot_wind_state_dim: int = 1
-    snapshot_avg_velocity_dim: int = 1
-    snapshot_max_acceleration_dim: int = 1
     snapshot_dim: int = 5
     """Total snapshot feature dimension:
     [visual_angle, looming_velocity, wind_state, avg_velocity_bg, max_acceleration_bg]."""
 
     # --- Per-frame physical features (4D) ---
-    per_frame_visual_dim: int = 1
-    per_frame_wind_dim: int = 1
-    per_frame_velocity_dim: int = 1
-    per_frame_acceleration_dim: int = 1
     per_frame_physical_dim: int = 4
     """Per-frame physical features:
     [v_vis(t), wind(t), v_kine(t-1), a_kine(t-1)]."""
