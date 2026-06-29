@@ -59,15 +59,15 @@ logger = logging.getLogger(__name__)
 # Reject pale/desaturated palettes. All colors are bright, saturated,
 # and clearly distinguishable — suitable for Cell/Science publication.
 LANCET_COLORS: Dict[int, str] = {
-    Label.ESCAPE.value: "#D63333",      # Vivid Red — urgent escape response
-    Label.PREWALK.value: "#228BE6",     # Bright Blue — locomotion
-    Label.PRE_ACTIVE.value: "#F76707",  # Vivid Orange — baseline activity
-    Label.NO_RESPONSE.value: "#7950F2", # Bright Purple — non-responsive
+    Label.ESCAPE.value: "#E64B35",      # Vivid Red — urgent escape response
+    Label.PREWALK.value: "#4DBBD5",     # Bright Blue — locomotion
+    Label.PRE_ACTIVE.value: "#00A087",  # Vivid Green — baseline activity
+    Label.NO_RESPONSE.value: "#3C5488", # Bright Purple — non-responsive
 }
 
 # Routing gate curve colors
-GATE_GRU_COLOR: str = "#228BE6"   # Bright Blue for g_gru(t)
-GATE_LIF_COLOR: str = "#D63333"   # Vivid Red for g_lif(t)
+GATE_GRU_COLOR: str = "#4DBBD5"   # Bright Blue for g_gru(t)
+GATE_LIF_COLOR: str = "#E64B35"   # Vivid Red for g_lif(t)
 
 # Label display names
 LABEL_NAMES: Dict[int, str] = {
