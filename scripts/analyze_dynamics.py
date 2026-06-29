@@ -1,7 +1,8 @@
 """
 NSMoR Mechanism Analysis -- Multi-Panel Publication Figure.
 
-Generates a Lancet/Cell-quality multi-panel figure for publication:
+Generates a Cell/Science-quality multi-panel figure for publication:
+  Vivid, high-contrast colors — rejects pale/desaturated palettes.
   - Panel A: 3D Phase-Space Manifold (PCA of combined LIF+GRU states)
   - Panel B: Per-Class Routing Gate Dynamics (mean +/- SEM by label)
   - Panel C: LIF Spike Rate Dynamics (mean +/- SEM by label)
@@ -54,17 +55,19 @@ logger = logging.getLogger(__name__)
 # Lancet / Cell Publication Style Constants
 # =========================================================================
 
-# -- High-contrast categorical color mapping --
+# -- Cell-style vivid high-contrast categorical color mapping --
+# Reject pale/desaturated palettes. All colors are bright, saturated,
+# and clearly distinguishable — suitable for Cell/Science publication.
 LANCET_COLORS: Dict[int, str] = {
-    Label.ESCAPE.value: "#C92A2A",      # Lancet Crimson Red
-    Label.PREWALK.value: "#1C7ED6",     # Cell Cobalt Blue
-    Label.PRE_ACTIVE.value: "#495057",  # Strong Slate Gray
-    Label.NO_RESPONSE.value: "#000000", # Absolute Jet Black
+    Label.ESCAPE.value: "#D63333",      # Vivid Red — urgent escape response
+    Label.PREWALK.value: "#228BE6",     # Bright Blue — locomotion
+    Label.PRE_ACTIVE.value: "#F76707",  # Vivid Orange — baseline activity
+    Label.NO_RESPONSE.value: "#7950F2", # Bright Purple — non-responsive
 }
 
 # Routing gate curve colors
-GATE_GRU_COLOR: str = "#1C7ED6"   # Cell Cobalt Blue for g_gru(t)
-GATE_LIF_COLOR: str = "#C92A2A"   # Lancet Crimson Red for g_lif(t)
+GATE_GRU_COLOR: str = "#228BE6"   # Bright Blue for g_gru(t)
+GATE_LIF_COLOR: str = "#D63333"   # Vivid Red for g_lif(t)
 
 # Label display names
 LABEL_NAMES: Dict[int, str] = {
@@ -92,15 +95,15 @@ FONT_SIZE_PANEL_LABEL: int = 14
 # -- Figure properties -----------------------------------------------------
 DPI: int = 300
 BACKGROUND_COLOR: str = "#FFFFFF"
-AXIS_COLOR: str = "#212529"
+AXIS_COLOR: str = "#343A40"  # Softer dark gray (Cell-style, not harsh black)
 
 # -- Plot properties -------------------------------------------------------
 LINE_WIDTH: float = 2.5
-SCATTER_ALPHA: float = 0.75
+SCATTER_ALPHA: float = 0.80
 SCATTER_SIZE: float = 25.0
-TRAJECTORY_ALPHA: float = 0.4
+TRAJECTORY_ALPHA: float = 0.45
 TRAJECTORY_LINEWIDTH: float = 0.8
-SEM_ALPHA: float = 0.25  # Alpha for SEM fill region
+SEM_ALPHA: float = 0.20  # Alpha for SEM fill region
 
 
 # =========================================================================
@@ -455,7 +458,10 @@ def compute_mean_sem_over_time(
 # =========================================================================
 
 def setup_lancet_style() -> None:
-    """Configure matplotlib for Lancet/Cell publication aesthetics."""
+    """Configure matplotlib for Cell/Science publication aesthetics.
+
+    Uses vivid, high-contrast colors — rejects pale/desaturated palettes.
+    """
     plt.rcParams.update({
         "font.family": "sans-serif",
         "font.sans-serif": [FONT_FAMILY, "Helvetica", "DejaVu Sans"],
