@@ -42,6 +42,8 @@ install: ## Install package in editable mode with dev deps
 test: ## Run full test suite with verbose output
 	$(PYTHON) -m pytest tests/ -v
 
+modeltest:
+	$(PYTHON) scripts/train.py --config $(CONFIG) --epochs 1 --output_dir $(RUN_DIR)
 # ── Pre Data loading ─────────────────────────────────────────
 load:
 	$(PYTHON) scripts/pre_load_data.py $(RAW)
