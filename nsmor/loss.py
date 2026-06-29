@@ -18,6 +18,7 @@ Shape legend
 
 from __future__ import annotations
 
+import math
 from typing import Optional
 
 import torch
@@ -306,32 +307,20 @@ class BioJointLoss(nn.Module):
             # Replaces KL divergence which has gradient dead zones at
             # p_hat=0 (clamp) and p_hat>0.998 (upper boundary).
             #
-            # L1 gradient analysis:
-            #   d(L1)/d(p_hat) = sign(p_hat - p_target)
-            #   At p_hat=0 (silent):     grad = -1 (constant, non-zero)
-            #   At p_hat=0.01 (<target): grad = -1
-            #   At p_hat=0.05 (=target): grad = 0 (minimum, expected)
-            #   At p_hat=0.20 (>target): grad = +1
-            #   At p_hat=1.0 (saturated): grad = +1
-            #
-            # Note: the above gradients are d(L)/d(p_hat).  The actual
-            # per-spike gradient is scaled by 1/N_valid_neuron_steps:
-            #   d(L)/d(spike[i]) = sign * lambda_sparse / N_valid
-            # For N_valid=960 and lambda_sparse=0.1, the per-spike
-            # gradient at p_hat=0 is -0.1/960 ≈ -1e-4, not -1.
-            # This is important for lambda_sparse tuning: the effective
-            # gradient magnitude scales as lambda_sparse / N_valid.
-            #
-            # Properties:
-            # - Non-zero gradient EVERYWHERE except exactly at target
-            # - No dead zones at boundaries
-            # - No gradient explosion (bounded [-1, +1] at p_hat level)
-            # - No Adam moment inflation
-            # - Symmetric penalty: undershoot and overshoot penalized equally
-            # - Bootstrap: gradient = -1 at p_hat=0, constant signal
-            #   to increase firing (surrogate gradient handles propagation)
+            # CF7 fix: Scale by sqrt(n_neurons) to counteract the
+            # averaging over neuron-steps that dilutes the gradient.
+            # Without this, the per-spike gradient is:
+            #   d(L)/d(spike[i]) = lambda_sparse / (N_valid * H) * sign
+            # For H=64, N_valid~3200, lambda_sparse=0.1:
+            #   gradient ~ 0.1 / 204800 * sign ~ 5e-7
+            # This is noise-level for Adam (beta2=0.999 second moment
+            # dominates).  Multiplying by sqrt(H) ~ 8 boosts the
+            # effective gradient to ~4e-6, making the sparsity loss
+            # actually influence training without destabilizing MSE.
+            n_neurons = lif_spikes.shape[2]
+            sparse_scale = math.sqrt(float(n_neurons))
             p = torch.tensor(self.target_rate, device=p_hat.device)
-            sparse_loss = lambda_sparse_eff * torch.abs(p_hat - p)
+            sparse_loss = lambda_sparse_eff * sparse_scale * torch.abs(p_hat - p)
             total_loss = total_loss + sparse_loss
 
         # ── Temporal coherence (jerk penalty) ─────────────────

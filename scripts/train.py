@@ -25,15 +25,22 @@ Programmatic::
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
+import math
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from tqdm import tqdm
 
 # ── Project imports ────────────────────────────────────────────
@@ -242,6 +249,7 @@ def build_model(config: ExperimentConfig) -> NSMoRCore:
         lif_dendritic_tau=config.model.lif_dendritic_tau,
         gru_neuromod_gain=config.model.gru_neuromod_gain,
         sensory_noise_std=config.model.sensory_noise_std,
+        lif_tbptt_steps=config.model.lif_tbptt_steps,
     )
     param_count = sum(p.numel() for p in model.parameters())
     logger.info("Model initialized — %s parameters", f"{param_count:,}")
@@ -253,7 +261,13 @@ def build_optimizer(
     config: ExperimentConfig,
 ) -> torch.optim.AdamW:
     """
-    Construct an ``AdamW`` optimizer from the experiment config.
+    Construct an ``AdamW`` optimizer with per-pathway learning rates.
+
+    CF7 fix: The LIF pathway has discrete (spike) outputs, making its
+    loss landscape highly sensitive to parameter perturbations.  A
+    single LR for all parameters causes either LIF instability (LR too
+    high) or GRU underfitting (LR too low).  Separate parameter groups
+    with 0.3x LR for LIF parameters resolve this trade-off.
 
     Args:
         model: The model whose parameters to optimize.
@@ -262,15 +276,20 @@ def build_optimizer(
     Returns:
         Configured AdamW optimizer.
     """
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=config.training.learning_rate,
-        weight_decay=config.training.weight_decay,
-    )
+    base_lr = config.training.learning_rate
+    lif_lr = base_lr * 0.3  # Lower LR for spiking pathway
+
+    lif_params = list(model.lif_cell.parameters())
+    lif_param_ids = {id(p) for p in lif_params}
+    other_params = [p for p in model.parameters() if id(p) not in lif_param_ids]
+
+    optimizer = torch.optim.AdamW([
+        {"params": other_params, "lr": base_lr, "name": "non_lif"},
+        {"params": lif_params, "lr": lif_lr, "name": "lif"},
+    ], weight_decay=config.training.weight_decay)
     logger.info(
-        "Optimizer: AdamW  lr=%.2e  weight_decay=%.2e",
-        config.training.learning_rate,
-        config.training.weight_decay,
+        "Optimizer: AdamW  base_lr=%.2e  lif_lr=%.2e  weight_decay=%.2e",
+        base_lr, lif_lr, config.training.weight_decay,
     )
     return optimizer
 
@@ -453,9 +472,17 @@ def compute_warmup_factor(epoch: int, warmup_epochs: int) -> float:
     """
     Compute the warmup scaling factor for bio-loss regularization terms.
 
-    During warmup (``epoch < warmup_epochs``), the factor ramps linearly
-    from ``1/warmup_epochs`` to ``1.0``.  After warmup, the factor is
+    During warmup (``epoch < warmup_epochs``), the factor ramps via a
+    cosine curve from 0 to ``1.0``.  After warmup, the factor is
     exactly ``1.0``.
+
+    CF7 fix: Cosine warmup replaces linear warmup to avoid the
+    gradient discontinuity at the warmup boundary.  Linear warmup
+    has a constant derivative (d/dt = 1/warmup_epochs), creating a
+    sudden "step" in the effective loss gradient when warmup ends.
+    Cosine warmup has zero derivative at both endpoints (smooth
+    S-curve), preventing the gradient shock that can destabilize
+    Adam's moment estimates.
 
     Note: ``lambda_reg`` is NOT scaled by this factor -- only
     ``lambda_energy``, ``lambda_sparse``, and ``lambda_jerk`` are.
@@ -466,10 +493,14 @@ def compute_warmup_factor(epoch: int, warmup_epochs: int) -> float:
             (factor is always 1.0).
 
     Returns:
-        Scaling factor in (0, 1] during warmup, 1.0 after.
+        Scaling factor in [0, 1] during warmup, 1.0 after.
     """
     if warmup_epochs > 0 and epoch < warmup_epochs:
-        return float(epoch + 1) / float(warmup_epochs)
+        # Cosine ramp: 0.5 * (1 - cos(pi * progress))
+        # At progress=0: factor=0.  At progress=1: factor=1.
+        # Derivative at endpoints = 0 (smooth start and end).
+        progress = float(epoch + 1) / float(warmup_epochs)
+        return 0.5 * (1.0 - math.cos(math.pi * progress))
     return 1.0
 
 
@@ -487,6 +518,7 @@ def train_one_epoch(
     grad_clip_norm: float = 1.0,
     log_interval: int = 10,
     epoch: int = 0,
+    lif_threshold: float = 1.0,
 ) -> float:
     """
     Run one training epoch.
@@ -548,6 +580,27 @@ def train_one_epoch(
             annealing_factor=annealing_factor,
         )
 
+        # ── Membrane health monitoring (CF7 fix) ──
+        # Logs V_max and spike rate for early detection of runaway
+        # membrane potential or LIF pathway collapse.
+        if batch_idx == 0 and epoch % 10 == 0:
+            with torch.no_grad():
+                lif_potentials = internals["lif_potentials"]
+                v_max = lif_potentials.abs().max().item()
+                v_mean = lif_potentials.abs().mean().item()
+                spike_rate = lif_spikes.float().mean().item()
+                logger.info(
+                    "Epoch %d LIF stats: V_max=%.3f V_mean=%.3f "
+                    "spike_rate=%.4f (threshold=%.2f)",
+                    epoch, v_max, v_mean, spike_rate, lif_threshold,
+                )
+                if v_max > 10.0 * lif_threshold:
+                    logger.warning(
+                        "Epoch %d: V_max=%.2f >> threshold=%.2f — "
+                        "potential membrane runaway detected!",
+                        epoch, v_max, lif_threshold,
+                    )
+
         # ── Backward pass ──
         optimizer.zero_grad()
         loss.backward()
@@ -556,6 +609,29 @@ def train_one_epoch(
         if grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(
                 model.parameters(), max_norm=grad_clip_norm,
+            )
+
+        # ── Per-pathway gradient norm logging (CF7 fix) ──
+        # Monitors gradient balance between LIF and non-LIF pathways.
+        # If LIF gradients are consistently 10x+ larger, it confirms
+        # the LIF pathway as the instability source.
+        if batch_idx == 0 and epoch % 10 == 0:
+            lif_grad_norm = 0.0
+            non_lif_grad_norm = 0.0
+            for name, p in model.named_parameters():
+                if p.grad is not None:
+                    gn = p.grad.data.norm(2).item()
+                    if "lif_cell" in name:
+                        lif_grad_norm += gn ** 2
+                    else:
+                        non_lif_grad_norm += gn ** 2
+            lif_grad_norm = lif_grad_norm ** 0.5
+            non_lif_grad_norm = non_lif_grad_norm ** 0.5
+            logger.info(
+                "Epoch %d grad norms: LIF=%.4f  non_LIF=%.4f  "
+                "ratio=%.2f",
+                epoch, lif_grad_norm, non_lif_grad_norm,
+                lif_grad_norm / max(non_lif_grad_norm, 1e-8),
             )
 
         optimizer.step()
@@ -645,7 +721,96 @@ def validate(
 
 
 # ═══════════════════════════════════════════════════════════════
-# 6.  Main Train Function
+# 6.  Evaluation Metrics & Loss Curve Plotting
+# ═══════════════════════════════════════════════════════════════
+
+@torch.no_grad()
+def compute_metrics(
+    model: NSMoRCore,
+    loader: torch.utils.data.DataLoader,
+    device: torch.device,
+) -> Dict[str, float]:
+    """
+    Compute regression metrics on a dataset using the given model.
+
+    Collects all predictions and ground-truth values (respecting
+    variable sequence lengths via masking), then computes MSE, RMSE,
+    MAE, and R² in a single pass.
+
+    Args:
+        model: Trained model (should be in eval mode).
+        loader: DataLoader for the evaluation split.
+        device: Device to run inference on.
+
+    Returns:
+        Dictionary with keys ``"mse"``, ``"rmse"``, ``"mae"``, ``"r2"``.
+    """
+    model.eval()
+    all_pred: List[np.ndarray] = []
+    all_true: List[np.ndarray] = []
+
+    for batch in loader:
+        x_batch, y_batch, lengths = batch
+        x_batch = x_batch.to(device).contiguous()
+        y_batch = y_batch.to(device).contiguous()
+        lengths = lengths.to(device).contiguous()
+
+        y_pred, _ = model(x_batch, lengths, return_internals=True)
+
+        # Mask padded timesteps per sequence
+        for i in range(x_batch.size(0)):
+            n = int(lengths[i])
+            all_pred.append(y_pred[i, :n].cpu().numpy())
+            all_true.append(y_batch[i, :n].cpu().numpy())
+
+    y_pred_all = np.concatenate(all_pred)
+    y_true_all = np.concatenate(all_true)
+
+    mse = float(mean_squared_error(y_true_all, y_pred_all))
+    rmse = float(np.sqrt(mse))
+    mae = float(mean_absolute_error(y_true_all, y_pred_all))
+    r2 = float(r2_score(y_true_all, y_pred_all))
+
+    return {"mse": mse, "rmse": rmse, "mae": mae, "r2": r2}
+
+
+def plot_loss_curve(
+    history: Dict[str, List[float]],
+    output_dir: Path,
+) -> Path:
+    """
+    Plot train/val loss curves and save to disk.
+
+    Args:
+        history: Dictionary with ``"train_loss"`` and ``"val_loss"`` lists.
+        output_dir: Directory to save the figure.
+
+    Returns:
+        Path to the saved PNG file.
+    """
+    fig, ax = plt.subplots(figsize=(7, 4), dpi=150)
+
+    epochs = range(1, len(history["train_loss"]) + 1)
+    ax.plot(epochs, history["train_loss"], label="Train Loss", linewidth=1.5)
+    if history["val_loss"]:
+        ax.plot(epochs, history["val_loss"], label="Val Loss", linewidth=1.5)
+
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Loss")
+    ax.set_title("Training & Validation Loss")
+    ax.legend(frameon=False)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+    fig.tight_layout()
+    out_path = output_dir / "loss_curve.png"
+    fig.savefig(out_path, bbox_inches="tight", pad_inches=0.1)
+    plt.close(fig)
+    return out_path
+
+
+# ═══════════════════════════════════════════════════════════════
+# 7.  Main Train Function
 # ═══════════════════════════════════════════════════════════════
 
 def train(
@@ -683,6 +848,9 @@ def train(
         if isinstance(m, nn.RNNBase):
             m.flatten_parameters()
     optimizer = build_optimizer(model, config)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=config.training.num_epochs, eta_min=1e-6,
+    )
     criterion = build_loss(config)
     train_loader, val_loader = build_dataloaders(config)
 
@@ -763,7 +931,9 @@ def train(
             grad_clip_norm=config.training.grad_clip_norm,
             log_interval=config.training.log_interval,
             epoch=epoch,
+            lif_threshold=config.model.lif_threshold,
         )
+        scheduler.step()
         history["train_loss"].append(train_loss)
 
         # ── Validate ──────────────────────────────────────────
@@ -807,8 +977,8 @@ def train(
             )
             logger.info("Saved periodic checkpoint: %s", epoch_path)
 
-        # Best-model checkpoint
-        if val_loss < best_val_loss:
+        # Best-model checkpoint (skip during warmup to avoid scale mismatch)
+        if warmup_factor >= 1.0 and val_loss < best_val_loss:
             best_val_loss = val_loss
             best_path = output_dir / "best_model.pth"
             save_checkpoint(
@@ -833,13 +1003,35 @@ def train(
     )
     logger.info("Saved final model: %s", final_path)
 
+    logger.info("Final LR: %.2e", scheduler.get_last_lr()[0])
     logger.info("=" * 60)
     logger.info("Training complete.  Best val loss: %.6f", best_val_loss)
     logger.info("=" * 60)
 
+    # ── Plot loss curve ──────────────────────────────────────────
+    loss_curve_path = plot_loss_curve(history, output_dir)
+    logger.info("Loss curve saved: %s", loss_curve_path)
+
+    # ── Evaluate best model on validation set ────────────────────
+    metrics: Dict[str, float] = {}
+    best_ckpt_path = output_dir / "best_model.pth"
+    if best_ckpt_path.exists() and val_loader is not None:
+        load_checkpoint(path=best_ckpt_path, model=model, map_location=device)
+        model.to(device)
+        metrics = compute_metrics(model, val_loader, device)
+        logger.info(
+            "Best model metrics — MSE: %.6f  RMSE: %.6f  MAE: %.6f  R²: %.4f",
+            metrics["mse"], metrics["rmse"], metrics["mae"], metrics["r2"],
+        )
+        metrics_path = output_dir / "metrics.json"
+        with open(metrics_path, "w") as f:
+            json.dump(metrics, f, indent=2)
+        logger.info("Metrics saved: %s", metrics_path)
+
     return {
         "best_val_loss": best_val_loss,
         "final_train_loss": history["train_loss"][-1] if history["train_loss"] else float("inf"),
+        "metrics": metrics,
     }
 
 

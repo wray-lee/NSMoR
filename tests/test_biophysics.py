@@ -1051,7 +1051,7 @@ class TestBiophysics:
 
         CF3 fix: Calls the ACTUAL compute_warmup_factor from train.py,
         not a local copy.  Verifies:
-        - During warmup (epoch < warmup_epochs): factor = (epoch+1)/warmup_epochs
+        - During warmup (epoch < warmup_epochs): cosine ramp from 0 to 1
         - After warmup: factor = 1.0
         - lambda_reg is NOT scaled by warmup
         """
@@ -1059,10 +1059,13 @@ class TestBiophysics:
 
         warmup_epochs = 10
 
-        # Verify ramp-up using the ACTUAL function from train.py
+        # Verify cosine ramp-up using the ACTUAL function from train.py
+        # Cosine formula: 0.5 * (1 - cos(pi * progress))
+        # At progress=0: factor=0.  At progress=1: factor=1.
         for epoch in range(warmup_epochs):
             factor = compute_warmup_factor(epoch, warmup_epochs)
-            expected = (epoch + 1) / warmup_epochs
+            progress = float(epoch + 1) / float(warmup_epochs)
+            expected = 0.5 * (1.0 - math.cos(math.pi * progress))
             assert abs(factor - expected) < 1e-9, (
                 f"Epoch {epoch}: factor={factor}, expected={expected}"
             )

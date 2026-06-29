@@ -365,6 +365,18 @@ class LIFCell(nn.Module):
             f"Otherwise the neuron fires spontaneously at rest."
         )
         self.v_rest = v_rest
+        # CF7 fix: Membrane potential upper bound to prevent runaway accumulation.
+        # 3x threshold is generous enough to allow natural spike overshoot
+        # dynamics but prevents exponential blow-up when alpha*V + I_syn
+        # compounds across timesteps.  Without this, V can grow to 100+,
+        # saturating the surrogate gradient and causing NaN/Inf in backward.
+        self._v_clamp_max = 3.0 * v_threshold
+        # CF7 fix: Synaptic current clamp to prevent I_syn accumulation runaway.
+        # With alpha_syn near 1.0, I_syn acts as an exponential moving average
+        # of raw_input.  If raw_input is consistently positive (from the
+        # linear projection W_in which has no output normalization), I_syn can
+        # grow without bound.  Clamping at 5x threshold prevents this.
+        self._i_syn_clamp = 5.0 * v_threshold
         # CF1 fix: Use boolean flag to track intent, not value comparison.
         # self.v_reset = v_rest when v_reset is None (backward compat).
         # self._hard_reset = True when user explicitly set v_reset.
@@ -653,6 +665,8 @@ class LIFCell(nn.Module):
         raw_input = self.beta * projected_input * stp_factor  # (B, H)
         alpha_syn = self._alpha_syn.to(device)
         i_syn_new = alpha_syn * i_syn + (1.0 - alpha_syn) * raw_input  # (B, H)
+        # CF7 fix: Clamp synaptic current to prevent accumulation runaway.
+        i_syn_new = i_syn_new.clamp(-self._i_syn_clamp, self._i_syn_clamp)
 
         # ── 4. Absolute refractory: clamp membrane ──
         in_abs_refract = (refract_counter > 0).float()       # (B, H) 0/1
@@ -683,6 +697,13 @@ class LIFCell(nn.Module):
         # ── 6. Membrane integration (clamped in abs refractory) ──
         v_new = self.alpha * v + i_syn_new - w_adapt         # (B, H)
         v_new = v_new * (1.0 - in_abs_refract) + self.v_rest * in_abs_refract  # (B, H)
+        # CF7 fix: Clamp membrane potential to prevent runaway accumulation.
+        # Upper bound = 3x threshold (allows natural spike overshoot but
+        # prevents exponential blow-up).  Lower bound = -threshold
+        # (allows hyperpolarization but prevents extreme negative values).
+        # Without this, V can grow unbounded when alpha*V + I_syn compounds,
+        # causing surrogate gradient saturation and NaN/Inf in backward pass.
+        v_new = v_new.clamp(-self.v_threshold, self._v_clamp_max)
 
         # ── 6b. Lateral inhibition (Gap A) ──
         # Ref: Ritzmann & Camhi 1978, J. Comp. Physiol.
@@ -1086,6 +1107,7 @@ class NSMoRCore(nn.Module):
         lif_dendritic_tau: float = 0.0,
         gru_neuromod_gain: float = 0.0,
         sensory_noise_std: float = 0.0,
+        lif_tbptt_steps: int = 64,
     ) -> None:
         """
         Args:
@@ -1137,6 +1159,13 @@ class NSMoRCore(nn.Module):
                 Models intrinsic neural variability and stochastic
                 resonance.  0 disables (backward compatible).
                 Ref: Douglass et al. 1993, Nature 365:721-723.
+            lif_tbptt_steps: Truncated BPTT window for the LIF pathway.
+                The LIF cell state is detached every this many timesteps
+                to cap the effective gradient path length.  This prevents
+                gradient explosion through the I_syn accumulation channel
+                (which has Jacobian eigenvalue ~ alpha_syn near 1.0).
+                Default 64.  Set to 0 to disable truncation (full BPTT).
+                Ref: Williams & Zipser 1989, Neural Computation.
         """
         super().__init__()
         self.sensory_dim = sensory_dim
@@ -1173,6 +1202,12 @@ class NSMoRCore(nn.Module):
             # Learnable gain scale: maps entropy scalar to gain multiplier
             self._gain_scale = nn.Parameter(torch.tensor(0.0))
             self._gain_bias = nn.Parameter(torch.tensor(1.0))
+
+        # ── Truncated BPTT for LIF pathway (CF7 fix) ──
+        # Ref: Williams & Zipser 1989, Neural Computation.
+        # Caps gradient path length to prevent explosion through
+        # the I_syn accumulation channel.
+        self._tbptt_steps = lif_tbptt_steps if lif_tbptt_steps > 0 else 0
 
     # -- Public API -------------------------------------------------
 
@@ -1599,6 +1634,14 @@ class NSMoRCore(nn.Module):
 
         for t in range(T):
             inp_t = e_sensory[:, t, :]
+            # CF7 fix: Truncated BPTT — detach state every _tbptt_steps
+            # to cap gradient path length.  This prevents gradient explosion
+            # through the I_syn accumulation channel (Jacobian eigenvalue
+            # ~ alpha_syn near 1.0).  Without this, gradients from step
+            # t-T flow through all T steps without attenuation.
+            # Ref: Williams & Zipser 1989, Neural Computation.
+            if self._tbptt_steps > 0 and t > 0 and t % self._tbptt_steps == 0:
+                lif_state = tuple(s.detach() for s in lif_state)
             spike, lif_state = self.lif_cell(inp_t, lif_state)
 
             mask = (t < lengths).float().unsqueeze(-1)

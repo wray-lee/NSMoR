@@ -73,6 +73,11 @@ class ModelConfig:
     # Gaussian noise std during training. 0 disables.
     sensory_noise_std: float = 0.0
 
+    # Truncated BPTT for LIF pathway (Williams & Zipser 1989)
+    # Detach LIF state every N timesteps to cap gradient path length.
+    # 0 disables (full BPTT — risky for long sequences).
+    lif_tbptt_steps: int = 64
+
 
 @dataclass
 class TrainingConfig:

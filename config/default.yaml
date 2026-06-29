@@ -19,11 +19,12 @@ model:
   lif_alpha: 0.9          # LIF leak factor (higher = slower decay)
   lif_threshold: 1.0      # LIF spike threshold
   lif_beta: 0.5           # LIF input scaling
+  lif_tbptt_steps: 64     # truncated BPTT window (0=full BPTT, risky for long seqs)
 
 # ── Training hyperparameters ────────────────────────────────
 training:
-  learning_rate: 0.001
-  weight_decay: 0.0
+  learning_rate: 0.0005
+  weight_decay: 0.0001
   num_epochs: 100
   batch_size: 32
   grad_clip_norm: 1.0
