@@ -33,6 +33,16 @@ training:
   random_seed: 42
   max_seq_len: 1000        # crop sequences longer than this (cuDNN compatibility)
 
+# ── Loss function ───────────────────────────────────────────
+loss:
+  reduction: mean           # MSE reduction: 'mean' or 'sum'
+  target_rate: 0.05         # target mean firing rate for sparsity L1
+  lambda_energy: 0.0        # ATP metabolic cost (0 disables)
+  lambda_sparse: 0.0        # population sparsity L1 (0 disables)
+  lambda_jerk: 0.0          # temporal coherence / jerk penalty (0 disables)
+  jerk_threshold: 0.1       # sudden-change jerk mask threshold
+  warmup_epochs: 0          # cosine warmup for bio-loss terms (0 disables)
+
 # ── Dataset paths ───────────────────────────────────────────
 # Each field is a list of CSV paths; multiple files are concatenated.
 data:

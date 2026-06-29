@@ -29,6 +29,8 @@ def save_checkpoint(
     path: Union[str, Path],
     *,
     scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
+    train_loss: Optional[float] = None,
+    val_loss: Optional[float] = None,
 ) -> Path:
     """
     Save a deterministic training checkpoint.
@@ -40,6 +42,8 @@ def save_checkpoint(
     * ``scheduler_state_dict`` — LR scheduler state (if provided)
     * ``epoch`` — current epoch index (0-based)
     * ``loss`` — loss value at the time of saving
+    * ``train_loss`` — training loss (if provided)
+    * ``val_loss`` — validation loss (if provided)
     * ``rng_state`` — ``torch.get_rng_state()`` for deterministic resumption
     * ``cuda_rng_state`` — ``torch.cuda.get_rng_state_all()`` if CUDA is
       available, so GPU-side stochasticity is also restored
@@ -49,10 +53,12 @@ def save_checkpoint(
         model: The model to checkpoint.
         optimizer: The optimizer whose state to persist.
         epoch: Current epoch number.
-        loss: Current loss value.
+        loss: Current loss value (legacy; used for backward compat).
         config: Experiment configuration dictionary.
         path: File path for the checkpoint (typically ``.pt``).
         scheduler: Optional LR scheduler.
+        train_loss: Training loss for this epoch (optional).
+        val_loss: Validation loss for this epoch (optional).
 
     Returns:
         The resolved :class:`~pathlib.Path` of the saved file.
@@ -68,6 +74,11 @@ def save_checkpoint(
         "rng_state": torch.get_rng_state(),
         "config": config,
     }
+
+    if train_loss is not None:
+        state["train_loss"] = train_loss
+    if val_loss is not None:
+        state["val_loss"] = val_loss
 
     if scheduler is not None:
         state["scheduler_state_dict"] = scheduler.state_dict()
@@ -134,9 +145,17 @@ def load_checkpoint(
 
     # ── Restore RNG ──
     if "rng_state" in checkpoint:
-        torch.set_rng_state(checkpoint["rng_state"])
+        rng_state = checkpoint["rng_state"]
+        if not isinstance(rng_state, torch.ByteTensor):
+            rng_state = rng_state.cpu().to(torch.uint8)
+        torch.set_rng_state(rng_state)
 
     if "cuda_rng_state" in checkpoint and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all(checkpoint["cuda_rng_state"])
+        cuda_rng_states = checkpoint["cuda_rng_state"]
+        cuda_rng_states = [
+            s.cpu().to(torch.uint8) if not isinstance(s, torch.ByteTensor) else s
+            for s in cuda_rng_states
+        ]
+        torch.cuda.set_rng_state_all(cuda_rng_states)
 
     return checkpoint

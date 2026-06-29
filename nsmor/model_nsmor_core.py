@@ -401,20 +401,32 @@ class LIFCell(nn.Module):
             self._k_rel = 0.0
 
         # Synaptic filter coefficient: alpha_syn = exp(-1/tau_syn)
+        # persistent=False: these are derived constants, not learnable
+        # parameters.  Using persistent=False keeps them OUT of
+        # state_dict(), so old checkpoints without these keys load
+        # cleanly with load_state_dict(strict=True).
         if tau_syn > 0.0:
-            self._alpha_syn = torch.tensor(
-                torch.exp(torch.tensor(-1.0 / tau_syn)).item()
+            self.register_buffer(
+                '_alpha_syn',
+                torch.tensor(torch.exp(torch.tensor(-1.0 / tau_syn)).item()),
+                persistent=False,
             )
         else:
-            self._alpha_syn = torch.tensor(0.0)
+            self.register_buffer(
+                '_alpha_syn', torch.tensor(0.0), persistent=False,
+            )
 
         # Adaptation decay coefficient: alpha_w = exp(-1/tau_w)
         if tau_w > 0.0:
-            self._decay_w = torch.tensor(
-                torch.exp(torch.tensor(-1.0 / tau_w)).item()
+            self.register_buffer(
+                '_decay_w',
+                torch.tensor(torch.exp(torch.tensor(-1.0 / tau_w)).item()),
+                persistent=False,
             )
         else:
-            self._decay_w = torch.tensor(0.0)
+            self.register_buffer(
+                '_decay_w', torch.tensor(0.0), persistent=False,
+            )
 
         # Short-Term Plasticity (Tsodyks-Markram)
         # STP is enabled only when BOTH time constants are positive.

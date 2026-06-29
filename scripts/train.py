@@ -605,11 +605,37 @@ def train_one_epoch(
         optimizer.zero_grad()
         loss.backward()
 
+        # ── NaN/Inf guard (Issues 1 & 2) ──
+        # Detect non-finite loss BEFORE clipping so we can skip the
+        # optimizer step and avoid poisoning Adam's moment estimates.
+        if not math.isfinite(loss.item()):
+            logger.warning(
+                "Epoch %d batch %d: non-finite loss=%s — skipping step",
+                epoch, batch_idx, loss.item(),
+            )
+            continue  # skip optimizer.step()
+
         # ── Gradient clipping ──
         if grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(
                 model.parameters(), max_norm=grad_clip_norm,
             )
+
+        # ── Post-clip gradient finiteness check (defense-in-depth) ──
+        # Even after clipping, NaN gradients can survive if the grad
+        # was already NaN (clip_grad_norm_ divides by a norm that may
+        # be NaN).  Detect and skip to avoid corrupting parameters.
+        has_nan_grad = False
+        for p in model.parameters():
+            if p.grad is not None and not torch.isfinite(p.grad).all():
+                has_nan_grad = True
+                break
+        if has_nan_grad:
+            logger.warning(
+                "Epoch %d batch %d: non-finite gradient after clipping — skipping step",
+                epoch, batch_idx,
+            )
+            continue  # skip optimizer.step()
 
         # ── Per-pathway gradient norm logging (CF7 fix) ──
         # Monitors gradient balance between LIF and non-LIF pathways.
@@ -974,6 +1000,8 @@ def train(
                 loss=train_loss,
                 config=config.to_dict(),
                 path=epoch_path,
+                train_loss=train_loss,
+                val_loss=val_loss if val_loss != float("inf") else None,
             )
             logger.info("Saved periodic checkpoint: %s", epoch_path)
 
@@ -988,6 +1016,8 @@ def train(
                 loss=val_loss,
                 config=config.to_dict(),
                 path=best_path,
+                train_loss=train_loss,
+                val_loss=val_loss,
             )
             logger.info("Saved best model (val_loss=%.6f): %s", val_loss, best_path)
 
@@ -1000,6 +1030,8 @@ def train(
         loss=train_loss,
         config=config.to_dict(),
         path=final_path,
+        train_loss=train_loss,
+        val_loss=val_loss if val_loss != float("inf") else None,
     )
     logger.info("Saved final model: %s", final_path)
 
@@ -1051,8 +1083,12 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     config, lambda_reg = build_config(argv)
     logger.info("Config loaded: %s", config.checkpoint.output_dir)
 
+    output_dir = Path(config.checkpoint.output_dir)
     results = train(config, lambda_reg=lambda_reg)
-    logger.info("Results: %s", results)
+    train_log_path = output_dir / "train.log"
+    with open(train_log_path, "w") as f:
+        json.dump(results, f, indent=2)
+    logger.info("Results: %s. Saved: %s", results, train_log_path)
 
 
 if __name__ == "__main__":
