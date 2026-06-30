@@ -27,12 +27,14 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import math
+from contextlib import nullcontext
 
 import matplotlib
 matplotlib.use("Agg")
@@ -439,21 +441,34 @@ def build_dataloaders(
     )
 
     # ── Create dataloaders ────────────────────────────────────
+    # num_workers: auto-scale based on dataset size.  Small datasets
+    # (< 200 sequences) don't benefit from multiprocessing overhead;
+    # larger datasets need prefetching to keep GPU fed.
+    _n_train = len(train_dataset)
+    if _n_train < 200:
+        _nw = 0
+    else:
+        _nw = min(4, (os.cpu_count() or 2) - 1)
+
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=config.training.batch_size,
         shuffle=True,
-        num_workers=0,
+        num_workers=_nw,
         collate_fn=collate_variable_length,
         pin_memory=torch.cuda.is_available(),
+        persistent_workers=_nw > 0,
+        prefetch_factor=2 if _nw > 0 else None,
     )
     val_loader = torch.utils.data.DataLoader(
         val_dataset,
         batch_size=config.training.batch_size,
         shuffle=False,
-        num_workers=0,
+        num_workers=_nw,
         collate_fn=collate_variable_length,
         pin_memory=torch.cuda.is_available(),
+        persistent_workers=_nw > 0,
+        prefetch_factor=2 if _nw > 0 else None,
     )
 
     logger.info(
@@ -519,6 +534,8 @@ def train_one_epoch(
     log_interval: int = 10,
     epoch: int = 0,
     lif_threshold: float = 1.0,
+    scaler: Optional[torch.amp.GradScaler] = None,
+    amp_ctx = None,
 ) -> float:
     """
     Run one training epoch.
@@ -567,26 +584,28 @@ def train_one_epoch(
         lengths = lengths.to(device).contiguous()
 
         # ── Forward pass (with internals for routing gates) ──
-        y_pred, internals = model(x_batch, lengths, return_internals=True)
+        _ctx = amp_ctx() if amp_ctx is not None else nullcontext()
+        with _ctx:
+            y_pred, internals = model(x_batch, lengths, return_internals=True)
 
-        # ── Extract g_gru from routing gates ──
-        # routing_gates: (B, T, 2) — index 1 is g_gru
-        g_gru = internals["routing_gates"][:, :, 1:2]           # (B, T, 1)
-        lif_spikes = internals["lif_spikes"]                    # (B, T, H)
+            # ── Extract g_gru from routing gates ──
+            # routing_gates: (B, T, 2) — index 1 is g_gru
+            g_gru = internals["routing_gates"][:, :, 1:2]           # (B, T, 1)
+            lif_spikes = internals["lif_spikes"]                    # (B, T, H)
 
-        # ── Compute loss ──
-        loss = criterion(
-            y_pred=y_pred,
-            y_true=y_batch,
-            lengths=lengths,
-            g_gru=g_gru,
-            lambda_reg=lambda_reg,
-            lif_spikes=lif_spikes,
-            lambda_energy=lambda_energy,
-            lambda_sparse=lambda_sparse,
-            lambda_jerk=lambda_jerk,
-            annealing_factor=annealing_factor,
-        )
+            # ── Compute loss ──
+            loss = criterion(
+                y_pred=y_pred,
+                y_true=y_batch,
+                lengths=lengths,
+                g_gru=g_gru,
+                lambda_reg=lambda_reg,
+                lif_spikes=lif_spikes,
+                lambda_energy=lambda_energy,
+                lambda_sparse=lambda_sparse,
+                lambda_jerk=lambda_jerk,
+                annealing_factor=annealing_factor,
+            )
 
         # ── Membrane health monitoring (CF9: per-epoch averages) ──
         # Tracks V_max, spike_rate, and adaptation current across all
@@ -601,9 +620,12 @@ def train_one_epoch(
                 _epoch_w_adapt += internals["lif_w_adapt"].abs().mean().item()
             _health_batches += 1
 
-        # ── Backward pass ──
+        # ── Backward pass (AMP-aware) ──
         optimizer.zero_grad()
-        loss.backward()
+        if scaler is not None and scaler.is_enabled():
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
 
         # ── NaN/Inf guard (Issues 1 & 2) ──
         # Detect non-finite loss BEFORE clipping so we can skip the
@@ -615,7 +637,9 @@ def train_one_epoch(
             )
             continue  # skip optimizer.step()
 
-        # ── Gradient clipping ──
+        # ── Gradient clipping (unscale first for AMP) ──
+        if scaler is not None and scaler.is_enabled():
+            scaler.unscale_(optimizer)
         if grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(
                 model.parameters(), max_norm=grad_clip_norm,
@@ -635,6 +659,10 @@ def train_one_epoch(
                 "Epoch %d batch %d: non-finite gradient after clipping — skipping step",
                 epoch, batch_idx,
             )
+            # Must call scaler.update() to reset internal state even
+            # when skipping, otherwise next unscale_() will raise.
+            if scaler is not None and scaler.is_enabled():
+                scaler.update()
             continue  # skip optimizer.step()
 
         # ── Per-pathway gradient norm logging (CF7 fix) ──
@@ -660,7 +688,11 @@ def train_one_epoch(
                 lif_grad_norm / max(non_lif_grad_norm, 1e-8),
             )
 
-        optimizer.step()
+        if scaler is not None and scaler.is_enabled():
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
 
         total_loss += loss.item()
         n_batches += 1
@@ -884,7 +916,18 @@ def train(
     for m in model.modules():
         if isinstance(m, nn.RNNBase):
             m.flatten_parameters()
+
     optimizer = build_optimizer(model, config)
+
+    # ── Mixed Precision (AMP) ─────────────────────────────────
+    # 5060 Ti has strong FP16 Tensor Cores.  AMP keeps master weights
+    # in FP32 but runs forward/backward in FP16, cutting memory ~40%
+    # and improving throughput on compute-bound workloads.
+    use_amp = device.type == "cuda"
+    scaler = torch.amp.GradScaler(enabled=use_amp)
+    amp_ctx = lambda: torch.amp.autocast(device_type="cuda", enabled=use_amp)
+    if use_amp:
+        logger.info("AMP enabled (FP16 forward/backward, FP32 master weights)")
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=config.training.num_epochs, eta_min=1e-6,
     )
@@ -973,6 +1016,8 @@ def train(
             log_interval=config.training.log_interval,
             epoch=epoch,
             lif_threshold=config.model.lif_threshold,
+            scaler=scaler,
+            amp_ctx=amp_ctx,
         )
         scheduler.step()
         history["train_loss"].append(train_loss)

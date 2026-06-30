@@ -76,50 +76,56 @@ def parse_trial_events(evt_path):
     df_e = pd.read_csv(evt_path)
     trial_info = {}
 
-    for _, row in df_e.iterrows():
-        # Handle both column name formats
-        event_name = str(row.get('event_type', row.get('event_name', '')))
-        trial_id = row.get('trial_id', row.get('global_trial_id', None))
-        details_str = str(row.get('event_value', row.get('details', '{}')))
-        timestamp_ms = float(row.get('time_ms', row.get('timestamp', 0)))
+    # Normalize column names
+    evt_col = 'event_type' if 'event_type' in df_e.columns else 'event_name'
+    tid_col = 'trial_id' if 'trial_id' in df_e.columns else 'global_trial_id'
+    val_col = 'event_value' if 'event_value' in df_e.columns else 'details'
+    ts_col = 'time_ms' if 'time_ms' in df_e.columns else 'timestamp'
 
-        if event_name == 'trial_start' and trial_id is not None:
-            try:
-                details = json.loads(details_str)
-            except:
-                details = {}
+    # ── trial_start events: extract trial metadata ──
+    ts_mask = df_e[evt_col] == 'trial_start'
+    for _, row in df_e[ts_mask].iterrows():
+        trial_id = row[tid_col]
+        try:
+            details = json.loads(str(row[val_col]))
+        except Exception:
+            details = {}
+        trial_info[trial_id] = {
+            'type': details.get('type', 'unknown'),
+            'lv_ratio_ms': details.get('lv_ratio_ms'),
+            'target_ttc_ms': details.get('target_ttc_ms'),
+            'wind_dir': details.get('wind_dir', 'none'),
+            'stimulus_onset_ms': None,
+            'looming_onset_ms': None,
+            'ttc_ms': None,
+        }
 
-            trial_info[trial_id] = {
-                'type': details.get('type', 'unknown'),
-                'lv_ratio_ms': details.get('lv_ratio_ms'),
-                'target_ttc_ms': details.get('target_ttc_ms'),
-                'wind_dir': details.get('wind_dir', 'none'),
-                'stimulus_onset_ms': None,
-                'looming_onset_ms': None,
-                'ttc_ms': None,
-            }
+    # ── phase_transition events: vectorized processing ──
+    pt_mask = df_e[evt_col] == 'phase_transition'
+    if trial_info and pt_mask.any():
+        pt_df = df_e.loc[pt_mask, [tid_col, val_col, ts_col]].copy()
+        # Only process transitions for known trials
+        pt_df = pt_df[pt_df[tid_col].isin(trial_info)]
 
-        # Track phase transitions for stimulus timing
-        if event_name == 'phase_transition' and trial_id in trial_info:
-            try:
-                details = json.loads(details_str)
-            except:
-                details = {}
+        # Parse details JSON in batch
+        parsed = pt_df[val_col].apply(lambda s: json.loads(str(s)) if pd.notna(s) else {})
+        pt_df['from_phase'] = parsed.apply(lambda d: d.get('from_phase', ''))
+        pt_df['to_phase'] = parsed.apply(lambda d: d.get('to_phase', ''))
 
-            from_phase = details.get('from_phase', '')
-            to_phase = details.get('to_phase', '')
+        # Looming onset: to_phase == 'Looming'
+        looming = pt_df[pt_df['to_phase'] == 'Looming']
+        for _, r in looming.iterrows():
+            trial_info[r[tid_col]]['looming_onset_ms'] = float(r[ts_col])
 
-            # Looming onset: transition TO Looming phase
-            if to_phase == 'Looming':
-                trial_info[trial_id]['looming_onset_ms'] = timestamp_ms
+        # TTC: to_phase == 'Collision_TTC0'
+        ttc = pt_df[pt_df['to_phase'] == 'Collision_TTC0']
+        for _, r in ttc.iterrows():
+            trial_info[r[tid_col]]['ttc_ms'] = float(r[ts_col])
 
-            # TTC: transition TO Collision_TTC0 phase
-            if to_phase == 'Collision_TTC0':
-                trial_info[trial_id]['ttc_ms'] = timestamp_ms
-
-            # Wind onset: transition from Baseline to PostStimulus (for wind trials)
-            if from_phase == 'Baseline' and to_phase == 'PostStimulus':
-                trial_info[trial_id]['stimulus_onset_ms'] = timestamp_ms
+        # Wind onset: from_phase == 'Baseline' -> to_phase == 'PostStimulus'
+        wind = pt_df[(pt_df['from_phase'] == 'Baseline') & (pt_df['to_phase'] == 'PostStimulus')]
+        for _, r in wind.iterrows():
+            trial_info[r[tid_col]]['stimulus_onset_ms'] = float(r[ts_col])
 
     return trial_info
 
@@ -184,46 +190,42 @@ def adapt_cercus_to_nsmor(raw_dir="data/raw"):
 
         # ── 3. Reconstruct visual angle per trial (always run) ──
         print(f"正在重构视觉角度: {kin_path.name}")
-        for tid, group in df_k.groupby("trial_id"):
+
+        # Pre-build trial parameter mapping for vectorized assignment
+        tid_series = df_k["trial_id"]
+        unique_tids = tid_series.unique()
+
+        for tid in unique_tids:
             trial_id = int(tid)
             info = trial_info.get(trial_id, {})
             trial_type = info.get('type', 'unknown')
             lv_ratio_ms = info.get('lv_ratio_ms')
 
-            # Determine visual stimulus parameters
             has_visual = trial_type in ('baseline_visual', 'looming_wind')
             has_wind = trial_type in ('baseline_wind', 'looming_wind')
 
-            if has_visual and lv_ratio_ms and lv_ratio_ms > 0:
-                # Reconstruct visual angle using experiment parameters
-                # time_ms is relative to trial start; looming starts at trial start
-                visual_angle = reconstruct_visual_angle(
-                    group["time_ms"].values,
-                    lv_ratio_ms,
-                    init_deg=2.0,  # Default from paradigm.py
-                )
-                df_k.loc[group.index, "visual_angle"] = visual_angle
-                df_k.loc[group.index, "l_v_ratio"] = lv_ratio_ms
-            else:
-                # No visual stimulus
-                df_k.loc[group.index, "visual_angle"] = 0.0
-                df_k.loc[group.index, "l_v_ratio"] = 0.0
+            # Boolean mask for this trial (faster than groupby + loc)
+            trial_mask = tid_series == tid
+            time_vals = df_k.loc[trial_mask, "time_ms"].values
 
-            # Set wind state from trial type (overwrite raw sensor data)
-            if has_wind:
-                # Keep wind_state from raw sensor data (already set)
-                pass
+            if has_visual and lv_ratio_ms and lv_ratio_ms > 0:
+                visual_angle = reconstruct_visual_angle(
+                    time_vals, lv_ratio_ms, init_deg=2.0,
+                )
+                df_k.loc[trial_mask, "visual_angle"] = visual_angle
+                df_k.loc[trial_mask, "l_v_ratio"] = lv_ratio_ms
             else:
-                # No wind stimulus for this trial type
-                df_k.loc[group.index, "wind_state"] = 0
+                df_k.loc[trial_mask, "visual_angle"] = 0.0
+                df_k.loc[trial_mask, "l_v_ratio"] = 0.0
+
+            if not has_wind:
+                df_k.loc[trial_mask, "wind_state"] = 0
 
             # Detect stimulus onset for events
-            # For wind trials: use wind onset time
-            # For visual-only trials: use looming onset time (trial start)
             if has_wind:
-                mask = group["wind_state"] > 0
-                if mask.any():
-                    stim_time = group.loc[mask, "time_ms"].iloc[0]
+                wind_mask = trial_mask & (df_k["wind_state"] > 0)
+                if wind_mask.any():
+                    stim_time = df_k.loc[wind_mask, "time_ms"].iloc[0]
                     stim_starts.append({
                         "session_id": session_id,
                         "trial_id": tid,
@@ -232,7 +234,6 @@ def adapt_cercus_to_nsmor(raw_dir="data/raw"):
                         "event_value": '{"source": "kinematics_injected"}'
                     })
             elif has_visual:
-                # Baseline visual: stimulus onset at trial start (looming begins immediately)
                 stim_starts.append({
                     "session_id": session_id,
                     "trial_id": tid,

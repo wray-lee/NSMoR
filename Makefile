@@ -16,7 +16,7 @@
 PYTHON   ?= python
 RAW	 ?= data/raw
 DATA	 ?= data/processed/nsmor_dataset.pt
-EPOCHS   ?= 100
+EPOCHS   ?= 150
 CONFIG   ?= config/default.yaml
 RUN_DIR  ?= runs/default
 OUTPUT   ?= results

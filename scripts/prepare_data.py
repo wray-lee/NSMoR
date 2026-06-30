@@ -126,78 +126,49 @@ def reconstruct_visual_looming(
         - For t >= TTC (post-collision), θ(t) is clamped to 180°.
         - For t < stimulus_onset (pre-stimulus), θ(t) = 0.
         - Handles NaN/zero-division gracefully via epsilon guard.
+        - Fully vectorized (no Python for-loop) for performance.
     """
     n_frames = len(time_ms)
-    visual_angle = np.zeros(n_frames, dtype=np.float64)
-    l_v_array = np.zeros(n_frames, dtype=np.float64)
+    eps = VISUAL_PHYSICS_EPSILON
 
     # ── Guard against invalid l/v ratio ──
     if np.isnan(l_v_ratio) or np.isinf(l_v_ratio):
         logger.warning(
             "Invalid l_v_ratio=%.4f, defaulting to 0.", l_v_ratio
         )
-        return visual_angle, l_v_array
+        return np.zeros(n_frames, dtype=np.float64), np.zeros(n_frames, dtype=np.float64)
 
-    # ── Compute θ(t) for each frame ──
-    for i, t in enumerate(time_ms):
-        # Pre-stimulus: no visual stimulus yet
-        if t < stimulus_onset_ms:
-            visual_angle[i] = 0.0
-            l_v_array[i] = 0.0
-            continue
+    # ── Vectorized computation ──
+    ttc_remaining = ttc_ms - time_ms  # (n_frames,)
 
-        # Time-to-collision remaining (can be negative post-TTC)
-        ttc_remaining = ttc_ms - t
+    # Region masks
+    pre_stimulus = time_ms < stimulus_onset_ms
+    post_collision = ttc_remaining < eps
+    active = ~pre_stimulus & ~post_collision  # normal looming region
 
-        # Post-collision: clamp to maximum visual angle
-        if ttc_remaining < VISUAL_PHYSICS_EPSILON:
-            visual_angle[i] = 180.0  # Maximum visual angle post-collision
-            l_v_array[i] = l_v_ratio
-            continue
+    # θ(t) = 2 × arctan(l/v / (TTC - t))  only for active frames
+    visual_angle = np.zeros(n_frames, dtype=np.float64)
+    l_v_array = np.zeros(n_frames, dtype=np.float64)
 
-        # ── Main formula: θ(t) = 2 × arctan(l/v / (TTC - t)) ──
-        # Guard against division by zero
-        denominator = ttc_remaining
-        if abs(denominator) < VISUAL_PHYSICS_EPSILON:
-            visual_angle[i] = 180.0
-            l_v_array[i] = l_v_ratio
-            continue
+    if np.any(active):
+        denom = ttc_remaining[active]
+        safe_denom = np.where(np.abs(denom) < eps, eps, denom)
+        ratio = l_v_ratio / safe_denom
 
-        # Compute the ratio inside arctan
-        ratio = l_v_ratio / denominator
+        theta_deg = np.degrees(2.0 * np.arctan(ratio))
+        # Replace NaN/Inf with 0, then clamp to [0, 180]
+        theta_deg = np.nan_to_num(theta_deg, nan=0.0, posinf=180.0, neginf=0.0)
+        theta_deg = np.clip(theta_deg, 0.0, 180.0)
 
-        # Guard against NaN from arctan
-        if np.isnan(ratio) or np.isinf(ratio):
-            visual_angle[i] = 0.0
-            l_v_array[i] = 0.0
-            continue
+        visual_angle[active] = theta_deg
+        l_v_array[active] = l_v_ratio
 
-        # Compute visual angle in radians, then convert to degrees
-        theta_rad = 2.0 * np.arctan(ratio)
-        theta_deg = np.degrees(theta_rad)
+    # Post-collision: clamp to 180°
+    if np.any(post_collision):
+        visual_angle[post_collision] = 180.0
+        l_v_array[post_collision] = l_v_ratio
 
-        # ── Sanity checks ──
-        if np.isnan(theta_deg) or np.isinf(theta_deg):
-            logger.warning(
-                "NaN/Inf in θ(t) at frame %d (t=%.1fms, TTC=%.1fms), "
-                "clamping to 0.",
-                i, t, ttc_ms,
-            )
-            theta_deg = 0.0
-
-        # Clamp to valid range [0, 180] degrees
-        theta_deg = float(np.clip(theta_deg, 0.0, 180.0))
-
-        visual_angle[i] = theta_deg
-        l_v_array[i] = l_v_ratio
-
-    # ── Shape assertions ──
-    assert visual_angle.shape == (n_frames,), (
-        f"visual_angle shape {visual_angle.shape} != ({n_frames},)"
-    )
-    assert l_v_array.shape == (n_frames,), (
-        f"l_v_array shape {l_v_array.shape} != ({n_frames},)"
-    )
+    # Pre-stimulus: already zeros (initialized)
 
     return visual_angle, l_v_array
 
