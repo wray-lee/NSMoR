@@ -551,6 +551,13 @@ def train_one_epoch(
     total_loss = 0.0
     n_batches = 0
 
+    # CF9: Per-epoch membrane health accumulators
+    _epoch_v_max = 0.0
+    _epoch_v_mean = 0.0
+    _epoch_spike_rate = 0.0
+    _epoch_w_adapt = 0.0
+    _health_batches = 0
+
     pbar = tqdm(loader, desc=f"Epoch {epoch + 1}", leave=False, dynamic_ncols=True)
     for batch_idx, batch in enumerate(pbar):
         # Unpack batch — expect (X, Y, lengths) from collate_variable_length
@@ -581,26 +588,18 @@ def train_one_epoch(
             annealing_factor=annealing_factor,
         )
 
-        # ── Membrane health monitoring (CF7 fix) ──
-        # Logs V_max and spike rate for early detection of runaway
-        # membrane potential or LIF pathway collapse.
-        if batch_idx == 0 and epoch % 10 == 0:
-            with torch.no_grad():
-                lif_potentials = internals["lif_potentials"]
-                v_max = lif_potentials.abs().max().item()
-                v_mean = lif_potentials.abs().mean().item()
-                spike_rate = lif_spikes.float().mean().item()
-                logger.info(
-                    "Epoch %d LIF stats: V_max=%.3f V_mean=%.3f "
-                    "spike_rate=%.4f (threshold=%.2f)",
-                    epoch, v_max, v_mean, spike_rate, lif_threshold,
-                )
-                if v_max > 10.0 * lif_threshold:
-                    logger.warning(
-                        "Epoch %d: V_max=%.2f >> threshold=%.2f — "
-                        "potential membrane runaway detected!",
-                        epoch, v_max, lif_threshold,
-                    )
+        # ── Membrane health monitoring (CF9: per-epoch averages) ──
+        # Tracks V_max, spike_rate, and adaptation current across all
+        # batches for early detection of runaway dynamics or collapse.
+        with torch.no_grad():
+            lif_potentials = internals["lif_potentials"]
+            _epoch_v_max = max(_epoch_v_max, lif_potentials.abs().max().item())
+            _epoch_v_mean += lif_potentials.abs().mean().item()
+            _epoch_spike_rate += lif_spikes.float().mean().item()
+            # Track adaptation current if available in internals
+            if "lif_w_adapt" in internals:
+                _epoch_w_adapt += internals["lif_w_adapt"].abs().mean().item()
+            _health_batches += 1
 
         # ── Backward pass ──
         optimizer.zero_grad()
@@ -671,7 +670,18 @@ def train_one_epoch(
         pbar.set_postfix({"loss": f"{loss.item():.4f}"})
 
     avg_loss = total_loss / max(n_batches, 1)
-    return avg_loss
+
+    # CF9: Compute per-epoch membrane health summary
+    health = {}
+    if _health_batches > 0:
+        health = {
+            "v_max": _epoch_v_max,
+            "v_mean": _epoch_v_mean / _health_batches,
+            "spike_rate": _epoch_spike_rate / _health_batches,
+            "w_adapt": _epoch_w_adapt / _health_batches,
+        }
+
+    return avg_loss, health
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -948,7 +958,7 @@ def train(
                 param.requires_grad = True
 
         # ── Train ─────────────────────────────────────────────
-        train_loss = train_one_epoch(
+        train_loss, health = train_one_epoch(
             model=model,
             loader=train_loader,
             criterion=criterion,
@@ -993,6 +1003,21 @@ def train(
             epoch + 1, config.training.num_epochs,
             train_loss, val_loss, elapsed,
         )
+
+        # ── CF9: Per-epoch membrane health summary ─────────────
+        if health:
+            logger.info(
+                "  Membrane: V_max=%.3f  V_mean=%.3f  spike_rate=%.4f  "
+                "w_adapt=%.4f  (threshold=%.2f)",
+                health["v_max"], health["v_mean"],
+                health["spike_rate"], health["w_adapt"],
+                config.model.lif_threshold,
+            )
+            if health["v_max"] > 10.0 * config.model.lif_threshold:
+                logger.warning(
+                    "  ⚠ V_max=%.2f >> threshold=%.2f — membrane runaway risk!",
+                    health["v_max"], config.model.lif_threshold,
+                )
 
         # ── Checkpointing ─────────────────────────────────────
         # Periodic checkpoint

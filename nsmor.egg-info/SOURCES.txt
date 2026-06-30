@@ -18,7 +18,6 @@ nsmor.egg-info/top_level.txt
 nsmor/analysis/__init__.py
 nsmor/analysis/dynamics.py
 nsmor/analysis/uq.py
-nsmor/pipeline/__init__.py
 nsmor/pipeline/io.py
 nsmor/pipeline/kinematics.py
 nsmor/pipeline/labeling.py

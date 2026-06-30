@@ -1437,7 +1437,8 @@ class NSMoRCore(nn.Module):
         (out_lif, lif_potentials, lif_spikes, lif_thresholds,
          lif_v_final, lif_i_syn_final, lif_refract_final,
          lif_w_adapt_final, lif_rel_refract_final,
-         lif_x_resource_final, lif_u_facil_final) = self._run_lif_path(
+         lif_x_resource_final, lif_u_facil_final,
+         lif_w_adapt_over_time) = self._run_lif_path(
             e_sensory, lengths, lif_state0=lif_state0,
         )
 
@@ -1545,6 +1546,7 @@ class NSMoRCore(nn.Module):
             "lif_potentials": lif_potentials,
             "lif_spikes": lif_spikes,
             "lif_thresholds": lif_thresholds,
+            "lif_w_adapt": lif_w_adapt_over_time,  # CF9: adaptation current over time
             "gru_hidden": out_gru,
         }
 
@@ -1609,7 +1611,7 @@ class NSMoRCore(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor,
                torch.Tensor, torch.Tensor, torch.Tensor,
                torch.Tensor, torch.Tensor, torch.Tensor,
-               torch.Tensor, torch.Tensor]:
+               torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Run the LIF cell step-by-step, masking padded positions.
 
@@ -1621,8 +1623,10 @@ class NSMoRCore(nn.Module):
         Returns:
             ``(out_lif, potentials, spikes, thresholds,
             v_final, i_syn_final, refract_final, w_adapt_final,
-            rel_refract_final, x_resource_final, u_facil_final)``
-            First four are ``(B, T, H)``; last seven are ``(B, H)``.
+            rel_refract_final, x_resource_final, u_facil_final,
+            w_adapt_over_time)``
+            First four and w_adapt_over_time are ``(B, T, H)``;
+            last seven are ``(B, H)``.
             x_resource_final and u_facil_final are ones/zeros when STP disabled.
 
             ``thresholds[:, t, :]`` records the effective threshold used
@@ -1656,6 +1660,7 @@ class NSMoRCore(nn.Module):
         potentials = torch.zeros(B, T, H, device=device)
         spikes = torch.zeros(B, T, H, device=device)
         thresh_over_time = torch.zeros(B, T, H, device=device)
+        w_adapt_over_time = torch.zeros(B, T, H, device=device)  # CF9: track adaptation
 
         for t in range(T):
             inp_t = e_sensory[:, t, :]
@@ -1673,6 +1678,7 @@ class NSMoRCore(nn.Module):
             out_lif[:, t, :] = spike * mask
             potentials[:, t, :] = lif_state[0] * mask
             spikes[:, t, :] = spike * mask
+            w_adapt_over_time[:, t, :] = lif_state[4] * mask  # CF9: adaptation current
             # Record threshold used for spike detection at step t.
             # lif_state[3] = v_thresh_new computed from the INCOMING
             # rel_refract_counter (step t-1 state).  The counter update
@@ -1701,7 +1707,8 @@ class NSMoRCore(nn.Module):
 
         return (out_lif, potentials, spikes, thresh_over_time,
                 v_final, i_syn_final, refract_final, w_adapt_final,
-                rel_refract_final, x_resource_final, u_facil_final)
+                rel_refract_final, x_resource_final, u_facil_final,
+                w_adapt_over_time)
 
 
 # ===============================================================

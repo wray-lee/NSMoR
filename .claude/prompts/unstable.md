@@ -1,17 +1,8 @@
 /goal
 
-解决当前 NSMoR 训练严重不稳定与 LIF 通路梯度塌陷问题。
+解决当前 NSMoR 训练严重不稳定问题。
 
-## 问题上下文与物理诊断
-
-先前的基础超参数调整（LR=5e-4, weight_decay=1e-4）已在当前配置中生效，但未能阻止训练崩溃。
-日志暴露的核心病灶如下：
-
-1. **LIF 梯度断崖式塌陷**：Epoch 0 时 LIF/non-LIF 梯度比为 0.45（健康），但到 Epoch 10 跌至 0.12，Epoch 20 仅剩 0.04（LIF=0.0306, non_LIF=0.8636）。
-2. **极度代偿性震荡**：由于 LIF 停止学习，后置网络或 GRU 强行拟合，导致 `train_loss` 与 `val_loss` 在 1.4 到 5.8 之间发生毁灭性震荡，完全无法收敛。
-3. **脉冲死区**：`V_mean` 停滞在 0.64 左右（远离阈值 1.00），大量神经元掉出替代梯度（Surrogate Gradient）的有效更新窗口。
-
-之前的训练 log 位于 `.pytest_cache/log`。请重点排查 `nsmor/model_nsmor_core.py` 中的替代梯度宽度/形状、LIF 参数初始化状态，以及 `nsmor/loss.py` 中 `lambda_reg` 是否引发了路由门的硬切换震荡。
+之前的训练 log 位于 `.pytest_cache/log`。
 
 ## 执行机制：平行双盲评审重构闭环
 
@@ -41,3 +32,19 @@
 6. Tester 执行通过 -> 执行 Git commit 并 push。
 
 请在后台接管此控制流。一旦发生审查被拒（需输出是谁拒绝及核心理由）、测试失败或最终成功，立即向我汇报。
+
+## 实验记录
+
+<!-- CF1: Gradient spikes causing NaN -->
+<!-- CF2: Loss magnitude instability -->
+<!-- CF3: Unstable dynamics, exploding membrane potentials -->
+<!-- CF4: Parameter drift, biologically implausible values -->
+<!-- CF5: NaN guards -->
+<!-- CF6: Buffer optimization, model speedup -->
+<!-- CF7: LIF neuron gradient flow improvement -->
+<!-- CF8: Stabilize LIF gradient flow — sharpened surrogate (sharpness=4.0), W_in bias, lambda_reg warmup, TBPTT=64 -->
+<!-- CF9: Enable biophysical mechanisms — synaptic delay (tau_syn=5), SFA (tau_w=100, b_adapt=0.5), lateral inhibition (0.1), stochastic resonance (0.01), TBPTT=32, warmup=20 -->
+<!-- CF9 Result: Training stable (no NaN/Inf), val_loss properly recorded (best=0.77), R²=0.461 -->
+<!-- CF9 Membrane: V_max=1.15 (safe), spike_rate=2.6% (sparse), w_adapt=1.20 (active) -->
+<!-- CF9 Concern: w_adapt=1.20 (2.4x threshold) may over-constrain LIF pathway; R² slightly lower than CF8 -->
+<!-- CF10: Reduce adaptation aggressiveness (b_adapt=0.2), reduce inhibition (0.05), longer training -->

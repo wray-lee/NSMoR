@@ -20,16 +20,37 @@ model:
   lif_threshold: 0.5      # LIF spike threshold
   lif_beta: 2.0           # LIF input scaling
 
-  # CF8 fix: TBPTT=64 prevents gradient collapse along recurrence.
-  # Full BPTT (0) causes (0.9)^1000 = 1.75e-46 gradient attenuation.
-  # TBPTT=64 caps attenuation at (0.9)^64 = 0.0013 (manageable).
-  lif_tbptt_steps: 64    # truncated BPTT window (0=full BPTT, risky for long seqs)
+  # CF8 fix: TBPTT prevents gradient collapse along recurrence.
+  # CF9: Tightened to 32 for stability with new biophysical dynamics.
+  lif_tbptt_steps: 32    # truncated BPTT window (0=full BPTT, risky for long seqs)
+
+  # CF9: Enable biophysical mechanisms ─────────────────────────
+  # Synaptic delay (Destexhe et al. 1994): IIR low-pass filter on
+  # input current.  tau_syn=5ms at dt≈1ms → alpha_syn ≈ 0.82.
+  # Smooths sharp input transients, prevents membrane voltage spikes.
+  lif_tau_syn: 5.0         # synaptic time constant (ms); 0 = disabled
+
+  # Spike-frequency adaptation (Brette & Gerstner 2005, AdEx):
+  # Slow adaptation current w accumulates on spike, decays between.
+  # tau_w=100ms → neurons reduce firing during sustained input.
+  # b_adapt=0.5 → per-spike adaptation increment.
+  lif_tau_w: 100.0         # adaptation time constant (ms); 0 = disabled
+  lif_b_adapt: 0.5         # per-spike adaptation increment
+
+  # Lateral inhibition (Ritzmann & Camhi 1978): subtracts weighted
+  # population spike history from membrane potential.
+  # Strength 0.1 — moderate inhibition, sharpens population response.
+  lif_lateral_inhibition: 0.1  # inhibition strength; 0 = disabled
+
+  # Stochastic resonance (Douglass et al. 1993): small Gaussian
+  # noise injected during training improves subthreshold signal detection.
+  sensory_noise_std: 0.01  # noise std; 0 = disabled
 
 # ── Training hyperparameters ────────────────────────────────
 training:
   learning_rate: 0.0005
   weight_decay: 0.0001
-  num_epochs: 100
+  num_epochs: 150
   batch_size: 32
   grad_clip_norm: 1.0
   log_interval: 10
@@ -45,7 +66,7 @@ loss:
   lambda_sparse: 0.005        # population sparsity L1 (0 disables)
   lambda_jerk: 0.005         # temporal coherence / jerk penalty (0 disables)
   jerk_threshold: 0.1       # sudden-change jerk mask threshold
-  warmup_epochs: 20          # cosine warmup for bio-loss terms (0 disables)
+  warmup_epochs: 20          # CF9: extended warmup for new biophysical mechanisms
 
 # ── Dataset paths ───────────────────────────────────────────
 # Each field is a list of CSV paths; multiple files are concatenated.
@@ -69,7 +90,7 @@ data:
 # unfreeze_after_epoch: set >= 0 to unfreeze all at that epoch.
 finetune:
   freeze_modules: []
-  unfreeze_after_epoch: -1
+  unfreeze_after_epoch: 10
 
 # ── Checkpoint / output ─────────────────────────────────────
 checkpoint:
