@@ -123,7 +123,6 @@ class MCMCPriorSKLearn:
 
         self.num_classes = num_classes
         self.model = LogisticRegression(
-            multi_class="multinomial",
             solver="lbfgs",
             max_iter=1000,
             random_state=random_state,

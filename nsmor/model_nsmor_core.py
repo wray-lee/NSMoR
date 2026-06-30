@@ -1039,7 +1039,7 @@ class MoRRouter(nn.Module):
         """
         combined = torch.cat([e_sensory, mcmc_prior], dim=-1)
         logits = self.gate(combined)
-        return torch.sigmoid(logits)
+        return torch.softmax(logits, dim=-1)
 
 
 # ===============================================================

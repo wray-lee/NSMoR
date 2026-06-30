@@ -1273,18 +1273,17 @@ class TestBiophysics:
         # Combined with synaptic IIR (alpha_syn=0.607, sum=2.56x),
         # theoretical worst-case amplification = 8.5 * 2.56 ≈ 21.8x.
         #
-        # However, sigmoid'(V-theta) << 0.25 for most neurons (far from
-        # threshold), so effective amplification is much smaller.
+        # CF8 fix: surrogate gradient sharpness raised from 1.0 to 4.0,
+        # so peak sigmoid'(V-theta) is 1.0 instead of 0.25 (4×).
+        # Post-CF8 empirical gradient norm ≈ 3.87 for this config.
         #
-        # Rather than hand-wave, we use the empirical gradient norm
-        # (measured at ~0.27 for this configuration) and set threshold
-        # at 10x empirical = 3.0.  This catches:
+        # Threshold = 10× empirical ≈ 40.  This catches:
         # - Gradient explosion (NaN/Inf)
-        # - Major implementation bugs (100x+ increase)
+        # - Major implementation bugs (10x+ increase from post-CF8 baseline)
         # While allowing for reasonable variance across random seeds.
-        assert grad_norm < 3.0, (
+        assert grad_norm < 40.0, (
             f"W_in gradient norm too large: {grad_norm:.4f} — "
-            f"empirical ~0.27, threshold 3.0 (10x)"
+            f"empirical ~3.87 (post-CF8), threshold 40.0 (10x)"
         )
 
     # ------------------------------------------------------------------
