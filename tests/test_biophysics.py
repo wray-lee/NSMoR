@@ -760,21 +760,23 @@ class TestBiophysics:
         )
         assert y2.shape == (1, 1)
         # Verify dendritic state and spike history are tracked
-        assert "lif_dendritic_state" in states2, (
-            "lif_dendritic_state missing from states_out"
+        # After Hybrid Funnel refactoring, dendritic state lives on
+        # FrontendEncoder and is stored as "frontend_dendritic_state".
+        assert "frontend_dendritic_state" in states2, (
+            "frontend_dendritic_state missing from states_out"
         )
         assert "lif_spike_history" in states2, (
             "lif_spike_history missing from states_out"
         )
         # CF4: dendritic state is visual-only (B, sensory_dim//2=2), not (B, sensory_dim)
-        assert states2["lif_dendritic_state"].shape == (1, 2)
+        assert states2["frontend_dendritic_state"].shape == (1, 2)
         assert states2["lif_spike_history"].shape == (1, self.H)
         # Step 3: verify states can be passed back
         y3, int3, states3 = model(
             X_step, len_step, return_internals=True, states=states2,
         )
         assert y3.shape == (1, 1)
-        assert "lif_dendritic_state" in states3
+        assert "frontend_dendritic_state" in states3
         assert "lif_spike_history" in states3
 
     def test_stateful_mechanisms_differ_with_vs_without_state(self):
