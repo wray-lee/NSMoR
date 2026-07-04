@@ -1,14 +1,14 @@
-# NSMoR — Data Pipeline & MCMC Module
+# NSMoR — Hybrid Funnel Architecture
 
 **Bio-inspired Multi-sensory Object Recognition** for cricket neural modelling.
 
-This module provides the deterministic data preprocessing pipeline and
-the MCMC (Markov Chain Monte Carlo) probabilistic prior generator.
-It bridges raw CSV outputs (events + kinematics) into structured
-PyTorch DataLoaders for the downstream continuous model.
+NSMoR implements a **Mixture-of-Recursions (MoR)** dual-pathway recurrent
+network with a **Hybrid Funnel** training strategy that separates sensory
+encoding from bio-physical decision-making via gradient isolation.
 
-> **Phase 1 only** — data quality, shape verification, and MCMC probability.
-> No RNN / GRU network is included in this phase.
+> **Hybrid Funnel** — two-phase training: Phase 1 fits the sensory frontend
+> with simple MSE; Phase 2 freezes the frontend and trains the bio-decision
+> core with ATP / sparsity / jerk penalties.
 
 ---
 
@@ -17,6 +17,20 @@ PyTorch DataLoaders for the downstream continuous model.
 ```
 nsmor/
 ├── config.py                 # Frozen dataclasses: thresholds, dimensions, windows
+├── config_parser.py          # YAML experiment configuration
+├── model_nsmor_core.py       # Hybrid Funnel: FrontendEncoder + BioDecisionCore
+│   ├── FrontendEncoder       #   Dendritic filtering + SensoryEncoder (Phase 1)
+│   ├── BioDecisionCore       #   LIF + GRU + Router + DirectionHead (Phase 2)
+│   ├── LIFCell               #   Leaky Integrate-and-Fire spiking neuron
+│   ├── GRUUnit               #   Packed-sequence GRU pathway
+│   ├── MoRRouter             #   Learned per-step LIF/GRU blending gate
+│   └── DirectionHead         #   Final decoder: LayerNorm → ReLU → Linear
+├── loss.py                   # Hybrid Funnel losses
+│   ├── FrontendLoss          #   Phase 1: masked MSE only
+│   ├── BioDecisionLoss       #   Phase 2: MSE + router reg + ATP + sparsity + jerk
+│   └── BioJointLoss          #   Backward-compatible wrapper
+├── checkpoint.py             # Deterministic save/load with full RNG state
+├── model_utils.py            # Canonical model loading from checkpoints
 ├── pipeline/
 │   ├── io.py                 # CSV loading, session concatenation, per-trial extraction
 │   ├── kinematics.py         # Savitzky-Golay / Gaussian smoothing, velocity / accel
@@ -24,6 +38,9 @@ nsmor/
 ├── data_extractor.py         # TTC-50ms snapshot + Trial-Start anchored sequences
 ├── mcmc_module.py            # PyTorch nn.Module + sklearn wrapper + Markov estimator
 └── nsmor_dataloader.py       # PyTorch Dataset + DataLoader with shape assertions
+
+scripts/
+└── train.py                  # Two-phase training engine (--phase1_epochs)
 ```
 
 ---
@@ -188,17 +205,36 @@ pytest tests/ -v
 
 ## Engineering & Architecture Capabilities
 
-### Modular Architecture (LIF + GRU + Causal Gate)
+### Hybrid Funnel Architecture (Frontend → .detach() → Backend)
 
-NSMoR implements a **Mixture-of-Recursions (MoR)** architecture with fully decoupled sub-modules:
+NSMoR implements a **two-stage** architecture with gradient isolation:
 
-| Module          | Class            | Purpose                                                                   |
-| --------------- | ---------------- | ------------------------------------------------------------------------- |
-| Sensory Encoder | `SensoryEncoder` | Maps raw 4-D sensory features to hidden representation                    |
-| LIF Pathway     | `LIFCell`        | Leaky Integrate-and-Fire spiking neuron for fast, event-driven transients |
-| GRU Pathway     | `GRUUnit`        | Standard GRU for smooth, continuous temporal integration                  |
-| Causal Gate     | `MoRRouter`      | Learned routing network blending LIF/GRU outputs per timestep             |
-| Decoder         | `DirectionHead`  | Final output layer for behavior/direction prediction                      |
+```
+X_batch [B,T,8] ──┬── Sensory_X [B,T,4] ─→ FrontendEncoder ─→ e_sensory [B,T,H]
+                   │                                                    │
+                   │                                          requires_grad toggle
+                   │                                                    │
+                   │                                         BioDecisionCore
+                   │    MCMC_Prior [B,T,4] ─────────────────────→      │
+                   │                                                    │
+                   │                                   ┌── LIF Path  ─→ out_lif  [B,T,H]
+                   │                                   ├── GRU Path  ─→ out_gru  [B,T,H]
+                   │                                   ├── Router    ─→ gates    [B,T,2]
+                   │                                   └── Integrate ─→ y_pred   [B,T]
+```
+
+| Stage | Module           | Class             | Phase 1 | Phase 2 |
+| ----- | ---------------- | ----------------- | ------- | ------- |
+| 1     | Dendritic Filter | (in FrontendEncoder) | trainable | frozen |
+| 1     | Sensory Encoder  | `SensoryEncoder`  | trainable | frozen |
+| 2     | LIF Pathway      | `LIFCell`         | frozen    | trainable |
+| 2     | GRU Pathway      | `GRUUnit`         | frozen    | trainable |
+| 2     | Causal Gate      | `MoRRouter`       | frozen    | trainable |
+| 2     | Decoder          | `DirectionHead`   | frozen    | trainable |
+
+**Gradient isolation** is achieved via `requires_grad` toggling — not
+unconditional `.detach()` — so Phase 1 MSE gradients flow through the
+frozen backend to reach the trainable frontend.
 
 ```python
 from nsmor.model_nsmor_core import NSMoRCore
@@ -213,6 +249,11 @@ model = NSMoRCore(
     lif_threshold=1.0,
     lif_beta=0.5,
 )
+
+# Sub-modules accessible as before (backward compatible)
+model.sensory_encoder   # → model.frontend.sensory_encoder
+model.lif_cell          # → model.backend.lif_cell
+model.router            # → model.backend.router
 ```
 
 ### White-Box Weight/Activation Extraction
@@ -359,43 +400,85 @@ loader = create_dataloader_from_config(
 
 ## Training & Analysis Components
 
-### Bio-Constrained Loss Function (`nsmor.loss`)
+### Hybrid Funnel Loss Functions (`nsmor.loss`)
 
-Custom `nn.Module` that combines masked MSE with biological router regularization:
+Separate losses for each training phase:
+
+**Phase 1 — `FrontendLoss`** (simple MSE):
+
+```python
+from nsmor.loss import FrontendLoss
+
+criterion = FrontendLoss(reduction="mean")
+loss = criterion(y_pred, y_true, lengths)
+```
+
+**Phase 2 — `BioDecisionLoss`** (MSE + bio penalties):
+
+```python
+from nsmor.loss import BioDecisionLoss
+
+criterion = BioDecisionLoss(reduction="mean", target_rate=0.05)
+loss = criterion(
+    y_pred, y_true, lengths,
+    g_gru=g_gru,             # (B, T, 1) — from routing_gates[:, :, 1:2]
+    lambda_reg=0.01,
+    lif_spikes=lif_spikes,   # (B, T, H) — from internals["lif_spikes"]
+    lambda_energy=1e-3,      # ATP metabolic cost
+    lambda_sparse=1e-2,      # Population sparsity L1
+    lambda_jerk=1e-3,        # Temporal coherence (jerk penalty)
+    annealing_factor=warmup, # Cosine warmup scaling
+)
+```
+
+**Backward-compatible wrapper — `BioJointLoss`** (delegates to `BioDecisionLoss`):
 
 ```python
 from nsmor.loss import BioJointLoss
 
 criterion = BioJointLoss(reduction="mean")
-loss = criterion(
-    y_pred=predictions,      # (B, T)
-    y_true=targets,          # (B, T)
-    lengths=lengths,         # (B,)
-    g_gru=g_gru,             # (B, T, 1) — from internals["routing_gates"][:, :, 1:2]
-    lambda_reg=0.01,
-)
+loss = criterion(y_pred, y_true, lengths, g_gru, lambda_reg=0.01)
 ```
 
-**Masked MSE:** Computes MSE only over valid (non-padded) time-steps using the mask `torch.arange(T) < lengths.unsqueeze(1)`.
-
-**Router Regularization:** Prevents the MoR Router from collapsing onto the higher-capacity GRU pathway:
-
-$$\mathcal{L} = \text{MaskedMSE}(y_{\text{pred}}, y_{\text{true}}) + \lambda \cdot \frac{1}{N} \sum_{b,t} g_{\text{gru}}(b,t) \cdot \text{mask}(b,t)$$
+| Loss Component           | Formula | Phase |
+| ------------------------ | ------- | ----- |
+| Masked MSE               | $\frac{1}{N}\sum(y_{\text{pred}} - y_{\text{true}})^2 \cdot \text{mask}$ | Both |
+| Router Regularization    | $\lambda_{\text{reg}} \cdot \frac{1}{N}\sum g_{\text{gru}} \cdot \text{mask}$ | 2 |
+| ATP Metabolic Cost       | $\lambda_{\text{energy}} \cdot \bar{r}_{\text{spike}}$ | 2 |
+| Population Sparsity (L1) | $\lambda_{\text{sparse}} \cdot \sqrt{H} \cdot |\hat{p} - p_{\text{target}}|$ | 2 |
+| Temporal Coherence       | $\lambda_{\text{jerk}} \cdot \text{mean}(\text{jerk}^2)$ | 2 |
 
 ### Main Training Engine (`scripts/train.py`)
 
-Full training pipeline with validation and checkpointing:
+Full training pipeline with **two-phase** (Hybrid Funnel) or single-phase mode:
 
 ```bash
-python scripts/train.py --config config/default.yaml
-python scripts/train.py --config config/default.yaml --lr 5e-4 --epochs 200
+# Single-phase (backward compatible — all parameters trainable)
+python scripts/train.py --config config/default.yaml --epochs 100
+
+# Two-phase: Phase 1 (30 epochs, frontend MSE) → Phase 2 (70 epochs, bio loss)
+python scripts/train.py --config config/default.yaml --epochs 100 --phase1_epochs 30
+
+# Skip Phase 1, start directly with Phase 2 (bio loss from epoch 0)
+python scripts/train.py --config config/default.yaml --epochs 100 --phase1_epochs 0
 ```
+
+**Two-phase training schedule:**
+
+| Epochs | Phase | Trainable | Loss | Optimizer |
+| ------ | ----- | --------- | ---- | --------- |
+| 0 … `phase1_epochs-1` | 1 | FrontendEncoder | FrontendLoss (MSE) | AdamW (single LR) |
+| `phase1_epochs` … end | 2 | BioDecisionCore | BioDecisionLoss (full bio) | AdamW (LIF 0.3× LR) |
 
 Features:
 
 - YAML config + CLI overrides via `config_parser`
-- AdamW optimizer with gradient clipping
-- `return_internals=True` for router gate extraction during training
+- Two-phase training with automatic phase transition (`--phase1_epochs`)
+- AdamW optimizer with per-pathway learning rates (LIF 0.3× base LR)
+- AMP (FP16 forward/backward, FP32 master weights) for RTX 5060 Ti
+- Cosine warmup for bio-loss regularization terms
+- NaN/Inf loss guard and post-clip gradient finiteness check
+- Membrane health monitoring (V_max, spike_rate, w_adapt per epoch)
 - Best-model checkpoint (`best_model.pth`) on validation improvement
 - Periodic checkpoints (`epoch_X.pth`) at configurable intervals
 - Automatic unfreezing at scheduled epoch
