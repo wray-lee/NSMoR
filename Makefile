@@ -54,8 +54,13 @@ data: ## Run ETL pipeline (prepare_data.py)
 	$(PYTHON) scripts/prepare_data.py --raw_dir $(RAW) --output $(DATA)
 
 # ── Training ─────────────────────────────────────────────────
-train: ## Run training engine (train.py)
+pretrain:
+	$(PYTHON) scripts/train.py --config $(CONFIG) --phase1_epochs $(EPOCHS) --output_dir $(RUN_DIR)
+posttrain:
 	$(PYTHON) scripts/train.py --config $(CONFIG) --epochs $(EPOCHS) --output_dir $(RUN_DIR)
+
+train: ## Run training engine (train.py)
+	$(PYTHON) scripts/train.py --config $(CONFIG) --epochs $(EPOCHS) --phase1_epochs $(EPOCHS) --output_dir $(RUN_DIR)
 
 # ── Analysis (all 5 scripts) ─────────────────────────────────
 analyze: dynamics lesion jacobian integration psychophysics ## Run all analysis scripts

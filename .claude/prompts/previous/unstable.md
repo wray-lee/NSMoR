@@ -32,19 +32,3 @@
 6. Tester 执行通过 -> 执行 Git commit 并 push。
 
 请在后台接管此控制流。一旦发生审查被拒（需输出是谁拒绝及核心理由）、测试失败或最终成功，立即向我汇报。
-
-## 实验记录
-
-<!-- CF1: Gradient spikes causing NaN -->
-<!-- CF2: Loss magnitude instability -->
-<!-- CF3: Unstable dynamics, exploding membrane potentials -->
-<!-- CF4: Parameter drift, biologically implausible values -->
-<!-- CF5: NaN guards -->
-<!-- CF6: Buffer optimization, model speedup -->
-<!-- CF7: LIF neuron gradient flow improvement -->
-<!-- CF8: Stabilize LIF gradient flow — sharpened surrogate (sharpness=4.0), W_in bias, lambda_reg warmup, TBPTT=64 -->
-<!-- CF9: Enable biophysical mechanisms — synaptic delay (tau_syn=5), SFA (tau_w=100, b_adapt=0.5), lateral inhibition (0.1), stochastic resonance (0.01), TBPTT=32, warmup=20 -->
-<!-- CF9 Result: Training stable (no NaN/Inf), val_loss properly recorded (best=0.77), R²=0.461 -->
-<!-- CF9 Membrane: V_max=1.15 (safe), spike_rate=2.6% (sparse), w_adapt=1.20 (active) -->
-<!-- CF9 Concern: w_adapt=1.20 (2.4x threshold) may over-constrain LIF pathway; R² slightly lower than CF8 -->
-<!-- CF10: Reduce adaptation aggressiveness (b_adapt=0.2), reduce inhibition (0.05), longer training -->
