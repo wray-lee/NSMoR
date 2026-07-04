@@ -49,7 +49,7 @@ from tqdm import tqdm
 from nsmor.checkpoint import load_checkpoint, save_checkpoint
 from nsmor.config import DEFAULT_FEATURE
 from nsmor.config_parser import ExperimentConfig
-from nsmor.loss import BioJointLoss
+from nsmor.loss import BioJointLoss, BioDecisionLoss, FrontendLoss
 from nsmor.model_nsmor_core import NSMoRCore
 
 # ── Logging setup ──────────────────────────────────────────────
@@ -154,6 +154,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Sub-modules to freeze (e.g. lif_cell router).",
     )
 
+    # ── Two-phase training (Hybrid Funnel) ────────────────────
+    parser.add_argument(
+        "--phase1_epochs",
+        type=int,
+        default=None,
+        help="Phase 1 epochs: train frontend only (MSE loss). "
+             "Phase 2 runs for remaining epochs. 0 = skip phase 1. "
+             "None = single-phase (backward compatible).",
+    )
+
     # ── Checkpointing ─────────────────────────────────────────
     parser.add_argument(
         "--resume",
@@ -171,9 +181,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def build_config(argv: Optional[Sequence[str]] = None) -> Tuple[ExperimentConfig, float]:
+def build_config(argv: Optional[Sequence[str]] = None) -> Tuple[ExperimentConfig, float, Optional[int]]:
     """
-    Parse CLI arguments and return a fully resolved config plus lambda_reg.
+    Parse CLI arguments and return a fully resolved config, lambda_reg,
+    and phase1_epochs.
 
     If ``--config`` is given, YAML is loaded first, then CLI flags
     override individual values.
@@ -182,7 +193,9 @@ def build_config(argv: Optional[Sequence[str]] = None) -> Tuple[ExperimentConfig
         argv: Argument list (defaults to ``sys.argv[1:]``).
 
     Returns:
-        ``(config, lambda_reg)`` tuple.
+        ``(config, lambda_reg, phase1_epochs)`` tuple.
+        ``phase1_epochs`` is ``None`` when two-phase training is disabled
+        (backward-compatible single-phase mode).
     """
     parser = build_arg_parser()
     args = parser.parse_args(argv)
@@ -211,7 +224,7 @@ def build_config(argv: Optional[Sequence[str]] = None) -> Tuple[ExperimentConfig
     if args.output_dir is not None:
         config.checkpoint.output_dir = args.output_dir
 
-    return config, args.lambda_reg
+    return config, args.lambda_reg, args.phase1_epochs
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -522,7 +535,7 @@ def compute_warmup_factor(epoch: int, warmup_epochs: int) -> float:
 def train_one_epoch(
     model: NSMoRCore,
     loader: torch.utils.data.DataLoader,
-    criterion: BioJointLoss,
+    criterion,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     lambda_reg: float = 0.01,
@@ -536,6 +549,7 @@ def train_one_epoch(
     lif_threshold: float = 1.0,
     scaler: Optional[torch.amp.GradScaler] = None,
     amp_ctx = None,
+    phase: int = 0,
 ) -> float:
     """
     Run one training epoch.
@@ -543,23 +557,21 @@ def train_one_epoch(
     Args:
         model: The NSMoR model.
         loader: Training DataLoader yielding ``(X_batch, Y_batch, lengths)``.
-        criterion: Loss function.
+        criterion: Loss function — either :class:`FrontendLoss` (phase 1)
+            or :class:`BioDecisionLoss` / :class:`BioJointLoss` (phase 2).
         optimizer: Optimizer.
         device: Device to train on.
-        lambda_reg: Router regularization weight.  NOW scaled by
-            annealing_factor (CF8 fix) to prevent premature router
-            forcing before LIF pathway stabilizes.
-        lambda_energy: ATP metabolic cost weight (base value before
-            annealing).
-        lambda_sparse: Population sparsity L1 weight (base value).
-        lambda_jerk: Temporal coherence weight (base value).
-        annealing_factor: Scaling factor for lambda_energy, lambda_sparse,
-            lambda_jerk, and lambda_reg (CF8 fix).  Typically equals the
-            warmup factor from ``compute_warmup_factor(epoch, warmup_epochs)``.
-            Default 1.0 (no annealing).
+        lambda_reg: Router regularization weight.
+        lambda_energy: ATP metabolic cost weight.
+        lambda_sparse: Population sparsity L1 weight.
+        lambda_jerk: Temporal coherence weight.
+        annealing_factor: Scaling factor for bio-loss lambdas.
         grad_clip_norm: Max gradient norm for clipping.
         log_interval: Log every N batches.
         epoch: Current epoch number (for logging).
+        phase: Training phase — ``1`` = frontend-only (FrontendLoss),
+            ``2`` = backend-only (BioDecisionLoss), ``0`` = single-phase
+            (BioJointLoss, backward compatible).
 
     Returns:
         Average training loss for this epoch.
@@ -594,18 +606,27 @@ def train_one_epoch(
             lif_spikes = internals["lif_spikes"]                    # (B, T, H)
 
             # ── Compute loss ──
-            loss = criterion(
-                y_pred=y_pred,
-                y_true=y_batch,
-                lengths=lengths,
-                g_gru=g_gru,
-                lambda_reg=lambda_reg,
-                lif_spikes=lif_spikes,
-                lambda_energy=lambda_energy,
-                lambda_sparse=lambda_sparse,
-                lambda_jerk=lambda_jerk,
-                annealing_factor=annealing_factor,
-            )
+            if phase == 1:
+                # Phase 1: FrontendLoss — MSE only, no bio penalties
+                loss = criterion(
+                    y_pred=y_pred,
+                    y_true=y_batch,
+                    lengths=lengths,
+                )
+            else:
+                # Phase 2 / single-phase: full bio-constrained loss
+                loss = criterion(
+                    y_pred=y_pred,
+                    y_true=y_batch,
+                    lengths=lengths,
+                    g_gru=g_gru,
+                    lambda_reg=lambda_reg,
+                    lif_spikes=lif_spikes,
+                    lambda_energy=lambda_energy,
+                    lambda_sparse=lambda_sparse,
+                    lambda_jerk=lambda_jerk,
+                    annealing_factor=annealing_factor,
+                )
 
         # ── Membrane health monitoring (CF9: per-epoch averages) ──
         # Tracks V_max, spike_rate, and adaptation current across all
@@ -724,12 +745,13 @@ def train_one_epoch(
 def validate(
     model: NSMoRCore,
     loader: torch.utils.data.DataLoader,
-    criterion: BioJointLoss,
+    criterion,
     device: torch.device,
     lambda_reg: float = 0.01,
     lambda_energy: float = 0.0,
     lambda_sparse: float = 0.0,
     lambda_jerk: float = 0.0,
+    phase: int = 0,
 ) -> float:
     """
     Run validation (no gradient computation).
@@ -740,16 +762,10 @@ def validate(
         criterion: Loss function.
         device: Device.
         lambda_reg: Router regularization weight.
-        lambda_energy: ATP metabolic cost weight (full value, NOT annealed).
-        lambda_sparse: Population sparsity L1 weight (full value).
-        lambda_jerk: Temporal coherence weight (full value).
-
-    Note:
-        Validation uses FULL lambda values (no annealing_factor).
-        This is intentional: annealing would bias best_model selection
-        toward early epochs where bio-loss is artificially suppressed,
-        producing a lower val_loss that doesn't reflect true performance.
-        See CF1 fix in train() for details.
+        lambda_energy: ATP metabolic cost weight.
+        lambda_sparse: Population sparsity L1 weight.
+        lambda_jerk: Temporal coherence weight.
+        phase: Training phase (1=frontend, 2=backend, 0=single-phase).
 
     Returns:
         Average validation loss.
@@ -766,20 +782,29 @@ def validate(
         lengths = lengths.to(device).contiguous()
 
         y_pred, internals = model(x_batch, lengths, return_internals=True)
-        g_gru = internals["routing_gates"][:, :, 1:2]
-        lif_spikes = internals["lif_spikes"]
 
-        loss = criterion(
-            y_pred=y_pred,
-            y_true=y_batch,
-            lengths=lengths,
-            g_gru=g_gru,
-            lambda_reg=lambda_reg,
-            lif_spikes=lif_spikes,
-            lambda_energy=lambda_energy,
-            lambda_sparse=lambda_sparse,
-            lambda_jerk=lambda_jerk,
-        )
+        if phase == 1:
+            # Phase 1: FrontendLoss — MSE only
+            loss = criterion(
+                y_pred=y_pred,
+                y_true=y_batch,
+                lengths=lengths,
+            )
+        else:
+            # Phase 2 / single-phase: full bio loss
+            g_gru = internals["routing_gates"][:, :, 1:2]
+            lif_spikes = internals["lif_spikes"]
+            loss = criterion(
+                y_pred=y_pred,
+                y_true=y_batch,
+                lengths=lengths,
+                g_gru=g_gru,
+                lambda_reg=lambda_reg,
+                lif_spikes=lif_spikes,
+                lambda_energy=lambda_energy,
+                lambda_sparse=lambda_sparse,
+                lambda_jerk=lambda_jerk,
+            )
 
         total_loss += loss.item()
         n_batches += 1
@@ -885,16 +910,37 @@ def plot_loss_curve(
 def train(
     config: ExperimentConfig,
     lambda_reg: float = 0.01,
+    phase1_epochs: Optional[int] = None,
 ) -> Dict[str, float]:
     """
     Full training pipeline.
 
+    Supports **two-phase training** (Hybrid Funnel) when
+    ``phase1_epochs`` is set:
+
+    - **Phase 1** (epochs 0 … phase1_epochs-1):
+      Freeze :class:`BioDecisionCore`, train
+      :class:`FrontendEncoder` with :class:`FrontendLoss`
+      (simple MSE).  The ``.detach()`` boundary ensures
+      gradients never reach the backend.
+
+    - **Phase 2** (epochs phase1_epochs … num_epochs-1):
+      Freeze ``FrontendEncoder``, train ``BioDecisionCore``
+      with :class:`BioDecisionLoss` (MSE + router reg +
+      ATP + sparsity + jerk).
+
+    When ``phase1_epochs`` is ``None`` (default), the pipeline
+    runs in single-phase mode — fully backward compatible.
+
     Args:
         config: Parsed experiment configuration.
-        lambda_reg: Router regularization weight for BioJointLoss.
+        lambda_reg: Router regularization weight.
+        phase1_epochs: Number of Phase 1 epochs.  ``None`` =
+            single-phase mode (backward compatible).  ``0`` =
+            skip Phase 1 entirely (start with Phase 2).
 
     Returns:
-        Dictionary with ``"best_val_loss"`` and ``"final_train_loss"``.
+        Dictionary with ``"best_val_loss`` and ``"final_train_loss"``.
 
     Raises:
         ValueError: If no training data is provided (loader is None).
@@ -917,12 +963,62 @@ def train(
         if isinstance(m, nn.RNNBase):
             m.flatten_parameters()
 
-    optimizer = build_optimizer(model, config)
+    # ── Two-phase training setup (Hybrid Funnel) ──────────────
+    # phase1_epochs=None → single-phase (backward compatible)
+    # phase1_epochs=0    → skip Phase 1, start with Phase 2
+    # phase1_epochs=N    → Phase 1 for N epochs, then Phase 2
+    two_phase = phase1_epochs is not None
+    if two_phase:
+        phase2_epochs = config.training.num_epochs - phase1_epochs
+        logger.info("=" * 60)
+        logger.info("Two-phase training (Hybrid Funnel): Phase 1 = %d epochs, Phase 2 = %d epochs",
+                     phase1_epochs, phase2_epochs)
+        logger.info("=" * 60)
+
+        # Phase 1: Freeze backend, train frontend with FrontendLoss
+        # Phase 2: Freeze frontend, train backend with BioDecisionLoss
+        frontend_criterion = FrontendLoss(reduction=config.loss.reduction).to(device)
+        backend_criterion = BioDecisionLoss(
+            reduction=config.loss.reduction,
+            target_rate=config.loss.target_rate,
+        ).to(device)
+
+        if phase1_epochs > 0:
+            # Start in Phase 1: freeze backend, train frontend
+            for param in model.backend.parameters():
+                param.requires_grad = False
+            for param in model.frontend.parameters():
+                param.requires_grad = True
+            optimizer = torch.optim.AdamW(
+                model.frontend.parameters(),
+                lr=config.training.learning_rate,
+                weight_decay=config.training.weight_decay,
+            )
+            criterion = frontend_criterion
+            current_phase = 1
+        else:
+            # phase1_epochs == 0: skip Phase 1, start with Phase 2
+            for param in model.frontend.parameters():
+                param.requires_grad = False
+            for param in model.backend.parameters():
+                param.requires_grad = True
+            base_lr = config.training.learning_rate
+            lif_lr = base_lr * 0.3
+            lif_params = list(model.backend.lif_cell.parameters())
+            lif_param_ids = {id(p) for p in lif_params}
+            other_backend = [p for p in model.backend.parameters() if id(p) not in lif_param_ids]
+            optimizer = torch.optim.AdamW([
+                {"params": other_backend, "lr": base_lr, "name": "non_lif"},
+                {"params": lif_params, "lr": lif_lr, "name": "lif"},
+            ], weight_decay=config.training.weight_decay)
+            criterion = backend_criterion
+            current_phase = 2
+    else:
+        optimizer = build_optimizer(model, config)
+        criterion = build_loss(config)
+        current_phase = 0  # single-phase mode
 
     # ── Mixed Precision (AMP) ─────────────────────────────────
-    # 5060 Ti has strong FP16 Tensor Cores.  AMP keeps master weights
-    # in FP32 but runs forward/backward in FP16, cutting memory ~40%
-    # and improving throughput on compute-bound workloads.
     use_amp = device.type == "cuda"
     scaler = torch.amp.GradScaler(enabled=use_amp)
     amp_ctx = lambda: torch.amp.autocast(device_type="cuda", enabled=use_amp)
@@ -931,7 +1027,8 @@ def train(
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=config.training.num_epochs, eta_min=1e-6,
     )
-    criterion = build_loss(config)
+    if not two_phase:
+        pass  # criterion already set above
     train_loader, val_loader = build_dataloaders(config)
 
     if train_loader is None:
@@ -984,6 +1081,36 @@ def train(
     for epoch in range(start_epoch, config.training.num_epochs):
         t0 = time.time()
 
+        # ── Phase transition (Hybrid Funnel) ──────────────────
+        if two_phase and current_phase == 1 and epoch >= phase1_epochs:
+            logger.info("=" * 60)
+            logger.info("Phase 1 → Phase 2 transition at epoch %d", epoch)
+            logger.info("Freezing frontend, unfreezing backend")
+            logger.info("=" * 60)
+
+            # Freeze frontend, unfreeze backend
+            for param in model.frontend.parameters():
+                param.requires_grad = False
+            for param in model.backend.parameters():
+                param.requires_grad = True
+
+            # New optimizer for backend only (with per-pathway LRs)
+            base_lr = config.training.learning_rate
+            lif_lr = base_lr * 0.3
+            lif_params = list(model.backend.lif_cell.parameters())
+            lif_param_ids = {id(p) for p in lif_params}
+            other_backend = [p for p in model.backend.parameters() if id(p) not in lif_param_ids]
+            optimizer = torch.optim.AdamW([
+                {"params": other_backend, "lr": base_lr, "name": "non_lif"},
+                {"params": lif_params, "lr": lif_lr, "name": "lif"},
+            ], weight_decay=config.training.weight_decay)
+
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=config.training.num_epochs - epoch, eta_min=1e-6,
+            )
+            criterion = backend_criterion
+            current_phase = 2
+
         # ── Warmup factor for bio-loss terms AND lambda_reg ──
         # CF8 fix: lambda_reg is now also scaled by warmup_factor.
         # During early epochs, the LIF pathway needs to stabilize
@@ -1018,16 +1145,13 @@ def train(
             lif_threshold=config.model.lif_threshold,
             scaler=scaler,
             amp_ctx=amp_ctx,
+            phase=current_phase,
         )
         scheduler.step()
         history["train_loss"].append(train_loss)
 
         # ── Validate ──────────────────────────────────────────
         # CF1 fix: Validation uses FULL lambda values (no warmup scaling).
-        # Warmup only applies to training gradients.  If validation also
-        # scaled by warmup_factor, best_model selection would be biased
-        # toward early epochs where bio-loss is artificially suppressed,
-        # producing a lower val_loss that doesn't reflect true performance.
         val_loss = float("inf")
         if val_loader is not None:
             val_loss = validate(
@@ -1039,6 +1163,7 @@ def train(
                 lambda_energy=config.loss.lambda_energy,
                 lambda_sparse=config.loss.lambda_sparse,
                 lambda_jerk=config.loss.lambda_jerk,
+                phase=current_phase,
             )
             history["val_loss"].append(val_loss)
 
@@ -1155,11 +1280,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     Args:
         argv: Argument list (defaults to ``sys.argv[1:]``).
     """
-    config, lambda_reg = build_config(argv)
+    config, lambda_reg, phase1_epochs = build_config(argv)
     logger.info("Config loaded: %s", config.checkpoint.output_dir)
 
     output_dir = Path(config.checkpoint.output_dir)
-    results = train(config, lambda_reg=lambda_reg)
+    results = train(config, lambda_reg=lambda_reg, phase1_epochs=phase1_epochs)
     train_log_path = output_dir / "train.log"
     with open(train_log_path, "w") as f:
         json.dump(results, f, indent=2)

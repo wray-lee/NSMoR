@@ -1078,41 +1078,164 @@ class DirectionHead(nn.Module):
 # 6.  NSMoR Core Network
 # ===============================================================
 
-_FREEZABLE_MODULES = frozenset({
-    "sensory_encoder",
-    "lif_cell",
-    "gru_unit",
-    "router",
-    "direction_head",
-})
+# ===============================================================
+# 6a.  Frontend Encoder (Hybrid Funnel — Stage 1)
+# ===============================================================
 
-
-class NSMoRCore(nn.Module):
+class FrontendEncoder(nn.Module):
     """
-    Mixture-of-Recursions (MoR) — dual-pathway recurrent network.
+    Frontend encoder for the Hybrid Funnel architecture.
 
-    Architecture::
+    Encapsulates dendritic compartmentalization (IIR filtering on
+    visual channels) and :class:`SensoryEncoder` into a single
+    front-end module.  The output ``e_sensory`` is detached before
+    entering :class:`BioDecisionCore`, severing the gradient path
+    between the two stages.
 
-        X_batch --+-- Sensory_X [B,T,4] -> SensoryEncoder -> E_sensory [B,T,H]
-                   |                                              |
-                   |                                    +--- LIF Path (step-by-step)
-                   |                                    |    -> Out_lif  [B,T,H]
-                   |                                    |
-                   |    MCMC_Prior [B,T,4] -> MoR Router -> [g_lif, g_gru] [B,T,2]
-                   |                                    |
-                   |                                    +--- GRU Path (packed)
-                   |                                         -> Out_gru  [B,T,H]
-                   |
-                   +-- Integration: H = g_lif*Out_lif + g_gru*Out_gru  [B,T,H]
-                                              |
-                                    DirectionHead(H, 1) -> Y_pred [B,T]
+    This separation enables **two-phase training**:
+
+    - **Phase 1:** Train FrontendEncoder with a simple MSE loss
+      (regular curve fitting).  BioDecisionCore is frozen.
+    - **Phase 2:** Freeze FrontendEncoder.  Train BioDecisionCore
+      with physics / ATP / sparsity penalties.  Gradients never
+      reach the frontend because of ``.detach()``.
+
+    Input:  ``(B, T, D)`` — raw sensory features
+    Output: ``(B, T, H)`` — sensory encoding (on computation graph)
     """
 
     def __init__(
         self,
         sensory_dim: int = 4,
-        mcmc_dim: int = 4,
         hidden_dim: int = 64,
+        sensory_noise_std: float = 0.0,
+        dendritic_tau: float = 0.0,
+    ) -> None:
+        """
+        Args:
+            sensory_dim: Input feature dimensionality (4).
+            hidden_dim: Hidden representation dimensionality.
+            sensory_noise_std: Gaussian noise std for stochastic resonance.
+                0 disables.  Ref: Douglass et al. 1993.
+            dendritic_tau: Time constant for dendritic IIR filter on
+                visual channels.  0 disables.
+                Ref: London & Hausser 2005.
+        """
+        super().__init__()
+        self.sensory_dim = sensory_dim
+        self.sensory_encoder = SensoryEncoder(sensory_dim, hidden_dim, sensory_noise_std)
+
+        # ── Dendritic compartmentalization ──
+        # Ref: London & Hausser 2005, Annu. Rev. Neurosci.
+        self._dendritic_enabled = dendritic_tau > 0.0
+        if self._dendritic_enabled:
+            self._alpha_dend = math.exp(-1.0 / dendritic_tau)
+        else:
+            self._alpha_dend = 0.0
+
+    def forward(
+        self,
+        sensory_x: torch.Tensor,
+        lengths: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Encode raw sensory features through dendritic filtering
+        and the sensory encoder.
+
+        Args:
+            sensory_x: ``(B, T, D)`` — raw sensory features.
+            lengths: ``(B,)`` — true sequence lengths (for padding mask).
+
+        Returns:
+            ``(B, T, H)`` — sensory encoding.
+        """
+        B, T, _ = sensory_x.shape
+        device = sensory_x.device
+
+        # Dendritic IIR filter on visual channels (optional)
+        if self._dendritic_enabled:
+            D = self.sensory_dim
+            half_d = D // 2
+            alpha_dend = self._alpha_dend
+
+            dend_state = getattr(self, '_dendritic_state', None)
+            if dend_state is None or dend_state.shape != (B, half_d):
+                dend_state = torch.zeros(B, half_d, device=device)
+
+            visual_raw = sensory_x[:, :, :half_d]   # (B, T, D//2)
+            wind_raw = sensory_x[:, :, half_d:]     # (B, T, D//2)
+
+            _SEG_LEN = 32
+
+            def _iir_segment(
+                seg_input: torch.Tensor, seg_state: torch.Tensor,
+            ) -> Tuple[torch.Tensor, torch.Tensor]:
+                """Process one IIR segment."""
+                seg_len = seg_input.shape[1]
+                seg_out = torch.zeros_like(seg_input)
+                s = seg_state
+                for t_s in range(seg_len):
+                    s = alpha_dend * s + (1.0 - alpha_dend) * seg_input[:, t_s, :]
+                    seg_out[:, t_s, :] = s
+                return seg_out, s
+
+            dend_visual = torch.zeros_like(visual_raw)
+            for seg_start in range(0, T, _SEG_LEN):
+                seg_end = min(seg_start + _SEG_LEN, T)
+                seg_input = visual_raw[:, seg_start:seg_end, :]
+
+                if self.training and seg_input.requires_grad:
+                    seg_out, dend_state = torch.utils.checkpoint.checkpoint(
+                        _iir_segment, seg_input, dend_state,
+                        use_reentrant=False,
+                    )
+                else:
+                    seg_out, dend_state = _iir_segment(seg_input, dend_state)
+
+                dend_visual[:, seg_start:seg_end, :] = seg_out
+
+            self._dendritic_state = dend_state.detach()
+            sensory_x = torch.cat([dend_visual, wind_raw], dim=-1)
+
+        return self.sensory_encoder(sensory_x)
+
+
+# ===============================================================
+# 6b.  Bio-Decision Core (Hybrid Funnel — Stage 2)
+# ===============================================================
+
+class BioDecisionCore(nn.Module):
+    """
+    Bio-decision core for the Hybrid Funnel architecture.
+
+    Encapsulates the dual-pathway recurrent network (LIF + GRU),
+    the MoR Router, pathway integration, and the final decoder.
+    This module receives **detached** sensory encodings from
+    :class:`FrontendEncoder`, ensuring that physics / ATP / sparsity
+    gradients never propagate back to the sensory frontend.
+
+    Architecture::
+
+        e_sensory_detached [B,T,H] -+-> LIF Path  -> out_lif  [B,T,H]
+                                     |
+            mcmc_prior [B,T,M] ---->-+-> MoR Router -> gates [B,T,2]
+                                     |
+                                     +-> GRU Path  -> out_gru  [B,T,H]
+                                     |
+                                     +-> Integration: H = g_lif*Out_lif + g_gru*Out_gru
+                                     |
+                                     +-> DirectionHead -> Y_pred [B,T]
+
+    Input:  ``e_sensory`` ``(B, T, H)`` — detached sensory encoding
+            ``mcmc_prior`` ``(B, T, M)`` — static MCMC prior vector
+            ``lengths`` ``(B,)`` — true sequence lengths
+    Output: ``y_pred`` ``(B, T)``
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int = 64,
+        mcmc_dim: int = 4,
         num_gru_layers: int = 1,
         dropout: float = 0.1,
         lif_alpha: float = 0.9,
@@ -1129,76 +1252,36 @@ class NSMoRCore(nn.Module):
         lif_tau_rec: float = 0.0,
         lif_U_stp_init: float = 0.5,
         lif_lateral_inhibition: float = 0.0,
-        lif_dendritic_tau: float = 0.0,
         gru_neuromod_gain: float = 0.0,
-        sensory_noise_std: float = 0.0,
         lif_tbptt_steps: int = 64,
     ) -> None:
         """
         Args:
-            sensory_dim: Dimensionality of raw sensory features (4).
-            mcmc_dim: Dimensionality of MCMC prior vector (4).
             hidden_dim: Hidden state dimensionality for both pathways.
+            mcmc_dim: Dimensionality of MCMC prior vector (4).
             num_gru_layers: Number of stacked GRU layers.
-            dropout: Dropout probability in the GRU and decoder.
+            dropout: Dropout probability in GRU and decoder.
             lif_alpha: LIF leak factor.
             lif_threshold: LIF spike threshold.
             lif_beta: LIF input scaling.
-            lif_abs_refract_steps: LIF absolute refractory period
-                in timesteps. 0 disables.
-            lif_rel_refract_steps: LIF relative refractory decay
-                length in timesteps. 0 disables.
-            lif_tau_syn: LIF synaptic time constant in dt units.
-                0 bypasses.
-            lif_v_rest: LIF resting membrane potential. Default 0.0.
-            lif_v_reset: LIF fixed reset potential after spike (standard
-                AdEx).  When ``None`` (default), uses backward-compatible
-                soft reset (subtract threshold).  When set, uses hard
-                reset to this voltage.  Typical: set to ``lif_v_rest``.
-            lif_tau_w: LIF adaptation time constant in dt units.
-                0 disables (backward compatible).
-            lif_b_adapt: LIF spike-triggered adaptation increment.
-                0 disables (backward compatible).
-            lif_tau_fac: LIF STP facilitation time constant in dt units.
-                0 disables STP (when combined with lif_tau_rec=0).
-            lif_tau_rec: LIF STP recovery time constant in dt units.
-                0 disables STP (when combined with lif_tau_fac=0).
-            lif_U_stp_init: LIF STP baseline utilization. Only used
-                when STP is enabled. Default 0.5.
-            lif_lateral_inhibition: Strength of recurrent lateral
-                inhibition in the LIF pathway.  0 disables (backward
-                compatible).  Ref: Ritzmann & Camhi 1978.
-            lif_dendritic_tau: Time constant for dendritic low-pass
-                filter on visual inputs.  0 disables (backward
-                compatible).  Ref: London & Hausser 2005.
-            gru_neuromod_gain: Strength of neuromodulatory (octopamine-
-                like) gain scaling on the GRU pathway.  When > 0, a
-                learnable arousal signal modulates GRU hidden states
-                via multiplicative scaling.  The arousal signal is
-                computed from MCMC prior entropy (high entropy =
-                uncertain stimulus = high arousal).  0 disables
-                (backward compatible).
-                Ref: Rillich & Stevenson 2011, PLOS ONE.
-            sensory_noise_std: Standard deviation of Gaussian noise
-                injected into the sensory encoding during training.
-                Models intrinsic neural variability and stochastic
-                resonance.  0 disables (backward compatible).
-                Ref: Douglass et al. 1993, Nature 365:721-723.
-            lif_tbptt_steps: Truncated BPTT window for the LIF pathway.
-                The LIF cell state is detached every this many timesteps
-                to cap the effective gradient path length.  This prevents
-                gradient explosion through the I_syn accumulation channel
-                (which has Jacobian eigenvalue ~ alpha_syn near 1.0).
-                Default 64.  Set to 0 to disable truncation (full BPTT).
-                Ref: Williams & Zipser 1989, Neural Computation.
+            lif_abs_refract_steps: LIF absolute refractory period (timesteps; 0=disabled).
+            lif_rel_refract_steps: LIF relative refractory decay length (timesteps; 0=disabled).
+            lif_tau_syn: LIF synaptic time constant (dt units; 0=bypasses).
+            lif_v_rest: LIF resting membrane potential.
+            lif_v_reset: LIF fixed reset potential (None=soft reset).
+            lif_tau_w: LIF adaptation time constant (0=disabled).
+            lif_b_adapt: LIF spike-triggered adaptation increment (0=disabled).
+            lif_tau_fac: LIF STP facilitation time constant (0=disabled).
+            lif_tau_rec: LIF STP recovery time constant (0=disabled).
+            lif_U_stp_init: LIF STP baseline utilization.
+            lif_lateral_inhibition: LIF lateral inhibition strength (0=disabled).
+            gru_neuromod_gain: Neuromodulatory gain strength on GRU (0=disabled).
+            lif_tbptt_steps: Truncated BPTT window for LIF (0=full BPTT).
         """
         super().__init__()
-        self.sensory_dim = sensory_dim
-        self.mcmc_dim = mcmc_dim
         self.hidden_dim = hidden_dim
+        self.mcmc_dim = mcmc_dim
 
-        # Named sub-modules (white-box)
-        self.sensory_encoder = SensoryEncoder(sensory_dim, hidden_dim, sensory_noise_std)
         self.lif_cell = LIFCell(
             hidden_dim, lif_alpha, lif_threshold, lif_beta,
             abs_refract_steps=lif_abs_refract_steps,
@@ -1212,33 +1295,25 @@ class NSMoRCore(nn.Module):
             tau_rec=lif_tau_rec,
             U_stp_init=lif_U_stp_init,
             lateral_inhibition=lif_lateral_inhibition,
-            dendritic_tau=lif_dendritic_tau,
+            dendritic_tau=0.0,  # dendritic filtering is in FrontendEncoder
         )
         self.gru_unit = GRUUnit(hidden_dim, num_gru_layers, dropout)
         self.router = MoRRouter(hidden_dim, mcmc_dim)
         self.direction_head = DirectionHead(hidden_dim, dropout)
 
         # ── Neuromodulatory gain for GRU pathway (Gap C) ──
-        # Ref: Rillich & Stevenson 2011, PLOS ONE.
-        # Octopamine-like arousal modulation: higher MCMC entropy
-        # (uncertain stimulus) -> higher arousal -> amplified GRU gain.
         self.gru_neuromod_gain = gru_neuromod_gain
         if gru_neuromod_gain > 0.0:
-            # Learnable gain scale: maps entropy scalar to gain multiplier
             self._gain_scale = nn.Parameter(torch.tensor(0.0))
             self._gain_bias = nn.Parameter(torch.tensor(1.0))
 
         # ── Truncated BPTT for LIF pathway (CF7 fix) ──
-        # Ref: Williams & Zipser 1989, Neural Computation.
-        # Caps gradient path length to prevent explosion through
-        # the I_syn accumulation channel.
         self._tbptt_steps = lif_tbptt_steps if lif_tbptt_steps > 0 else 0
-
-    # -- Public API -------------------------------------------------
 
     def forward(
         self,
-        X_batch: torch.Tensor,
+        e_sensory: torch.Tensor,
+        mcmc_prior: torch.Tensor,
         lengths: torch.Tensor,
         *,
         return_internals: bool = False,
@@ -1246,137 +1321,28 @@ class NSMoRCore(nn.Module):
         states: Optional[Dict[str, torch.Tensor]] = None,
     ) -> torch.Tensor | Tuple[torch.Tensor, Dict[str, torch.Tensor]] | Tuple[torch.Tensor, Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
         """
-        Forward pass.
+        Forward pass through the bio-decision core.
 
         Args:
-            X_batch: ``(B, T, 8)`` — padded feature tensor.
-            lengths: ``(B,)`` — true (unpadded) sequence lengths.
+            e_sensory: ``(B, T, H)`` — sensory encoding (should be detached).
+            mcmc_prior: ``(B, T, M)`` — MCMC prior vector.
+            lengths: ``(B,)`` — true sequence lengths.
             return_internals: If ``True``, return internals dict.
             override_gates: Optional dict for in-silico lesioning.
             states: Optional dict of recurrent states for autoregressive mode.
 
         Returns:
-            If ``return_internals=False`` and ``states=None``:
-                ``Y_pred``: ``(B, T)``
-            If ``return_internals=True`` and ``states=None``:
-                ``(Y_pred, internals)``
-            If ``states`` is not None:
-                ``(Y_pred, internals, states_out)``
+            Same as :meth:`NSMoRCore.forward`.
         """
-        X_batch = X_batch.contiguous()
-        lengths = lengths.contiguous()
-
-        expected_dim = self.sensory_dim + self.mcmc_dim
-        if X_batch.shape[-1] != expected_dim:
-            raise ValueError(
-                f"Expected feature dim {expected_dim}, got {X_batch.shape[-1]}"
-            )
-
-        B, T, _ = X_batch.shape
-        device = X_batch.device
-
-        # Input shape assertions
-        assert X_batch.dim() == 3, (
-            f"X_batch must be 3-D (B, T, F), got {X_batch.dim()}-D"
-        )
-        assert lengths.shape == (B,), (
-            f"lengths must be (B={B},), got {tuple(lengths.shape)}"
-        )
-        assert (lengths > 0).all(), "All sequence lengths must be positive"
-        assert (lengths <= T).all(), (
-            f"lengths must not exceed seq_len={T}, got max={lengths.max().item()}"
-        )
-
-        # Step 1: Unpack input
-        sensory_x = X_batch[:, :, :self.sensory_dim]
-        mcmc_prior = X_batch[:, :, self.sensory_dim:]
-
-        assert sensory_x.shape == (B, T, self.sensory_dim), (
-            f"sensory_x shape {tuple(sensory_x.shape)} != "
-            f"(B={B}, T={T}, D={self.sensory_dim})"
-        )
-        assert mcmc_prior.shape == (B, T, self.mcmc_dim), (
-            f"mcmc_prior shape {tuple(mcmc_prior.shape)} != "
-            f"(B={B}, T={T}, M={self.mcmc_dim})"
-        )
-
-        # Step 2: Dendritic compartmentalization (Gap B) — CF2 fix
-        # Ref: London & Hausser 2005, Annu. Rev. Neurosci.
-        # Apply IIR filter to raw visual channels BEFORE encoding.
-        # This preserves modality isolation: visual signals are filtered
-        # through slow dendrites, wind/kinematic signals bypass directly.
-        if self.lif_cell._dendritic_enabled:
-            D = self.sensory_dim
-            half_d = D // 2
-            alpha_dend = self.lif_cell._alpha_dend
-            # Retrieve or initialize dendritic state in sensory space
-            # CF4 fix: only store visual IIR state (B, half_d), not full (B, D)
-            dend_state = getattr(self.lif_cell, '_dendritic_state', None)
-            if dend_state is None or dend_state.shape != (B, half_d):
-                dend_state = torch.zeros(B, half_d, device=device)
-            # Visual channels: IIR filter
-            visual_raw = sensory_x[:, :, :half_d]              # (B, T, D//2)
-            wind_raw = sensory_x[:, :, half_d:]                # (B, T, D//2)
-
-            # CF6 fix: Use gradient checkpointing to reduce O(T) memory.
-            # Process the IIR filter in segments.  Within each segment,
-            # torch.utils.checkpoint discards intermediate activations
-            # and recomputes them during backward, reducing memory from
-            # O(T) to O(sqrt(T)) while preserving correct gradients.
-            #
-            # CF4 note: alpha_dend is a Python float (from math.exp),
-            # not a tensor.  This means it is captured by closure in
-            # _iir_segment and is NOT part of the computation graph.
-            # If alpha_dend were changed to a learnable nn.Parameter,
-            # checkpoint would use the value at graph construction time,
-            # not the current value.  The fix would be to pass alpha_dend
-            # as an explicit argument to _iir_segment (using *args pattern).
-            # Currently this is not an issue because alpha_dend is constant.
-            _SEG_LEN = 32  # segment length for checkpointing
-
-            def _iir_segment(
-                seg_input: torch.Tensor, seg_state: torch.Tensor,
-            ) -> Tuple[torch.Tensor, torch.Tensor]:
-                """Process one IIR segment: seg_input (B, seg_len, half_d) -> output."""
-                seg_len = seg_input.shape[1]
-                seg_out = torch.zeros_like(seg_input)
-                s = seg_state
-                for t_s in range(seg_len):
-                    s = alpha_dend * s + (1.0 - alpha_dend) * seg_input[:, t_s, :]
-                    seg_out[:, t_s, :] = s
-                return seg_out, s
-
-            # Process in checkpointed segments
-            dend_visual = torch.zeros_like(visual_raw)
-            for seg_start in range(0, T, _SEG_LEN):
-                seg_end = min(seg_start + _SEG_LEN, T)
-                seg_input = visual_raw[:, seg_start:seg_end, :]
-
-                if self.training and seg_input.requires_grad:
-                    # Checkpoint: discard intermediate activations, recompute in backward
-                    seg_out, dend_state = torch.utils.checkpoint.checkpoint(
-                        _iir_segment, seg_input, dend_state,
-                        use_reentrant=False,
-                    )
-                else:
-                    seg_out, dend_state = _iir_segment(seg_input, dend_state)
-
-                dend_visual[:, seg_start:seg_end, :] = seg_out
-
-            # Cache for next forward call (detach: persistent state
-            # is NOT part of the current computation graph)
-            self.lif_cell._dendritic_state = dend_state.detach()
-            sensory_x = torch.cat([dend_visual, wind_raw], dim=-1)  # (B, T, D)
-
-        # Step 2c: Encode sensory input
-        e_sensory = self.sensory_encoder(sensory_x)
+        B, T, H = e_sensory.shape
+        device = e_sensory.device
 
         assert e_sensory.shape == (B, T, self.hidden_dim), (
             f"e_sensory shape {tuple(e_sensory.shape)} != "
             f"(B={B}, T={T}, H={self.hidden_dim})"
         )
 
-        # Step 2b: Extract initial states (autoregressive mode, CF3: +rel_refract)
+        # ── Initial states (autoregressive mode, CF3: +rel_refract) ──
         lif_state0: Optional[Tuple[torch.Tensor, ...]] = None
         gru_h0: Optional[torch.Tensor] = None
         if states is not None:
@@ -1387,12 +1353,8 @@ class NSMoRCore(nn.Module):
             lif_rel_refract0 = states.get("lif_rel_refract", None)
             if lif_v0 is not None:
                 _zeros = torch.zeros_like(lif_v0)
-                # CF1 fix: default rel_refract_counter to large value (not zero).
-                # counter=0 means "just spiked" (threshold elevated to max).
-                # counter=large means "no recent spikes" (threshold at baseline).
                 _large_rel = float(10 * max(self.lif_cell.rel_refract_steps, 1))
                 _rel_refract_default = torch.full_like(lif_v0, _large_rel)
-                # Build state tuple for LIFCell
                 if self.lif_cell.stp_enabled:
                     lif_x_resource0 = states.get("lif_x_resource", None)
                     lif_u_facil0 = states.get("lif_u_facil", None)
@@ -1421,19 +1383,17 @@ class NSMoRCore(nn.Module):
                     )
             gru_h0 = states.get("gru_h", None)
 
-            # Restore dendritic compartment cache when available
             if self.lif_cell._dendritic_enabled:
                 dend_state_in = states.get("lif_dendritic_state", None)
                 if dend_state_in is not None:
                     self.lif_cell._dendritic_state = dend_state_in
 
-            # Restore lateral inhibition spike history when available
             if self.lif_cell.lateral_inhibition > 0.0:
                 spike_hist_in = states.get("lif_spike_history", None)
                 if spike_hist_in is not None:
                     self.lif_cell._spike_history = spike_hist_in
 
-        # Step 3: Path A -- LIF (step-by-step, respects padding)
+        # ── Path A: LIF (step-by-step) ──
         (out_lif, lif_potentials, lif_spikes, lif_thresholds,
          lif_v_final, lif_i_syn_final, lif_refract_final,
          lif_w_adapt_final, lif_rel_refract_final,
@@ -1442,102 +1402,52 @@ class NSMoRCore(nn.Module):
             e_sensory, lengths, lif_state0=lif_state0,
         )
 
-        # LIF output shape assertions
         assert out_lif.shape == (B, T, self.hidden_dim), (
             f"out_lif shape {tuple(out_lif.shape)} != (B={B}, T={T}, H={self.hidden_dim})"
         )
-        assert lif_potentials.shape == (B, T, self.hidden_dim), (
-            f"lif_potentials shape {tuple(lif_potentials.shape)} != "
-            f"(B={B}, T={T}, H={self.hidden_dim})"
-        )
-        assert lif_spikes.shape == (B, T, self.hidden_dim), (
-            f"lif_spikes shape {tuple(lif_spikes.shape)} != "
-            f"(B={B}, T={T}, H={self.hidden_dim})"
-        )
-        assert lif_thresholds.shape == (B, T, self.hidden_dim), (
-            f"lif_thresholds shape {tuple(lif_thresholds.shape)} != "
-            f"(B={B}, T={T}, H={self.hidden_dim})"
-        )
-        assert lif_v_final.shape == (B, self.hidden_dim), (
-            f"lif_v_final shape {tuple(lif_v_final.shape)} != (B={B}, H={self.hidden_dim})"
-        )
 
-        # Step 4: Path B -- GRU (packed, efficient)
+        # ── Path B: GRU (packed) ──
         out_gru = self.gru_unit(e_sensory, lengths, h0=gru_h0)
 
-        assert out_gru.shape == (B, T, self.hidden_dim), (
-            f"out_gru shape {tuple(out_gru.shape)} != (B={B}, T={T}, H={self.hidden_dim})"
-        )
-
-        # Step 4b: Neuromodulatory gain on GRU pathway (Gap C)
-        # Ref: Rillich & Stevenson 2011, PLOS ONE.
-        # Computes an arousal signal from MCMC prior entropy:
-        # high entropy (uncertain stimulus) -> high arousal -> amplified GRU.
-        # gain = sigmoid(gain_scale * entropy + gain_bias)
-        # out_gru = out_gru * gain
+        # ── Neuromodulatory gain on GRU (Gap C) ──
         if self.gru_neuromod_gain > 0.0:
-            # MCMC entropy: H = -sum(p * log(p)) per timestep
-            # mcmc_prior: (B, T, M)
-            mcmc_safe = mcmc_prior.clamp(min=1e-8)            # (B, T, M)
-            entropy = -(mcmc_safe * mcmc_safe.log()).sum(dim=-1)  # (B, T)
-            assert entropy.shape == (B, T), (
-                f"entropy shape {tuple(entropy.shape)} != (B={B}, T={T})"
-            )
-            # Normalize entropy to [0, 1] range (max entropy = log(M))
+            mcmc_safe = mcmc_prior.clamp(min=1e-8)
+            entropy = -(mcmc_safe * mcmc_safe.log()).sum(dim=-1)
             max_entropy = math.log(self.mcmc_dim)
-            entropy_norm = entropy / max_entropy               # (B, T) in [0, 1]
-            # Gain modulation: gain in (0, 2) centered at 1
+            entropy_norm = entropy / max_entropy
             gain = torch.sigmoid(
                 self._gain_scale * entropy_norm + self._gain_bias
-            ) * 2.0                                            # (B, T) in (0, 2)
-            gain = gain.unsqueeze(-1)                          # (B, T, 1)
-            out_gru = out_gru * gain                           # (B, T, H)
-            assert out_gru.shape == (B, T, self.hidden_dim), (
-                f"neuromod out_gru shape {tuple(out_gru.shape)} != (B={B}, T={T}, H={self.hidden_dim})"
-            )
+            ) * 2.0
+            gain = gain.unsqueeze(-1)
+            out_gru = out_gru * gain
 
-        # Step 5: MoR Router -- per-step blending weights
+        # ── MoR Router ──
         e_flat = e_sensory.reshape(B * T, -1)
         m_flat = mcmc_prior.reshape(B * T, -1)
         gates = self.router(e_flat, m_flat)
         gates = gates.reshape(B, T, 2)
 
-        assert gates.shape == (B, T, 2), (
-            f"gates shape {tuple(gates.shape)} != (B={B}, T={T}, 2)"
-        )
-
         g_lif = gates[:, :, 0:1]
         g_gru = gates[:, :, 1:2]
 
-        # Step 5b: In-Silico Lesion Hook
+        # ── In-Silico Lesion Hook ──
         if override_gates is not None:
             if "g_lif" in override_gates:
                 g_lif = torch.full_like(g_lif, override_gates["g_lif"])
             if "g_gru" in override_gates:
                 g_gru = torch.full_like(g_gru, override_gates["g_gru"])
 
-            assert g_lif.shape == (B, T, 1), (
-                f"g_lif override shape {tuple(g_lif.shape)} != (B={B}, T={T}, 1)"
-            )
-            assert g_gru.shape == (B, T, 1), (
-                f"g_gru override shape {tuple(g_gru.shape)} != (B={B}, T={T}, 1)"
-            )
-
-        # Step 6: Integrate pathways
+        # ── Integration ──
         h_out = g_lif * out_lif + g_gru * out_gru
 
-        assert h_out.shape == (B, T, self.hidden_dim), (
-            f"h_out shape {tuple(h_out.shape)} != (B={B}, T={T}, H={self.hidden_dim})"
-        )
-
-        # Step 7: Decode to continuous output
+        # ── Decode ──
         y_pred = self.direction_head(h_out)
 
         assert y_pred.shape == (B, T), (
             f"y_pred shape {tuple(y_pred.shape)} != (B={B}, T={T})"
         )
 
-        # Step 8: Build output
+        # ── Build output ──
         effective_gates = torch.cat([g_lif, g_gru], dim=-1)
 
         internals: Dict[str, torch.Tensor] = {
@@ -1546,11 +1456,10 @@ class NSMoRCore(nn.Module):
             "lif_potentials": lif_potentials,
             "lif_spikes": lif_spikes,
             "lif_thresholds": lif_thresholds,
-            "lif_w_adapt": lif_w_adapt_over_time,  # CF9: adaptation current over time
+            "lif_w_adapt": lif_w_adapt_over_time,
             "gru_hidden": out_gru,
         }
 
-        # Build updated states for autoregressive mode
         if states is not None:
             states_out: Dict[str, torch.Tensor] = {
                 "lif_v": lif_v_final.contiguous(),
@@ -1560,16 +1469,13 @@ class NSMoRCore(nn.Module):
                 "lif_rel_refract": lif_rel_refract_final.contiguous(),
                 "gru_h": out_gru[:, -1:, :].permute(1, 0, 2).contiguous(),
             }
-            # Add STP state when enabled
             if self.lif_cell.stp_enabled:
                 states_out["lif_x_resource"] = lif_x_resource_final.contiguous()
                 states_out["lif_u_facil"] = lif_u_facil_final.contiguous()
-            # Add dendritic compartment state when enabled
             if self.lif_cell._dendritic_enabled:
                 dend_state = getattr(self.lif_cell, '_dendritic_state', None)
                 if dend_state is not None:
                     states_out["lif_dendritic_state"] = dend_state.contiguous()
-            # Add lateral inhibition spike history when enabled
             if self.lif_cell.lateral_inhibition > 0.0:
                 spike_hist = getattr(self.lif_cell, '_spike_history', None)
                 if spike_hist is not None:
@@ -1581,9 +1487,271 @@ class NSMoRCore(nn.Module):
 
         return y_pred
 
+    def _run_lif_path(
+        self,
+        e_sensory: torch.Tensor,
+        lengths: torch.Tensor,
+        lif_state0: Optional[Tuple[torch.Tensor, ...]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor,
+               torch.Tensor, torch.Tensor, torch.Tensor,
+               torch.Tensor, torch.Tensor, torch.Tensor,
+               torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run the LIF cell step-by-step, masking padded positions."""
+        B, T, H = e_sensory.shape
+        device = e_sensory.device
+
+        if lif_state0 is not None:
+            lif_state = lif_state0
+        else:
+            lif_state = self.lif_cell.init_state(B, device)
+
+        out_lif = torch.zeros(B, T, H, device=device)
+        potentials = torch.zeros(B, T, H, device=device)
+        spikes = torch.zeros(B, T, H, device=device)
+        thresh_over_time = torch.zeros(B, T, H, device=device)
+        w_adapt_over_time = torch.zeros(B, T, H, device=device)
+
+        for t in range(T):
+            inp_t = e_sensory[:, t, :]
+            if self._tbptt_steps > 0 and t > 0 and t % self._tbptt_steps == 0:
+                lif_state = tuple(s.detach() for s in lif_state)
+            spike, lif_state = self.lif_cell(inp_t, lif_state)
+
+            mask = (t < lengths).float().unsqueeze(-1)
+            out_lif[:, t, :] = spike * mask
+            potentials[:, t, :] = lif_state[0] * mask
+            spikes[:, t, :] = spike * mask
+            w_adapt_over_time[:, t, :] = lif_state[4] * mask
+            thresh_over_time[:, t, :] = lif_state[3] * mask
+
+        v_final = lif_state[0]
+        i_syn_final = lif_state[1]
+        refract_final = lif_state[2]
+        w_adapt_final = lif_state[4]
+        rel_refract_final = lif_state[5]
+
+        if self.lif_cell.stp_enabled and len(lif_state) == 8:
+            x_resource_final = lif_state[6]
+            u_facil_final = lif_state[7]
+        else:
+            x_resource_final = torch.ones(B, H, device=device)
+            u_facil_final = torch.zeros(B, H, device=device)
+
+        return (out_lif, potentials, spikes, thresh_over_time,
+                v_final, i_syn_final, refract_final, w_adapt_final,
+                rel_refract_final, x_resource_final, u_facil_final,
+                w_adapt_over_time)
+
+
+# ===============================================================
+# 6c.  NSMoR Core Network (Hybrid Funnel Composition)
+# ===============================================================
+
+_FREEZABLE_MODULES = frozenset({
+    "sensory_encoder",
+    "lif_cell",
+    "gru_unit",
+    "router",
+    "direction_head",
+})
+
+
+class NSMoRCore(nn.Module):
+    """
+    Mixture-of-Recursions (MoR) — Hybrid Funnel architecture.
+
+    Composes :class:`FrontendEncoder` and :class:`BioDecisionCore`
+    with a **gradient-severing** ``.detach()`` boundary between them::
+
+        X_batch --+-- Sensory_X [B,T,4]
+                   |       |
+                   |  FrontendEncoder
+                   |       |
+                   |   e_sensory [B,T,H] -- .detach() --> e_detached
+                   |                                      |
+                   |                           BioDecisionCore
+                   |       MCMC_Prior [B,T,4] ----->      |
+                   |                                      |
+                   +-- Integration + Decode -> Y_pred [B,T]
+
+    The ``.detach()`` ensures that Phase-2 physics / ATP / sparsity
+    gradients never propagate back to the sensory frontend, enabling
+    clean two-phase training.
+
+    Backward-compatible: ``forward()`` signature is unchanged.
+    ``sensory_encoder``, ``lif_cell``, etc. remain accessible as
+    attributes (delegated to the sub-modules).
+    """
+
+    def __init__(
+        self,
+        sensory_dim: int = 4,
+        mcmc_dim: int = 4,
+        hidden_dim: int = 64,
+        num_gru_layers: int = 1,
+        dropout: float = 0.1,
+        lif_alpha: float = 0.9,
+        lif_threshold: float = 1.0,
+        lif_beta: float = 0.5,
+        lif_abs_refract_steps: int = 0,
+        lif_rel_refract_steps: int = 0,
+        lif_tau_syn: float = 0.0,
+        lif_v_rest: float = 0.0,
+        lif_v_reset: Optional[float] = None,
+        lif_tau_w: float = 0.0,
+        lif_b_adapt: float = 0.0,
+        lif_tau_fac: float = 0.0,
+        lif_tau_rec: float = 0.0,
+        lif_U_stp_init: float = 0.5,
+        lif_lateral_inhibition: float = 0.0,
+        lif_dendritic_tau: float = 0.0,
+        gru_neuromod_gain: float = 0.0,
+        sensory_noise_std: float = 0.0,
+        lif_tbptt_steps: int = 64,
+    ) -> None:
+        super().__init__()
+        self.sensory_dim = sensory_dim
+        self.mcmc_dim = mcmc_dim
+        self.hidden_dim = hidden_dim
+
+        # ── Hybrid Funnel: two-stage composition ──
+        self.frontend = FrontendEncoder(
+            sensory_dim=sensory_dim,
+            hidden_dim=hidden_dim,
+            sensory_noise_std=sensory_noise_std,
+            dendritic_tau=lif_dendritic_tau,
+        )
+        self.backend = BioDecisionCore(
+            hidden_dim=hidden_dim,
+            mcmc_dim=mcmc_dim,
+            num_gru_layers=num_gru_layers,
+            dropout=dropout,
+            lif_alpha=lif_alpha,
+            lif_threshold=lif_threshold,
+            lif_beta=lif_beta,
+            lif_abs_refract_steps=lif_abs_refract_steps,
+            lif_rel_refract_steps=lif_rel_refract_steps,
+            lif_tau_syn=lif_tau_syn,
+            lif_v_rest=lif_v_rest,
+            lif_v_reset=lif_v_reset,
+            lif_tau_w=lif_tau_w,
+            lif_b_adapt=lif_b_adapt,
+            lif_tau_fac=lif_tau_fac,
+            lif_tau_rec=lif_tau_rec,
+            lif_U_stp_init=lif_U_stp_init,
+            lif_lateral_inhibition=lif_lateral_inhibition,
+            gru_neuromod_gain=gru_neuromod_gain,
+            lif_tbptt_steps=lif_tbptt_steps,
+        )
+
+        # ── Backward-compatible attribute aliases ──
+        self.sensory_encoder = self.frontend.sensory_encoder
+        self.lif_cell = self.backend.lif_cell
+        self.gru_unit = self.backend.gru_unit
+        self.router = self.backend.router
+        self.direction_head = self.backend.direction_head
+
+    # -- Public API -------------------------------------------------
+
+    def forward(
+        self,
+        X_batch: torch.Tensor,
+        lengths: torch.Tensor,
+        *,
+        return_internals: bool = False,
+        override_gates: Optional[Dict[str, float]] = None,
+        states: Optional[Dict[str, torch.Tensor]] = None,
+    ) -> torch.Tensor | Tuple[torch.Tensor, Dict[str, torch.Tensor]] | Tuple[torch.Tensor, Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+        """
+        Forward pass (Hybrid Funnel).
+
+        Args:
+            X_batch: ``(B, T, 8)`` — padded feature tensor.
+            lengths: ``(B,)`` — true (unpadded) sequence lengths.
+            return_internals: If ``True``, return internals dict.
+            override_gates: Optional dict for in-silico lesioning.
+            states: Optional dict of recurrent states for autoregressive mode.
+
+        Returns:
+            Same as original ``NSMoRCore.forward``.
+        """
+        X_batch = X_batch.contiguous()
+        lengths = lengths.contiguous()
+
+        expected_dim = self.sensory_dim + self.mcmc_dim
+        if X_batch.shape[-1] != expected_dim:
+            raise ValueError(
+                f"Expected feature dim {expected_dim}, got {X_batch.shape[-1]}"
+            )
+
+        B, T, _ = X_batch.shape
+
+        # ── Unpack input ──
+        sensory_x = X_batch[:, :, :self.sensory_dim]
+        mcmc_prior = X_batch[:, :, self.sensory_dim:]
+
+        # ── Restore frontend dendritic state (autoregressive mode) ──
+        if states is not None and self.frontend._dendritic_enabled:
+            dend_in = states.get("frontend_dendritic_state", None)
+            if dend_in is not None:
+                self.frontend._dendritic_state = dend_in
+
+        # ── Stage 1: Frontend encoding ──
+        e_sensory = self.frontend(sensory_x, lengths)
+
+        # ── Stage 2: Bio-decision core ──
+        # NOTE: No explicit .detach() here.  Gradient isolation between
+        # the two stages is achieved via `requires_grad` toggling in the
+        # training script:
+        #
+        #   Phase 1 (train frontend, freeze backend):
+        #       backend params have requires_grad=False → backward through
+        #       backend operations still reaches e_sensory, but backend
+        #       param .grad stays None → only frontend receives updates.
+        #
+        #   Phase 2 (freeze frontend, train backend):
+        #       frontend params have requires_grad=False → e_sensory has
+        #       no grad_fn → bio-loss gradients cannot reach frontend.
+        #
+        #   Single-phase (all trainable):
+        #       gradients flow freely through both stages.
+        #
+        # An explicit .detach() would break Phase 1 by severing the
+        # gradient path before it reaches the trainable frontend.
+        if states is not None:
+            y_pred, internals, states_out = self.backend(
+                e_sensory, mcmc_prior, lengths,
+                return_internals=True,
+                override_gates=override_gates,
+                states=states,
+            )
+            # Include frontend dendritic state in states_out so
+            # autoregressive checkpoint/restore preserves it.
+            if self.frontend._dendritic_enabled:
+                dend = getattr(self.frontend, '_dendritic_state', None)
+                if dend is not None:
+                    states_out["frontend_dendritic_state"] = dend.contiguous()
+            return y_pred, internals, states_out
+
+        if return_internals:
+            y_pred, internals = self.backend(
+                e_sensory, mcmc_prior, lengths,
+                return_internals=True,
+                override_gates=override_gates,
+            )
+            return y_pred, internals
+
+        return self.backend(
+            e_sensory, mcmc_prior, lengths,
+            override_gates=override_gates,
+        )
+
     def freeze_modules(self, module_names: List[str]) -> None:
         """
         Freeze parameters of the specified sub-modules.
+
+        Supports both old-style names (``sensory_encoder``, ``lif_cell``,
+        etc.) which are delegated to the appropriate sub-module.
 
         Args:
             module_names: List of sub-module names to freeze.
@@ -1597,118 +1765,13 @@ class NSMoRCore(nn.Module):
                     f"Unknown module '{name}'. "
                     f"Valid names: {sorted(_FREEZABLE_MODULES)}"
                 )
-            submodule: nn.Module = getattr(self, name)
+            # Route to the correct sub-module
+            if name == "sensory_encoder":
+                submodule = self.frontend.sensory_encoder
+            else:
+                submodule = getattr(self.backend, name)
             for param in submodule.parameters():
                 param.requires_grad = False
-
-    # -- Private pathway runners ------------------------------------
-
-    def _run_lif_path(
-        self,
-        e_sensory: torch.Tensor,
-        lengths: torch.Tensor,
-        lif_state0: Optional[Tuple[torch.Tensor, ...]] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor,
-               torch.Tensor, torch.Tensor, torch.Tensor,
-               torch.Tensor, torch.Tensor, torch.Tensor,
-               torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Run the LIF cell step-by-step, masking padded positions.
-
-        Args:
-            e_sensory: ``(B, T, H)``
-            lengths: ``(B,)``
-            lif_state0: Optional initial state tuple.
-
-        Returns:
-            ``(out_lif, potentials, spikes, thresholds,
-            v_final, i_syn_final, refract_final, w_adapt_final,
-            rel_refract_final, x_resource_final, u_facil_final,
-            w_adapt_over_time)``
-            First four and w_adapt_over_time are ``(B, T, H)``;
-            last seven are ``(B, H)``.
-            x_resource_final and u_facil_final are ones/zeros when STP disabled.
-
-            ``thresholds[:, t, :]`` records the effective threshold used
-            for spike detection at step *t*.  This threshold is computed
-            from ``rel_refract_counter`` at step *t-1* (the incoming
-            counter state).  Execution order within ``LIFCell.forward``:
-
-            1. ``v_thresh_new`` computed from incoming ``rel_refract_counter``
-               (carried from step *t-1*).
-            2. Spike detection uses ``v_thresh_new``.
-            3. ``rel_refract_new`` computed (counter reset to 0 on spike,
-               else incremented).
-            4. State packed: ``lif_state[3] = v_thresh_new`` (from step 1,
-               NOT from the updated counter).
-
-            ``thresholds[t]`` and ``spikes[t]`` describe the same physical
-            moment: both use the threshold from the *t-1* counter state.
-            The counter update at step *t* (``rel_refract_new``) does NOT
-            affect ``thresholds[t]`` — it produces the threshold at step
-            *t+1*.
-        """
-        B, T, H = e_sensory.shape
-        device = e_sensory.device
-
-        if lif_state0 is not None:
-            lif_state = lif_state0
-        else:
-            lif_state = self.lif_cell.init_state(B, device)
-
-        out_lif = torch.zeros(B, T, H, device=device)
-        potentials = torch.zeros(B, T, H, device=device)
-        spikes = torch.zeros(B, T, H, device=device)
-        thresh_over_time = torch.zeros(B, T, H, device=device)
-        w_adapt_over_time = torch.zeros(B, T, H, device=device)  # CF9: track adaptation
-
-        for t in range(T):
-            inp_t = e_sensory[:, t, :]
-            # CF7 fix: Truncated BPTT — detach state every _tbptt_steps
-            # to cap gradient path length.  This prevents gradient explosion
-            # through the I_syn accumulation channel (Jacobian eigenvalue
-            # ~ alpha_syn near 1.0).  Without this, gradients from step
-            # t-T flow through all T steps without attenuation.
-            # Ref: Williams & Zipser 1989, Neural Computation.
-            if self._tbptt_steps > 0 and t > 0 and t % self._tbptt_steps == 0:
-                lif_state = tuple(s.detach() for s in lif_state)
-            spike, lif_state = self.lif_cell(inp_t, lif_state)
-
-            mask = (t < lengths).float().unsqueeze(-1)
-            out_lif[:, t, :] = spike * mask
-            potentials[:, t, :] = lif_state[0] * mask
-            spikes[:, t, :] = spike * mask
-            w_adapt_over_time[:, t, :] = lif_state[4] * mask  # CF9: adaptation current
-            # Record threshold used for spike detection at step t.
-            # lif_state[3] = v_thresh_new computed from the INCOMING
-            # rel_refract_counter (step t-1 state).  The counter update
-            # at step t (rel_refract_new) does NOT affect this value —
-            # it will produce the threshold at step t+1.
-            thresh_over_time[:, t, :] = lif_state[3] * mask  # v_thresh_eff
-
-        # Extract final state components
-        # State layout (CF3):
-        #   No STP, 6-tuple: (v, i_syn, refract, v_thresh, w_adapt, rel_refract)
-        #   STP,    8-tuple: (v, i_syn, refract, v_thresh, w_adapt, rel_refract, x_resource, u_facil)
-        v_final = lif_state[0]
-        i_syn_final = lif_state[1]
-        refract_final = lif_state[2]
-        w_adapt_final = lif_state[4]
-        rel_refract_final = lif_state[5]
-
-        # STP state (when enabled, state has 8 elements)
-        if self.lif_cell.stp_enabled and len(lif_state) == 8:
-            x_resource_final = lif_state[6]
-            u_facil_final = lif_state[7]
-        else:
-            # STP disabled: return dummy tensors for consistent return signature
-            x_resource_final = torch.ones(B, H, device=device)
-            u_facil_final = torch.zeros(B, H, device=device)
-
-        return (out_lif, potentials, spikes, thresh_over_time,
-                v_final, i_syn_final, refract_final, w_adapt_final,
-                rel_refract_final, x_resource_final, u_facil_final,
-                w_adapt_over_time)
 
 
 # ===============================================================
