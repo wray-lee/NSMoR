@@ -1155,7 +1155,14 @@ def train(
         # During early epochs, the LIF pathway needs to stabilize
         # (via sharpened surrogate gradient and TBPTT) before the
         # router regularization pressure for LIF routing ramps up.
-        warmup_factor = compute_warmup_factor(epoch, warmup_epochs)
+        #
+        # Two-phase fix: In Hybrid Funnel mode, Phase 2 starts at
+        # global epoch = phase1_epochs.  We must use the *local*
+        # Phase 2 epoch so the warmup restarts from 0 at the phase
+        # transition; otherwise warmup_factor jumps straight to 1.0
+        # and the untrained backend gets hit with full penalties.
+        warmup_epoch = (epoch - phase1_epochs) if (two_phase and current_phase == 2) else epoch
+        warmup_factor = compute_warmup_factor(warmup_epoch, warmup_epochs)
 
         # ── Unfreeze if scheduled ─────────────────────────────
         if (
