@@ -1417,42 +1417,69 @@ class BioDecisionCore(nn.Module):
             f"out_lif shape {tuple(out_lif.shape)} != (B={B}, T={T}, H={self.hidden_dim})"
         )
 
-        # ── Path B: GRU (packed) ──
-        out_gru = self.gru_unit(e_sensory, lengths, h0=gru_h0)
+        # ── Non-LIF paths forced to FP32 (residual NaN gradient fix) ──
+        # CF10 forced the LIF loop to FP32, eliminating most NaN gradients.
+        # The remaining 1-element NaN comes from the GRU, Router softmax,
+        # and DirectionHead running under AMP FP16:
+        #
+        #   1. cuDNN FP16 GRU: sigmoid/tanh saturate for |x|>2.75 in FP16
+        #      (vs 8.8 in FP32).  Gate derivatives flush to zero (denorm),
+        #      then multiply by large upstream gradients -> NaN.
+        #   2. Router softmax: exp(logit) overflows for logit>11.1 in FP16,
+        #      producing Inf/Inf=NaN.  Softmax backward with underflowed
+        #      softmax_j=0 produces 0*large=NaN.
+        #   3. DirectionHead LayerNorm: affine gradient passes through FP16,
+        #      accumulating rounding error over H=64 dimensions.
+        #
+        # FP32 cost is negligible: GRU matmuls on (B, T, H=64) are not
+        # the compute-bound bottleneck (that would be large transformer
+        # models).  The Router and DirectionHead are element-wise on small
+        # tensors.
+        _amp_device = "cuda" if device.type == "cuda" else "cpu"
+        with torch.amp.autocast(device_type=_amp_device, enabled=False):
+            # Cast inputs to FP32 for the non-LIF computation graph
+            e_sensory_f32 = e_sensory.float()
+            mcmc_prior_f32 = mcmc_prior.float()
+            # Cast GRU hidden state to FP32 (may be FP16 from autoregressive
+            # mode where states were stored under AMP).
+            gru_h0_f32 = gru_h0.float() if gru_h0 is not None else None
 
-        # ── Neuromodulatory gain on GRU (Gap C) ──
-        if self.gru_neuromod_gain > 0.0:
-            mcmc_safe = mcmc_prior.clamp(min=1e-8)
-            entropy = -(mcmc_safe * mcmc_safe.log()).sum(dim=-1)
-            max_entropy = math.log(self.mcmc_dim)
-            entropy_norm = entropy / max_entropy
-            gain = torch.sigmoid(
-                self._gain_scale * entropy_norm + self._gain_bias
-            ) * 2.0
-            gain = gain.unsqueeze(-1)
-            out_gru = out_gru * gain
+            # ── Path B: GRU (packed) ──
+            out_gru = self.gru_unit(e_sensory_f32, lengths, h0=gru_h0_f32)
 
-        # ── MoR Router ──
-        e_flat = e_sensory.reshape(B * T, -1)
-        m_flat = mcmc_prior.reshape(B * T, -1)
-        gates = self.router(e_flat, m_flat)
-        gates = gates.reshape(B, T, 2)
+            # ── Neuromodulatory gain on GRU (Gap C) ──
+            if self.gru_neuromod_gain > 0.0:
+                mcmc_safe = mcmc_prior_f32.clamp(min=1e-8)
+                entropy = -(mcmc_safe * mcmc_safe.log()).sum(dim=-1)
+                max_entropy = math.log(self.mcmc_dim)
+                entropy_norm = entropy / max_entropy
+                gain = torch.sigmoid(
+                    self._gain_scale * entropy_norm + self._gain_bias
+                ) * 2.0
+                gain = gain.unsqueeze(-1)
+                out_gru = out_gru * gain
 
-        g_lif = gates[:, :, 0:1]
-        g_gru = gates[:, :, 1:2]
+            # ── MoR Router ──
+            e_flat = e_sensory_f32.reshape(B * T, -1)
+            m_flat = mcmc_prior_f32.reshape(B * T, -1)
+            gates = self.router(e_flat, m_flat)
+            gates = gates.reshape(B, T, 2)
 
-        # ── In-Silico Lesion Hook ──
-        if override_gates is not None:
-            if "g_lif" in override_gates:
-                g_lif = torch.full_like(g_lif, override_gates["g_lif"])
-            if "g_gru" in override_gates:
-                g_gru = torch.full_like(g_gru, override_gates["g_gru"])
+            g_lif = gates[:, :, 0:1]
+            g_gru = gates[:, :, 1:2]
 
-        # ── Integration ──
-        h_out = g_lif * out_lif + g_gru * out_gru
+            # ── In-Silico Lesion Hook ──
+            if override_gates is not None:
+                if "g_lif" in override_gates:
+                    g_lif = torch.full_like(g_lif, override_gates["g_lif"])
+                if "g_gru" in override_gates:
+                    g_gru = torch.full_like(g_gru, override_gates["g_gru"])
 
-        # ── Decode ──
-        y_pred = self.direction_head(h_out)
+            # ── Integration ──
+            h_out = g_lif * out_lif.float() + g_gru * out_gru
+
+            # ── Decode ──
+            y_pred = self.direction_head(h_out)
 
         assert y_pred.shape == (B, T), (
             f"y_pred shape {tuple(y_pred.shape)} != (B={B}, T={T})"
