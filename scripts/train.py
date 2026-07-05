@@ -668,15 +668,36 @@ def train_one_epoch(
         trainable_params = [p for p in model.parameters() if p.requires_grad]
         if scaler is not None and scaler.is_enabled():
             scaler.unscale_(optimizer)
+
+        # ── Pre-clip gradient sanitization ──
+        # Catch NaN/Inf gradients BEFORE clipping to prevent
+        # clip_grad_norm_ from producing NaN (it divides by norm).
+        # This is more efficient than post-clip check because it
+        # avoids the NaN propagation issue entirely.
+        pre_nan_count = 0
+        for p in trainable_params:
+            if p.grad is not None and not torch.isfinite(p.grad).all():
+                pre_nan_count += p.grad.data.numel() - torch.isfinite(p.grad.data).sum().item()
+                p.grad.data = torch.where(
+                    torch.isfinite(p.grad.data),
+                    p.grad.data,
+                    torch.zeros_like(p.grad.data),
+                )
+        if pre_nan_count > 0:
+            logger.warning(
+                "Epoch %d batch %d: %d non-finite gradient elements sanitized BEFORE clipping",
+                epoch, batch_idx, pre_nan_count,
+            )
+
         if grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(
                 trainable_params, max_norm=grad_clip_norm,
             )
 
         # ── Post-clip gradient finiteness check (defense-in-depth) ──
-        # Even after clipping, NaN gradients can survive if the grad
-        # was already NaN (clip_grad_norm_ divides by a norm that may
-        # be NaN).  Detect and skip to avoid corrupting parameters.
+        # CF10: With FP32 LIF loop, NaN gradients should be rare.
+        # If they still occur, skip the step to preserve Adam's moment
+        # estimates from corruption by artificial zeros.
         # Only check ACTIVE parameters — frozen params have no grad.
         has_nan_grad = False
         for p in trainable_params:

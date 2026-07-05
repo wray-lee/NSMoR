@@ -759,7 +759,11 @@ class LIFCell(nn.Module):
         # - Numerical stability (no drift/NaN risk)
         # Ref: surrogate gradient sharpness in spiking neural networks.
         _SHARPNESS = 4.0
-        sig = torch.sigmoid(_SHARPNESS * (v_new - v_thresh_new))  # (B, H) smooth
+        # CF10 fix: Force FP32 for surrogate gradient to prevent sigmoid saturation
+        # in FP16 (AMP).  In FP16, sigmoid saturates for |x| > ~2.75, creating
+        # gradient dead zones.  FP32 extends non-saturated range to |x| > ~8.8.
+        _v_diff_fp32 = (v_new - v_thresh_new).float()
+        sig = torch.sigmoid(_SHARPNESS * _v_diff_fp32).to(v_new.dtype)  # (B, H) smooth
         spike = spike_mask - sig.detach() + sig              # (B, H) binary fwd, smooth bwd
 
         # ── 7b. Update spike history for lateral inhibition ──
@@ -803,6 +807,13 @@ class LIFCell(nn.Module):
         # ── 9. Spike-frequency adaptation update ──
         decay_w = self._decay_w.to(device)
         w_new = decay_w * w_adapt + self.b_adapt * spike_mask  # (B, H)
+        # CF10 fix: Clamp adaptation current to prevent unbounded growth.
+        # With tau_w=100 (decay_w=0.99), w can accumulate to ~13.7 in 32 TBPTT
+        # steps, driving membrane to extreme negative values.  Biological
+        # adaptation currents are bounded by maximal conductance densities.
+        # min=0: adaptation is hyperpolarizing (outward K+ current), never depolarizing.
+        # max=10*v_threshold: matches _i_syn_clamp convention, allows strong suppression.
+        w_new = w_new.clamp(min=0.0, max=10.0 * self.v_threshold)
 
         # ── 10. STP spike-triggered update (AFTER spike detection) ──
         # Critical: this happens AFTER we know spike_mask.
@@ -1511,18 +1522,37 @@ class BioDecisionCore(nn.Module):
         thresh_over_time = torch.zeros(B, T, H, device=device)
         w_adapt_over_time = torch.zeros(B, T, H, device=device)
 
-        for t in range(T):
-            inp_t = e_sensory[:, t, :]
-            if self._tbptt_steps > 0 and t > 0 and t % self._tbptt_steps == 0:
-                lif_state = tuple(s.detach() for s in lif_state)
-            spike, lif_state = self.lif_cell(inp_t, lif_state)
+        # CF10 fix: Force FP32 for the entire LIF loop to prevent NaN
+        # gradients under AMP (FP16).  The LIF cell uses discontinuous
+        # spike-and-reset dynamics with surrogate gradients that are
+        # numerically sensitive in FP16:
+        #
+        #   1. The sigmoid surrogate gradient saturates to exactly 0 or 1
+        #      in FP16 for |input| > ~2.75, killing gradient signal.
+        #   2. The IIR synaptic filter and membrane recurrence amplify
+        #      FP16 rounding errors over 32 TBPTT steps.
+        #   3. The clamp operations create gradient dead zones that
+        #      destabilize Adam's moment estimates in FP16.
+        #
+        # FP32 cost is negligible: LIF ops are element-wise on (B, H)
+        # tensors, not the compute-bound bottleneck (that's the GRU).
+        _amp_device = "cuda" if device.type == "cuda" else "cpu"
+        with torch.amp.autocast(device_type=_amp_device, enabled=False):
+            # Cast state tensors to FP32 for the loop
+            lif_state = tuple(s.float() for s in lif_state)
 
-            mask = (t < lengths).float().unsqueeze(-1)
-            out_lif[:, t, :] = spike * mask
-            potentials[:, t, :] = lif_state[0] * mask
-            spikes[:, t, :] = spike * mask
-            w_adapt_over_time[:, t, :] = lif_state[4] * mask
-            thresh_over_time[:, t, :] = lif_state[3] * mask
+            for t in range(T):
+                inp_t = e_sensory[:, t, :].float()
+                if self._tbptt_steps > 0 and t > 0 and t % self._tbptt_steps == 0:
+                    lif_state = tuple(s.detach() for s in lif_state)
+                spike, lif_state = self.lif_cell(inp_t, lif_state)
+
+                mask = (t < lengths).float().unsqueeze(-1)
+                out_lif[:, t, :] = spike * mask
+                potentials[:, t, :] = lif_state[0] * mask
+                spikes[:, t, :] = spike * mask
+                w_adapt_over_time[:, t, :] = lif_state[4] * mask
+                thresh_over_time[:, t, :] = lif_state[3] * mask
 
         v_final = lif_state[0]
         i_syn_final = lif_state[1]
