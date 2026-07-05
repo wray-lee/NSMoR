@@ -642,7 +642,10 @@ def train_one_epoch(
             _health_batches += 1
 
         # ── Backward pass (AMP-aware) ──
-        optimizer.zero_grad()
+        # Use set_to_none=True to fully release old gradients from
+        # GPU memory — avoids accumulating stale ghost gradients on
+        # frozen parameters across phase transitions.
+        model.zero_grad(set_to_none=True)
         if scaler is not None and scaler.is_enabled():
             scaler.scale(loss).backward()
         else:
@@ -659,19 +662,24 @@ def train_one_epoch(
             continue  # skip optimizer.step()
 
         # ── Gradient clipping (unscale first for AMP) ──
+        # Only clip ACTIVE parameters — frozen parameters retain
+        # stale gradients from Phase 1 whose norm may be Inf,
+        # which would zero-out all trainable gradients.
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
         if scaler is not None and scaler.is_enabled():
             scaler.unscale_(optimizer)
         if grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(
-                model.parameters(), max_norm=grad_clip_norm,
+                trainable_params, max_norm=grad_clip_norm,
             )
 
         # ── Post-clip gradient finiteness check (defense-in-depth) ──
         # Even after clipping, NaN gradients can survive if the grad
         # was already NaN (clip_grad_norm_ divides by a norm that may
         # be NaN).  Detect and skip to avoid corrupting parameters.
+        # Only check ACTIVE parameters — frozen params have no grad.
         has_nan_grad = False
-        for p in model.parameters():
+        for p in trainable_params:
             if p.grad is not None and not torch.isfinite(p.grad).all():
                 has_nan_grad = True
                 break
@@ -694,7 +702,10 @@ def train_one_epoch(
             lif_grad_norm = 0.0
             non_lif_grad_norm = 0.0
             for name, p in model.named_parameters():
-                if p.grad is not None:
+                # Only read gradients from trainable, non-frozen
+                # parameters — frozen params retain stale grads from
+                # Phase 1 whose norms would corrupt the metric.
+                if p.requires_grad and p.grad is not None:
                     gn = p.grad.data.norm(2).item()
                     if "lif_cell" in name:
                         lif_grad_norm += gn ** 2
@@ -1087,6 +1098,13 @@ def train(
             logger.info("Phase 1 → Phase 2 transition at epoch %d", epoch)
             logger.info("Freezing frontend, unfreezing backend")
             logger.info("=" * 60)
+
+            # Purge ghost gradients before freezing frontend
+            # Phase 1 MSE gradients are tiny → AMP accumulates a huge
+            # Scale Factor.  Residual gradients on frozen frontend
+            # parameters would cause clip_grad_norm_ to see Inf,
+            # zeroing all trainable gradients to NaN.
+            model.zero_grad(set_to_none=True)
 
             # Freeze frontend, unfreeze backend
             for param in model.frontend.parameters():
