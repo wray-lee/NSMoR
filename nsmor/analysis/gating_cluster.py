@@ -114,10 +114,14 @@ class GatingClusterAdapter:
             config: ClusterGatingConfig (uses defaults if None).
         """
         self.model = model
-        self.model.eval()
+        if hasattr(model, 'eval'):
+            self.model.eval()
 
         if device is None:
-            device = next(model.parameters()).device
+            try:
+                device = next(model.parameters()).device
+            except StopIteration:
+                device = torch.device("cpu")
         self.device = device
 
         self.config = config if config is not None else ClusterGatingConfig()
@@ -314,12 +318,13 @@ class GatingClusterAdapter:
         """
         Compute 6 features for a single gate sequence.
 
-        Features: mean, std, max, min, lif_dominant_fraction, entropy
+        Features: mean, std, max, min, dominant_fraction, entropy
 
-        The lif_dominant_fraction is the proportion of timesteps where
-        this gate exceeds the other pathway gate (for LIF, this is the
-        fraction where g_lif > g_gru). This captures the dominant
-        routing regime and has biological relevance for pathway engagement.
+        The dominant_fraction is the proportion of timesteps where this gate
+        exceeds 0.5 (the softmax midpoint). Since gates are softmax outputs
+        summing to 1.0, a gate > 0.5 implies that pathway dominates at that
+        timestep. This captures the dominant routing regime and has biological
+        relevance for pathway engagement strategy.
 
         Args:
             gate: 1-D array of gate values, shape (T,).
@@ -338,14 +343,61 @@ class GatingClusterAdapter:
         max_val = float(np.max(gate))
         min_val = float(np.min(gate))
 
-        # LIF/GRU dominant regime fraction is computed in the calling method
-        # For now, we compute a placeholder that will be replaced
-        # This will be computed as the proportion of timesteps where this gate > 0.5
-        # (since gates are softmax outputs, >0.5 implies dominance)
+        # Dominant regime fraction: proportion where gate > 0.5 (softmax midpoint)
+        # Since gates sum to 1.0, >0.5 means this pathway dominates
         dominant_frac = float(np.mean(gate > 0.5))
 
         # Entropy of histogram (length-normalized differential entropy estimate)
         entropy = self._compute_entropy(gate, T)
+
+        return np.array([mean_val, std_val, max_val, min_val, dominant_frac, entropy])
+
+    @staticmethod
+    def _compute_gate_features_static(gate: np.ndarray, config: ClusterGatingConfig) -> np.ndarray:
+        """
+        Static version of _compute_gate_features for module-level delegation.
+
+        Args:
+            gate: 1-D array of gate values, shape (T,).
+            config: ClusterGatingConfig instance.
+
+        Returns:
+            np.ndarray of shape (6,) with [mean, std, max, min, dominant_frac, entropy].
+        """
+        T = len(gate)
+
+        if T == 0:
+            return np.zeros(6)
+
+        # Basic statistics
+        mean_val = float(np.mean(gate))
+        std_val = float(np.std(gate, ddof=1)) if T > 1 else 0.0
+        max_val = float(np.max(gate))
+        min_val = float(np.min(gate))
+
+        # Dominant regime fraction
+        dominant_frac = float(np.mean(gate > 0.5))
+
+        # Entropy (inline for static method)
+        n_samples = len(gate)
+        n_bins = min(config.entropy_bins, max(5, int(np.sqrt(n_samples))))
+        hist, _ = np.histogram(
+            gate,
+            bins=n_bins,
+            range=(float(np.min(gate)), float(np.max(gate)) + 1e-12),
+        )
+        prob = hist.astype(np.float64) / n_samples
+        prob = prob[prob > 0]
+        if len(prob) == 0:
+            entropy = 0.0
+        else:
+            eps = 1e-12
+            entropy_raw = -np.sum(prob * np.log2(prob + eps))
+            max_entropy = np.log2(n_bins)
+            entropy = entropy_raw / max_entropy if max_entropy > 0 else 0.0
+            if T < 20:
+                entropy *= T / 20.0
+            entropy = float(np.clip(entropy, 0.0, 1.0))
 
         return np.array([mean_val, std_val, max_val, min_val, dominant_frac, entropy])
 
@@ -508,8 +560,8 @@ class GatingClusterAdapter:
         for k in self.config.n_clusters_range:
             if k >= N:
                 continue
-            if N < 10:
-                # Too few samples for reliable bootstrap
+            if N < max(self.config.n_clusters_range) + 5:
+                # Too few samples for reliable bootstrap with all k values
                 stability_scores[k] = 0.0
                 continue
 
@@ -519,7 +571,7 @@ class GatingClusterAdapter:
                 # Bootstrap resample
                 idx = rng.choice(N, size=N, replace=True)
                 idx_oob = np.setdiff1d(np.arange(N), np.unique(idx))
-                if len(idx_oob) < 2:
+                if len(idx_oob) < k:
                     continue
 
                 # Fit on bootstrap sample
@@ -698,17 +750,7 @@ class GatingClusterAdapter:
             if gates.shape[0] == 0:
                 continue
 
-            T_orig = gates.shape[0]
-            x_orig = np.linspace(0, 1, T_orig)
-            x_new = np.linspace(0, 1, interp_length)
-
-            # Interpolate both gates
-            interp_gates = np.zeros((interp_length, 2))
-            for j in range(2):
-                f = sp_interp.interp1d(x_orig, gates[:, j], kind='linear',
-                                       fill_value='extrapolate')
-                interp_gates[:, j] = f(x_new)
-
+            interp_gates = interpolate_for_viz(gates, interp_length)
             cluster_trajectories[cluster_id].append(interp_gates)
 
         # Compute mean trajectory per cluster
@@ -964,6 +1006,9 @@ def fingerprint(gates: np.ndarray, config: ClusterGatingConfig) -> np.ndarray:
     """
     Compute 16-dimensional fingerprint from gate sequence (module-level export).
 
+    Thin wrapper that delegates to GatingClusterAdapter._compute_gate_features
+    and _pearson_correlation for canonical implementation.
+
     Args:
         gates: Gate sequence of shape (T, 2).
         config: ClusterGatingConfig.
@@ -971,7 +1016,6 @@ def fingerprint(gates: np.ndarray, config: ClusterGatingConfig) -> np.ndarray:
     Returns:
         Fingerprint vector of shape (config.fingerprint_dim,).
     """
-    # Use the static method from GatingClusterAdapter
     T = gates.shape[0]
     if T == 0:
         return np.zeros(config.fingerprint_dim)
@@ -979,40 +1023,9 @@ def fingerprint(gates: np.ndarray, config: ClusterGatingConfig) -> np.ndarray:
     g_lif = gates[:, 0]
     g_gru = gates[:, 1]
 
-    def _compute_gate_features(gate: np.ndarray, entropy_bins: int) -> np.ndarray:
-        """Compute 6 features for a single gate sequence."""
-        T_local = len(gate)
-        if T_local == 0:
-            return np.zeros(6)
-
-        mean_val = float(np.mean(gate))
-        std_val = float(np.std(gate, ddof=1)) if T_local > 1 else 0.0
-        max_val = float(np.max(gate))
-        min_val = float(np.min(gate))
-        dominant_frac = float(np.mean(gate > 0.5))
-
-        # Entropy
-        n_bins = min(entropy_bins, max(5, int(np.sqrt(T_local))))
-        hist, _ = np.histogram(
-            gate, bins=n_bins,
-            range=(float(np.min(gate)), float(np.max(gate)) + 1e-12),
-        )
-        prob = hist.astype(np.float64) / T_local
-        prob = prob[prob > 0]
-        if len(prob) == 0:
-            entropy = 0.0
-        else:
-            eps = 1e-12
-            entropy_raw = -np.sum(prob * np.log2(prob + eps))
-            max_entropy = np.log2(n_bins)
-            entropy = entropy_raw / max_entropy if max_entropy > 0 else 0.0
-            if T_local < 20:
-                entropy *= T_local / 20.0
-
-        return np.array([mean_val, std_val, max_val, min_val, dominant_frac, entropy])
-
-    feat_lif = _compute_gate_features(g_lif, config.entropy_bins)
-    feat_gru = _compute_gate_features(g_gru, config.entropy_bins)
+    # Delegate to canonical class methods
+    feat_lif = GatingClusterAdapter._compute_gate_features_static(g_lif, config)
+    feat_gru = GatingClusterAdapter._compute_gate_features_static(g_gru, config)
     corr = GatingClusterAdapter._pearson_correlation(g_lif, g_gru)
     t_max = float(np.argmax(g_lif)) / T if T > 0 else 0.0
     t_min = float(np.argmin(g_lif)) / T if T > 0 else 0.0
@@ -1039,6 +1052,8 @@ def compute_fingerprints(
     """
     Compute fingerprints for all sequences (module-level export).
 
+    Thin wrapper that delegates to GatingClusterAdapter.compute_fingerprints.
+
     Args:
         sequences: List of dicts from extract_gating_sequences.
         config: ClusterGatingConfig.
@@ -1046,11 +1061,8 @@ def compute_fingerprints(
     Returns:
         Fingerprint matrix of shape (N, config.fingerprint_dim).
     """
-    fingerprints = []
-    for seq in sequences:
-        fp = fingerprint(seq["gates"], config)
-        fingerprints.append(fp)
-    return np.array(fingerprints)
+    adapter = GatingClusterAdapter(torch.nn.Module(), config=config)
+    return adapter.compute_fingerprints(sequences)
 
 
 def cluster(
@@ -1060,6 +1072,8 @@ def cluster(
     """
     Perform unsupervised clustering (module-level export).
 
+    Thin wrapper that delegates to GatingClusterAdapter.cluster.
+
     Args:
         fingerprints: Fingerprint matrix of shape (N, fingerprint_dim).
         config: ClusterGatingConfig.
@@ -1067,72 +1081,8 @@ def cluster(
     Returns:
         Dict with clustering results.
     """
-    N = fingerprints.shape[0]
-    if N < 2:
-        raise ValueError(f"Need at least 2 samples for clustering, got {N}")
-
-    # Set seeds
-    np.random.seed(config.random_state)
-    import random
-    random.seed(config.random_state)
-    torch.manual_seed(config.random_state)
-
-    # Scale
-    scaler = StandardScaler()
-    fingerprints_scaled = scaler.fit_transform(fingerprints)
-
-    # Silhouette analysis
-    silhouette_scores: Dict[int, float] = {}
-    for k in config.n_clusters_range:
-        if k >= N:
-            continue
-        kmeans = KMeans(
-            n_clusters=k,
-            random_state=config.random_state,
-            n_init=10,
-        )
-        labels = kmeans.fit_predict(fingerprints_scaled)
-        if len(np.unique(labels)) >= 2:
-            score = silhouette_score(fingerprints_scaled, labels)
-            silhouette_scores[k] = float(score)
-
-    k_opt = max(silhouette_scores, key=silhouette_scores.get) if silhouette_scores else config.n_clusters
-
-    # KMeans for k=4, k=3, k_opt
-    kmeans_4 = KMeans(n_clusters=4, random_state=config.random_state, n_init=10)
-    labels_k4 = kmeans_4.fit_predict(fingerprints_scaled)
-
-    kmeans_3 = KMeans(n_clusters=3, random_state=config.random_state, n_init=10)
-    labels_k3 = kmeans_3.fit_predict(fingerprints_scaled)
-
-    kmeans_opt = KMeans(n_clusters=k_opt, random_state=config.random_state, n_init=10)
-    labels_kopt = kmeans_opt.fit_predict(fingerprints_scaled)
-
-    # UMAP
-    umap_embedding: Optional[np.ndarray] = None
-    if config.use_umap and UMAP_AVAILABLE:
-        try:
-            reducer = umap.UMAP(
-                n_neighbors=min(15, N - 1),
-                min_dist=0.1,
-                n_components=2,
-                random_state=config.random_state,
-                n_jobs=1,
-            )
-            umap_embedding = reducer.fit_transform(fingerprints_scaled)
-        except Exception:
-            pass
-
-    return {
-        "k_opt": k_opt,
-        "silhouette_scores": silhouette_scores,
-        "labels_k4": labels_k4,
-        "labels_k3": labels_k3,
-        "labels_kopt": labels_kopt,
-        "umap_embedding": umap_embedding,
-        "fingerprints_scaled": fingerprints_scaled,
-        "scaler": scaler,
-    }
+    adapter = GatingClusterAdapter(torch.nn.Module(), config=config)
+    return adapter.cluster(fingerprints)
 
 
 def interpolate_for_viz(
@@ -1142,6 +1092,8 @@ def interpolate_for_viz(
     """
     Interpolate gate sequence for visualization (module-level export).
 
+    Thin wrapper that delegates to scipy.interpolate.interp1d.
+
     Args:
         gates: Gate sequence of shape (T, 2).
         target_length: Target interpolation length.
@@ -1149,8 +1101,6 @@ def interpolate_for_viz(
     Returns:
         Interpolated sequence of shape (target_length, 2).
     """
-    from scipy import interpolate as sp_interp
-
     T = gates.shape[0]
     if T == target_length:
         return gates.copy()
@@ -1158,7 +1108,10 @@ def interpolate_for_viz(
     old_x = np.linspace(0, 1, T)
     new_x = np.linspace(0, 1, target_length)
 
-    interp_lif = np.interp(new_x, old_x, gates[:, 0])
-    interp_gru = np.interp(new_x, old_x, gates[:, 1])
+    interp_gates = np.zeros((target_length, 2), dtype=gates.dtype)
+    for j in range(2):
+        f = sp_interp.interp1d(old_x, gates[:, j], kind='linear',
+                               fill_value='extrapolate')
+        interp_gates[:, j] = f(new_x)
 
-    return np.stack([interp_lif, interp_gru], axis=1)
+    return interp_gates

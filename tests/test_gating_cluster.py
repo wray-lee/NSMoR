@@ -232,12 +232,9 @@ class TestCluster:
         for k, score in result["silhouette_scores"].items():
             assert -1 <= score <= 1, f"Silhouette score {score} out of range for k={k}"
 
-    def test_k_opt_selection(self) -> None:
-        """Test k_opt is in n_clusters_range."""
-        config = ClusterGatingConfig(
-            n_clusters_range=[2, 3, 4, 5],
-            random_state=42,
-        )
+    def test_stability_scores_present(self) -> None:
+        """Test that stability_scores is present in cluster output."""
+        config = ClusterGatingConfig(random_state=42)
 
         np.random.seed(42)
         data = np.vstack([
@@ -248,7 +245,59 @@ class TestCluster:
 
         result = cluster(data, config)
 
+        assert "stability_scores" in result, "Missing stability_scores in cluster output"
+        assert len(result["stability_scores"]) > 0, "stability_scores should not be empty"
+
+    def test_stability_scores_in_range(self) -> None:
+        """Test that stability scores are in [0, 1]."""
+        config = ClusterGatingConfig(random_state=42)
+
+        np.random.seed(42)
+        data = np.vstack([
+            np.random.randn(20, 16) + [5] * 16,
+            np.random.randn(20, 16) + [-5] * 16,
+            np.random.randn(20, 16) + [0] * 16,
+        ])
+
+        result = cluster(data, config)
+
+        for k, score in result["stability_scores"].items():
+            assert 0.0 <= score <= 1.0, f"Stability score {score} out of [0,1] for k={k}"
+
+    def test_stability_high_for_well_separated(self) -> None:
+        """Test stability is high for well-separated clusters."""
+        config = ClusterGatingConfig(random_state=42)
+
+        # Create very well-separated clusters
+        np.random.seed(42)
+        data = np.vstack([
+            np.random.randn(30, 16) + [10] * 16,
+            np.random.randn(30, 16) + [-10] * 16,
+            np.random.randn(30, 16) + [0] * 16,
+        ])
+
+        result = cluster(data, config)
+
+        # For k=3, stability should be high (>0.6)
+        if 3 in result["stability_scores"]:
+            assert result["stability_scores"][3] >= 0.6, \
+                f"Expected high stability for k=3, got {result['stability_scores'][3]}"
+
+    def test_stability_fallback_when_low(self) -> None:
+        """Test that k_opt falls back to silhouette when stability is low."""
+        config = ClusterGatingConfig(random_state=42)
+
+        # Create noisy data with poor cluster structure
+        np.random.seed(42)
+        data = np.random.randn(25, 16)  # Pure noise, no clusters
+
+        result = cluster(data, config)
+
+        # Should still return a valid k_opt
         assert result["k_opt"] in config.n_clusters_range
+        # With pure noise, stability should be low for at least some k
+        assert any(s < 0.6 for s in result["stability_scores"].values()), \
+            "Expected low stability for noisy data"
 
 
 class TestGatingClusterAdapter:
