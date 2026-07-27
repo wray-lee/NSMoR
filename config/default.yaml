@@ -96,3 +96,20 @@ finetune:
 checkpoint:
   output_dir: runs/default
   resume_from: null        # path to .pt checkpoint to resume from
+
+# ── Gating Cluster Analysis ────────────────────────────────
+# Window-free unsupervised clustering of MoR routing strategies.
+# See nsmor/analysis/gating_cluster.py for implementation details.
+# Window-free by design. NSMoR is Trial-Start anchored. TTC-50ms is only
+# for MCMC prior 5-D snapshot. Baseline 5700ms is variant for pure-wind
+# via TimeWindowConfig, not universal. Manual windows like [-5700:-500]
+# inject human bias and break unsupervised claim.
+cluster_gating:
+  n_clusters: 4
+  n_clusters_range: [2, 3, 4, 5]
+  random_state: 42
+  use_umap: true
+  fingerprint_dim: 16
+  entropy_bins: 20
+  interp_length: 200
+  # No window field — window-free by design

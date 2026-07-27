@@ -63,8 +63,8 @@ posttrain:
 train: ## Run training engine (train.py)
 	$(PYTHON) scripts/train.py --config $(CONFIG) --epochs $(EPOCHS) --phase1_epochs $(PRE_EPOCHS) --output_dir $(RUN_DIR)
 
-# ── Analysis (all 5 scripts) ─────────────────────────────────
-analyze: dynamics lesion jacobian integration psychophysics ## Run all analysis scripts
+# ── Analysis (all 6 analysis scripts) ──────────────────────────
+analyze: dynamics lesion jacobian integration psychophysics cluster ## Run all analysis scripts
 
 dynamics: $(BEST) ## Run dynamics & manifold analysis
 	$(PYTHON) scripts/analyze_dynamics.py --checkpoint $(BEST) --output $(OUTPUT)/mechanism_analysis.png
@@ -80,6 +80,9 @@ integration: $(BEST) ## Run multisensory integration window
 
 psychophysics: $(BEST) ## Run Bayesian reliability analysis
 	$(PYTHON) scripts/simulate_psychophysics.py --checkpoint $(BEST) --output_dir $(OUTPUT)
+
+cluster: $(BEST) ## Run unsupervised gating strategy clustering
+	$(PYTHON) scripts/analyze_gating.py --checkpoint $(BEST) --output_dir $(OUTPUT)
 
 # ── Autoregressive Generation ────────────────────────────────
 generate: $(BEST) ## Run autoregressive closed-loop generation

@@ -128,6 +128,44 @@ class CheckpointConfig:
     """Path to a checkpoint file to resume from."""
 
 
+@dataclass(frozen=True)
+class ClusterGatingConfig:
+    """
+    Configuration for unsupervised gating strategy clustering.
+
+    Window-free by design. NSMoR is Trial-Start anchored. TTC-50ms is only
+    for MCMC prior 5-D snapshot. Baseline 5700ms is variant for pure-wind
+    via TimeWindowConfig, not universal. Manual windows like [-5700:-500]
+    inject human bias and break unsupervised claim. Clustering is
+    unsupervised (silhouette selects k without labels); k=4 matches
+    labeling.py cardinality; k=3 merged is for biological interpretation
+    only and defined as Startle->Escape, Walk+Pre_Active->PreWalk,
+    NoResponse->NoResponse. Pearson NaN guarded to 0.0 when std==0.
+    """
+    n_clusters: int = 4
+    """Target number of clusters for k=4 analysis (matches labeling.py)."""
+
+    n_clusters_range: List[int] = field(default_factory=lambda: [2, 3, 4, 5])
+    """Range of k values to evaluate via silhouette score."""
+
+    random_state: int = 42
+    """Deterministic seed for all RNG operations."""
+
+    use_umap: bool = True
+    """Whether to compute UMAP embeddings for visualization."""
+
+    fingerprint_dim: int = 16
+    """Dimensionality of trial-level gate fingerprint vectors."""
+
+    entropy_bins: int = 20
+    """Number of histogram bins for entropy calculation in [0, 1]."""
+
+    interp_length: int = 200
+    """Target length for trajectory interpolation (visualization only)."""
+
+    # No window field — window-free by design
+
+
 @dataclass
 class LossConfig:
     """BioJointLoss hyperparameters and regularization schedule."""
@@ -165,6 +203,7 @@ class ExperimentConfig:
     * :attr:`data` — dataset split paths
     * :attr:`finetune` — freezing strategy
     * :attr:`checkpoint` — output / resume paths
+    * :attr:`cluster_gating` — gating strategy clustering
 
     Construction
     ------------
@@ -187,6 +226,7 @@ class ExperimentConfig:
     data: DataPaths = field(default_factory=DataPaths)
     finetune: FineTuneConfig = field(default_factory=FineTuneConfig)
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
+    cluster_gating: ClusterGatingConfig = field(default_factory=ClusterGatingConfig)
 
     # ── Constructors ─────────────────────────────────────────
 
@@ -239,6 +279,8 @@ class ExperimentConfig:
             cfg.finetune = _update_dataclass(cfg.finetune, raw["finetune"])
         if "checkpoint" in raw:
             cfg.checkpoint = _update_dataclass(cfg.checkpoint, raw["checkpoint"])
+        if "cluster_gating" in raw:
+            cfg.cluster_gating = _update_dataclass(cfg.cluster_gating, raw["cluster_gating"])
 
         return cfg
 

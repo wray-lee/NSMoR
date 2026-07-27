@@ -29,6 +29,9 @@ WORKDIR /workspace
 COPY pyproject.toml requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Ensure umap-learn is installed (may not be in requirements.txt during transition)
+RUN pip install --no-cache-dir umap-learn>=0.5.0 || true
+
 # ── Source code ─────────────────────────────────────────────
 COPY . .
 
