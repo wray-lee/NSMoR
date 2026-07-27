@@ -29,6 +29,14 @@ nsmor/
 │   ├── FrontendLoss          #   Phase 1: masked MSE only
 │   ├── BioDecisionLoss       #   Phase 2: MSE + router reg + ATP + sparsity + jerk
 │   └── BioJointLoss          #   Backward-compatible wrapper
+├── analysis/
+│   ├── dynamics.py           # FixedPointAdapter for dynamical systems analysis
+│   ├── gating_cluster.py     # Window-free unsupervised gating strategy clustering
+│   └── uq.py                 # Uncertainty quantification: bootstrap CI, Cohen's d
+├── analysis/
+│   ├── dynamics.py           # FixedPointAdapter for dynamical systems analysis
+│   ├── gating_cluster.py     # Window-free unsupervised gating strategy clustering
+│   └── uq.py                 # Uncertainty quantification: bootstrap CI, Cohen's d
 ├── checkpoint.py             # Deterministic save/load with full RNG state
 ├── model_utils.py            # Canonical model loading from checkpoints
 ├── pipeline/
@@ -40,7 +48,48 @@ nsmor/
 └── nsmor_dataloader.py       # PyTorch Dataset + DataLoader with shape assertions
 
 scripts/
-└── train.py                  # Two-phase training engine (--phase1_epochs)
+├── train.py                  # Two-phase training engine (--phase1_epochs)
+├── analyze_dynamics.py       # Phase-space manifold and gate dynamics
+├── analyze_jacobian.py       # Jacobian eigenvalue spectrum
+├── analyze_integration.py    # Multisensory integration window
+├── analyze_gating.py         # Unsupervised gating strategy clustering (NEW)
+├── simulate_lesion.py        # In-silico lesion analysis
+├── simulate_psychophysics.py # Bayesian reliability analysis
+└── simulate_autoregressive.py # Closed-loop autoregressive generation
+```
+
+---
+
+## Analysis Pipeline
+
+NSMoR provides 6 analysis modules for mechanistic interpretation:
+
+| Command | Output | Description |
+|---------|--------|-------------|
+| `make dynamics` | `mechanism_analysis.png` | 3D phase-space manifold, routing gates |
+| `make jacobian` | `jacobian_spectrum.png` | Jacobian eigenvalue analysis |
+| `make integration` | `integration_window.png` | Multisensory integration window |
+| `make psychophysics` | `reliability_*.png` | Bayesian reliability analysis |
+| `make lesion` | `ablation_kinematics.png` | In-silico lesion effects |
+| `make cluster` | `gating_*.png, *.json` | **Unsupervised gating clustering** |
+
+Run all analyses:
+```bash
+make analyze  # Runs all 6 analysis scripts
+```
+
+### Gating Cluster Analysis (Window-Free)
+
+The `cluster` analysis performs unsupervised clustering of MoR routing strategies:
+
+- **16-dim fingerprint**: mean, std, max, min, dominant fraction, entropy for LIF/GRU gates
+- **Pearson correlation** with NaN guard
+- **Silhouette-based k selection** (k ∈ {2,3,4,5})
+- **UMAP visualization** with true labels and predicted clusters
+- **Outputs**: 5 PNG figures + JSON summary + CSV statistics at 300 DPI
+
+```bash
+make cluster  # Requires trained model at runs/default/best_model.pth
 ```
 
 ---
