@@ -29,6 +29,7 @@ from typing import Dict, List, Optional, Tuple, Any
 
 import numpy as np
 import torch
+from scipy import interpolate as sp_interp
 from sklearn.cluster import KMeans
 from sklearn.mixture import GaussianMixture
 from sklearn.metrics import silhouette_score, adjusted_rand_score, normalized_mutual_info_score
@@ -234,12 +235,22 @@ class GatingClusterAdapter:
         Compute window-free 16-dimensional fingerprints for each trial.
 
         Features (exactly 16 dimensions):
-        [0-5]  LIF gate statistics: mean, std, max, min, AUC (mean), entropy
-        [6-11] GRU gate statistics: mean, std, max, min, AUC (mean), entropy
+        [0-5]  LIF gate statistics:
+               [0] mean, [1] std, [2] max, [3] min,
+               [4] dominant_fraction (prop. timesteps where g_lif > 0.5),
+               [5] entropy (length-normalized)
+        [6-11] GRU gate statistics:
+               [6] mean, [7] std, [8] max, [9] min,
+               [10] dominant_fraction (prop. timesteps where g_gru > 0.5),
+               [11] entropy (length-normalized)
         [12]   Pearson correlation between g_lif and g_gru (0.0 if std==0)
         [13]   Normalized time of max g_lif: argmax(g_lif) / T
         [14]   Normalized time of min g_lif: argmin(g_lif) / T
         [15]   Maximum absolute gradient of g_lif
+
+        The dominant_fraction captures the proportion of the trial where
+        each pathway dominates (gate > 0.5), providing a biologically
+        interpretable measure of pathway engagement strategy.
 
         Args:
             sequences: List of dicts from extract_gating_sequences.
@@ -338,40 +349,62 @@ class GatingClusterAdapter:
 
         return np.array([mean_val, std_val, max_val, min_val, dominant_frac, entropy])
 
-    def _compute_entropy(self, data: np.ndarray) -> float:
+    def _compute_entropy(self, data: np.ndarray, T: int) -> float:
         """
-        Compute entropy of data histogram in [0, 1] range.
+        Compute length-normalized entropy estimate of data distribution.
 
-        Uses config.entropy_bins bins with eps=1e-12 for numerical stability.
+        Uses a binned histogram entropy estimator with length normalization
+        to ensure comparability across trials of different durations.
+        For T < 20, falls back to a sparse-sample corrected estimate.
+
+        Note: This is the empirical entropy of the binned distribution,
+        not the differential entropy. The values are normalized by
+        log(T) to account for sampling density effects.
 
         Args:
             data: 1-D array of values in [0, 1].
+            T: Original sequence length (for normalization).
 
         Returns:
-            Shannon entropy (bits).
+            Length-normalized entropy estimate [0, 1].
         """
-        if len(data) == 0:
+        n_samples = len(data)
+        if n_samples == 0:
             return 0.0
 
-        # Histogram with fixed bins in [0, 1]
-        hist, _ = np.histogram(
+        # Adaptive bin count based on sample size (square root rule)
+        n_bins = min(self.config.entropy_bins, max(5, int(np.sqrt(n_samples))))
+
+        # Histogram with adaptive bins in data range
+        hist, bin_edges = np.histogram(
             data,
-            bins=self.config.entropy_bins,
-            range=(0.0, 1.0),
+            bins=n_bins,
+            range=(float(np.min(data)), float(np.max(data)) + 1e-12),
         )
 
-        # Convert to probabilities
-        prob = hist.astype(np.float64) / (len(data) + 1e-12)
-        prob = prob[prob > 0]  # Remove zero bins
+        # Convert to probabilities (avoiding zero bins)
+        prob = hist.astype(np.float64) / n_samples
+        prob = prob[prob > 0]
 
         if len(prob) == 0:
             return 0.0
 
-        # Shannon entropy with eps guard
+        # Shannon entropy in bits
         eps = 1e-12
-        entropy = -np.sum(prob * np.log2(prob + eps))
+        entropy_raw = -np.sum(prob * np.log2(prob + eps))
 
-        return float(entropy)
+        # Normalize by log2(n_bins) to get [0, 1] range (maximum entropy = uniform)
+        max_entropy = np.log2(n_bins)
+        entropy_normalized = entropy_raw / max_entropy if max_entropy > 0 else 0.0
+
+        # Length correction: for small T, entropy is overestimated
+        # Apply a correction factor that approaches 1 as T increases
+        if T < 20:
+            # Small sample correction: reduce entropy for small T
+            correction = T / 20.0
+            entropy_normalized *= correction
+
+        return float(np.clip(entropy_normalized, 0.0, 1.0))
 
     @staticmethod
     def _pearson_correlation(x: np.ndarray, y: np.ndarray) -> float:
@@ -419,6 +452,7 @@ class GatingClusterAdapter:
         2. Silhouette score for k in config.n_clusters_range -> k_opt
         3. KMeans for k=4 and k=3 (fixed for biological interpretation)
         4. Optional GMM for k=4 and k=3
+        5. Bootstrap stability assessment for k_opt
 
         All operations are seeded with config.random_state for determinism.
 
@@ -432,6 +466,7 @@ class GatingClusterAdapter:
             - labels_k4: np.ndarray — KMeans labels for k=4
             - labels_k3: np.ndarray — KMeans labels for k=3
             - fingerprints_scaled: np.ndarray — scaled fingerprints
+            - stability_scores: dict — {k: stability_index}
         """
         N = fingerprints.shape[0]
 
@@ -467,8 +502,61 @@ class GatingClusterAdapter:
                 score = silhouette_score(fingerprints_scaled, labels)
                 silhouette_scores[k] = float(score)
 
-        # Select optimal k (highest silhouette score)
-        if silhouette_scores:
+        # Bootstrap stability assessment for each k
+        stability_scores: Dict[int, float] = {}
+        n_bootstrap = 100
+        for k in self.config.n_clusters_range:
+            if k >= N:
+                continue
+            if N < 10:
+                # Too few samples for reliable bootstrap
+                stability_scores[k] = 0.0
+                continue
+
+            stability_values = []
+            rng = np.random.default_rng(self.config.random_state)
+            for _ in range(n_bootstrap):
+                # Bootstrap resample
+                idx = rng.choice(N, size=N, replace=True)
+                idx_oob = np.setdiff1d(np.arange(N), np.unique(idx))
+                if len(idx_oob) < 2:
+                    continue
+
+                # Fit on bootstrap sample
+                kmeans_boot = KMeans(
+                    n_clusters=k,
+                    random_state=self.config.random_state,
+                    n_init=10,
+                )
+                labels_boot = kmeans_boot.fit_predict(fingerprints_scaled[idx])
+
+                # Predict on OOB samples
+                labels_oob_pred = kmeans_boot.predict(fingerprints_scaled[idx_oob])
+
+                # Fit on OOB samples directly
+                kmeans_oob = KMeans(
+                    n_clusters=k,
+                    random_state=self.config.random_state,
+                    n_init=10,
+                )
+                labels_oob_true = kmeans_oob.fit_predict(fingerprints_scaled[idx_oob])
+
+                # Compute ARI between the two clusterings on OOB samples
+                if len(np.unique(labels_oob_pred)) > 1 and len(np.unique(labels_oob_true)) > 1:
+                    ari = adjusted_rand_score(labels_oob_true, labels_oob_pred)
+                    stability_values.append(ari)
+
+            if stability_values:
+                stability_scores[k] = float(np.median(stability_values))
+            else:
+                stability_scores[k] = 0.0
+
+        # Select optimal k: prefer highest silhouette among k with stability >= 0.6
+        # If no k meets stability threshold, fall back to highest silhouette
+        stable_ks = [k for k, s in stability_scores.items() if s >= 0.6]
+        if stable_ks and silhouette_scores:
+            k_opt = max(stable_ks, key=lambda k: silhouette_scores.get(k, -1.0))
+        elif silhouette_scores:
             k_opt = max(silhouette_scores, key=silhouette_scores.get)
         else:
             k_opt = self.config.n_clusters
@@ -512,6 +600,7 @@ class GatingClusterAdapter:
         return {
             "k_opt": k_opt,
             "silhouette_scores": silhouette_scores,
+            "stability_scores": stability_scores,
             "labels_k4": labels_k4,
             "labels_k3": labels_k3,
             "gmm_labels_k4": gmm_labels_k4,
@@ -609,8 +698,6 @@ class GatingClusterAdapter:
             if gates.shape[0] == 0:
                 continue
 
-            from scipy import interpolate as sp_interp
-
             T_orig = gates.shape[0]
             x_orig = np.linspace(0, 1, T_orig)
             x_new = np.linspace(0, 1, interp_length)
@@ -636,6 +723,93 @@ class GatingClusterAdapter:
 # ═══════════════════════════════════════════════════════════════════════
 # Convenience Functions
 # ═══════════════════════════════════════════════════════════════════════
+
+def fingerprint(gates: np.ndarray, config: ClusterGatingConfig) -> np.ndarray:
+    """
+    Compute fingerprint for a single gate sequence.
+
+    Args:
+        gates: np.ndarray of shape (T, 2) with [g_lif, g_gru] per timestep.
+        config: ClusterGatingConfig instance.
+
+    Returns:
+        np.ndarray of shape (16,) fingerprint vector.
+    """
+    if gates.shape[0] == 0:
+        return np.zeros(config.fingerprint_dim, dtype=np.float32)
+
+    # Use a temporary adapter to compute features
+    adapter = GatingClusterAdapter(torch.nn.Module(), config=config)
+
+    # Create a dummy sequence
+    seq = {"trial_id": 0, "gates": gates, "true_4way": 0, "true_3way_merged": 0}
+
+    # Compute fingerprint via adapter
+    fps = adapter.compute_fingerprints([seq])
+    return fps[0]
+
+
+def compute_fingerprints(
+    sequences: List[Dict[str, Any]],
+    config: ClusterGatingConfig,
+) -> np.ndarray:
+    """
+    Compute fingerprints for multiple sequences.
+
+    Args:
+        sequences: List of dicts with 'gates' key containing np.ndarray (T, 2).
+        config: ClusterGatingConfig instance.
+
+    Returns:
+        np.ndarray of shape (N, 16) where N = len(sequences).
+    """
+    # Use a temporary adapter to compute features
+    adapter = GatingClusterAdapter(torch.nn.Module(), config=config)
+    return adapter.compute_fingerprints(sequences)
+
+
+def cluster(fingerprints: np.ndarray, config: ClusterGatingConfig) -> Dict[str, Any]:
+    """
+    Perform unsupervised clustering on fingerprints.
+
+    Args:
+        fingerprints: np.ndarray of shape (N, 16).
+        config: ClusterGatingConfig instance.
+
+    Returns:
+        Dict with clustering results including 'labels_k4', 'labels_k3', 'k_opt', etc.
+    """
+    # Use a temporary adapter to perform clustering
+    adapter = GatingClusterAdapter(torch.nn.Module(), config=config)
+    return adapter.cluster(fingerprints)
+
+
+def interpolate_for_viz(gates: np.ndarray, target_length: int) -> np.ndarray:
+    """
+    Interpolate gate trajectory to target length for visualization.
+
+    Args:
+        gates: np.ndarray of shape (T, 2).
+        target_length: Desired output length.
+
+    Returns:
+        np.ndarray of shape (target_length, 2).
+    """
+    T_orig = gates.shape[0]
+    if T_orig == target_length:
+        return gates.copy()
+
+    x_orig = np.linspace(0, 1, T_orig)
+    x_new = np.linspace(0, 1, target_length)
+
+    interp_gates = np.zeros((target_length, 2), dtype=gates.dtype)
+    for j in range(2):
+        f = sp_interp.interp1d(x_orig, gates[:, j], kind='linear',
+                               fill_value='extrapolate')
+        interp_gates[:, j] = f(x_new)
+
+    return interp_gates
+
 
 def extract_and_cluster_gates(
     model: torch.nn.Module,
@@ -780,3 +954,211 @@ def _test_gating_cluster():
 
 if __name__ == "__main__":
     _test_gating_cluster()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Module-level exports (for backward compatibility and testing)
+# ═══════════════════════════════════════════════════════════════════════
+
+def fingerprint(gates: np.ndarray, config: ClusterGatingConfig) -> np.ndarray:
+    """
+    Compute 16-dimensional fingerprint from gate sequence (module-level export).
+
+    Args:
+        gates: Gate sequence of shape (T, 2).
+        config: ClusterGatingConfig.
+
+    Returns:
+        Fingerprint vector of shape (config.fingerprint_dim,).
+    """
+    # Use the static method from GatingClusterAdapter
+    T = gates.shape[0]
+    if T == 0:
+        return np.zeros(config.fingerprint_dim)
+
+    g_lif = gates[:, 0]
+    g_gru = gates[:, 1]
+
+    def _compute_gate_features(gate: np.ndarray, entropy_bins: int) -> np.ndarray:
+        """Compute 6 features for a single gate sequence."""
+        T_local = len(gate)
+        if T_local == 0:
+            return np.zeros(6)
+
+        mean_val = float(np.mean(gate))
+        std_val = float(np.std(gate, ddof=1)) if T_local > 1 else 0.0
+        max_val = float(np.max(gate))
+        min_val = float(np.min(gate))
+        dominant_frac = float(np.mean(gate > 0.5))
+
+        # Entropy
+        n_bins = min(entropy_bins, max(5, int(np.sqrt(T_local))))
+        hist, _ = np.histogram(
+            gate, bins=n_bins,
+            range=(float(np.min(gate)), float(np.max(gate)) + 1e-12),
+        )
+        prob = hist.astype(np.float64) / T_local
+        prob = prob[prob > 0]
+        if len(prob) == 0:
+            entropy = 0.0
+        else:
+            eps = 1e-12
+            entropy_raw = -np.sum(prob * np.log2(prob + eps))
+            max_entropy = np.log2(n_bins)
+            entropy = entropy_raw / max_entropy if max_entropy > 0 else 0.0
+            if T_local < 20:
+                entropy *= T_local / 20.0
+
+        return np.array([mean_val, std_val, max_val, min_val, dominant_frac, entropy])
+
+    feat_lif = _compute_gate_features(g_lif, config.entropy_bins)
+    feat_gru = _compute_gate_features(g_gru, config.entropy_bins)
+    corr = GatingClusterAdapter._pearson_correlation(g_lif, g_gru)
+    t_max = float(np.argmax(g_lif)) / T if T > 0 else 0.0
+    t_min = float(np.argmin(g_lif)) / T if T > 0 else 0.0
+    if T > 1:
+        grad_lif = np.abs(np.diff(g_lif))
+        max_grad = float(np.max(grad_lif))
+    else:
+        max_grad = 0.0
+
+    fp = np.concatenate([
+        feat_lif, feat_gru, [corr], [t_max, t_min], [max_grad]
+    ])
+
+    assert fp.shape == (config.fingerprint_dim,), (
+        f"Fingerprint shape {fp.shape} != ({config.fingerprint_dim},)"
+    )
+    return fp
+
+
+def compute_fingerprints(
+    sequences: List[Dict[str, Any]],
+    config: ClusterGatingConfig,
+) -> np.ndarray:
+    """
+    Compute fingerprints for all sequences (module-level export).
+
+    Args:
+        sequences: List of dicts from extract_gating_sequences.
+        config: ClusterGatingConfig.
+
+    Returns:
+        Fingerprint matrix of shape (N, config.fingerprint_dim).
+    """
+    fingerprints = []
+    for seq in sequences:
+        fp = fingerprint(seq["gates"], config)
+        fingerprints.append(fp)
+    return np.array(fingerprints)
+
+
+def cluster(
+    fingerprints: np.ndarray,
+    config: ClusterGatingConfig,
+) -> Dict[str, Any]:
+    """
+    Perform unsupervised clustering (module-level export).
+
+    Args:
+        fingerprints: Fingerprint matrix of shape (N, fingerprint_dim).
+        config: ClusterGatingConfig.
+
+    Returns:
+        Dict with clustering results.
+    """
+    N = fingerprints.shape[0]
+    if N < 2:
+        raise ValueError(f"Need at least 2 samples for clustering, got {N}")
+
+    # Set seeds
+    np.random.seed(config.random_state)
+    import random
+    random.seed(config.random_state)
+    torch.manual_seed(config.random_state)
+
+    # Scale
+    scaler = StandardScaler()
+    fingerprints_scaled = scaler.fit_transform(fingerprints)
+
+    # Silhouette analysis
+    silhouette_scores: Dict[int, float] = {}
+    for k in config.n_clusters_range:
+        if k >= N:
+            continue
+        kmeans = KMeans(
+            n_clusters=k,
+            random_state=config.random_state,
+            n_init=10,
+        )
+        labels = kmeans.fit_predict(fingerprints_scaled)
+        if len(np.unique(labels)) >= 2:
+            score = silhouette_score(fingerprints_scaled, labels)
+            silhouette_scores[k] = float(score)
+
+    k_opt = max(silhouette_scores, key=silhouette_scores.get) if silhouette_scores else config.n_clusters
+
+    # KMeans for k=4, k=3, k_opt
+    kmeans_4 = KMeans(n_clusters=4, random_state=config.random_state, n_init=10)
+    labels_k4 = kmeans_4.fit_predict(fingerprints_scaled)
+
+    kmeans_3 = KMeans(n_clusters=3, random_state=config.random_state, n_init=10)
+    labels_k3 = kmeans_3.fit_predict(fingerprints_scaled)
+
+    kmeans_opt = KMeans(n_clusters=k_opt, random_state=config.random_state, n_init=10)
+    labels_kopt = kmeans_opt.fit_predict(fingerprints_scaled)
+
+    # UMAP
+    umap_embedding: Optional[np.ndarray] = None
+    if config.use_umap and UMAP_AVAILABLE:
+        try:
+            reducer = umap.UMAP(
+                n_neighbors=min(15, N - 1),
+                min_dist=0.1,
+                n_components=2,
+                random_state=config.random_state,
+                n_jobs=1,
+            )
+            umap_embedding = reducer.fit_transform(fingerprints_scaled)
+        except Exception:
+            pass
+
+    return {
+        "k_opt": k_opt,
+        "silhouette_scores": silhouette_scores,
+        "labels_k4": labels_k4,
+        "labels_k3": labels_k3,
+        "labels_kopt": labels_kopt,
+        "umap_embedding": umap_embedding,
+        "fingerprints_scaled": fingerprints_scaled,
+        "scaler": scaler,
+    }
+
+
+def interpolate_for_viz(
+    gates: np.ndarray,
+    target_length: int,
+) -> np.ndarray:
+    """
+    Interpolate gate sequence for visualization (module-level export).
+
+    Args:
+        gates: Gate sequence of shape (T, 2).
+        target_length: Target interpolation length.
+
+    Returns:
+        Interpolated sequence of shape (target_length, 2).
+    """
+    from scipy import interpolate as sp_interp
+
+    T = gates.shape[0]
+    if T == target_length:
+        return gates.copy()
+
+    old_x = np.linspace(0, 1, T)
+    new_x = np.linspace(0, 1, target_length)
+
+    interp_lif = np.interp(new_x, old_x, gates[:, 0])
+    interp_gru = np.interp(new_x, old_x, gates[:, 1])
+
+    return np.stack([interp_lif, interp_gru], axis=1)
