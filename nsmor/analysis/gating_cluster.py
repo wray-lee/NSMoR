@@ -197,6 +197,7 @@ class GatingClusterAdapter:
                 sequences.append({
                     "trial_id": trial_idx,
                     "gates": gates_i,
+                    "length": length_i,
                     "true_4way": true_4way,
                     "true_3way_merged": true_3way_merged,
                 })
@@ -381,20 +382,24 @@ class GatingClusterAdapter:
         # Entropy (inline for static method)
         n_samples = len(gate)
         n_bins = min(config.entropy_bins, max(5, int(np.sqrt(n_samples))))
-        hist, _ = np.histogram(
-            gate,
-            bins=n_bins,
-            range=(float(np.min(gate)), float(np.max(gate)) + 1e-12),
-        )
-        prob = hist.astype(np.float64) / n_samples
-        prob = prob[prob > 0]
-        if len(prob) == 0:
+        dmin, dmax = float(np.min(gate)), float(np.max(gate))
+        if np.isclose(dmin, dmax):
             entropy = 0.0
         else:
-            eps = 1e-12
-            entropy_raw = -np.sum(prob * np.log2(prob + eps))
-            max_entropy = np.log2(n_bins)
-            entropy = entropy_raw / max_entropy if max_entropy > 0 else 0.0
+            hist, _ = np.histogram(
+                gate,
+                bins=n_bins,
+                range=(dmin, dmax + 1e-12),
+            )
+            prob = hist.astype(np.float64) / n_samples
+            prob = prob[prob > 0]
+            if len(prob) == 0:
+                entropy = 0.0
+            else:
+                eps = 1e-12
+                entropy_raw = -np.sum(prob * np.log2(prob + eps))
+                max_entropy = np.log2(n_bins)
+                entropy = entropy_raw / max_entropy if max_entropy > 0 else 0.0
             if T < 20:
                 entropy *= T / 20.0
             entropy = float(np.clip(entropy, 0.0, 1.0))
@@ -413,6 +418,13 @@ class GatingClusterAdapter:
         not the differential entropy. The values are normalized by
         log(T) to account for sampling density effects.
 
+        Edge cases:
+        - Empty data (n_samples == 0): returns 0.0.
+        - Constant data (max ≈ min): returns 0.0 (no uncertainty).
+        - Very-near-constant data (range tiny relative to bin count):
+          clamped to a minimum range of 1e-12 to avoid numpy histogram
+          ValueError ("Too many bins for data range").
+
         Args:
             data: 1-D array of values in [0, 1].
             T: Original sequence length (for normalization).
@@ -427,11 +439,16 @@ class GatingClusterAdapter:
         # Adaptive bin count based on sample size (square root rule)
         n_bins = min(self.config.entropy_bins, max(5, int(np.sqrt(n_samples))))
 
+        # Guard: if data is constant (or nearly so), entropy is 0
+        dmin, dmax = float(np.min(data)), float(np.max(data))
+        if np.isclose(dmin, dmax):
+            return 0.0
+
         # Histogram with adaptive bins in data range
         hist, bin_edges = np.histogram(
             data,
             bins=n_bins,
-            range=(float(np.min(data)), float(np.max(data)) + 1e-12),
+            range=(dmin, dmax + 1e-12),
         )
 
         # Convert to probabilities (avoiding zero bins)
@@ -484,7 +501,11 @@ class GatingClusterAdapter:
         if std_x < 1e-12 or std_y < 1e-12:
             return 0.0
 
-        corr = np.corrcoef(x, y)[0, 1]
+        # Suppress harmless "invalid value in divide" when std ≈ 0
+        # passes the 1e-12 guard above but still triggers np.corrcoef's
+        # internal normalization warning. The NaN guard below handles it.
+        with np.errstate(invalid='ignore'):
+            corr = np.corrcoef(x, y)[0, 1]
 
         # Guard against NaN
         if np.isnan(corr):
@@ -649,12 +670,21 @@ class GatingClusterAdapter:
         except Exception:
             gmm_labels_k3 = labels_k3.copy()
 
+        # KMeans for k_opt (optimal k from silhouette + stability)
+        kmeans_kopt = KMeans(
+            n_clusters=k_opt,
+            random_state=self.config.random_state,
+            n_init=10,
+        )
+        labels_kopt = kmeans_kopt.fit_predict(fingerprints_scaled)
+
         return {
             "k_opt": k_opt,
             "silhouette_scores": silhouette_scores,
             "stability_scores": stability_scores,
             "labels_k4": labels_k4,
             "labels_k3": labels_k3,
+            "labels_kopt": labels_kopt,
             "gmm_labels_k4": gmm_labels_k4,
             "gmm_labels_k3": gmm_labels_k3,
             "fingerprints_scaled": fingerprints_scaled,
@@ -915,6 +945,7 @@ def extract_and_cluster_gates(
         "silhouette_scores": cluster_result["silhouette_scores"],
         "labels_k4": cluster_result["labels_k4"],
         "labels_k3": cluster_result["labels_k3"],
+        "labels_kopt": cluster_result["labels_kopt"],
         "umap_embedding": umap_embedding,
         "evaluation": evaluation,
         "trajectories_k4": trajectories_k4,
