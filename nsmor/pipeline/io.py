@@ -7,8 +7,9 @@ raw experimental data into pandas DataFrames and per-trial dictionaries.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
-from typing import Dict, List, Union
+from typing import Any, Dict, List, Union
 
 import numpy as np
 import pandas as pd
@@ -38,6 +39,57 @@ EVENT_COLUMNS: List[str] = [
     "event_type",
     "event_value",
 ]
+
+
+def _parse_event_value(value: Any) -> Dict[str, Any]:
+    """Parse JSON-like event metadata without failing legacy scalar values."""
+    if isinstance(value, dict):
+        return value
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return {}
+    try:
+        parsed = json.loads(str(value))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _normalise_side(value: Any) -> str:
+    """Return a canonical wind side or ``unknown`` for ambiguous metadata."""
+    side = str(value).strip().lower() if value is not None else ""
+    if side in {"left", "l"}:
+        return "left"
+    if side in {"right", "r"}:
+        return "right"
+    return "unknown"
+
+
+def _trial_wind_side(
+    events: pd.DataFrame, session_id: str, trial_id: int,
+) -> str:
+    """Resolve side from wind_onset, then trial_start metadata."""
+    trial = events[
+        (events["session_id"] == session_id) & (events["trial_id"] == trial_id)
+    ]
+    for event_type in ("wind_onset", "wind_onset_event"):
+        values = trial.loc[trial["event_type"] == event_type, "event_value"]
+        parsed = [_parse_event_value(value) for value in values]
+        sides = {_normalise_side(item.get("wind_side", item.get("side"))) for item in parsed}
+        sides.discard("unknown")
+        if len(sides) == 1:
+            return sides.pop()
+        if len(sides) > 1:
+            return "unknown"
+
+    starts = trial.loc[trial["event_type"] == "trial_start", "event_value"]
+    sides = {
+        _normalise_side(
+            item.get("wind_dir", item.get("wind_side", item.get("screen_side")))
+        )
+        for item in (_parse_event_value(value) for value in starts)
+    }
+    sides.discard("unknown")
+    return sides.pop() if len(sides) == 1 else "unknown"
 
 
 # ──────────────────────────────────────────────────────────────
@@ -167,6 +219,7 @@ def extract_trial_data(
     evt = session_data["events"]
     mask_evt = (evt["session_id"] == session_id) & (evt["trial_id"] == trial_id)
     evt_trial = evt.loc[mask_evt].sort_values("time_ms")
+    wind_side = _trial_wind_side(evt, session_id, trial_id)
 
     return {
         "time_ms": kin_trial["time_ms"].to_numpy(dtype=np.float64),
@@ -180,6 +233,9 @@ def extract_trial_data(
         "l_v_ratio": kin_trial["l_v_ratio"].to_numpy(dtype=np.float64),
         "event_times": evt_trial["time_ms"].to_numpy(dtype=np.float64),
         "event_types": evt_trial["event_type"].to_numpy(),
+        "event_values": evt_trial["event_value"].to_numpy(),
+        "wind_side_original": wind_side,
+        "wind_side_unified": wind_side,
         "session_id": session_id,
         "trial_id": trial_id,
     }

@@ -33,6 +33,7 @@ from nsmor.config import (
     FeatureConfig,
     TimeWindowConfig,
 )
+from nsmor.pipeline.kinematics import mirror_to_right
 
 # Pure-wind prepended baseline: 5.7 s × 100 Hz = 570 frames
 PURE_WIND_PREPEND_FRAMES: int = 570
@@ -307,6 +308,7 @@ def build_snapshot_dataset(
 def build_sequence_dataset(
     labeled_trials: List[Dict],
     feature_config: FeatureConfig = DEFAULT_FEATURE,
+    unify_wind_sides: bool = False,
 ) -> List[Tuple[np.ndarray, np.ndarray, int]]:
     """
     Build Trial-Start anchored sequences for all valid trials.
@@ -314,6 +316,7 @@ def build_sequence_dataset(
     Args:
         labeled_trials: Output of :func:`labeling.assign_ground_truth_labels`.
         feature_config: Feature dimension configuration.
+        unify_wind_sides: Mirror left-wind trials into the right-wind frame.
 
     Returns:
         List of ``(X_seq, Y_seq, label)`` tuples.
@@ -322,8 +325,11 @@ def build_sequence_dataset(
 
     for info in labeled_trials:
         try:
+            trial_data = info["trial_data"]
+            if unify_wind_sides:
+                trial_data = mirror_to_right(trial_data)
             X_seq, Y_seq = extract_trial_sequence(
-                info["trial_data"],
+                trial_data,
                 feature_config=feature_config,
             )
             sequences.append((X_seq, Y_seq, int(info["label"])))

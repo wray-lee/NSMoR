@@ -7,11 +7,88 @@ with utilities for computing derived kinematic quantities.
 
 from __future__ import annotations
 
-from typing import Literal, Optional, Tuple
+from copy import deepcopy
+from typing import Any, Dict, Literal, Optional, Tuple
 
 import numpy as np
 from scipy.ndimage import gaussian_filter1d
 from scipy.signal import savgol_filter
+
+
+WIND_SIDES = {"left", "right"}
+
+
+def _copy_trial(trial: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a defensive copy of a trial dictionary."""
+    return {
+        key: value.copy() if isinstance(value, np.ndarray) else deepcopy(value)
+        for key, value in trial.items()
+    }
+
+
+def mirror_to_right(trial: Dict[str, Any]) -> Dict[str, Any]:
+    """Reflect a left-wind trial into the canonical right-wind frame.
+
+    The processed NSMoR target ``velocity`` is scalar speed magnitude, so it
+    is invariant under reflection. The global x coordinate is lateral; its
+    sign and the corresponding heading angle are reflected. Raw directional
+    ``dx`` and ``vel_x`` fields are reflected when present. Raw ``dz`` is yaw
+    rotation and is reflected with heading. Provenance makes the operation
+    idempotent and permits later de-mirroring.
+
+    Args:
+        trial: Per-trial dictionary from ``extract_trial_data``.
+
+    Returns:
+        A copied trial in the canonical right-wind frame.
+    """
+    mirrored = _copy_trial(trial)
+    original_side = str(
+        mirrored.get("wind_side_original", mirrored.get("wind_side", "unknown"))
+    ).lower()
+    mirrored["wind_side_original"] = original_side
+
+    if mirrored.get("wind_side_unified") == "right":
+        if "wind_side_mirrored" not in mirrored:
+            mirrored["wind_side_mirrored"] = original_side == "left"
+        return mirrored
+
+    if original_side == "left":
+        for field in ("x_pos", "dx", "dz", "vel_x"):
+            if field in mirrored:
+                mirrored[field] = -np.asarray(mirrored[field])
+        if "heading" in mirrored:
+            mirrored["heading"] = (-np.asarray(mirrored["heading"])) % 360.0
+        mirrored["wind_side_unified"] = "right"
+        mirrored["wind_side_mirrored"] = True
+    else:
+        mirrored["wind_side_unified"] = (
+            "right" if original_side == "right" else original_side
+        )
+        mirrored["wind_side_mirrored"] = False
+
+    return mirrored
+
+
+def demirror_prediction(
+    y_pred_unified: np.ndarray, original_side: str,
+) -> np.ndarray:
+    """Map unified scalar-speed predictions to the original-side view.
+
+    ``Y`` is speed magnitude (derived from Euclidean displacement), not a
+    signed lateral component. Reflection therefore leaves prediction values
+    unchanged; the original side is preserved separately for absolute-side
+    grouping in analyses.
+
+    Args:
+        y_pred_unified: Predicted scalar speed in the canonical frame.
+        original_side: Original wind side (``left``, ``right``, or unknown).
+
+    Returns:
+        A copy of the prediction in the original experimental frame.
+    """
+    del original_side
+    return np.asarray(y_pred_unified).copy()
 
 
 def smooth_kinematics(
