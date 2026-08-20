@@ -3,6 +3,23 @@ Kinematics processing: smoothing, velocity / acceleration computation.
 
 Provides Savitzky-Golay and Gaussian kernel smoothing for raw position data,
 with utilities for computing derived kinematic quantities.
+
+Coordinate convention (fixed for mirroring):
+    - allocentric frame: +Y = forward (anterior), +X = right (lateral),
+      heading = yaw angle in degrees, 0 = +Y, CCW positive (standard
+      mathematical rotation). This matches pre_load_adapt.py:
+        heading = cumsum(degrees(dz / 30))
+        x_pos = cumsum(dx*cos - dy*sin)/10, y_pos = cumsum(dx*sin + dy*cos)/10
+    - Mirroring across the sagittal (Y) plane: x -> -x, heading -> -heading
+      (mod 360), dz -> -dz, dx -> -dx, vel_x -> -vel_x. Scalar speed
+      ``velocity = sqrt(dx^2+dy^2)/dt`` is rotation-invariant, so Y target
+      is identity under reflection. Fields y_pos, visual_angle, l_v_ratio
+      are sagittal-invariant and intentionally not mirrored.
+    - Biological/energetic invariance: cercal GI afferents and downstream
+      giant-fiber conduction are bilaterally symmetric; ATP cost of spiking
+      scales with scalar spike-count (velocity magnitude), not signed
+      lateral direction, and synaptic delay is symmetric across midline. No
+      lateralized metabolic or delay asymmetry is introduced by reflection.
 """
 
 from __future__ import annotations
@@ -19,11 +36,9 @@ WIND_SIDES = {"left", "right"}
 
 
 def _copy_trial(trial: Dict[str, Any]) -> Dict[str, Any]:
-    """Return a defensive copy of a trial dictionary."""
-    return {
-        key: value.copy() if isinstance(value, np.ndarray) else deepcopy(value)
-        for key, value in trial.items()
-    }
+    """Return a defensive deep copy of a trial dictionary."""
+    # deepcopy ensures object-dtype arrays (event_values) do not share refs
+    return deepcopy(trial)
 
 
 def mirror_to_right(trial: Dict[str, Any]) -> Dict[str, Any]:
@@ -33,8 +48,16 @@ def mirror_to_right(trial: Dict[str, Any]) -> Dict[str, Any]:
     is invariant under reflection. The global x coordinate is lateral; its
     sign and the corresponding heading angle are reflected. Raw directional
     ``dx`` and ``vel_x`` fields are reflected when present. Raw ``dz`` is yaw
-    rotation and is reflected with heading. Provenance makes the operation
-    idempotent and permits later de-mirroring.
+    increment and is reflected with heading. ``y_pos``, ``visual_angle``,
+    ``l_v_ratio`` are sagittal-invariant and left unchanged. Provenance
+    (``wind_side_mirrored``) is the sole idempotency source; repeated calls
+    are no-ops.
+
+    Biological basis: cricket cercal wind afferents are bilateral; escape
+    direction is lateralized (mirror-symmetric). Pooling left/right by
+    reflection preserves the biomechanical symmetry while keeping scalar
+    vigor (and thus spike-count ATP cost and axonal conduction delay,
+    both symmetric across midline) invariant.
 
     Args:
         trial: Per-trial dictionary from ``extract_trial_data``.
@@ -43,22 +66,48 @@ def mirror_to_right(trial: Dict[str, Any]) -> Dict[str, Any]:
         A copied trial in the canonical right-wind frame.
     """
     mirrored = _copy_trial(trial)
+    # Defensive shape assertions for core kinematics (1-D time series)
+    if "time_ms" in mirrored:
+        assert isinstance(mirrored["time_ms"], np.ndarray), "time_ms must be ndarray"
+        assert mirrored["time_ms"].ndim == 1, f"time_ms ndim {mirrored['time_ms'].ndim} !=1"
+        T = mirrored["time_ms"].shape[0]
+        for key in ("x_pos", "y_pos", "heading", "velocity", "acceleration"):
+            if key in mirrored and isinstance(mirrored[key], np.ndarray):
+                assert mirrored[key].shape == (T,), f"{key} shape {mirrored[key].shape} != ({T},)"
     original_side = str(
         mirrored.get("wind_side_original", mirrored.get("wind_side", "unknown"))
     ).lower()
     mirrored["wind_side_original"] = original_side
 
-    if mirrored.get("wind_side_unified") == "right":
-        if "wind_side_mirrored" not in mirrored:
-            mirrored["wind_side_mirrored"] = original_side == "left"
+    # Idempotency: wind_side_mirrored is the single source of truth
+    if mirrored.get("wind_side_mirrored") is True:
+        mirrored["wind_side_unified"] = "right"
         return mirrored
+    if mirrored.get("wind_side_mirrored") is False:
+        # Already processed as non-mirrored; preserve unified value
+        return mirrored
+    # Legacy path: no provenance yet. If already unified right with
+    # original right, mark as non-mirrored and return.
+    if mirrored.get("wind_side_unified") == "right" and original_side == "right":
+        mirrored["wind_side_mirrored"] = False
+        return mirrored
+    # If unified==right but original==left with no provenance, treat as
+    # not-yet-mirrored (dirty metadata) and fall through to flip.
 
     if original_side == "left":
         for field in ("x_pos", "dx", "dz", "vel_x"):
             if field in mirrored:
-                mirrored[field] = -np.asarray(mirrored[field])
+                arr = np.asarray(mirrored[field])
+                assert arr.ndim == 1, f"{field} ndim {arr.ndim} !=1"
+                if "T" in locals():
+                    assert arr.shape[0] == T, f"{field} len {arr.shape[0]} != T={T}"
+                mirrored[field] = -arr
         if "heading" in mirrored:
-            mirrored["heading"] = (-np.asarray(mirrored["heading"])) % 360.0
+            h = np.asarray(mirrored["heading"])
+            assert h.ndim == 1, f"heading ndim {h.ndim} !=1"
+            if "T" in locals():
+                assert h.shape[0] == T, f"heading len {h.shape[0]} != T={T}"
+            mirrored["heading"] = (-h) % 360.0
         mirrored["wind_side_unified"] = "right"
         mirrored["wind_side_mirrored"] = True
     else:
@@ -81,14 +130,17 @@ def demirror_prediction(
     grouping in analyses.
 
     Args:
-        y_pred_unified: Predicted scalar speed in the canonical frame.
+        y_pred_unified: Predicted scalar speed in the canonical frame,
+            shape (T,) or (N, T).
         original_side: Original wind side (``left``, ``right``, or unknown).
 
     Returns:
         A copy of the prediction in the original experimental frame.
     """
+    arr = np.asarray(y_pred_unified)
+    assert arr.ndim in (1, 2), f"y_pred ndim {arr.ndim} not in (1,2)"
     del original_side
-    return np.asarray(y_pred_unified).copy()
+    return arr.copy()
 
 
 def smooth_kinematics(

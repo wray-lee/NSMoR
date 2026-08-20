@@ -29,9 +29,11 @@ from nsmor.config import (
     TimeWindowConfig,
 )
 from nsmor.pipeline.io import (
+    _parse_event_value,
     extract_trial_data,
     load_and_concat_sessions,
 )
+from nsmor.pipeline.kinematics import demirror_prediction, mirror_to_right
 from nsmor.pipeline.labeling import assign_ground_truth_labels
 from nsmor.data_extractor import (
     PURE_WIND_PREPEND_FRAMES,
@@ -336,6 +338,134 @@ class TestSequenceExtraction:
 
         # Original region should have non-zero wind after stimulus
         assert np.any(X_seq[PURE_WIND_PREPEND_FRAMES:, 1] != 0.0)
+
+
+class TestMirrorToRight:
+    """Tests for wind-side mirroring (NSMoR-pond reviewer #2 gating)."""
+
+    def _left_trial(self, T: int = 20) -> dict:
+        t = np.arange(T, dtype=np.float64) * 10.0
+        return {
+            "time_ms": t,
+            "x_pos": np.linspace(1.0, 5.0, T, dtype=np.float64),
+            "y_pos": np.linspace(0.0, 2.0, T, dtype=np.float64),
+            "heading": np.linspace(0.0, 90.0, T, dtype=np.float64),
+            "velocity": np.random.uniform(0, 1, T).astype(np.float64),
+            "acceleration": np.zeros(T, dtype=np.float64),
+            "visual_angle": np.zeros(T, dtype=np.float64),
+            "wind_state": np.ones(T, dtype=np.float64),
+            "l_v_ratio": np.zeros(T, dtype=np.float64),
+            "event_types": np.array(["wind_onset"], dtype=object),
+            "event_values": np.array(["{'wind_side': 'left'}"] * T, dtype=object),
+            "wind_side_original": "left",
+            "wind_side_unified": "left",
+            "session_id": "s0",
+            "trial_id": 0,
+            "dx": np.ones(T, dtype=np.float64),
+            "dz": np.ones(T, dtype=np.float64) * 10.0,
+            "vel_x": np.ones(T, dtype=np.float64) * 2.0,
+        }
+
+    def _right_trial(self, T: int = 20) -> dict:
+        t = self._left_trial(T)
+        t["wind_side_original"] = "right"
+        t["wind_side_unified"] = "right"
+        t["event_values"] = np.array(["{'wind_side': 'right'}"] * T, dtype=object)
+        return t
+
+    def test_left_flip_and_heading(self) -> None:
+        trial = self._left_trial()
+        x_before = trial["x_pos"].copy()
+        h_before = trial["heading"].copy()
+        mirrored = mirror_to_right(trial)
+        # x, dx, dz, vel_x sign flipped
+        np.testing.assert_allclose(mirrored["x_pos"], -x_before)
+        np.testing.assert_allclose(mirrored["dx"], -trial["dx"])
+        np.testing.assert_allclose(mirrored["dz"], -trial["dz"])
+        np.testing.assert_allclose(mirrored["vel_x"], -trial["vel_x"])
+        # heading = (-h) % 360
+        np.testing.assert_allclose(mirrored["heading"], (-h_before) % 360.0)
+        # y invariant
+        np.testing.assert_allclose(mirrored["y_pos"], trial["y_pos"])
+        assert mirrored["wind_side_original"] == "left"
+        assert mirrored["wind_side_unified"] == "right"
+        assert mirrored["wind_side_mirrored"] is True
+        # shape assertions hold
+        assert mirrored["x_pos"].shape == mirrored["time_ms"].shape
+
+    def test_right_no_flip(self) -> None:
+        trial = self._right_trial()
+        x_before = trial["x_pos"].copy()
+        mirrored = mirror_to_right(trial)
+        np.testing.assert_allclose(mirrored["x_pos"], x_before)
+        assert mirrored["wind_side_mirrored"] is False
+        assert mirrored["wind_side_unified"] == "right"
+
+    def test_idempotent_left(self) -> None:
+        trial = self._left_trial()
+        m1 = mirror_to_right(trial)
+        m2 = mirror_to_right(m1)
+        np.testing.assert_allclose(m2["x_pos"], m1["x_pos"])
+        np.testing.assert_allclose(m2["heading"], m1["heading"])
+        assert m2["wind_side_mirrored"] is True
+
+    def test_idempotent_right(self) -> None:
+        trial = self._right_trial()
+        m1 = mirror_to_right(trial)
+        m2 = mirror_to_right(m1)
+        np.testing.assert_allclose(m2["x_pos"], m1["x_pos"])
+        assert m2["wind_side_mirrored"] is False
+
+    def test_missing_optional_fields_no_crash(self) -> None:
+        trial = self._left_trial()
+        for k in ("dx", "dz", "vel_x"):
+            trial.pop(k, None)
+        mirrored = mirror_to_right(trial)
+        # still flips x_pos/heading
+        assert mirrored["wind_side_mirrored"] is True
+        assert "dx" not in mirrored
+
+    def test_deepcopy_isolation(self) -> None:
+        trial = self._left_trial()
+        mirrored = mirror_to_right(trial)
+        mirrored["x_pos"][0] = 999.0
+        assert trial["x_pos"][0] != 999.0
+        # object array isolation
+        assert mirrored["event_values"] is not trial["event_values"]
+
+    def test_demirror_identity_scalar_speed(self) -> None:
+        pred = np.array([1.0, 2.0, 3.0], dtype=np.float64)
+        out_left = demirror_prediction(pred, "left")
+        out_right = demirror_prediction(pred, "right")
+        np.testing.assert_allclose(out_left, pred)
+        np.testing.assert_allclose(out_right, pred)
+        assert out_left is not pred  # copy
+
+    def test_demirror_shape_assert(self) -> None:
+        pred2d = np.zeros((2, 10), dtype=np.float64)
+        out = demirror_prediction(pred2d, "left")
+        assert out.shape == (2, 10)
+        import pytest as _pytest
+        with _pytest.raises(AssertionError):
+            demirror_prediction(np.zeros((2, 3, 4)), "left")
+
+    def test_parse_event_value_single_quotes(self) -> None:
+        parsed = _parse_event_value("{'wind_side': 'left'}")
+        assert parsed.get("wind_side") == "left"
+        # strict JSON also works
+        parsed2 = _parse_event_value('{"wind_side": "right"}')
+        assert parsed2.get("wind_side") == "right"
+        # NaN / empty -> {}
+        assert _parse_event_value(float("nan")) == {}
+        assert _parse_event_value("") == {}
+
+    def test_unknown_side_no_flip(self) -> None:
+        trial = self._left_trial()
+        trial["wind_side_original"] = "unknown"
+        trial["wind_side_unified"] = "unknown"
+        mirrored = mirror_to_right(trial)
+        assert mirrored["wind_side_mirrored"] is False
+        assert mirrored["wind_side_unified"] == "unknown"
 
 
 class TestMCMCModule:

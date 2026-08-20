@@ -317,6 +317,23 @@ def build_sequence_dataset(
         labeled_trials: Output of :func:`labeling.assign_ground_truth_labels`.
         feature_config: Feature dimension configuration.
         unify_wind_sides: Mirror left-wind trials into the right-wind frame.
+            When ``True``, left-wind trials are reflected via
+            :func:`pipeline.kinematics.mirror_to_right` into a canonical
+            right frame so that lateralized escape is pooled. Scalar speed
+            target is invariant; ``wind_side_original`` / ``wind_side_mirrored``
+            provenance is preserved in the source trial dict for downstream
+            stratification.
+
+            **Statistical caveat (must be honoured downstream):** pooling
+            left+right doubles nominal *n* but does not double independent
+            subjects — trials from the same animal are paired. Any
+            inferential test on pooled ``X_seq/Y_seq`` must stratify or
+            model ``wind_side_original`` (mixed-effects / stratified
+            permutation) and report effect size (Cohen's d) with
+            FDR/Bonferroni correction; do not treat pooled trials as i.i.d.
+            for naive t-tests. Train/test splits must apply the same
+            ``unify_wind_sides`` flag on both sides to avoid leakage; log
+            the flag in experiment metadata.
 
     Returns:
         List of ``(X_seq, Y_seq, label)`` tuples.
@@ -328,6 +345,9 @@ def build_sequence_dataset(
             trial_data = info["trial_data"]
             if unify_wind_sides:
                 trial_data = mirror_to_right(trial_data)
+                # Preserve provenance for downstream stratification (no API break)
+                info["_wind_side_original"] = trial_data.get("wind_side_original", "unknown")
+                info["_wind_side_mirrored"] = trial_data.get("wind_side_mirrored", False)
             X_seq, Y_seq = extract_trial_sequence(
                 trial_data,
                 feature_config=feature_config,

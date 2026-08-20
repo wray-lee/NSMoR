@@ -1,0 +1,12 @@
+# Enforce LF line endings on all text files for WSL/Linux CI determinism
+* text=auto eol=lf
+*.py text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.md text eol=lf
+*.csv text eol=lf
+*.json text eol=lf
+*.sh text eol=lf
+*.toml text eol=lf
+*.cfg text eol=lf
+*.ini text eol=lf

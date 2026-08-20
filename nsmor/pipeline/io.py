@@ -7,6 +7,7 @@ raw experimental data into pandas DataFrames and per-trial dictionaries.
 
 from __future__ import annotations
 
+import ast
 import json
 from pathlib import Path
 from typing import Any, Dict, List, Union
@@ -42,14 +43,30 @@ EVENT_COLUMNS: List[str] = [
 
 
 def _parse_event_value(value: Any) -> Dict[str, Any]:
-    """Parse JSON-like event metadata without failing legacy scalar values."""
+    """Parse JSON-like event metadata without failing legacy scalar values.
+
+    Handles both strict JSON (double quotes) and Python literal dicts
+    (single quotes, e.g. ``{'wind_side': 'left'}``) that appear in legacy
+    cercus exports. Falls back to ``{}`` for bare scalars / NaN.
+    """
     if isinstance(value, dict):
         return value
     if value is None or (isinstance(value, float) and np.isnan(value)):
         return {}
+    raw = str(value).strip()
+    if not raw:
+        return {}
+    # Try strict JSON first (double-quoted)
     try:
-        parsed = json.loads(str(value))
+        parsed = json.loads(raw)
     except (TypeError, ValueError, json.JSONDecodeError):
+        parsed = None
+    if isinstance(parsed, dict):
+        return parsed
+    # Fallback for single-quoted Python literals: "{'wind_side': 'left'}"
+    try:
+        parsed = ast.literal_eval(raw)
+    except (ValueError, SyntaxError, TypeError, MemoryError):
         return {}
     return parsed if isinstance(parsed, dict) else {}
 
@@ -221,8 +238,18 @@ def extract_trial_data(
     evt_trial = evt.loc[mask_evt].sort_values("time_ms")
     wind_side = _trial_wind_side(evt, session_id, trial_id)
 
+    time_ms_arr = kin_trial["time_ms"].to_numpy(dtype=np.float64)
+    # Shape / monotonicity assertions (engineering rigor)
+    assert time_ms_arr.ndim == 1, f"time_ms ndim {time_ms_arr.ndim} !=1"
+    assert time_ms_arr.shape[0] > 0, "time_ms empty"
+    assert np.all(np.diff(time_ms_arr) >= 0), "time_ms not sorted ascending"
+    T = time_ms_arr.shape[0]
+    for _col in ("x_pos", "y_pos", "heading", "velocity", "acceleration", "visual_angle", "wind_state", "l_v_ratio"):
+        arr = kin_trial[_col].to_numpy(dtype=np.float64)
+        assert arr.shape == (T,), f"{_col} shape {arr.shape} != ({T},)"
+
     return {
-        "time_ms": kin_trial["time_ms"].to_numpy(dtype=np.float64),
+        "time_ms": time_ms_arr,
         "x_pos": kin_trial["x_pos"].to_numpy(dtype=np.float64),
         "y_pos": kin_trial["y_pos"].to_numpy(dtype=np.float64),
         "heading": kin_trial["heading"].to_numpy(dtype=np.float64),
