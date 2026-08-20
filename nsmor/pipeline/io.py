@@ -117,7 +117,11 @@ def load_kinematics_csv(path: Union[str, Path]) -> pd.DataFrame:
     """
     Load a single kinematics CSV file.
 
-    Validates that all expected columns are present.
+    Validates that all expected columns are present and sanitizes
+    ``wind_state`` to binary ``{0, 1}``. Real data contains rare
+    single-sample spikes at ``time_ms==0`` (values 12, 297, 602,
+    752, 852) that are legacy encoding artifacts — only ``1`` is
+    a true wind-on signal.
 
     Args:
         path: File path to the kinematics CSV.
@@ -132,7 +136,9 @@ def load_kinematics_csv(path: Union[str, Path]) -> pd.DataFrame:
     missing = set(KINEMATICS_COLUMNS) - set(df.columns)
     if missing:
         raise ValueError(f"Missing columns in {path}: {missing}")
-    return df[KINEMATICS_COLUMNS]
+    df = df[KINEMATICS_COLUMNS].copy()
+    df["wind_state"] = pd.to_numeric(df["wind_state"], errors="coerce").fillna(0).eq(1).astype(np.int64)
+    return df
 
 
 def load_events_csv(path: Union[str, Path]) -> pd.DataFrame:

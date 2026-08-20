@@ -186,7 +186,13 @@ def adapt_cercus_to_nsmor(raw_dir="data/raw"):
 
             df_k["visual_angle"] = 0.0
             df_k["l_v_ratio"] = 0.0
-            df_k["wind_state"] = df_k["stim_state"] if "stim_state" in df_k.columns else 0
+            if "stim_state" in df_k.columns:
+                df_k["wind_state"] = pd.to_numeric(df_k["stim_state"], errors="coerce").fillna(0).eq(1).astype(int)
+            else:
+                df_k["wind_state"] = 0
+        # Sanitize wind_state to binary (only 1 is wind-on; legacy spikes >1 at t==0 map to 0)
+        if "wind_state" in df_k.columns:
+            df_k["wind_state"] = pd.to_numeric(df_k["wind_state"], errors="coerce").fillna(0).eq(1).astype(int)
 
         # ── 3. Reconstruct visual angle per trial (always run) ──
         print(f"正在重构视觉角度: {kin_path.name}")
@@ -223,7 +229,7 @@ def adapt_cercus_to_nsmor(raw_dir="data/raw"):
 
             # Detect stimulus onset for events
             if has_wind:
-                wind_mask = trial_mask & (df_k["wind_state"] > 0)
+                wind_mask = trial_mask & (df_k["wind_state"] == 1)
                 if wind_mask.any():
                     stim_time = df_k.loc[wind_mask, "time_ms"].iloc[0]
                     stim_starts.append({
