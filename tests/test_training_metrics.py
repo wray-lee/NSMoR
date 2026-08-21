@@ -127,6 +127,30 @@ def test_normalized_rescale_then_clip_round_trips(compute_metrics):
     assert m["rmse"] < 1e-3
 
 
+def test_escape_above_clip_is_not_masked(compute_metrics):
+    # CORE AUDIT FIX: a model that under-predicts a large escape must show a
+    # LARGE escape_rmse, NOT ~0 (which the old clipped-space metric would mask).
+    # y_true has a 150 cm/s escape; target_clip_cm_s=100 would flatten it to
+    # the boundary.  A model predicting a flat clip value (90) everywhere must
+    # register a big raw error on that escape frame.
+    y = np.array([0.0, 0.0, 0.0, 0.0, 150.0, 0.0, 0.0, 0.0])
+    yt = torch.as_tensor(y, dtype=torch.float32).view(1, 8)
+    # model predicts 90.0 everywhere (i.e. x carries 90 on its channel)
+    x90 = torch.full((1, 8, 1), 90.0, dtype=torch.float32)
+    lengths = torch.full((1,), 8, dtype=torch.long)
+    ds = torch.utils.data.TensorDataset(x90, yt, lengths)
+    loader = torch.utils.data.DataLoader(ds, batch_size=1)
+
+    m = compute_metrics(
+        _FakeModel(scale=1.0), loader, torch.device("cpu"),
+        target_mean=0.0, target_std=1.0, target_clip_cm_s=100.0,
+        escape_band_cm_s=10.0,
+    )
+    # the 150 escape is above the 100 clip; a flat-90 model errs by |150-90|=60
+    assert int(m["n_escape_frames"]) == 1
+    assert m["escape_rmse"] > 50.0, f"escape above clip was masked: {m['escape_rmse']:.2f}"
+
+
 def test_zero_escape_frames_handled_without_error(compute_metrics):
     # All-resting (no |y|>=10) -> escape_rmse must be NaN (documented) and
     # the dict still returns all nine keys (resting_rmse present).

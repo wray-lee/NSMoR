@@ -1134,14 +1134,23 @@ def compute_metrics(
 
     Returns:
         Dictionary with keys ``"mse"``, ``"rmse"``, ``"mae"``, ``"r2"``
-        in physical (cm/s) units, plus a per-condition escape-signal
+        in physical (cm/s) units, plus a high-velocity-band escape-signal
         audit: ``"escape_band_cm_s"``, ``"n_escape_frames"``,
         ``"escape_rmse"`` (RMSE on ``|y_true| >= escape_band_cm_s`` frames),
         ``"resting_rmse"`` (RMSE on the remaining resting frames), and
-        ``"escape_ratio"``.  The per-condition split exposes whether the
+        ``"escape_ratio"``.  The band split exposes whether the
         network learned the high-velocity escape transient or only the
         resting-mode bulk (a bulk-fitting model scores well on clipped
         ``rmse``/``r2`` yet shows ``escape_rmse >> resting_rmse``).
+
+        The band audit is measured on the **raw (unclipped)** prediction and
+        target, so frames whose true magnitude exceeds ``target_clip_cm_s`` are
+        still measured at their true magnitude rather than flattened to the
+        clip boundary.  The band is an absolute-velocity-magnitude heuristic
+        (``escape_band_cm_s``), NOT a wind-stimulus-conditioned or
+        per-trial-baseline-subtracted escape definition — see the
+        ``escape_band_cm_s`` config docstring.  A single band value does not by
+        itself prove escape learning; sweep the band for sensitivity.
     """
     model.eval()
     all_pred: List[np.ndarray] = []
@@ -1170,11 +1179,12 @@ def compute_metrics(
         y_pred_all = y_pred_all * target_std + target_mean
 
     # Symmetric robust clip before scoring (mirrors training-target clip).
-    # Keep a RAW copy of y_true for escape-membership classification below,
-    # so frames a real escape transient flattened to ±clip are still
-    # classified as escape (best-effort; the clamp magnitude remains a
-    # known bound documented on the escape_band param).
-    y_true_raw = y_true_all
+    # Keep RAW copies of both prediction and target (post-rescale, pre-clip)
+    # for the high-velocity-band audit below, so a real escape transient whose
+    # true magnitude exceeds ±clip is still measured at its raw magnitude — not
+    # flattened to the clip boundary (which would mask silent escape-signal loss).
+    y_pred_all_raw = y_pred_all.copy()
+    y_true_all_raw = y_true_all.copy()
     if target_clip_cm_s > 0.0:
         y_pred_all = np.clip(y_pred_all, -target_clip_cm_s, target_clip_cm_s)
         y_true_all = np.clip(y_true_all, -target_clip_cm_s, target_clip_cm_s)
@@ -1184,7 +1194,7 @@ def compute_metrics(
     mae = float(mean_absolute_error(y_true_all, y_pred_all))
     r2 = float(r2_score(y_true_all, y_pred_all))
 
-    # ── Per-condition escape-signal check ───────────────────────
+    # ── High-velocity-band escape-signal check ────────────────
     # Reviewer requirement: a bulk-fitting model can report an excellent
     # clipped RMSE/R² while failing to learn the biologically meaningful
     # escape transient (resting-dominant, zero-inflated target).  Break the
@@ -1192,15 +1202,22 @@ def compute_metrics(
     # silent escape-signal loss is visible in the reported metrics rather
     # than masked by the resting-mode bulk.
     #   high-speed band: |y_true| >= escape_band_cm_s frames.
-    # Note: escape membership is decided on the UNclipped y_true, so frames
-    # that the ±target_clip_cm_s clip flattened to the boundary are still
-    # classified as escape (best-effort proxy; see escape_band docstring).
-    is_escape = np.abs(y_true_raw) >= escape_band_cm_s
+    # Critical: membership AND magnitude are both measured on the RAW
+    # (unclipped) prediction and target.  Measuring in the raw space means an
+    # escape transient whose true magnitude exceeds ±target_clip_cm_s is NOT
+    # flattened to the clip boundary — a model predicting a flat ~clip for
+    # every large escape scores a large raw escape_rmse, so the audit actually
+    # exposes silent escape-signal loss rather than being blinded by the clip.
+    # (The overall mse/rmse/mae/r2 above remain clipped-space, matching the
+    # training-target clip; the band audit deliberately reports raw magnitude.)
+    escape_pred = y_pred_all_raw          # raw prediction, pre-clip
+    escape_true = y_true_all_raw          # raw target, pre-clip
+    is_escape = np.abs(escape_true) >= escape_band_cm_s
     n_escape = int(is_escape.sum())
     escape_rmse = float(np.sqrt(mean_squared_error(
-        y_true_all[is_escape], y_pred_all[is_escape]))) if n_escape else float("nan")
+        escape_true[is_escape], escape_pred[is_escape]))) if n_escape else float("nan")
     resting_rmse = float(np.sqrt(mean_squared_error(
-        y_true_all[~is_escape], y_pred_all[~is_escape]))) if (~is_escape).any() else float("nan")
+        escape_true[~is_escape], escape_pred[~is_escape]))) if (~is_escape).any() else float("nan")
 
     metrics: Dict[str, float] = {
         "mse": mse,
@@ -1404,6 +1421,19 @@ def train(
         "data/processed/nsmor_dataset.pt",
         config,
     )
+
+    # Statistical coherence guard: normalizing without a target clip amplifies
+    # the very heavy-tail (tracking-artifact) frames it is meant to suppress —
+    # the loss standardises every frame by the small bulk std, so a ~1e7 cm/s
+    # outlier becomes O(1e5-1e6) sigma.  Recommend enabling clip together.
+    if config.training.normalize_targets and config.training.target_clip_cm_s <= 0.0:
+        logger.warning(
+            "normalize_targets=True but target_clip_cm_s=%s (disabled).  "
+            "Without a non-zero clip, the raw tracking-artifact outliers "
+            "dominate the standardized MSE and can destabilize training.  "
+            "Strongly recommend enabling both together for a coherent target.",
+            config.training.target_clip_cm_s,
+        )
 
     # ── Apply freezing strategy ───────────────────────────────
     if config.finetune.freeze_modules:

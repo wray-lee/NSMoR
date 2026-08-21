@@ -131,7 +131,34 @@ class TrainingConfig:
 
     Note: clipping acts on ``y_true`` *before* the loss (and symmetrically on
     ``y_pred`` only for the reported metrics), so it is a pure training-target
-    pre-processing — the frozen loss and model remain untouched."""
+    pre-processing — the frozen loss and model remain untouched.
+
+    WARNING (statistical coherence): when ``normalize_targets`` is enabled but
+    ``target_clip_cm_s`` is left at ``0.0`` (disabled), the loss standardises
+    *every* frame — including the untrimmed ``~1e7 cm/s`` artifacts — by the
+    small bulk std computed in :func:`~scripts.train.compute_target_stats`.
+    Those outliers become O(1e5–1e6) sigma and dominate the standardized MSE,
+    *amplifying* the very heavy-tail domination normalization was meant to
+    suppress.  We therefore strongly discourage enabling normalization without
+    a non-zero clip; enable both together for a statistically coherent target."""
+
+    escape_band_cm_s: float = 10.0
+    """Absolute velocity-magnitude threshold (cm/s) defining the *high-velocity
+    band* for the escape-signal audit in :func:`~scripts.train.compute_metrics`.
+
+    This is a **magnitude heuristic**, NOT a stimulus-conditioned or
+    per-trial-baseline-subtracted definition of escape: any frame with
+    ``|y| >= escape_band_cm_s`` is grouped into the band.  Cricket intermittent
+    locomotion routinely reaches ~20–100 cm/s during exploration, and noise /
+    tracking rigs can exceed the band, so the band includes GO-fast and noisy
+    frames — not only wind-triggered escapes.  To *condition* the audit on the
+    wind stimulus (per-trial baseline subtraction, onset-aligned windows) is
+    out of scope here and remains future work.
+
+    Default ``10.0`` cm/s.  It is a *parameter* — pass a different value at the
+    ``compute_metrics`` call site (or tune it) to sweep sensitivity; a single
+    fixed value does not prove the model learned escapes, only that its error is
+    lower in this velocity band."""
 
 
 @dataclass
