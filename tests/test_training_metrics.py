@@ -84,8 +84,11 @@ def test_compute_metrics_returns_nine_key_dict(compute_metrics):
 
 
 def test_escape_classified_on_unclipped_y_true(compute_metrics):
-    # Frames 150 and -200 real escape transients that the ±100 clip flattens
-    # to the boundary; they must STILL be counted as escape (raw membership).
+    # Frames 150 and -200 are a real escape transient (two consecutive frames)
+    # that the ±100 clip flattens to the boundary; they must STILL be counted as
+    # escape (raw membership).  The isolated single 30-cm/s frame is below the
+    # sustained-run guard (min 2 consecutive over-band frames) and is excluded,
+    # matching the artifact/escape decoupling.
     y = np.array([0.0, 0.0, 30.0, 0.0, 150.0, -200.0, 5.0, 0.0])
     loader = _tiny_loader(y)
     m = compute_metrics(
@@ -93,8 +96,9 @@ def test_escape_classified_on_unclipped_y_true(compute_metrics):
         target_mean=0.0, target_std=1.0, target_clip_cm_s=100.0,
         escape_band_cm_s=10.0,
     )
-    # raw |y| >= 10 frames: {30, 150, -200} -> 3
-    assert int(m["n_escape_frames"]) == 3
+    # raw |y| >= 10 frames: {30(iso single→dropped), 150, -200(consecutive run)}
+    # -> sustained escape frames = {150, -200} => 2
+    assert int(m["n_escape_frames"]) == 2
     # perfect prediction (scale=1.0) on clipped values -> near-zero escape_rmse
     assert m["escape_rmse"] < 1e-3
 
@@ -130,10 +134,11 @@ def test_normalized_rescale_then_clip_round_trips(compute_metrics):
 def test_escape_above_clip_is_not_masked(compute_metrics):
     # CORE AUDIT FIX: a model that under-predicts a large escape must show a
     # LARGE escape_rmse, NOT ~0 (which the old clipped-space metric would mask).
-    # y_true has a 150 cm/s escape; target_clip_cm_s=100 would flatten it to
-    # the boundary.  A model predicting a flat clip value (90) everywhere must
-    # register a big raw error on that escape frame.
-    y = np.array([0.0, 0.0, 0.0, 0.0, 150.0, 0.0, 0.0, 0.0])
+    # y_true has a 150 cm/s escape (two consecutive frames so it survives the
+    # sustained-run guard); target_clip_cm_s=100 would flatten each to the
+    # boundary.  A model predicting a flat clip value (90) everywhere must
+    # register a big raw error on that escape.
+    y = np.array([0.0, 0.0, 0.0, 150.0, 150.0, 0.0, 0.0, 0.0])
     yt = torch.as_tensor(y, dtype=torch.float32).view(1, 8)
     # model predicts 90.0 everywhere (i.e. x carries 90 on its channel)
     x90 = torch.full((1, 8, 1), 90.0, dtype=torch.float32)
@@ -147,8 +152,51 @@ def test_escape_above_clip_is_not_masked(compute_metrics):
         escape_band_cm_s=10.0,
     )
     # the 150 escape is above the 100 clip; a flat-90 model errs by |150-90|=60
-    assert int(m["n_escape_frames"]) == 1
+    assert int(m["n_escape_frames"]) == 2
     assert m["escape_rmse"] > 50.0, f"escape above clip was masked: {m['escape_rmse']:.2f}"
+
+
+def test_isolated_artifact_spike_excluded_from_escape(compute_metrics):
+    # SUSTAINED-MEMBERSHIP GUARD: a single isolated ~1e7 cm/s tracking-artifact
+    # frame (which the training-target clip removes, but which would otherwise
+    # land in the raw escape band) must NOT count as escape.  This decouples the
+    # audit from the very artifact the clip suppresses — otherwise escape_rmse
+    # would be mechanically inflated to O(1e7) by clip-handled artifacts, and
+    # "escape_rmse >> resting_rmse" would be a clip artifact, not evidence.
+    y = np.array([0.0, 0.0, 1.3e7, 0.0, 0.0, 0.0, 0.0, 0.0])  # one isolated spike
+    loader = _tiny_loader(y)
+    m = compute_metrics(
+        _FakeModel(scale=1.0), loader, torch.device("cpu"),
+        target_mean=0.0, target_std=1.0, target_clip_cm_s=100.0,
+        escape_band_cm_s=10.0,
+    )
+    assert int(m["n_escape_frames"]) == 0, (
+        "isolated artifact spike should be excluded by the sustained-run guard"
+    )
+    # and a real sustained escape must still be caught
+    y2 = np.array([0.0, 0.0, 150.0, 160.0, 0.0, 0.0, 0.0, 0.0])
+    m2 = compute_metrics(
+        _FakeModel(scale=1.0), _tiny_loader(y2), torch.device("cpu"),
+        target_mean=0.0, target_std=1.0, target_clip_cm_s=100.0,
+        escape_band_cm_s=10.0,
+    )
+    assert int(m2["n_escape_frames"]) == 2
+
+
+def test_sustained_run_helper():
+    mod = _load_train_module()
+    over = np.array([False, False, True, False, True, True, False, False])
+    assert mod._sustained_run(over, min_run=2).tolist() == \
+        [False, False, False, False, True, True, False, False]
+    # isolated single frame dropped
+    assert mod._sustained_run(np.array([False, True, False]), min_run=2).tolist() == \
+        [False, False, False]
+    # trailing run reaching the end kept
+    assert mod._sustained_run(np.array([True, True, False, True]), min_run=2).tolist() == \
+        [True, True, False, False]
+    # min_run=1 is identity
+    assert mod._sustained_run(np.array([False, True, False]), min_run=1).tolist() == \
+        [False, True, False]
 
 
 def test_zero_escape_frames_handled_without_error(compute_metrics):

@@ -1101,6 +1101,34 @@ def validate(
 # ═══════════════════════════════════════════════════════════════
 
 @torch.no_grad()
+def _sustained_run(mask: np.ndarray, min_run: int = 2) -> np.ndarray:
+    """Return a copy of ``mask`` keeping only elements that belong to a run of
+    at least ``min_run`` consecutive ``True`` values.
+
+    Used to exclude isolated single-frame out-of-band spikes (e.g. ~1e7 cm/s
+    tracking artifacts) from the escape audit, keeping only temporally-extended
+    events which we call escapes.  Runs shorter than ``min_run`` are zeroed.
+    """
+    mask = np.asarray(mask, dtype=bool)
+    if mask.ndim != 1:
+        raise ValueError(f"_sustained_run expects a 1-D mask, got {mask.ndim}-D")
+    if min_run <= 1:
+        return mask.copy()
+    keep = np.zeros(mask.shape[0], dtype=bool)
+    run = 0
+    for i, on in enumerate(mask):
+        if on:
+            run += 1
+        else:
+            if run >= min_run:
+                keep[i - run : i] = True
+            run = 0
+    if run >= min_run:  # trailing run reaches the array end
+        keep[mask.shape[0] - run :] = True
+    return keep
+
+
+@torch.no_grad()
 def compute_metrics(
     model: NSMoRCore,
     loader: torch.utils.data.DataLoader,
@@ -1210,9 +1238,35 @@ def compute_metrics(
     # exposes silent escape-signal loss rather than being blinded by the clip.
     # (The overall mse/rmse/mae/r2 above remain clipped-space, matching the
     # training-target clip; the band audit deliberately reports raw magnitude.)
-    escape_pred = y_pred_all_raw          # raw prediction, pre-clip
-    escape_true = y_true_all_raw          # raw target, pre-clip
-    is_escape = np.abs(escape_true) >= escape_band_cm_s
+    # ── High-velocity-band escape-signal check ────────────────
+    # Reviewer requirement: a bulk-fitting model can report an excellent
+    # clipped RMSE/R² while failing to learn the biologically meaningful
+    # escape transient (resting-dominant, zero-inflated target).  Break the
+    # validation error into resting vs high-velocity (escape) frames so that
+    # silent escape-signal loss is visible in the reported metrics rather
+    # than masked by the resting-mode bulk.
+    #   high-speed band: |y_true| >= escape_band_cm_s frames.
+    # Critical: membership AND magnitude are both measured on the RAW
+    # (unclipped) prediction and target.  Measuring in the raw space means an
+    # escape transient whose true magnitude exceeds ±target_clip_cm_s is NOT
+    # flattened to the clip boundary — a model predicting a flat ~clip for
+    # every large escape scores a large raw escape_rmse, so the audit actually
+    # exposes silent escape-signal loss rather than being blinded by the clip.
+    # (The overall mse/rmse/mae/r2 above remain clipped-space, matching the
+    # training-target clip; the band audit deliberately reports raw magnitude.)
+    #
+    # Sustained-membership guard: escape membership requires the frame to be
+    # part of a *run* of at least 2 consecutive |y_true|>=escape_band_cm_s
+    # frames (cricket escape is a ~10-100 ms kick = several samples at 500 Hz),
+    # so an isolated single-frame ~1e7 cm/s tracking-artifact spike — which the
+    # training-target clip removes but which would otherwise still land in the
+    # raw escape band — is excluded.  This decouples the audit from the very
+    # artifact the clip exists to suppress (artifact/escape collinearity).  A
+    # true escape kick has non-trivial temporal extent and survives.
+    escape_true = y_true_all_raw
+    escape_pred = y_pred_all_raw
+    over = np.abs(escape_true) >= escape_band_cm_s
+    is_escape = _sustained_run(over, min_run=2)
     n_escape = int(is_escape.sum())
     escape_rmse = float(np.sqrt(mean_squared_error(
         escape_true[is_escape], escape_pred[is_escape]))) if n_escape else float("nan")
