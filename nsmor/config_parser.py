@@ -92,6 +92,47 @@ class TrainingConfig:
     random_seed: int = 42
     max_seq_len: Optional[int] = 1000  # crop sequences longer than this (cuDNN compat)
 
+    lr_warmup_epochs: int = 0
+    """Linear LR warmup epoch count.  During the first ``lr_warmup_epochs``
+    epochs the effective learning rate is ramped from 0 to :attr:`learning_rate`.
+    Prevents the cold-start overshoot that destabilises the coupled LIF+GRU
+    gradient flow.  0 disables (backward compatible)."""
+
+    # ── Target normalization for stable, interpretable convergence ──
+    normalize_targets: bool = False
+    """When ``True``, regress on the *mean-centered, variance-scaled* velocity
+    target instead of the raw cm/s signal.  The raw velocity is a heavy-tailed
+    signal (p99.99 ≈ 81 cm/s but max ≈ 13e6) where a handful of extreme frames
+    dominate the masked MSE and produce the per-epoch loss noise.  Revealing
+    the bulk (≈99.99% of frames, |y| < 100 cm/s) to the network::
+
+        y_norm = (y - y_train_mean) / y_train_std
+
+    gives a well-conditioned homoscedastic regression target.  Predictions are
+    rescaled back to cm/s for reporting.  The normalization statistics are
+    computed from the *training* split only (no validation leakage).  Statistics
+    are transparently logged and cached for rescoring.  ``False`` preserves the
+    original raw-velocity objective (backward compatible)."""
+
+    target_clip_cm_s: float = 0.0
+    """Clip the magnitude of the velocity target (in cm/s) before computing
+    loss-based metrics.  ``0.0`` disables clipping (backward compatible).
+
+    This is a *robust regression* safeguard: the raw velocity is
+    heavy-tailed (p99.99 ≈ 81 cm/s, but max ≈ 1.3e7 cm/s), driven by a small
+    number of tracking-artifact frames near trial onset (~index 1360+).
+    A single such frame contributes ``(1.3e7)**2 ≈ 1.7e14`` to the batch MSE,
+    completely swamping the resting/escape signal and producing the large
+    epoch-to-epoch loss swings.  Clamping the target to a physiologically
+    defensible cap (cricket escape vigour is tens of cm/s; a generous cap of
+    ``100`` cm/s keeps every real escape response while removing the artifacts)
+    keeps the loss landscape well-conditioned.  Predictions are clamped with
+    the same value in ``compute_metrics`` so reported error stays physical.
+
+    Note: clipping acts on ``y_true`` *before* the loss (and symmetrically on
+    ``y_pred`` only for the reported metrics), so it is a pure training-target
+    pre-processing — the frozen loss and model remain untouched."""
+
 
 @dataclass
 class DataPaths:

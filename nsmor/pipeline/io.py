@@ -113,18 +113,32 @@ def _trial_wind_side(
 # Single-file loaders
 # ──────────────────────────────────────────────────────────────
 
-def load_kinematics_csv(path: Union[str, Path]) -> pd.DataFrame:
+def load_kinematics_csv(
+    path: Union[str, Path],
+    artifact_velocity_cm_s: float = 1000.0,
+) -> pd.DataFrame:
     """
     Load a single kinematics CSV file.
 
-    Validates that all expected columns are present and sanitizes
-    ``wind_state`` to binary ``{0, 1}``. Real data contains rare
-    single-sample spikes at ``time_ms==0`` (values 12, 297, 602,
-    752, 852) that are legacy encoding artifacts — only ``1`` is
-    a true wind-on signal.
+    Validates that all required columns are present, sanitizes ``wind_state``
+    to binary ``{0, 1}``, and zeros the phantom velocity/acceleration spike on
+    a trial's first frame (``time_ms==0``) when it exceeds
+    ``artifact_velocity_cm_s``.
+
+    Real data contains rare single-sample spikes at ``time_ms==0`` (values
+    12, 297, 602, 752, 852) that are legacy encoding artifacts — only ``1``
+    is a true wind-on signal. Separately, the first frame of each trial
+    carries a ``10^6``-cm/s-scale velocity/acceleration phantom spike from
+    the raw sensor cross-trial position jump (see the fixture block below);
+    both are zeroed here.
 
     Args:
         path: File path to the kinematics CSV.
+        artifact_velocity_cm_s: Single-frame velocity magnitude above which
+            a trial-first frame's velocity is treated as a cross-trial
+            sensor-jump artifact (zeroed).  Real escape onsets are ~10^1-10^2
+            cm/s; the sensor spike is 10^3+ cm/s, so ``1000`` is a safe
+            three-order-of-magnitude separation.  ``float("inf")`` disables.
 
     Returns:
         DataFrame with columns matching :data:`KINEMATICS_COLUMNS`.
@@ -138,6 +152,35 @@ def load_kinematics_csv(path: Union[str, Path]) -> pd.DataFrame:
         raise ValueError(f"Missing columns in {path}: {missing}")
     df = df[KINEMATICS_COLUMNS].copy()
     df["wind_state"] = pd.to_numeric(df["wind_state"], errors="coerce").fillna(0).eq(1).astype(np.int64)
+
+    # ── Trial-boundary velocity/acceleration sanitization ──
+    # NSMoR audit 2026-08-21: in the adapted cercus CSVs the first frame
+    # of each trial (time_ms==0) can carry phantom velocity/acceleration
+    # spikes of 10^6-10^7 cm/s. Root cause: the raw sensor dx/dy at the
+    # reset frame encode the cross-trial arena-position jump (positions
+    # restart at (0,0) but dx/dy still encode the displacement from the
+    # previous trial's last sample), and velocity = step_dist/dt_clamped
+    # yields the spur.  A blanket zero of *every* first frame, however,
+    # would also erase legitimate wind-onset escape kinematics when the
+    # first frame genuinely begins a fast evasive jump (finite sampling
+    # cadence, nonzero dt).  We therefore zero a first frame ONLY when it
+    # is an artifact-scale spike: an apparent single-frame velocity above the
+    # physical plausibility bound ``artifact_velocity_cm_s``.  Solo escape
+    # jumps are ~10^1-10^2 cm/s; the sensor-jump artifact is 10^3+ cm/s, so
+    # a 3-order magnitude gap makes the bound safe.  Frames below the bound
+    # keep their true onset value; only the artifact-scale spike is nulled
+    # and the per-trial acceleration is recomputed from the cleaned velocity
+    # (removing both the frame-0 velocity spike and its diff-echo in frame 1).
+    if len(df) > 0:
+        first_frame = df.groupby(["session_id", "trial_id"], sort=False)["time_ms"].transform("min")
+        is_trial_first = df["time_ms"] == first_frame
+        is_artifact = is_trial_first & (df["velocity"].abs() >= artifact_velocity_cm_s)
+        df.loc[is_artifact, "velocity"] = 0.0
+        # Recompute acceleration as per-trial diff of the cleaned velocity;
+        # artifact first frames are 0 by construction, others keep theirs.
+        df["acceleration"] = df.groupby(["session_id", "trial_id"], sort=False)["velocity"].transform(
+            lambda v: v.diff().fillna(0.0)
+        )
     return df
 
 

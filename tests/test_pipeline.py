@@ -32,6 +32,7 @@ from nsmor.pipeline.io import (
     _parse_event_value,
     extract_trial_data,
     load_and_concat_sessions,
+    load_kinematics_csv,
 )
 from nsmor.pipeline.kinematics import demirror_prediction, mirror_to_right
 from nsmor.pipeline.labeling import assign_ground_truth_labels
@@ -244,6 +245,72 @@ class TestPipelineIO:
         assert trial["trial_id"] == 0
         assert len(trial["time_ms"]) == 400
         assert trial["velocity"].dtype == np.float64
+
+    def test_sanitize_trial_first_frame_spike(self, tmp_path: Path) -> None:
+        """First-frame phantom spike is zeroed; legitimate onsets preserved.
+
+        Regression test for the NSMoR audit finding: adapted cercus CSVs can
+        carry a ``10**6``-cm/s velocity spike on a trial's first frame
+        (``time_ms==0``), a pure cross-trial kinematics artifact. The artifact
+        guard ``artifact_velocity_cm_s`` (default 1000 cm/s) must zero that
+        frame's velocity and recompute acceleration from the cleaned velocity
+        so no spike survives, while preserving first-frame velocities below
+        the plausibility bound (real wind-onset escape onsets).
+        """
+        # Build two trials; plant one phantom spike on trial 1's first frame.
+        kin_path, evt_path = _make_synthetic_csvs(tmp_path)
+        raw = pd.read_csv(kin_path)
+        spiked_idx = raw.index[(raw["trial_id"] == 1) & (raw["time_ms"] == 0.0)][0]
+        raw.loc[spiked_idx, "velocity"] = 5_278_733.873
+        raw.loc[spiked_idx, "acceleration"] = 5_278_733.873
+        raw.to_csv(kin_path, index=False)
+
+        df = load_kinematics_csv(kin_path)
+        # The spiked trial's first frame must be zeroed...
+        spiked = df[(df["trial_id"] == 1) & (df["time_ms"] == 0.0)]
+        assert spiked["velocity"].abs().max() < 1.0, (
+            f"First-frame spike survived sanitization: "
+            f"{spiked[['trial_id', 'time_ms', 'velocity']].to_dict('records')}"
+        )
+        # ...while non-spiked trials' legitimate small onsets are preserved
+        # (not nulled): they must retain their original <1000 cm/s value.
+        other = df[(df["trial_id"] != 1) & (df["time_ms"] == 0.0)]
+        assert float(other["velocity"].abs().min()) > 0.0, (
+            "Non-spiked first frames were blanket-zeroed; legitimate onsets lost."
+        )
+        assert float(other["velocity"].abs().max()) < 1e3, (
+            "Non-spiked first frame exceeds plausibility bound unexpectedly."
+        )
+        # Recomputed acceleration must also be finite/bounded (no diff-echo).
+        assert np.isfinite(df["acceleration"]).all()
+        assert float(df["acceleration"].abs().max()) < 1e3, (
+            f"Acceleration still carries a spike after recompute: "
+            f"{df['acceleration'].abs().max()}"
+        )
+
+    def test_sanitize_first_frame_preserves_legitimate_onset(
+        self, tmp_path: Path,
+    ) -> None:
+        """A realistic (sub-plausibility-bound) first-frame velocity survives.
+
+        The artifact guard zeroes a trial-first frame ONLY when it exceeds
+        the ``artifact_velocity_cm_s`` artifact bound (a cross-trial sensor
+        jump).  A legitimate wind-onset escape — e.g. a genuine first-frame
+        velocity of tens of cm/s — must be preserved, not blanket-zeroed,
+        so real onset kinematics are not erased.
+        """
+        kin_path, evt_path = _make_synthetic_csvs(tmp_path)
+        raw = pd.read_csv(kin_path)
+        first_idx = raw.index[(raw["trial_id"] == 1) & (raw["time_ms"] == 0.0)][0]
+        raw.loc[first_idx, "velocity"] = 42.0  # realistic escape onset, cm/s
+        raw.loc[first_idx, "acceleration"] = 42.0
+        raw.to_csv(kin_path, index=False)
+
+        df = load_kinematics_csv(kin_path)
+        first_idx_loaded = df.index[(df["trial_id"] == 1) & (df["time_ms"] == 0.0)][0]
+        assert df.loc[first_idx_loaded, "velocity"] == pytest.approx(42.0, abs=1e-6), (
+            "Legitimate first-frame onset velocity was incorrectly zeroed."
+        )
 
 
 class TestLabeling:
