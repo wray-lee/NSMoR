@@ -1635,20 +1635,63 @@ def train(
         ckpt_path = Path(config.checkpoint.resume_from)
         if ckpt_path.exists():
             logger.info("Resuming from checkpoint: %s", ckpt_path)
-            # Detect a legacy checkpoint without scheduler state BEFORE
-            # loading: load_checkpoint would silently skip the scheduler
-            # restore and the fresh CosineAnnealingLR would restart at
-            # epoch 0 mid-run, silently diverging the LR trajectory.
-            _has_sched = "scheduler_state_dict" in torch.load(
+            # Peek BEFORE load_checkpoint: (a) detect legacy checkpoints
+            # without scheduler state (loud warning instead of silent LR
+            # restart), and (b) learn start_epoch so the correct-PHASE
+            # optimizer/scheduler exists before their state is loaded.
+            ckpt_peek = torch.load(
                 ckpt_path, map_location="cpu", weights_only=False,
             )
-            if not _has_sched:
+            if "scheduler_state_dict" not in ckpt_peek:
                 logger.warning(
                     "Checkpoint %s has NO scheduler_state_dict (legacy "
                     "format) — LR schedule restarts from scratch; resumed "
                     "runs will NOT match an uninterrupted trajectory.",
                     ckpt_path,
                 )
+            start_epoch = ckpt_peek.get("epoch", -1) + 1
+
+            # Resume x two-phase: build the phase-2 optimizer/scheduler
+            # BEFORE load_checkpoint restores state — otherwise state is
+            # loaded into the phase-1 optimizer and then discarded when a
+            # fresh phase-2 one replaces it after the load.
+            if (
+                two_phase
+                and current_phase == 1
+                and start_epoch >= phase1_epochs
+            ):
+                logger.info(
+                    "Resume past phase boundary (start_epoch=%d >= "
+                    "phase1_epochs=%d) — building phase-2 optimizer "
+                    "before state restore",
+                    start_epoch, phase1_epochs,
+                )
+                for param in model.frontend.parameters():
+                    param.requires_grad = False
+                for param in model.backend.parameters():
+                    param.requires_grad = True
+                base_lr = config.training.learning_rate
+                lif_lr = base_lr * 0.3
+                lif_params = list(model.backend.lif_cell.parameters())
+                other_params = [
+                    p for n, p in model.backend.named_parameters()
+                    if "lif_cell" not in n
+                ]
+                optimizer = torch.optim.AdamW([
+                    {"params": other_params, "lr": base_lr, "base_lr": base_lr, "name": "backend"},
+                    {"params": lif_params, "lr": lif_lr, "base_lr": lif_lr, "name": "lif"},
+                ], weight_decay=config.training.weight_decay)
+                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer,
+                    T_max=max(
+                        1,
+                        (config.training.num_epochs - start_epoch) - config.training.lr_warmup_epochs,
+                    ),
+                    eta_min=1e-6,
+                )
+                criterion = backend_criterion
+                current_phase = 2
+
             checkpoint = load_checkpoint(
                 path=ckpt_path,
                 model=model,
@@ -1656,7 +1699,6 @@ def train(
                 scheduler=scheduler,
                 map_location=device,
             )
-            start_epoch = checkpoint["epoch"] + 1
             best_val_loss = checkpoint.get("loss", float("inf"))
             logger.info("Resumed at epoch %d, loss=%.6f", start_epoch, best_val_loss)
         else:
@@ -1675,49 +1717,6 @@ def train(
 
     # ── Bio-loss warmup schedule ─────────────────────────────
     warmup_epochs = config.loss.warmup_epochs
-
-    # Resume x two-phase: if resuming at or past the phase boundary, build
-    # the phase-2 optimizer/scheduler BEFORE the loop — otherwise the
-    # in-loop transition below would construct a fresh AdamW + cosine on
-    # the first resumed epoch and silently discard the checkpoint's
-    # optimizer/scheduler state (cold-start Adam on a converged system).
-    # The in-loop transition then only fires for runs that START in
-    # phase 1.
-    if (
-        two_phase
-        and current_phase == 1
-        and start_epoch >= phase1_epochs
-    ):
-        logger.info(
-            "Resume past phase boundary (start_epoch=%d >= phase1_epochs=%d) "
-            "— building phase-2 optimizer before loop",
-            start_epoch, phase1_epochs,
-        )
-        for param in model.frontend.parameters():
-            param.requires_grad = False
-        for param in model.backend.parameters():
-            param.requires_grad = True
-        base_lr = config.training.learning_rate
-        lif_lr = base_lr * 0.3
-        lif_params = list(model.backend.lif_cell.parameters())
-        other_params = [
-            p for n, p in model.backend.named_parameters()
-            if "lif_cell" not in n
-        ]
-        optimizer = torch.optim.AdamW([
-            {"params": other_params, "lr": base_lr, "base_lr": base_lr, "name": "backend"},
-            {"params": lif_params, "lr": lif_lr, "base_lr": lif_lr, "name": "lif"},
-        ], weight_decay=config.training.weight_decay)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=max(
-                1,
-                (config.training.num_epochs - start_epoch) - config.training.lr_warmup_epochs,
-            ),
-            eta_min=1e-6,
-        )
-        criterion = backend_criterion
-        current_phase = 2
 
     for epoch in range(start_epoch, config.training.num_epochs):
         t0 = time.time()
