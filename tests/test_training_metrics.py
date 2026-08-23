@@ -213,3 +213,74 @@ def test_zero_escape_frames_handled_without_error(compute_metrics):
     assert np.isnan(m["escape_rmse"])
     assert 0.0 <= m["escape_ratio"] <= 1.0
     assert "resting_rmse" in m
+
+
+def test_lr_warmup_scale_linear_and_idempotent():
+    # Regression (round-2 review): LR warmup must ramp linearly from 0→1 over
+    # the warmup window and return to 1 past it, honouring the backward-compat
+    # default (lr_warmup_epochs=0 ⇒ identity scale, no drift).
+    mod = _load_train_module()
+    compute = mod.compute_lr_warmup_scale
+    assert compute(0, 4) == pytest.approx(0.25)
+    assert compute(1, 4) == pytest.approx(0.5)
+    assert compute(2, 4) == pytest.approx(0.75)
+    assert compute(3, 4) == pytest.approx(1.0)
+    assert compute(5, 4) == 1.0          # past window → full LR
+    assert compute(0, 0) == 1.0          # warmup disabled → identity (backward compat)
+
+
+def test_apply_lr_warmup_requires_base_lr_groups():
+    # Regression (round-2 review): a param group WITHOUT ``base_lr`` (the
+    # shape the phase-1 frontend optimizer formerly used) must raise a clear
+    # error — guarding the two-phase × warmup combination — while a group that
+    # DOES carry ``base_lr`` is scaled without error.
+    mod = _load_train_module()
+    import torch as _t
+    p = _t.nn.Parameter(_t.zeros(2))
+
+    # single group missing base_lr → ValueError (this was the crash path)
+    bad = _t.optim.AdamW([{"params": [p], "lr": 1e-3}])
+    try:
+        mod.apply_lr_warmup(bad, epoch=0, lr_warmup_epochs=4)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("expected ValueError for group without base_lr")
+
+    # group carrying base_lr → LR correctly ramped, no error
+    good = _t.optim.AdamW([{"params": [p], "lr": 1e-3, "base_lr": 1e-3}])
+    mod.apply_lr_warmup(good, epoch=0, lr_warmup_epochs=4)
+    assert good.param_groups[0]["lr"] == pytest.approx(2.5e-4)  # base_lr * 0.25
+
+
+def test_scheduler_released_only_after_warmup():
+    # Regression (round-2 review): with warmup active the cosine step is held
+    # until the warmup window has fully elapsed (budget not consumed by the
+    # warmup override); with warmup disabled the step is unconditional.
+    mod = _load_train_module()
+
+    class _Sched:
+        def __init__(self):
+            self.steps = 0
+        def step(self):
+            self.steps += 1
+
+    s = _Sched()
+    mod._maybe_step_scheduler(
+        scheduler=s,
+        lr_warmup_epochs=4,
+        warmup_epoch=3,          # last warmup epoch → NOT yet released
+    )
+    assert s.steps == 0
+    mod._maybe_step_scheduler(
+        scheduler=s,
+        lr_warmup_epochs=4,
+        warmup_epoch=4,          # window fully elapsed → released
+    )
+    assert s.steps == 1
+    mod._maybe_step_scheduler(
+        scheduler=s,
+        lr_warmup_epochs=0,      # disabled → unconditional
+        warmup_epoch=0,
+    )
+    assert s.steps == 2

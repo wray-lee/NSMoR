@@ -714,6 +714,24 @@ def apply_lr_warmup(
         group["lr"] = group["base_lr"] * scale
 
 
+def _maybe_step_scheduler(
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
+    lr_warmup_epochs: int,
+    warmup_epoch: int,
+) -> None:
+    """
+    Advance the LR scheduler once per epoch, holding it during the warmup
+    window so the anneal budget isn't consumed by ``apply_lr_warmup``'s
+    override.
+
+    Backward-compat contract: when ``lr_warmup_epochs == 0`` (default), the
+    step is unconditional — identical to the original single-schedule loop —
+    so the default-config cosine trajectory is byte-for-byte the baseline's.
+    """
+    if lr_warmup_epochs == 0 or warmup_epoch >= lr_warmup_epochs:
+        scheduler.step()
+
+
 def compute_warmup_factor(epoch: int, warmup_epochs: int) -> float:
     """
     Compute the warmup scaling factor for bio-loss regularization terms.
@@ -1238,22 +1256,6 @@ def compute_metrics(
     # exposes silent escape-signal loss rather than being blinded by the clip.
     # (The overall mse/rmse/mae/r2 above remain clipped-space, matching the
     # training-target clip; the band audit deliberately reports raw magnitude.)
-    # ── High-velocity-band escape-signal check ────────────────
-    # Reviewer requirement: a bulk-fitting model can report an excellent
-    # clipped RMSE/R² while failing to learn the biologically meaningful
-    # escape transient (resting-dominant, zero-inflated target).  Break the
-    # validation error into resting vs high-velocity (escape) frames so that
-    # silent escape-signal loss is visible in the reported metrics rather
-    # than masked by the resting-mode bulk.
-    #   high-speed band: |y_true| >= escape_band_cm_s frames.
-    # Critical: membership AND magnitude are both measured on the RAW
-    # (unclipped) prediction and target.  Measuring in the raw space means an
-    # escape transient whose true magnitude exceeds ±target_clip_cm_s is NOT
-    # flattened to the clip boundary — a model predicting a flat ~clip for
-    # every large escape scores a large raw escape_rmse, so the audit actually
-    # exposes silent escape-signal loss rather than being blinded by the clip.
-    # (The overall mse/rmse/mae/r2 above remain clipped-space, matching the
-    # training-target clip; the band audit deliberately reports raw magnitude.)
     #
     # Sustained-membership guard: escape membership requires the frame to be
     # part of a *run* of at least 2 consecutive |y_true|>=escape_band_cm_s
@@ -1408,9 +1410,15 @@ def train(
                 param.requires_grad = False
             for param in model.frontend.parameters():
                 param.requires_grad = True
+            # Single group carrying ``base_lr`` (mirroring build_optimizer) so
+            # apply_lr_warmup (used when lr_warmup_epochs>0) never hits its
+            # "param group must carry both base_lr and lr" ValueError.
             optimizer = torch.optim.AdamW(
-                model.frontend.parameters(),
-                lr=config.training.learning_rate,
+                [{
+                    "params": list(model.frontend.parameters()),
+                    "lr": config.training.learning_rate,
+                    "base_lr": config.training.learning_rate,
+                }],
                 weight_decay=config.training.weight_decay,
             )
             criterion = frontend_criterion
@@ -1647,13 +1655,15 @@ def train(
             target_std=target_std,
             target_clip_cm_s=config.training.target_clip_cm_s,
         )
-        # Advance the cosine only once the warmup window has fully elapsed,
-        # so the anneal budget isn't consumed while `apply_lr_warmup` overrides
-        # the LR.  (For lr_warmup_epochs==0, warmup_epoch>=max(1,0)=1 is always
-        # true for epoch>=1, and epoch 0's first step here advances last_epoch
-        # from -1→0 as before.)
-        if warmup_epoch >= max(1, config.training.lr_warmup_epochs):
-            scheduler.step()
+        # Advance the cosine.  When lr_warmup_epochs==0 (default), the step is
+        # unconditional exactly as in the original pipeline, preserving the
+        # byte-identical default LR trajectory (backward-compat invariant).
+        # When warmup is active, the cosine is held while `apply_lr_warmup`
+        # overrides the LR (so the anneal budget isn't consumed by the warmup
+        # window), then released once the window has fully elapsed.
+        _maybe_step_scheduler(
+            scheduler, config.training.lr_warmup_epochs, warmup_epoch
+        )
         history["train_loss"].append(train_loss)
 
         # ── Validate ──────────────────────────────────────────
