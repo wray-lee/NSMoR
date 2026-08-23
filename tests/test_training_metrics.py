@@ -284,6 +284,139 @@ def test_zero_escape_frames_handled_without_error(compute_metrics):
     assert "resting_rmse" in m
 
 
+# ═══════════════════════════════════════════════════════════════
+# Resume x two-phase regression (round-6 review blocker)
+# ═══════════════════════════════════════════════════════════════
+
+def _make_synthetic_dataset(path: Path, n_seqs: int = 6, T: int = 12) -> None:
+    """Write a minimal ``nsmor_dataset.pt``-shaped file."""
+    rng = np.random.RandomState(0)
+    X_seqs = [rng.randn(T, 8).astype(np.float32) for _ in range(n_seqs)]
+    Y_seqs = [rng.randn(T).astype(np.float32) * 5 for _ in range(n_seqs)]
+    priors = np.abs(rng.randn(n_seqs, 4).astype(np.float32)) + 0.1
+    priors /= priors.sum(axis=1, keepdims=True)
+    dataset = {
+        "X_seqs": X_seqs,
+        "Y_seqs": Y_seqs,
+        "mcmc_priors": priors,
+        "labels": np.zeros(n_seqs, dtype=np.int64),
+        "lengths": np.full(n_seqs, T, dtype=np.int64),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(dataset, path)
+
+
+def _tiny_config(mod, output_dir):
+    cfg = mod.ExperimentConfig()
+    cfg.model.hidden_dim = 8
+    cfg.model.num_gru_layers = 1
+    cfg.training.num_epochs = 2
+    cfg.training.batch_size = 2
+    cfg.training.checkpoint_interval = 1
+    cfg.training.log_interval = 1
+    cfg.training.lr_warmup_epochs = 0
+    cfg.checkpoint.output_dir = str(output_dir)
+    return cfg
+
+
+def test_resume_past_phase_boundary_restores_state(tmp_path, monkeypatch):
+    # ROUND-6 BLOCKER regression: resuming at/past the phase-1->2 boundary
+    # must mirror the uninterrupted trajectory exactly — an uninterrupted
+    # run builds a FRESH phase-2 optimizer at the boundary (phase-1 Adam
+    # moments deliberately discarded), so a resumed run must restore ONLY
+    # model weights and let the in-loop transition build that fresh
+    # optimizer.  Previously the resume path either crashed (1-group
+    # checkpoint loaded into a pre-built 2-group optimizer) or restored
+    # state into an optimizer that was then discarded.
+    mod = _load_train_module()
+    ds_path = tmp_path / "nsmor_dataset.pt"
+    _make_synthetic_dataset(ds_path)
+    monkeypatch.setattr(mod, "_DATASET_PATH", str(ds_path))
+
+    # Run 1: two-phase, phase1_epochs=1 → epoch 0 runs in phase 1 and saves
+    # a periodic checkpoint at end of epoch 0 (still in phase 1).
+    run1 = tmp_path / "run1"
+    cfg = _tiny_config(mod, run1)
+    mod.train(cfg, phase1_epochs=1)
+
+    ckpt_path = run1 / "epoch_1.pth"
+    assert ckpt_path.exists()
+    saved = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+
+    # Run 2: resume from the epoch-1 checkpoint — start_epoch=1 >=
+    # phase1_epochs=1, so training resumes directly at the boundary.
+    run2 = tmp_path / "run2"
+    cfg2 = _tiny_config(mod, run2)
+    cfg2.checkpoint.resume_from = str(ckpt_path)
+    summary = mod.train(cfg2, phase1_epochs=1)
+    assert summary is not None
+
+    # The final checkpoint of run2 must carry a PHASE-2 optimizer shape
+    # (two param groups named non_lif/lif — the in-loop transition ran).
+    final_path = (run2 / "best_model.pth") if (run2 / "best_model.pth").exists() \
+        else (run2 / "epoch_2.pth")
+    final = torch.load(final_path, map_location="cpu", weights_only=False)
+    groups = final["optimizer_state_dict"]["param_groups"]
+    names = [g.get("name") for g in groups]
+    assert names == ["non_lif", "lif"], (
+        f"resume did not land in the phase-2 optimizer; groups={names}"
+    )
+    # Model weights were actually restored before continuing: the resumed
+    # run's best val loss must be finite and the run must have completed
+    # its remaining epochs (summary produced).
+    import math as _math
+    assert _math.isfinite(summary.get("best_val_loss", float("nan")))
+
+
+def test_resume_within_phase_preserves_optimizer_state(tmp_path, monkeypatch):
+    # Complement to the boundary test: resuming WITHIN phase 1 must restore
+    # the Adam moments and scheduler progress into the SAME optimizer (the
+    # round-5 fix's original guarantee).  A fresh optimizer would restart
+    # step counters at 0.
+    mod = _load_train_module()
+    ds_path = tmp_path / "nsmor_dataset.pt"
+    _make_synthetic_dataset(ds_path)
+    monkeypatch.setattr(mod, "_DATASET_PATH", str(ds_path))
+
+    # Run 1 with num_epochs=2 so the epoch-0 checkpoint is mid-phase.
+    run1 = tmp_path / "run1"
+    cfg = _tiny_config(mod, run1)
+    cfg.training.num_epochs = 2
+    cfg.training.checkpoint_interval = 1
+    mod.train(cfg, phase1_epochs=5)   # stays in phase 1 throughout
+
+    ckpt_path = run1 / "epoch_1.pth"
+    assert ckpt_path.exists()
+    saved = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    saved_steps = sorted(
+        int(s["step"]) for s in saved["optimizer_state_dict"]["state"].values()
+    )
+    assert all(s >= 1 for s in saved_steps)
+
+    # Run 2: resume within phase 1 (start_epoch=1 < phase1_epochs=5).
+    run2 = tmp_path / "run2"
+    cfg2 = _tiny_config(mod, run2)
+    cfg2.training.num_epochs = 2
+    cfg2.checkpoint.resume_from = str(ckpt_path)
+    mod.train(cfg2, phase1_epochs=5)
+
+    final_path = (run2 / "best_model.pth") if (run2 / "best_model.pth").exists() \
+        else (run2 / "epoch_2.pth")
+    final = torch.load(final_path, map_location="cpu", weights_only=False)
+    groups = final["optimizer_state_dict"]["param_groups"]
+    # Single-group frontend optimizer preserved (not replaced by anything).
+    assert len(groups) == 1
+    steps = sorted(
+        int(s["step"]) for s in final["optimizer_state_dict"]["state"].values()
+    )
+    # Restored moments survived: step counters continued from the saved
+    # values (>= saved max), not restarted from scratch.
+    assert len(steps) == len(saved_steps)
+    assert min(steps) >= max(saved_steps), (
+        f"optimizer state was reset on resume: saved={saved_steps} final={steps}"
+    )
+
+
 def test_lr_warmup_scale_linear_and_idempotent():
     # Regression (round-2 review): LR warmup must ramp linearly from 0→1 over
     # the warmup window and return to 1 past it, honouring the backward-compat

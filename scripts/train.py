@@ -1637,8 +1637,8 @@ def train(
             logger.info("Resuming from checkpoint: %s", ckpt_path)
             # Peek BEFORE load_checkpoint: (a) detect legacy checkpoints
             # without scheduler state (loud warning instead of silent LR
-            # restart), and (b) learn start_epoch so the correct-PHASE
-            # optimizer/scheduler exists before their state is loaded.
+            # restart), and (b) learn start_epoch so the restore can match
+            # the phase the run will continue in.
             ckpt_peek = torch.load(
                 ckpt_path, map_location="cpu", weights_only=False,
             )
@@ -1651,55 +1651,43 @@ def train(
                 )
             start_epoch = ckpt_peek.get("epoch", -1) + 1
 
-            # Resume x two-phase: build the phase-2 optimizer/scheduler
-            # BEFORE load_checkpoint restores state — otherwise state is
-            # loaded into the phase-1 optimizer and then discarded when a
-            # fresh phase-2 one replaces it after the load.
-            if (
+            # Resume x two-phase: when the resume point is at/past the
+            # phase-1→2 boundary, an uninterrupted run would have built a
+            # FRESH phase-2 optimizer at the boundary (the phase-1 Adam
+            # moments are deliberately discarded there).  Mirror that
+            # exactly: restore ONLY model weights here and let the
+            # in-loop transition construct the fresh phase-2 optimizer on
+            # the first epoch.  Restoring into (or pre-building) the
+            # phase-2 optimizer either crashes (1-group checkpoint vs
+            # 2-group optimizer) or silently diverges from the canonical
+            # uninterrupted trajectory.
+            _crosses_boundary = (
                 two_phase
                 and current_phase == 1
                 and start_epoch >= phase1_epochs
-            ):
+            )
+            if _crosses_boundary:
                 logger.info(
                     "Resume past phase boundary (start_epoch=%d >= "
-                    "phase1_epochs=%d) — building phase-2 optimizer "
-                    "before state restore",
+                    "phase1_epochs=%d) — restoring model weights only; "
+                    "fresh phase-2 optimizer built by the in-loop "
+                    "transition",
                     start_epoch, phase1_epochs,
                 )
-                for param in model.frontend.parameters():
-                    param.requires_grad = False
-                for param in model.backend.parameters():
-                    param.requires_grad = True
-                base_lr = config.training.learning_rate
-                lif_lr = base_lr * 0.3
-                lif_params = list(model.backend.lif_cell.parameters())
-                other_params = [
-                    p for n, p in model.backend.named_parameters()
-                    if "lif_cell" not in n
-                ]
-                optimizer = torch.optim.AdamW([
-                    {"params": other_params, "lr": base_lr, "base_lr": base_lr, "name": "backend"},
-                    {"params": lif_params, "lr": lif_lr, "base_lr": lif_lr, "name": "lif"},
-                ], weight_decay=config.training.weight_decay)
-                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                    optimizer,
-                    T_max=max(
-                        1,
-                        (config.training.num_epochs - start_epoch) - config.training.lr_warmup_epochs,
-                    ),
-                    eta_min=1e-6,
+                load_checkpoint(
+                    path=ckpt_path,
+                    model=model,
+                    map_location=device,
                 )
-                criterion = backend_criterion
-                current_phase = 2
-
-            checkpoint = load_checkpoint(
-                path=ckpt_path,
-                model=model,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                map_location=device,
-            )
-            best_val_loss = checkpoint.get("loss", float("inf"))
+            else:
+                load_checkpoint(
+                    path=ckpt_path,
+                    model=model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    map_location=device,
+                )
+            best_val_loss = ckpt_peek.get("loss", float("inf"))
             logger.info("Resumed at epoch %d, loss=%.6f", start_epoch, best_val_loss)
         else:
             logger.warning("Checkpoint not found: %s — starting fresh", ckpt_path)
