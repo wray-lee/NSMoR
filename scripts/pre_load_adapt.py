@@ -170,14 +170,36 @@ def adapt_cercus_to_nsmor(raw_dir="data/raw"):
             # Compute velocity from raw sensor data (matching kinematics.py)
             # velocity = sqrt(dx^2 + dy^2) / dt, converted to cm/s
             # dx, dy are in mm; dt is in seconds from sys_time
-            step_dist_mm = np.sqrt(df_k["dx"]**2 + df_k["dy"]**2)
-            dt_s = df_k.groupby("trial_id")["abs_time"].transform(
+            #
+            # Root-cause guard (NSMoR audit 2026-08-21): the raw sensor dx/dy
+            # columns carry the ONE-SAMPLE cross-trial position jump at the
+            # first frame of each trial (the absolute arena coord restart at the
+            # new trial's origin, but the first dx/dy still encode the jump from
+            # the previous trial's last sample). Dividing by the clamped dt
+            # (=0.001 s) therefore produced phantom velocities of 10^6-10^7
+            # cm/s on the first frame of affected trials. Reconstructed
+            # x_pos/y_pos are per-trial cumsum (reset to 0,0), so velocity must
+            # be derived from those SAME per-trial position increments, where
+            # the first frame increment is identically 0. This yields the
+            # physically correct first-frame velocity (an animal cannot move in
+            # a zero-duration interval) and removes the phantom spike at the
+            # source, before it is ever persisted.
+            per_trial_group = df_k.groupby("trial_id", sort=False)
+            dx_sq = per_trial_group["x_pos"].transform(
+                lambda x: np.concatenate([[0.0], np.diff(x) ** 2])
+            )
+            dy_sq = per_trial_group["y_pos"].transform(
+                lambda y: np.concatenate([[0.0], np.diff(y) ** 2])
+            )
+            # step in cm (x_pos/y_pos are cm); convert to mm to match velocity unit
+            step_dist_mm = np.sqrt(dx_sq.to_numpy() + dy_sq.to_numpy()) * 10.0
+            dt_s = per_trial_group["abs_time"].transform(
                 lambda x: x.diff().fillna(0) / 1000.0
             )
-            # Avoid division by zero
+            # Avoid division by zero / negative dt artifacts
             dt_s = dt_s.clip(lower=0.001)
             # velocity in mm/s, then convert to cm/s
-            df_k["velocity"] = (step_dist_mm / dt_s) / 10.0
+            df_k["velocity"] = (step_dist_mm / dt_s.to_numpy()) / 10.0
 
             # Compute acceleration as diff of velocity
             df_k["acceleration"] = df_k.groupby("trial_id")["velocity"].transform(

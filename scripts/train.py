@@ -60,6 +60,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Opt-in escape-band sensitivity sweep list, set by build_config() from
+# --sweep_escape_band and consumed by train().  ``None`` disables (default).
+_SWEEP_BANDS: Optional[List[float]] = None
+
+# Single source of truth for the train/val split fraction, threaded to BOTH
+# build_dataloaders and compute_target_stats — otherwise a non-default split
+# silently desynchronises the normalization statistics from the training set
+# (validation leakage into target mean/std).
+_VAL_SPLIT = 0.2
+
+# Hardcoded dataset path shared by build_dataloaders and compute_target_stats
+# call sites (single source; the .pt file is also loaded only once this way).
+_DATASET_PATH = "data/processed/nsmor_dataset.pt"
+
 
 # ═══════════════════════════════════════════════════════════════
 # 1.  Argument Parsing
@@ -164,6 +178,50 @@ def build_arg_parser() -> argparse.ArgumentParser:
              "None = single-phase (backward compatible).",
     )
 
+    # ── LR schedule (training-stability refactor) ──────────────
+    # Linear warmup for the *main* MSE path.  Under a shared
+    # AdamW across the coupled LIF + GRU parameter groups, taking
+    # a full-LR step on the very first epochs (where recurrent
+    # states and surrogate gradients are still settling) triggers
+    # overshooting that the constant cosine schedule then cannot
+    # recover within a short run.  A brief linear ramp keeps the
+    # early updates small and clean.
+    parser.add_argument(
+        "--lr_warmup_epochs",
+        type=int,
+        default=None,
+        help="Number of epochs over which the base LR is ramped "
+             "linearly from 0 to its full value. 0 disables. "
+             "Overrides config.training.lr_warmup_epochs.",
+    )
+
+    # ── Target normalization ───────────────────────────────────
+    parser.add_argument(
+        "--normalize_targets",
+        default=None,
+        action="store_true",
+        help="Regress on mean-centered, std-scaled velocity instead of raw "
+             "cm/s.  The raw target is heavy-tailed (a few frames reach "
+             "~1e7 cm/s) which inflates and destabilises the masked MSE. "
+             "Normalising reveals the resting-mode bulk where the escape "
+             "response lives. Statistics are fit on training split only.",
+    )
+    parser.add_argument(
+        "--no-normalize_targets",
+        dest="normalize_targets",
+        default=None,
+        action="store_false",
+        help="Disable target normalization (use raw velocity).",
+    )
+    parser.add_argument(
+        "--target_clip_cm_s",
+        type=float,
+        default=None,
+        help="Clip |velocity target| to this value (cm/s) before computing "
+             "the loss. 0 disables.  Removes tracking-artifact frames whose "
+             "huge |y| (>1e6 cm/s) otherwise dominate the masked MSE.",
+    )
+
     # ── Checkpointing ─────────────────────────────────────────
     parser.add_argument(
         "--resume",
@@ -176,6 +234,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="Override output directory.",
+    )
+    parser.add_argument(
+        "--sweep_escape_band",
+        type=str,
+        default=None,
+        help="Comma-separated escape-band thresholds (cm/s) for the "
+             "sensitivity sweep, e.g. '5,10,20,50'.  After training, "
+             "rescores the best model's validation metrics at every band "
+             "x min_run in {1,2,3} and writes "
+             "escape_sensitivity.csv to the output dir.  Requires a "
+             "completed training run with a val split.",
     )
 
     return parser
@@ -217,12 +286,27 @@ def build_config(argv: Optional[Sequence[str]] = None) -> Tuple[ExperimentConfig
         config.training.num_epochs = args.epochs
     if args.hidden_dim is not None:
         config.model.hidden_dim = args.hidden_dim
+    if getattr(args, "lr_warmup_epochs", None) is not None:
+        config.training.lr_warmup_epochs = args.lr_warmup_epochs
+    if getattr(args, "normalize_targets", None) is not None:
+        config.training.normalize_targets = args.normalize_targets
+    if getattr(args, "target_clip_cm_s", None) is not None:
+        config.training.target_clip_cm_s = args.target_clip_cm_s
     if args.freeze is not None:
         config.finetune.freeze_modules = args.freeze
     if args.resume is not None:
         config.checkpoint.resume_from = args.resume
     if args.output_dir is not None:
         config.checkpoint.output_dir = args.output_dir
+
+    # Sweep bands: parse the comma list into a module-level holder consumed
+    # by train() (kept out of ExperimentConfig — it is a reporting option,
+    # not a training hyperparameter).
+    global _SWEEP_BANDS
+    _SWEEP_BANDS = (
+        [float(b) for b in args.sweep_escape_band.split(",") if b.strip()]
+        if args.sweep_escape_band else None
+    )
 
     return config, args.lambda_reg, args.phase1_epochs
 
@@ -299,8 +383,8 @@ def build_optimizer(
     other_params = [p for p in model.parameters() if id(p) not in lif_param_ids]
 
     optimizer = torch.optim.AdamW([
-        {"params": other_params, "lr": base_lr, "name": "non_lif"},
-        {"params": lif_params, "lr": lif_lr, "name": "lif"},
+        {"params": other_params, "lr": base_lr, "base_lr": base_lr, "name": "non_lif"},
+        {"params": lif_params, "lr": lif_lr, "base_lr": lif_lr, "name": "lif"},
     ], weight_decay=config.training.weight_decay)
     logger.info(
         "Optimizer: AdamW  base_lr=%.2e  lif_lr=%.2e  weight_decay=%.2e",
@@ -492,9 +576,194 @@ def build_dataloaders(
     return train_loader, val_loader
 
 
+def compute_target_stats(
+    dataset_path: str,
+    config: ExperimentConfig,
+    val_split: float = 0.2,
+) -> Tuple[float, float]:
+    """
+    Compute training-split velocity mean and std for target normalization.
+
+    Uses the *same* deterministic train/val split as
+    :func:`build_dataloaders` (seeded by ``config.training.random_seed``)
+    and aggregates only the training sequences, so no validation signal
+    leaks into the normalization statistics.
+
+    The raw velocity target is heavy-tailed: 99.99% of frames satisfy
+    ``|y| < 100 cm/s`` (resting cricket), but a handful reach ~1e7 cm/s.
+    Using the std over the full distribution would still let those extreme
+    frames dominate a standardized MSE.  We therefore compute statistics
+    over the *robust* bulk (frames in the middle ``100% - 2*trim``
+    percentile band) and, when :attr:`TrainingConfig.normalize_targets`
+    is enabled, report them for downstream model fitting.
+
+    Args:
+        dataset_path: Path to the preprocessed ``nsmor_dataset.pt``.
+        config: Parsed experiment configuration (for the split seed).
+        val_split: Fraction held out for validation (must match
+            :func:`build_dataloaders`).
+
+    Returns:
+        ``(train_mean, train_std)`` in cm/s.  When normalization is
+        disabled this returns ``(0.0, 1.0)`` so callers can pass the
+        values unconditionally as the identity transform.
+    """
+    if not config.training.normalize_targets:
+        return 0.0, 1.0
+
+    dataset_file = Path(dataset_path)
+    if not dataset_file.exists():
+        logger.warning(
+            "Dataset not found for target stats: %s — using identity.",
+            dataset_file,
+        )
+        return 0.0, 1.0
+
+    dataset = torch.load(dataset_file, weights_only=False)
+    Y_seqs = dataset["Y_seqs"]
+
+    rng = np.random.RandomState(config.training.random_seed)
+    indices = np.arange(len(Y_seqs))
+    rng.shuffle(indices)
+    n_val = max(1, int(len(Y_seqs) * val_split))
+    n_train = len(Y_seqs) - n_val
+    train_indices = indices[:n_train]
+
+    train_y = np.concatenate([Y_seqs[i] for i in train_indices]).astype(np.float64)
+
+    # Fit the statistic in the SAME space the loss sees.  ``train_one_epoch``
+    # clips the target to ``[-target_clip_cm_s, +target_clip_cm_s]`` before
+    # standardising, so we clip here first; otherwise the ±(81..100] cm/s band
+    # that survives clip would be divided by a *smaller* trimmed std, re-imposing
+    # heavy-tail domination (the statistic and transform would disagree).
+    clip = config.training.target_clip_cm_s
+    if clip > 0.0:
+        train_y = np.clip(train_y, -clip, clip)
+
+    # Robust trim of the remaining bulk for a well-conditioned mean/std.
+    lo, hi = np.percentile(train_y, [0.5, 99.5])
+    bulk = train_y[(train_y >= lo) & (train_y <= hi)]
+    if bulk.size == 0:
+        bulk = train_y
+
+    mean = float(bulk.mean())
+    std = float(bulk.std())
+    if std < 1e-3:
+        # Degenerate constant target — fall back to identity.
+        logger.warning("Target std near zero (%.6f) — using identity transform.", std)
+        return 0.0, 1.0
+
+    logger.info(
+        "Target normalization on train split: mean=%.4f cm/s  std=%.4f cm/s  "
+        "(n=%d bulk frames, trimmed to [%s, %s])",
+        mean, std, int(bulk.size),
+        f"{lo:.4f}", f"{hi:.4f}",
+    )
+    return mean, std
+
+
 # ═══════════════════════════════════════════════════════════════
 # 4.  Training Loop
 # ═══════════════════════════════════════════════════════════════
+
+def compute_lr_warmup_scale(epoch: int, lr_warmup_epochs: int) -> float:
+    """
+    Compute the linear LR warmup scale.
+
+    During the first ``lr_warmup_epochs`` epochs, the base learning rate
+    is ramped linearly (times each param group's configured base LR).
+    After warmup the scale is ``1.0``.
+
+    Optimization rationale: a full-LR first optimiser step on a cold
+    recurrent state (LIF surrogate gradients and GRU hidden states not yet
+    settled) overshoots the loss surface; the shared AdamW then accumulates
+    a polluted second moment (``v``) that the cosine schedule cannot
+    correct within a short run.  Ramping the LR keeps early updates small
+    and clean so that ``v`` tracks the true landscape.
+
+    The scale is applied multiplicatively to the param group's ``lr``
+    before the scheduler-step of the same epoch (LR warmup precedence
+    over cosine annealing, matching the effective phase of a
+    ``LinearWarmupCosineAnnealingLR`` without a new optimiser group).
+
+    Args:
+        epoch: Current 0-indexed epoch.
+        lr_warmup_epochs: Warmup epoch count.  ``0`` disables (scale = 1).
+
+    Returns:
+        ``float`` in ``[0.0, 1.0]`` — LR multiplier for this epoch.
+    """
+    if lr_warmup_epochs <= 0:
+        return 1.0
+    if epoch >= lr_warmup_epochs:
+        return 1.0
+    # Linear ramp over [0, lr_warmup_epochs): epoch e gets scale (e+1)/W.
+    # The first step is 1/W (tiny but non-zero — avoids a dead start) and
+    # the last warmup epoch reaches exactly 1.0, closing the window at the
+    # boundary.  (The nominal half-open window is documented as "ramp over
+    # W epochs"; reaching full LR on the final warmup epoch is the chosen
+    # convention — the alternative e/W leaves the window one epoch short.)
+    return float((epoch + 1) / lr_warmup_epochs)
+
+
+def apply_lr_warmup(
+    optimizer: torch.optim.Optimizer,
+    epoch: int,
+    lr_warmup_epochs: int,
+) -> None:
+    """
+    Ramp each param group's LR linearly during the warmup window.
+
+    Each group must carry a ``base_lr`` key (set at optimiser
+    construction) holding its FULL configured LR.  During warmup the
+    group LR is set to ``base_lr * scale`` — overriding the cosine-
+    scheduled value — so warmup is deterministic and does not compound
+    with the cosine decay.  Setting ``base_lr`` separately from the
+    cosine-updated ``lr`` preserves each group's relative rate, including
+    the 0.3x LIF damping.
+
+    The cosine ``scheduler.step()`` (called later in the same loop
+    iteration) writes ``group["lr"]`` fresh each epoch, so the warmup
+    override and the cosine anneal never accumulate.
+
+    Args:
+        optimizer: The AdamW optimiser to scale.
+        epoch: Current 0-indexed epoch (local to the phase in two-phase
+            training, so the warmup restarts cleanly at the transition).
+        lr_warmup_epochs: Warmup epoch count.  ``0`` disables warmup.
+
+    Raises:
+        ValueError: If any param group is missing either ``"base_lr"``
+            or ``"lr"``.
+    """
+    if lr_warmup_epochs <= 0:
+        return
+    scale = compute_lr_warmup_scale(epoch, lr_warmup_epochs)
+    for group in optimizer.param_groups:
+        if "base_lr" not in group or "lr" not in group:
+            raise ValueError(
+                "apply_lr_warmup: param group must carry both 'base_lr' and 'lr'.",
+            )
+        group["lr"] = group["base_lr"] * scale
+
+
+def _maybe_step_scheduler(
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
+    lr_warmup_epochs: int,
+    warmup_epoch: int,
+) -> None:
+    """
+    Advance the LR scheduler once per epoch, holding it during the warmup
+    window so the anneal budget isn't consumed by ``apply_lr_warmup``'s
+    override.
+
+    Backward-compat contract: when ``lr_warmup_epochs == 0`` (default), the
+    step is unconditional — identical to the original single-schedule loop —
+    so the default-config cosine trajectory is byte-for-byte the baseline's.
+    """
+    if lr_warmup_epochs == 0 or warmup_epoch >= lr_warmup_epochs:
+        scheduler.step()
+
 
 def compute_warmup_factor(epoch: int, warmup_epochs: int) -> float:
     """
@@ -550,6 +819,9 @@ def train_one_epoch(
     scaler: Optional[torch.amp.GradScaler] = None,
     amp_ctx = None,
     phase: int = 0,
+    target_mean: float = 0.0,
+    target_std: float = 1.0,
+    target_clip_cm_s: float = 0.0,
 ) -> float:
     """
     Run one training epoch.
@@ -574,11 +846,16 @@ def train_one_epoch(
             (BioJointLoss, backward compatible).
 
     Returns:
-        Average training loss for this epoch.
+        Average training loss for this epoch.  Skip counters
+        (``n_skipped_nonfinite_loss``, ``n_skipped_nonfinite_grad``) are
+        reported via :attr:`train_one_epoch.last_skip_counts` — a training
+        stability audit must surface how many steps were silently dropped.
     """
     model.train()
     total_loss = 0.0
     n_batches = 0
+    n_skipped_nonfinite_loss = 0
+    n_skipped_nonfinite_grad = 0
 
     # CF9: Per-epoch membrane health accumulators
     _epoch_v_max = 0.0
@@ -594,6 +871,18 @@ def train_one_epoch(
         x_batch = x_batch.to(device).contiguous()
         y_batch = y_batch.to(device).contiguous()
         lengths = lengths.to(device).contiguous()
+
+        # ── Target normalization (if enabled) ──
+        # Regress on (y - target_mean)/target_std so the loss is dominated
+        # by the well-conditioned bulk of the velocity distribution rather
+        # than the handful of extreme frames.  Applied on-device to y_true
+        # only; the forward/backward treats it as the regression target.
+        # Optional robust clip removes tracking-artifact frames (|y| > cap)
+        # that would otherwise contribute (1e6+)² to the MSE.
+        if target_clip_cm_s > 0.0:
+            y_batch = torch.clamp(y_batch, -target_clip_cm_s, target_clip_cm_s)
+        if target_std != 1.0 or target_mean != 0.0:
+            y_batch = (y_batch - target_mean) / target_std
 
         # ── Forward pass (with internals for routing gates) ──
         _ctx = amp_ctx() if amp_ctx is not None else nullcontext()
@@ -659,6 +948,15 @@ def train_one_epoch(
                 "Epoch %d batch %d: non-finite loss=%s — skipping step",
                 epoch, batch_idx, loss.item(),
             )
+            # Plain continue: no unscale_() ran on this iteration and
+            # step() was not called, so the GradScaler holds no per-iter
+            # state that update() could reconcile.  (Calling update() here
+            # would read an empty found_inf and GROW the scale, amplifying
+            # exactly the overflow that produced the non-finite loss.)
+            # AMP caveat: if the non-finite loss came from an FP16 forward
+            # overflow, the scale is NOT reduced on this path — documented
+            # limitation; the gradient check below is the backstop.
+            n_skipped_nonfinite_loss += 1
             continue  # skip optimizer.step()
 
         # ── Gradient clipping (unscale first for AMP) ──
@@ -669,25 +967,28 @@ def train_one_epoch(
         if scaler is not None and scaler.is_enabled():
             scaler.unscale_(optimizer)
 
-        # ── Pre-clip gradient sanitization ──
-        # Catch NaN/Inf gradients BEFORE clipping to prevent
-        # clip_grad_norm_ from producing NaN (it divides by norm).
-        # This is more efficient than post-clip check because it
-        # avoids the NaN propagation issue entirely.
-        pre_nan_count = 0
+        # ── Pre-clip gradient finiteness check ──
+        # Non-finite gradients SKIP the whole step: zeroing them (the old
+        # behavior) feeds artificial zeros into Adam's second moment,
+        # systematically polluting v.  found_inf was set inside unscale_()
+        # above, so scaler.step() would already have skipped — but we
+        # continue explicitly so the skip is counted and logged.
+        has_nonfinite_grad = False
         for p in trainable_params:
             if p.grad is not None and not torch.isfinite(p.grad).all():
-                pre_nan_count += p.grad.data.numel() - torch.isfinite(p.grad.data).sum().item()
-                p.grad.data = torch.where(
-                    torch.isfinite(p.grad.data),
-                    p.grad.data,
-                    torch.zeros_like(p.grad.data),
-                )
-        if pre_nan_count > 0:
+                has_nonfinite_grad = True
+                break
+        if has_nonfinite_grad:
+            n_skipped_nonfinite_grad += 1
             logger.warning(
-                "Epoch %d batch %d: %d non-finite gradient elements sanitized BEFORE clipping",
-                epoch, batch_idx, pre_nan_count,
+                "Epoch %d batch %d: non-finite gradient before clipping — skipping step",
+                epoch, batch_idx,
             )
+            # GradScaler bookkeeping: found_inf is already set from
+            # unscale_(); update() halves the scale and clears it.
+            if scaler is not None and scaler.is_enabled():
+                scaler.update()
+            continue  # skip optimizer.step()
 
         if grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(
@@ -751,10 +1052,22 @@ def train_one_epoch(
         n_batches += 1
 
         # ── Logging ──
-        pbar.update(1)
+        # (No pbar.update here — iterating the tqdm wrapper already advances
+        # it once per batch; an extra update double-counted progress.)
         pbar.set_postfix({"loss": f"{loss.item():.4f}"})
 
     avg_loss = total_loss / max(n_batches, 1)
+
+    # Surface skip counts for the stability audit (see docstring).
+    train_one_epoch.last_skip_counts = {
+        "n_skipped_nonfinite_loss": n_skipped_nonfinite_loss,
+        "n_skipped_nonfinite_grad": n_skipped_nonfinite_grad,
+    }
+    if n_skipped_nonfinite_loss or n_skipped_nonfinite_grad:
+        logger.warning(
+            "Epoch %d skipped steps: %d non-finite loss, %d non-finite grad",
+            epoch, n_skipped_nonfinite_loss, n_skipped_nonfinite_grad,
+        )
 
     # CF9: Compute per-epoch membrane health summary
     health = {}
@@ -784,6 +1097,9 @@ def validate(
     lambda_sparse: float = 0.0,
     lambda_jerk: float = 0.0,
     phase: int = 0,
+    target_mean: float = 0.0,
+    target_std: float = 1.0,
+    target_clip_cm_s: float = 0.0,
 ) -> float:
     """
     Run validation (no gradient computation).
@@ -798,6 +1114,14 @@ def validate(
         lambda_sparse: Population sparsity L1 weight.
         lambda_jerk: Temporal coherence weight.
         phase: Training phase (1=frontend, 2=backend, 0=single-phase).
+        target_mean: Target mean (cm/s) used when target normalization is
+            enabled; paired with ``target_std`` to put ``y_true`` on the
+            same scale the network predicts.  Default ``(0.0, 1.0)`` is
+            the identity (no normalization).
+        target_std: Target std (cm/s) used when target normalization is
+            enabled.  Default ``(0.0, 1.0)`` is the identity.
+        target_clip_cm_s: Robust clip magnitude (cm/s) applied to the
+            validation target to mirror training.  ``0.0`` disables.
 
     Returns:
         Average validation loss.
@@ -812,6 +1136,12 @@ def validate(
         x_batch = x_batch.to(device).contiguous()
         y_batch = y_batch.to(device).contiguous()
         lengths = lengths.to(device).contiguous()
+
+        # Match the training-time target transformation (if enabled).
+        if target_clip_cm_s > 0.0:
+            y_batch = torch.clamp(y_batch, -target_clip_cm_s, target_clip_cm_s)
+        if target_std != 1.0 or target_mean != 0.0:
+            y_batch = (y_batch - target_mean) / target_std
 
         y_pred, internals = model(x_batch, lengths, return_internals=True)
 
@@ -851,10 +1181,42 @@ def validate(
 # ═══════════════════════════════════════════════════════════════
 
 @torch.no_grad()
+def _sustained_run(mask: np.ndarray, min_run: int = 2) -> np.ndarray:
+    """Return a copy of ``mask`` keeping only elements that belong to a run of
+    at least ``min_run`` consecutive ``True`` values.
+
+    Used to exclude isolated single-frame out-of-band spikes (e.g. ~1e7 cm/s
+    tracking artifacts) from the escape audit, keeping only temporally-extended
+    events which we call escapes.  Runs shorter than ``min_run`` are zeroed.
+    """
+    mask = np.asarray(mask, dtype=bool)
+    if mask.ndim != 1:
+        raise ValueError(f"_sustained_run expects a 1-D mask, got {mask.ndim}-D")
+    if min_run <= 1:
+        return mask.copy()
+    keep = np.zeros(mask.shape[0], dtype=bool)
+    run = 0
+    for i, on in enumerate(mask):
+        if on:
+            run += 1
+        else:
+            if run >= min_run:
+                keep[i - run : i] = True
+            run = 0
+    if run >= min_run:  # trailing run reaches the array end
+        keep[mask.shape[0] - run :] = True
+    return keep
+
+
+@torch.no_grad()
 def compute_metrics(
     model: NSMoRCore,
     loader: torch.utils.data.DataLoader,
     device: torch.device,
+    target_mean: float = 0.0,
+    target_std: float = 1.0,
+    target_clip_cm_s: float = 0.0,
+    escape_band_cm_s: float = 10.0,
 ) -> Dict[str, float]:
     """
     Compute regression metrics on a dataset using the given model.
@@ -867,9 +1229,36 @@ def compute_metrics(
         model: Trained model (should be in eval mode).
         loader: DataLoader for the evaluation split.
         device: Device to run inference on.
+        target_mean: Training-target mean (cm/s).  When target
+            normalization was enabled during training, predictions are
+            in standardised units and are rescaled back to cm/s via
+            ``pred_cm_s = pred_norm * target_std + target_mean`` before
+            computing metrics, so reported numbers are in physical units.
+            Default ``(0.0, 1.0)`` is the identity.
+        target_std: Training-target std (cm/s).
+        target_clip_cm_s: Robust clip magnitude (cm/s) applied to both
+            predictions and targets before computing metrics, mirroring
+            the training-time target clip.  ``0.0`` disables.
 
     Returns:
-        Dictionary with keys ``"mse"``, ``"rmse"``, ``"mae"``, ``"r2"``.
+        Dictionary with keys ``"mse"``, ``"rmse"``, ``"mae"``, ``"r2"``
+        in physical (cm/s) units, plus a high-velocity-band escape-signal
+        audit: ``"escape_band_cm_s"``, ``"n_escape_frames"``,
+        ``"escape_rmse"`` (RMSE on ``|y_true| >= escape_band_cm_s`` frames),
+        ``"resting_rmse"`` (RMSE on the remaining resting frames), and
+        ``"escape_ratio"``.  The band split exposes whether the
+        network learned the high-velocity escape transient or only the
+        resting-mode bulk (a bulk-fitting model scores well on clipped
+        ``rmse``/``r2`` yet shows ``escape_rmse >> resting_rmse``).
+
+        The band audit is measured on the **raw (unclipped)** prediction and
+        target, so frames whose true magnitude exceeds ``target_clip_cm_s`` are
+        still measured at their true magnitude rather than flattened to the
+        clip boundary.  The band is an absolute-velocity-magnitude heuristic
+        (``escape_band_cm_s``), NOT a wind-stimulus-conditioned or
+        per-trial-baseline-subtracted escape definition — see the
+        ``escape_band_cm_s`` config docstring.  A single band value does not by
+        itself prove escape learning; sweep the band for sensitivity.
     """
     model.eval()
     all_pred: List[np.ndarray] = []
@@ -892,12 +1281,132 @@ def compute_metrics(
     y_pred_all = np.concatenate(all_pred)
     y_true_all = np.concatenate(all_true)
 
+    # Rescale predictions from standardized units back to cm/s (units
+    # matching y_true) so metrics are reported in physical velocity units.
+    if target_std != 1.0 or target_mean != 0.0:
+        y_pred_all = y_pred_all * target_std + target_mean
+
+    # Symmetric robust clip before scoring (mirrors training-target clip).
+    # Keep RAW copies of both prediction and target (post-rescale, pre-clip)
+    # for the high-velocity-band audit below, so a real escape transient whose
+    # true magnitude exceeds ±clip is still measured at its raw magnitude — not
+    # flattened to the clip boundary (which would mask silent escape-signal loss).
+    y_pred_all_raw = y_pred_all.copy()
+    y_true_all_raw = y_true_all.copy()
+    if target_clip_cm_s > 0.0:
+        y_pred_all = np.clip(y_pred_all, -target_clip_cm_s, target_clip_cm_s)
+        y_true_all = np.clip(y_true_all, -target_clip_cm_s, target_clip_cm_s)
+
     mse = float(mean_squared_error(y_true_all, y_pred_all))
     rmse = float(np.sqrt(mse))
     mae = float(mean_absolute_error(y_true_all, y_pred_all))
     r2 = float(r2_score(y_true_all, y_pred_all))
 
-    return {"mse": mse, "rmse": rmse, "mae": mae, "r2": r2}
+    # ── High-velocity-band escape-signal check ────────────────
+    # Reviewer requirement: a bulk-fitting model can report an excellent
+    # clipped RMSE/R² while failing to learn the biologically meaningful
+    # escape transient (resting-dominant, zero-inflated target).  Break the
+    # validation error into resting vs high-velocity (escape) frames so that
+    # silent escape-signal loss is visible in the reported metrics rather
+    # than masked by the resting-mode bulk.
+    #   high-speed band: |y_true| >= escape_band_cm_s frames.
+    # Critical: membership AND magnitude are both measured on the RAW
+    # (unclipped) prediction and target.  Measuring in the raw space means an
+    # escape transient whose true magnitude exceeds ±target_clip_cm_s is NOT
+    # flattened to the clip boundary — a model predicting a flat ~clip for
+    # every large escape scores a large raw escape_rmse, so the audit actually
+    # exposes silent escape-signal loss rather than being blinded by the clip.
+    # (The overall mse/rmse/mae/r2 above remain clipped-space, matching the
+    # training-target clip; the band audit deliberately reports raw magnitude.)
+    #
+    # Sustained-membership guard: escape membership requires the frame to be
+    # part of a *run* of at least ``min_run=2`` consecutive
+    # |y_true|>=escape_band_cm_s frames.  min_run is a conservative artifact
+    # filter, NOT a biophysical timescale claim: tracking artifacts are
+    # single-frame sensor jumps, so min_run=2 already excludes them, while a
+    # larger value would start trimming genuine short escapes.  (At 500 Hz,
+    # 2 frames = 4 ms — well below the ~10-100 ms kick; the guard trades
+    # sensitivity for artifact-robustness.  Sweep band x min_run for
+    # sensitivity — see task/roadmap.)
+    #
+    # The guard is applied PER SEQUENCE, before concatenation: frame adjacency
+    # in the concatenated array is meaningless across trial boundaries, so a
+    # run computed post-concat could bridge two unrelated trials (false escape)
+    # or split one truncated at a boundary.
+    over_seq = [np.abs(t) >= escape_band_cm_s for t in all_true]
+    keep_seq = [_sustained_run(o, min_run=2) for o in over_seq]
+    is_escape = np.concatenate(keep_seq) if keep_seq else np.zeros(0, dtype=bool)
+    n_escape = int(is_escape.sum())
+    escape_rmse = float(np.sqrt(mean_squared_error(
+        y_true_all_raw[is_escape], y_pred_all_raw[is_escape]))) if n_escape else float("nan")
+    resting_rmse = float(np.sqrt(mean_squared_error(
+        y_true_all_raw[~is_escape], y_pred_all_raw[~is_escape]))) if (~is_escape).any() else float("nan")
+
+    metrics: Dict[str, float] = {
+        "mse": mse,
+        "rmse": rmse,
+        "mae": mae,
+        "r2": r2,
+        "escape_band_cm_s": escape_band_cm_s,
+        "n_escape_frames": float(n_escape),
+        "escape_rmse": escape_rmse,
+        "resting_rmse": resting_rmse,
+        "escape_ratio": n_escape / max(1, int(y_true_all.size)),
+    }
+    return metrics
+
+
+def sweep_escape_sensitivity(
+    all_true: List[np.ndarray],
+    all_pred: List[np.ndarray],
+    bands_cm_s: List[float],
+    min_runs: List[int] = (1, 2, 3),
+) -> List[Dict[str, float]]:
+    """
+    Band x min_run sensitivity table for the escape audit.
+
+    Rescores the SAME per-sequence raw predictions/targets (as collected by
+    :func:`compute_metrics`) at every escape-band threshold and sustained-run
+    length, so the reported headline number can be shown to be robust (or
+    not) to its two free parameters rather than a single arbitrary-threshold
+    point estimate.
+
+    Returns one dict per (band, min_run) pair with keys ``band_cm_s``,
+    ``min_run``, ``n_escape_frames``, ``n_escape_events`` (number of
+    contiguous per-sequence runs — the event-level unit), ``escape_rmse``,
+    ``resting_rmse``, and ``escape_ratio``.
+    """
+    rows: List[Dict[str, float]] = []
+    y_pred_all_raw = np.concatenate(all_pred)
+    y_true_all_raw = np.concatenate(all_true)
+    err_sq_all = (y_pred_all_raw - y_true_all_raw) ** 2
+    for band in bands_cm_s:
+        for mr in min_runs:
+            keep_seq = [
+                _sustained_run(np.abs(t) >= band, min_run=mr) for t in all_true
+            ]
+            is_escape = np.concatenate(keep_seq)
+            n_escape = int(is_escape.sum())
+            # Event count: transitions into an over-band kept run.
+            n_events = sum(
+                int(np.count_nonzero(k[1:] & ~k[:-1]) + int(k[0]))
+                for k in keep_seq
+            )
+            esc = float(np.sqrt(err_sq_all[is_escape].mean())) if n_escape else float("nan")
+            rest = (
+                float(np.sqrt(err_sq_all[~is_escape].mean()))
+                if (~is_escape).any() else float("nan")
+            )
+            rows.append({
+                "band_cm_s": band,
+                "min_run": mr,
+                "n_escape_frames": n_escape,
+                "n_escape_events": n_events,
+                "escape_rmse": esc,
+                "resting_rmse": rest,
+                "escape_ratio": n_escape / max(1, is_escape.size),
+            })
+    return rows
 
 
 def plot_loss_curve(
@@ -1021,9 +1530,15 @@ def train(
                 param.requires_grad = False
             for param in model.frontend.parameters():
                 param.requires_grad = True
+            # Single group carrying ``base_lr`` (mirroring build_optimizer) so
+            # apply_lr_warmup (used when lr_warmup_epochs>0) never hits its
+            # "param group must carry both base_lr and lr" ValueError.
             optimizer = torch.optim.AdamW(
-                model.frontend.parameters(),
-                lr=config.training.learning_rate,
+                [{
+                    "params": list(model.frontend.parameters()),
+                    "lr": config.training.learning_rate,
+                    "base_lr": config.training.learning_rate,
+                }],
                 weight_decay=config.training.weight_decay,
             )
             criterion = frontend_criterion
@@ -1040,8 +1555,8 @@ def train(
             lif_param_ids = {id(p) for p in lif_params}
             other_backend = [p for p in model.backend.parameters() if id(p) not in lif_param_ids]
             optimizer = torch.optim.AdamW([
-                {"params": other_backend, "lr": base_lr, "name": "non_lif"},
-                {"params": lif_params, "lr": lif_lr, "name": "lif"},
+                {"params": other_backend, "lr": base_lr, "base_lr": base_lr, "name": "non_lif"},
+                {"params": lif_params, "lr": lif_lr, "base_lr": lif_lr, "name": "lif"},
             ], weight_decay=config.training.weight_decay)
             criterion = backend_criterion
             current_phase = 2
@@ -1057,16 +1572,52 @@ def train(
     if use_amp:
         logger.info("AMP enabled (FP16 forward/backward, FP32 master weights)")
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=config.training.num_epochs, eta_min=1e-6,
+        optimizer,
+        T_max=max(1, config.training.num_epochs - config.training.lr_warmup_epochs),
+        eta_min=1e-6,
     )
+    # LR budget accounting: `apply_lr_warmup` ramps the *base* LR during the
+    # warmup window while the cosine is held at its start value (step() is a
+    # no-op below while warming up).  The cosine therefore anneals from the
+    # full base LR across the post-warmup epochs, matching the documented
+    # semantics — the two schedules never race.  (T_max is reduced by the
+    # warmup count so the cosine covers exactly the post-warmup horizon.)
     if not two_phase:
         pass  # criterion already set above
-    train_loader, val_loader = build_dataloaders(config)
+    train_loader, val_loader = build_dataloaders(
+        config, dataset_path=_DATASET_PATH, val_split=_VAL_SPLIT,
+    )
 
     if train_loader is None:
         raise ValueError(
             "Training DataLoader is None.  "
             "Wire build_dataloaders() to the real data pipeline."
+        )
+
+    # ── Target normalization statistics (train split only) ──
+    # When config.training.normalize_targets is enabled, the velocity
+    # target is mean-centered and std-scaled using training-split
+    # statistics.  These same values are threaded through train_one_epoch,
+    # validate, and compute_metrics so the loss, the selection-criteria,
+    # and the reported metrics all live in one consistent space, and the
+    # final metrics are rescaled back to cm/s.
+    target_mean, target_std = compute_target_stats(
+        _DATASET_PATH,
+        config,
+        val_split=_VAL_SPLIT,
+    )
+
+    # Statistical coherence guard: normalizing without a target clip amplifies
+    # the very heavy-tail (tracking-artifact) frames it is meant to suppress —
+    # the loss standardises every frame by the small bulk std, so a ~1e7 cm/s
+    # outlier becomes O(1e5-1e6) sigma.  Recommend enabling clip together.
+    if config.training.normalize_targets and config.training.target_clip_cm_s <= 0.0:
+        logger.warning(
+            "normalize_targets=True but target_clip_cm_s=%s (disabled).  "
+            "Without a non-zero clip, the raw tracking-artifact outliers "
+            "dominate the standardized MSE and can destabilize training.  "
+            "Strongly recommend enabling both together for a coherent target.",
+            config.training.target_clip_cm_s,
         )
 
     # ── Apply freezing strategy ───────────────────────────────
@@ -1076,6 +1627,32 @@ def train(
         )
         model.freeze_modules(config.finetune.freeze_modules)
 
+    # ── Phase-2 optimizer/scheduler builder (single source of truth) ──
+    # Both the in-loop phase-1→2 transition and the mid-phase-2 resume path
+    # construct the SAME 2-group backend optimizer.  Keeping this in one
+    # helper guarantees a resumed phase-2 run rebuilds an optimizer that
+    # exactly matches the shape the checkpoint's optimizer_state_dict was
+    # saved from, so load_state_dict can restore the Adam moments.
+    def _build_phase2_optimizer_scheduler(model, config, at_epoch):
+        base_lr = config.training.learning_rate
+        lif_lr = base_lr * 0.3
+        lif_params = list(model.backend.lif_cell.parameters())
+        lif_param_ids = {id(p) for p in lif_params}
+        other_backend = [p for p in model.backend.parameters() if id(p) not in lif_param_ids]
+        optimizer = torch.optim.AdamW([
+            {"params": other_backend, "lr": base_lr, "base_lr": base_lr, "name": "non_lif"},
+            {"params": lif_params, "lr": lif_lr, "base_lr": lif_lr, "name": "lif"},
+        ], weight_decay=config.training.weight_decay)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=max(
+                1,
+                (config.training.num_epochs - at_epoch) - config.training.lr_warmup_epochs,
+            ),
+            eta_min=1e-6,
+        )
+        return optimizer, scheduler
+
     # ── Resume from checkpoint ────────────────────────────────
     start_epoch = 0
     best_val_loss = float("inf")
@@ -1084,14 +1661,96 @@ def train(
         ckpt_path = Path(config.checkpoint.resume_from)
         if ckpt_path.exists():
             logger.info("Resuming from checkpoint: %s", ckpt_path)
-            checkpoint = load_checkpoint(
-                path=ckpt_path,
-                model=model,
-                optimizer=optimizer,
-                map_location=device,
+            # Peek BEFORE load_checkpoint: (a) detect legacy checkpoints
+            # without scheduler state (loud warning instead of silent LR
+            # restart), and (b) learn start_epoch so the restore can match
+            # the phase the run will continue in.
+            ckpt_peek = torch.load(
+                ckpt_path, map_location="cpu", weights_only=False,
             )
-            start_epoch = checkpoint["epoch"] + 1
-            best_val_loss = checkpoint.get("loss", float("inf"))
+            if "scheduler_state_dict" not in ckpt_peek:
+                logger.warning(
+                    "Checkpoint %s has NO scheduler_state_dict (legacy "
+                    "format) — LR schedule restarts from scratch; resumed "
+                    "runs will NOT match an uninterrupted trajectory.",
+                    ckpt_path,
+                )
+            start_epoch = ckpt_peek.get("epoch", -1) + 1
+
+            # Resume x two-phase: when the resume point is at/past the
+            # phase-1→2 boundary, an uninterrupted run would have built a
+            # FRESH phase-2 optimizer at the boundary (the phase-1 Adam
+            # moments are deliberately discarded there).  Mirror that
+            # exactly: restore ONLY model weights here and let the
+            # in-loop transition construct the fresh phase-2 optimizer on
+            # the first epoch.  Restoring into (or pre-building) the
+            # phase-2 optimizer either crashes (1-group checkpoint vs
+            # 2-group optimizer) or silently diverges from the canonical
+            # uninterrupted trajectory.
+            # Resume phase is decided by start_epoch, NOT the init-time
+            # current_phase (which is 1 whenever phase1_epochs>0 and takes no
+            # account of where the checkpoint actually is):
+            #   * start_epoch <  phase1_epochs: within phase 1 → restore the
+            #     full phase-1 optimizer/scheduler state (moment continuity).
+            #   * start_epoch == phase1_epochs: landing exactly at the
+            #     phase-1→2 boundary → restore ONLY model weights and let the
+            #     in-loop transition build the fresh phase-2 optimizer
+            #     (an uninterrupted run discards the phase-1 Adam moments
+            #     there, so the resumed run must too).
+            #   * start_epoch >  phase1_epochs: resuming inside an ESTABLISHED
+            #     phase 2 → the checkpoint holds the 2-group phase-2 optimizer
+            #     and scheduler.  Rebuild that exact optimizer (via the shared
+            #     builder) BEFORE restoring so load_state_dict can rehydrate
+            #     the saved Adam moments and scheduling instead of silently
+            #     resetting them via a second in-loop transition.
+            _landing_phase2 = two_phase and start_epoch > phase1_epochs
+            _crosses_boundary = two_phase and start_epoch == phase1_epochs
+
+            if _landing_phase2:
+                # Restore the phase-2 freeze state (requires_grad is NOT carried
+                # by the checkpoint): init leaves frontend unfrozen/backend frozen
+                # (the phase-1 posture), but a mid-phase-2 checkpoint implies the
+                # opposite.  Without this the rebuilt backend optimizer would hold
+                # frozen params (dead groups) while the unfrozen frontend is not
+                # covered by any optimizer — silently training nothing.
+                for param in model.frontend.parameters():
+                    param.requires_grad = False
+                for param in model.backend.parameters():
+                    param.requires_grad = True
+                optimizer, scheduler = _build_phase2_optimizer_scheduler(
+                    model, config, start_epoch,
+                )
+                criterion = backend_criterion
+                current_phase = 2
+                load_checkpoint(
+                    path=ckpt_path,
+                    model=model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    map_location=device,
+                )
+            elif _crosses_boundary:
+                logger.info(
+                    "Resume past phase boundary (start_epoch=%d >= "
+                    "phase1_epochs=%d) — restoring model weights only; "
+                    "fresh phase-2 optimizer built by the in-loop "
+                    "transition",
+                    start_epoch, phase1_epochs,
+                )
+                load_checkpoint(
+                    path=ckpt_path,
+                    model=model,
+                    map_location=device,
+                )
+            else:
+                load_checkpoint(
+                    path=ckpt_path,
+                    model=model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    map_location=device,
+                )
+            best_val_loss = ckpt_peek.get("loss", float("inf"))
             logger.info("Resumed at epoch %d, loss=%.6f", start_epoch, best_val_loss)
         else:
             logger.warning("Checkpoint not found: %s — starting fresh", ckpt_path)
@@ -1140,13 +1799,22 @@ def train(
             lif_param_ids = {id(p) for p in lif_params}
             other_backend = [p for p in model.backend.parameters() if id(p) not in lif_param_ids]
             optimizer = torch.optim.AdamW([
-                {"params": other_backend, "lr": base_lr, "name": "non_lif"},
-                {"params": lif_params, "lr": lif_lr, "name": "lif"},
+                {"params": other_backend, "lr": base_lr, "base_lr": base_lr, "name": "non_lif"},
+                {"params": lif_params, "lr": lif_lr, "base_lr": lif_lr, "name": "lif"},
             ], weight_decay=config.training.weight_decay)
 
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer, T_max=config.training.num_epochs - epoch, eta_min=1e-6,
+                optimizer,
+                T_max=max(
+                    1,
+                    (config.training.num_epochs - epoch) - config.training.lr_warmup_epochs,
+                ),
+                eta_min=1e-6,
             )
+            # LR budget accounting mirrors the default path: subtract the
+            # warmup horizon from T_max and hold the cosine during warmup
+            # (gated step below), so the phase-2 backend also anneals from
+            # the full base LR instead of ramp-into-decayed-cosine.
             criterion = backend_criterion
             current_phase = 2
 
@@ -1163,6 +1831,28 @@ def train(
         # and the untrained backend gets hit with full penalties.
         warmup_epoch = (epoch - phase1_epochs) if (two_phase and current_phase == 2) else epoch
         warmup_factor = compute_warmup_factor(warmup_epoch, warmup_epochs)
+
+        # ── LR warmup (linear ramp of the shared AdamW LR) ────
+        # Applied *before* the epoch so every optimiser step this epoch
+        # runs at the ramped LR.  Uses the same phase-local epoch so LR
+        # warmup also restarts cleanly across the Phase 1→2 transition
+        # (the backend's cold recurrent state gets a soft first step).
+        # Dead-code guard: lr_warmup_epochs announced but previously
+        # never consumed — this wires config.training.lr_warmup_epochs
+        # into the loop, making the CLI flag meaningful.
+        # Only override during the warmup window; once it ends the
+        # override is skipped so the cosine scheduler's own `lr` value
+        # (written by `scheduler.step()` at the prior epoch tail) is used
+        # unchanged and the anneal proceeds from the full base LR.
+        if (
+            config.training.lr_warmup_epochs > 0
+            and warmup_epoch < config.training.lr_warmup_epochs
+        ):
+            apply_lr_warmup(
+                optimizer,
+                epoch=warmup_epoch,
+                lr_warmup_epochs=config.training.lr_warmup_epochs,
+            )
 
         # ── Unfreeze if scheduled ─────────────────────────────
         if (
@@ -1192,9 +1882,29 @@ def train(
             scaler=scaler,
             amp_ctx=amp_ctx,
             phase=current_phase,
+            target_mean=target_mean,
+            target_std=target_std,
+            target_clip_cm_s=config.training.target_clip_cm_s,
         )
-        scheduler.step()
+        # Advance the cosine.  When lr_warmup_epochs==0 (default), the step is
+        # unconditional exactly as in the original pipeline, preserving the
+        # byte-identical default LR trajectory (backward-compat invariant).
+        # When warmup is active, the cosine is held while `apply_lr_warmup`
+        # overrides the LR (so the anneal budget isn't consumed by the warmup
+        # window), then released once the window has fully elapsed.
+        _maybe_step_scheduler(
+            scheduler, config.training.lr_warmup_epochs, warmup_epoch
+        )
         history["train_loss"].append(train_loss)
+        # First-class stability telemetry: how many optimizer steps were
+        # silently dropped this epoch (non-finite loss / non-finite grad).
+        skips = getattr(train_one_epoch, "last_skip_counts", None)
+        if skips:
+            logger.info(
+                "Epoch %d skipped steps: %s",
+                epoch,
+                {k: v for k, v in skips.items() if v},
+            )
 
         # ── Validate ──────────────────────────────────────────
         # CF1 fix: Validation uses FULL lambda values (no warmup scaling).
@@ -1210,6 +1920,9 @@ def train(
                 lambda_sparse=config.loss.lambda_sparse,
                 lambda_jerk=config.loss.lambda_jerk,
                 phase=current_phase,
+                target_mean=target_mean,
+                target_std=target_std,
+                target_clip_cm_s=config.training.target_clip_cm_s,
             )
             history["val_loss"].append(val_loss)
 
@@ -1242,6 +1955,7 @@ def train(
             save_checkpoint(
                 model=model,
                 optimizer=optimizer,
+                scheduler=scheduler,
                 epoch=epoch,
                 loss=train_loss,
                 config=config.to_dict(),
@@ -1252,12 +1966,17 @@ def train(
             logger.info("Saved periodic checkpoint: %s", epoch_path)
 
         # Best-model checkpoint (skip during warmup to avoid scale mismatch)
+        # Selection uses the bulk val_loss; the escape-signal audit (below)
+        # makes the escape vs resting RMSE *visible* so a silent
+        # fit-bulk-lose-escape failure is not undetectable, even if it is not
+        # the selection criterion itself.
         if warmup_factor >= 1.0 and val_loss < best_val_loss:
             best_val_loss = val_loss
             best_path = output_dir / "best_model.pth"
             save_checkpoint(
                 model=model,
                 optimizer=optimizer,
+                scheduler=scheduler,
                 epoch=epoch,
                 loss=val_loss,
                 config=config.to_dict(),
@@ -1272,6 +1991,7 @@ def train(
     save_checkpoint(
         model=model,
         optimizer=optimizer,
+        scheduler=scheduler,
         epoch=config.training.num_epochs - 1,
         loss=train_loss,
         config=config.to_dict(),
@@ -1296,15 +2016,60 @@ def train(
     if best_ckpt_path.exists() and val_loader is not None:
         load_checkpoint(path=best_ckpt_path, model=model, map_location=device)
         model.to(device)
-        metrics = compute_metrics(model, val_loader, device)
+        metrics = compute_metrics(
+            model, val_loader, device,
+            target_mean=target_mean, target_std=target_std,
+            target_clip_cm_s=config.training.target_clip_cm_s,
+            escape_band_cm_s=config.training.escape_band_cm_s,
+        )
         logger.info(
             "Best model metrics — MSE: %.6f  RMSE: %.6f  MAE: %.6f  R²: %.4f",
             metrics["mse"], metrics["rmse"], metrics["mae"], metrics["r2"],
         )
+        if "escape_rmse" in metrics:
+            logger.info(
+                "Escape-signal audit — escape_band=%.1f cm/s  n_escape=%d (%.3f%% of frames)  "
+                "escape_rmse=%.4f  resting_rmse=%.4f",
+                metrics["escape_band_cm_s"],
+                metrics["n_escape_frames"],
+                metrics["escape_ratio"] * 100.0,
+                metrics["escape_rmse"],
+                metrics["resting_rmse"],
+            )
         metrics_path = output_dir / "metrics.json"
         with open(metrics_path, "w") as f:
             json.dump(metrics, f, indent=2)
         logger.info("Metrics saved: %s", metrics_path)
+
+        # ── Band x min_run sensitivity sweep (opt-in) ──────────
+        if _SWEEP_BANDS:
+            all_true: List[np.ndarray] = []
+            all_pred: List[np.ndarray] = []
+            for batch in val_loader:
+                x_batch, y_batch, lengths = batch
+                x_batch = x_batch.to(device).contiguous()
+                lengths = lengths.to(device).contiguous()
+                y_pred, _ = model(x_batch, lengths, return_internals=True)
+                for i in range(x_batch.size(0)):
+                    n = int(lengths[i])
+                    p = y_pred[i, :n].cpu().numpy()
+                    if target_std != 1.0 or target_mean != 0.0:
+                        p = p * target_std + target_mean
+                    all_pred.append(p)
+                    all_true.append(y_batch[i, :n].cpu().numpy())
+            rows = sweep_escape_sensitivity(
+                all_true, all_pred, _SWEEP_BANDS,
+            )
+            sweep_path = output_dir / "escape_sensitivity.csv"
+            with open(sweep_path, "w", encoding="utf-8") as f:
+                keys = ["band_cm_s", "min_run", "n_escape_frames",
+                        "n_escape_events", "escape_rmse", "resting_rmse",
+                        "escape_ratio"]
+                f.write(",".join(keys) + "\n")
+                for r in rows:
+                    f.write(",".join(str(r[k]) for k in keys) + "\n")
+            logger.info("Escape sensitivity sweep (%d configs): %s",
+                        len(rows), sweep_path)
 
     return {
         "best_val_loss": best_val_loss,

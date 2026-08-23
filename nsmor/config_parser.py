@@ -92,6 +92,74 @@ class TrainingConfig:
     random_seed: int = 42
     max_seq_len: Optional[int] = 1000  # crop sequences longer than this (cuDNN compat)
 
+    lr_warmup_epochs: int = 0
+    """Linear LR warmup epoch count.  During the first ``lr_warmup_epochs``
+    epochs the effective learning rate is ramped from 0 to :attr:`learning_rate`.
+    Prevents the cold-start overshoot that destabilises the coupled LIF+GRU
+    gradient flow.  0 disables (backward compatible)."""
+
+    # ── Target normalization for stable, interpretable convergence ──
+    normalize_targets: bool = False
+    """When ``True``, regress on the *mean-centered, variance-scaled* velocity
+    target instead of the raw cm/s signal.  The raw velocity is a heavy-tailed
+    signal (p99.99 ≈ 81 cm/s but max ≈ 13e6) where a handful of extreme frames
+    dominate the masked MSE and produce the per-epoch loss noise.  Revealing
+    the bulk (≈99.99% of frames, |y| < 100 cm/s) to the network::
+
+        y_norm = (y - y_train_mean) / y_train_std
+
+    gives a well-conditioned homoscedastic regression target.  Predictions are
+    rescaled back to cm/s for reporting.  The normalization statistics are
+    computed from the *training* split only (no validation leakage).  Statistics
+    are transparently logged and cached for rescoring.  ``False`` preserves the
+    original raw-velocity objective (backward compatible)."""
+
+    target_clip_cm_s: float = 0.0
+    """Clip the magnitude of the velocity target (in cm/s) before computing
+    loss-based metrics.  ``0.0`` disables clipping (backward compatible).
+
+    This is a *robust regression* safeguard: the raw velocity is
+    heavy-tailed (p99.99 ≈ 81 cm/s, but max ≈ 1.3e7 cm/s), driven by a small
+    number of tracking-artifact frames near trial onset (~index 1360+).
+    A single such frame contributes ``(1.3e7)**2 ≈ 1.7e14`` to the batch MSE,
+    completely swamping the resting/escape signal and producing the large
+    epoch-to-epoch loss swings.  Clamping the target to a physiologically
+    defensible cap (cricket escape vigour is tens of cm/s; a generous cap of
+    ``100`` cm/s keeps every real escape response while removing the artifacts)
+    keeps the loss landscape well-conditioned.  Predictions are clamped with
+    the same value in ``compute_metrics`` so reported error stays physical.
+
+    Note: clipping acts on ``y_true`` *before* the loss (and symmetrically on
+    ``y_pred`` only for the reported metrics), so it is a pure training-target
+    pre-processing — the frozen loss and model remain untouched.
+
+    WARNING (statistical coherence): when ``normalize_targets`` is enabled but
+    ``target_clip_cm_s`` is left at ``0.0`` (disabled), the loss standardises
+    *every* frame — including the untrimmed ``~1e7 cm/s`` artifacts — by the
+    small bulk std computed in :func:`~scripts.train.compute_target_stats`.
+    Those outliers become O(1e5–1e6) sigma and dominate the standardized MSE,
+    *amplifying* the very heavy-tail domination normalization was meant to
+    suppress.  We therefore strongly discourage enabling normalization without
+    a non-zero clip; enable both together for a statistically coherent target."""
+
+    escape_band_cm_s: float = 10.0
+    """Absolute velocity-magnitude threshold (cm/s) defining the *high-velocity
+    band* for the escape-signal audit in :func:`~scripts.train.compute_metrics`.
+
+    This is a **magnitude heuristic**, NOT a stimulus-conditioned or
+    per-trial-baseline-subtracted definition of escape: any frame with
+    ``|y| >= escape_band_cm_s`` is grouped into the band.  Cricket intermittent
+    locomotion routinely reaches ~20–100 cm/s during exploration, and noise /
+    tracking rigs can exceed the band, so the band includes GO-fast and noisy
+    frames — not only wind-triggered escapes.  To *condition* the audit on the
+    wind stimulus (per-trial baseline subtraction, onset-aligned windows) is
+    out of scope here and remains future work.
+
+    Default ``10.0`` cm/s.  It is a *parameter* — pass a different value at the
+    ``compute_metrics`` call site (or tune it) to sweep sensitivity; a single
+    fixed value does not prove the model learned escapes, only that its error is
+    lower in this velocity band."""
+
 
 @dataclass
 class DataPaths:
