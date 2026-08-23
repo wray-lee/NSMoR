@@ -64,6 +64,16 @@ logger = logging.getLogger(__name__)
 # --sweep_escape_band and consumed by train().  ``None`` disables (default).
 _SWEEP_BANDS: Optional[List[float]] = None
 
+# Single source of truth for the train/val split fraction, threaded to BOTH
+# build_dataloaders and compute_target_stats — otherwise a non-default split
+# silently desynchronises the normalization statistics from the training set
+# (validation leakage into target mean/std).
+_VAL_SPLIT = 0.2
+
+# Hardcoded dataset path shared by build_dataloaders and compute_target_stats
+# call sites (single source; the .pt file is also loaded only once this way).
+_DATASET_PATH = "data/processed/nsmor_dataset.pt"
+
 
 # ═══════════════════════════════════════════════════════════════
 # 1.  Argument Parsing
@@ -175,8 +185,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # states and surrogate gradients are still settling) triggers
     # overshooting that the constant cosine schedule then cannot
     # recover within a short run.  A brief linear ramp keeps the
-    # early updates small — analogous to synaptic weights not
-    # jumping at stimulus onset (gradual Hebbian integration).
+    # early updates small and clean.
     parser.add_argument(
         "--lr_warmup_epochs",
         type=int,
@@ -662,18 +671,15 @@ def compute_lr_warmup_scale(epoch: int, lr_warmup_epochs: int) -> float:
     Compute the linear LR warmup scale.
 
     During the first ``lr_warmup_epochs`` epochs, the base learning rate
-    is ramped linearly from ``0`` to ``1.0`` (times each param group's
-    configured base LR).  After warmup the scale is ``1.0``.
+    is ramped linearly (times each param group's configured base LR).
+    After warmup the scale is ``1.0``.
 
-    Biological rationale: at stimulus onset, recurrent synapses in the
-    escape circuit integrate input *gradually* (Hebbian / short-term
-    facilitation) rather than jumping to a saturating conductance.  A
-    full-LR first optimiser step on a cold recurrent state (LIF surrogate
-    gradients and GRU hidden states not yet settled) overshoots the
-    loss surface; the shared AdamW then accumulates a polluted second
-    moment (``v``) that the cosine schedule cannot correct within a short
-    run.  Ramping the LR keeps early updates small and clean so that
-    ``v`` tracks the true landscape.
+    Optimization rationale: a full-LR first optimiser step on a cold
+    recurrent state (LIF surrogate gradients and GRU hidden states not yet
+    settled) overshoots the loss surface; the shared AdamW then accumulates
+    a polluted second moment (``v``) that the cosine schedule cannot
+    correct within a short run.  Ramping the LR keeps early updates small
+    and clean so that ``v`` tracks the true landscape.
 
     The scale is applied multiplicatively to the param group's ``lr``
     before the scheduler-step of the same epoch (LR warmup precedence
@@ -691,9 +697,12 @@ def compute_lr_warmup_scale(epoch: int, lr_warmup_epochs: int) -> float:
         return 1.0
     if epoch >= lr_warmup_epochs:
         return 1.0
-    # Linear ramp over [0, lr_warmup_epochs).  At epoch 0 scale is small
-    # (1/lr_warmup_epochs, not 0.0) so the first step is tiny but nonzero,
-    # avoiding a full zero-gradient dead-start while keeping updates soft.
+    # Linear ramp over [0, lr_warmup_epochs): epoch e gets scale (e+1)/W.
+    # The first step is 1/W (tiny but non-zero — avoids a dead start) and
+    # the last warmup epoch reaches exactly 1.0, closing the window at the
+    # boundary.  (The nominal half-open window is documented as "ramp over
+    # W epochs"; reaching full LR on the final warmup epoch is the chosen
+    # convention — the alternative e/W leaves the window one epoch short.)
     return float((epoch + 1) / lr_warmup_epochs)
 
 
@@ -837,11 +846,16 @@ def train_one_epoch(
             (BioJointLoss, backward compatible).
 
     Returns:
-        Average training loss for this epoch.
+        Average training loss for this epoch.  Skip counters
+        (``n_skipped_nonfinite_loss``, ``n_skipped_nonfinite_grad``) are
+        reported via :attr:`train_one_epoch.last_skip_counts` — a training
+        stability audit must surface how many steps were silently dropped.
     """
     model.train()
     total_loss = 0.0
     n_batches = 0
+    n_skipped_nonfinite_loss = 0
+    n_skipped_nonfinite_grad = 0
 
     # CF9: Per-epoch membrane health accumulators
     _epoch_v_max = 0.0
@@ -941,7 +955,8 @@ def train_one_epoch(
             # exactly the overflow that produced the non-finite loss.)
             # AMP caveat: if the non-finite loss came from an FP16 forward
             # overflow, the scale is NOT reduced on this path — documented
-            # limitation; the gradient sanitizer below is the backstop.
+            # limitation; the gradient check below is the backstop.
+            n_skipped_nonfinite_loss += 1
             continue  # skip optimizer.step()
 
         # ── Gradient clipping (unscale first for AMP) ──
@@ -952,25 +967,28 @@ def train_one_epoch(
         if scaler is not None and scaler.is_enabled():
             scaler.unscale_(optimizer)
 
-        # ── Pre-clip gradient sanitization ──
-        # Catch NaN/Inf gradients BEFORE clipping to prevent
-        # clip_grad_norm_ from producing NaN (it divides by norm).
-        # This is more efficient than post-clip check because it
-        # avoids the NaN propagation issue entirely.
-        pre_nan_count = 0
+        # ── Pre-clip gradient finiteness check ──
+        # Non-finite gradients SKIP the whole step: zeroing them (the old
+        # behavior) feeds artificial zeros into Adam's second moment,
+        # systematically polluting v.  found_inf was set inside unscale_()
+        # above, so scaler.step() would already have skipped — but we
+        # continue explicitly so the skip is counted and logged.
+        has_nonfinite_grad = False
         for p in trainable_params:
             if p.grad is not None and not torch.isfinite(p.grad).all():
-                pre_nan_count += p.grad.data.numel() - torch.isfinite(p.grad.data).sum().item()
-                p.grad.data = torch.where(
-                    torch.isfinite(p.grad.data),
-                    p.grad.data,
-                    torch.zeros_like(p.grad.data),
-                )
-        if pre_nan_count > 0:
+                has_nonfinite_grad = True
+                break
+        if has_nonfinite_grad:
+            n_skipped_nonfinite_grad += 1
             logger.warning(
-                "Epoch %d batch %d: %d non-finite gradient elements sanitized BEFORE clipping",
-                epoch, batch_idx, pre_nan_count,
+                "Epoch %d batch %d: non-finite gradient before clipping — skipping step",
+                epoch, batch_idx,
             )
+            # GradScaler bookkeeping: found_inf is already set from
+            # unscale_(); update() halves the scale and clears it.
+            if scaler is not None and scaler.is_enabled():
+                scaler.update()
+            continue  # skip optimizer.step()
 
         if grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(
@@ -1034,10 +1052,22 @@ def train_one_epoch(
         n_batches += 1
 
         # ── Logging ──
-        pbar.update(1)
+        # (No pbar.update here — iterating the tqdm wrapper already advances
+        # it once per batch; an extra update double-counted progress.)
         pbar.set_postfix({"loss": f"{loss.item():.4f}"})
 
     avg_loss = total_loss / max(n_batches, 1)
+
+    # Surface skip counts for the stability audit (see docstring).
+    train_one_epoch.last_skip_counts = {
+        "n_skipped_nonfinite_loss": n_skipped_nonfinite_loss,
+        "n_skipped_nonfinite_grad": n_skipped_nonfinite_grad,
+    }
+    if n_skipped_nonfinite_loss or n_skipped_nonfinite_grad:
+        logger.warning(
+            "Epoch %d skipped steps: %d non-finite loss, %d non-finite grad",
+            epoch, n_skipped_nonfinite_loss, n_skipped_nonfinite_grad,
+        )
 
     # CF9: Compute per-epoch membrane health summary
     health = {}
@@ -1348,6 +1378,8 @@ def sweep_escape_sensitivity(
     """
     rows: List[Dict[str, float]] = []
     y_pred_all_raw = np.concatenate(all_pred)
+    y_true_all_raw = np.concatenate(all_true)
+    err_sq_all = (y_pred_all_raw - y_true_all_raw) ** 2
     for band in bands_cm_s:
         for mr in min_runs:
             keep_seq = [
@@ -1360,7 +1392,6 @@ def sweep_escape_sensitivity(
                 int(np.count_nonzero(k[1:] & ~k[:-1]) + int(k[0]))
                 for k in keep_seq
             )
-            err_sq_all = (y_pred_all_raw - np.concatenate(all_true)) ** 2
             esc = float(np.sqrt(err_sq_all[is_escape].mean())) if n_escape else float("nan")
             rest = (
                 float(np.sqrt(err_sq_all[~is_escape].mean()))
@@ -1422,11 +1453,6 @@ def train(
     lambda_reg: float = 0.01,
     phase1_epochs: Optional[int] = None,
 ) -> Dict[str, float]:
-    # Single source of truth for the train/val split fraction, threaded to
-    # BOTH build_dataloaders and compute_target_stats — otherwise a
-    # non-default split silently desynchronises the normalization statistics
-    # from the training set (validation leakage into target mean/std).
-    _VAL_SPLIT = 0.2
     """
     Full training pipeline.
 
@@ -1559,7 +1585,7 @@ def train(
     if not two_phase:
         pass  # criterion already set above
     train_loader, val_loader = build_dataloaders(
-        config, val_split=_VAL_SPLIT,
+        config, dataset_path=_DATASET_PATH, val_split=_VAL_SPLIT,
     )
 
     if train_loader is None:
@@ -1576,7 +1602,7 @@ def train(
     # and the reported metrics all live in one consistent space, and the
     # final metrics are rescaled back to cm/s.
     target_mean, target_std = compute_target_stats(
-        "data/processed/nsmor_dataset.pt",
+        _DATASET_PATH,
         config,
         val_split=_VAL_SPLIT,
     )
@@ -1609,6 +1635,20 @@ def train(
         ckpt_path = Path(config.checkpoint.resume_from)
         if ckpt_path.exists():
             logger.info("Resuming from checkpoint: %s", ckpt_path)
+            # Detect a legacy checkpoint without scheduler state BEFORE
+            # loading: load_checkpoint would silently skip the scheduler
+            # restore and the fresh CosineAnnealingLR would restart at
+            # epoch 0 mid-run, silently diverging the LR trajectory.
+            _has_sched = "scheduler_state_dict" in torch.load(
+                ckpt_path, map_location="cpu", weights_only=False,
+            )
+            if not _has_sched:
+                logger.warning(
+                    "Checkpoint %s has NO scheduler_state_dict (legacy "
+                    "format) — LR schedule restarts from scratch; resumed "
+                    "runs will NOT match an uninterrupted trajectory.",
+                    ckpt_path,
+                )
             checkpoint = load_checkpoint(
                 path=ckpt_path,
                 model=model,
@@ -1635,6 +1675,49 @@ def train(
 
     # ── Bio-loss warmup schedule ─────────────────────────────
     warmup_epochs = config.loss.warmup_epochs
+
+    # Resume x two-phase: if resuming at or past the phase boundary, build
+    # the phase-2 optimizer/scheduler BEFORE the loop — otherwise the
+    # in-loop transition below would construct a fresh AdamW + cosine on
+    # the first resumed epoch and silently discard the checkpoint's
+    # optimizer/scheduler state (cold-start Adam on a converged system).
+    # The in-loop transition then only fires for runs that START in
+    # phase 1.
+    if (
+        two_phase
+        and current_phase == 1
+        and start_epoch >= phase1_epochs
+    ):
+        logger.info(
+            "Resume past phase boundary (start_epoch=%d >= phase1_epochs=%d) "
+            "— building phase-2 optimizer before loop",
+            start_epoch, phase1_epochs,
+        )
+        for param in model.frontend.parameters():
+            param.requires_grad = False
+        for param in model.backend.parameters():
+            param.requires_grad = True
+        base_lr = config.training.learning_rate
+        lif_lr = base_lr * 0.3
+        lif_params = list(model.backend.lif_cell.parameters())
+        other_params = [
+            p for n, p in model.backend.named_parameters()
+            if "lif_cell" not in n
+        ]
+        optimizer = torch.optim.AdamW([
+            {"params": other_params, "lr": base_lr, "base_lr": base_lr, "name": "backend"},
+            {"params": lif_params, "lr": lif_lr, "base_lr": lif_lr, "name": "lif"},
+        ], weight_decay=config.training.weight_decay)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=max(
+                1,
+                (config.training.num_epochs - start_epoch) - config.training.lr_warmup_epochs,
+            ),
+            eta_min=1e-6,
+        )
+        criterion = backend_criterion
+        current_phase = 2
 
     for epoch in range(start_epoch, config.training.num_epochs):
         t0 = time.time()
@@ -1763,6 +1846,15 @@ def train(
             scheduler, config.training.lr_warmup_epochs, warmup_epoch
         )
         history["train_loss"].append(train_loss)
+        # First-class stability telemetry: how many optimizer steps were
+        # silently dropped this epoch (non-finite loss / non-finite grad).
+        skips = getattr(train_one_epoch, "last_skip_counts", None)
+        if skips:
+            logger.info(
+                "Epoch %d skipped steps: %s",
+                epoch,
+                {k: v for k, v in skips.items() if v},
+            )
 
         # ── Validate ──────────────────────────────────────────
         # CF1 fix: Validation uses FULL lambda values (no warmup scaling).

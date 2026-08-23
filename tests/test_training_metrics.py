@@ -199,6 +199,44 @@ def test_sustained_run_helper():
         [False, True, False]
 
 
+def test_sweep_escape_sensitivity():
+    # Regression (round-5 review): the band x min_run sensitivity sweep must
+    # (a) apply _sustained_run PER SEQUENCE (no cross-trial run bridging),
+    # (b) count events as contiguous kept runs per sequence, and (c) return
+    # NaN escape_rmse when a config admits no frames.
+    mod = _load_train_module()
+    t1 = np.array([0.0, 30.0, 40.0, 0.0])       # sustained 2-frame run @30-40
+    t2 = np.array([150.0, 0.0, 0.0, 1e7])       # tail-run + isolated artifact spike
+    pred = [t1.copy(), t2.copy()]               # perfect predictions
+
+    rows = mod.sweep_escape_sensitivity(
+        [t1, t2], pred, bands_cm_s=[10.0], min_runs=(1, 2),
+    )
+    by = {(r["band_cm_s"], r["min_run"]): r for r in rows}
+    assert set(by.keys()) == {(10.0, 1), (10.0, 2)}
+
+    r1 = by[(10.0, 1)]
+    # min_run=1: {30,40} + {150} + artifact 1e7 all admitted; runs do NOT
+    # bridge the sequence boundary ({40},{150} are separate events).
+    assert r1["n_escape_frames"] == 4
+    assert r1["n_escape_events"] == 3
+    assert r1["escape_rmse"] == pytest.approx(0.0)
+
+    r2 = by[(10.0, 2)]
+    # min_run=2: artifact spike and lone 150 dropped; only {30,40} survives.
+    assert r2["n_escape_frames"] == 2
+    assert r2["n_escape_events"] == 1
+    assert r2["escape_ratio"] == pytest.approx(2 / 8)
+
+    # No-frame config: band above every value -> NaN rmse, zero counts.
+    rows_hi = mod.sweep_escape_sensitivity(
+        [t1], [t1.copy()], bands_cm_s=[1e9], min_runs=(2,),
+    )
+    assert rows_hi[0]["n_escape_frames"] == 0
+    assert np.isnan(rows_hi[0]["escape_rmse"])
+
+
+
 def test_escape_runs_do_not_span_sequence_boundaries(compute_metrics):
     # ROUND-3 BLOCKER regression: the sustained-run guard must be applied
     # PER SEQUENCE.  Here seq1 ends with a single over-band frame (150) and
