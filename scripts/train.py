@@ -1627,6 +1627,32 @@ def train(
         )
         model.freeze_modules(config.finetune.freeze_modules)
 
+    # ── Phase-2 optimizer/scheduler builder (single source of truth) ──
+    # Both the in-loop phase-1→2 transition and the mid-phase-2 resume path
+    # construct the SAME 2-group backend optimizer.  Keeping this in one
+    # helper guarantees a resumed phase-2 run rebuilds an optimizer that
+    # exactly matches the shape the checkpoint's optimizer_state_dict was
+    # saved from, so load_state_dict can restore the Adam moments.
+    def _build_phase2_optimizer_scheduler(model, config, at_epoch):
+        base_lr = config.training.learning_rate
+        lif_lr = base_lr * 0.3
+        lif_params = list(model.backend.lif_cell.parameters())
+        lif_param_ids = {id(p) for p in lif_params}
+        other_backend = [p for p in model.backend.parameters() if id(p) not in lif_param_ids]
+        optimizer = torch.optim.AdamW([
+            {"params": other_backend, "lr": base_lr, "base_lr": base_lr, "name": "non_lif"},
+            {"params": lif_params, "lr": lif_lr, "base_lr": lif_lr, "name": "lif"},
+        ], weight_decay=config.training.weight_decay)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=max(
+                1,
+                (config.training.num_epochs - at_epoch) - config.training.lr_warmup_epochs,
+            ),
+            eta_min=1e-6,
+        )
+        return optimizer, scheduler
+
     # ── Resume from checkpoint ────────────────────────────────
     start_epoch = 0
     best_val_loss = float("inf")
@@ -1661,12 +1687,49 @@ def train(
             # phase-2 optimizer either crashes (1-group checkpoint vs
             # 2-group optimizer) or silently diverges from the canonical
             # uninterrupted trajectory.
-            _crosses_boundary = (
-                two_phase
-                and current_phase == 1
-                and start_epoch >= phase1_epochs
-            )
-            if _crosses_boundary:
+            # Resume phase is decided by start_epoch, NOT the init-time
+            # current_phase (which is 1 whenever phase1_epochs>0 and takes no
+            # account of where the checkpoint actually is):
+            #   * start_epoch <  phase1_epochs: within phase 1 → restore the
+            #     full phase-1 optimizer/scheduler state (moment continuity).
+            #   * start_epoch == phase1_epochs: landing exactly at the
+            #     phase-1→2 boundary → restore ONLY model weights and let the
+            #     in-loop transition build the fresh phase-2 optimizer
+            #     (an uninterrupted run discards the phase-1 Adam moments
+            #     there, so the resumed run must too).
+            #   * start_epoch >  phase1_epochs: resuming inside an ESTABLISHED
+            #     phase 2 → the checkpoint holds the 2-group phase-2 optimizer
+            #     and scheduler.  Rebuild that exact optimizer (via the shared
+            #     builder) BEFORE restoring so load_state_dict can rehydrate
+            #     the saved Adam moments and scheduling instead of silently
+            #     resetting them via a second in-loop transition.
+            _landing_phase2 = two_phase and start_epoch > phase1_epochs
+            _crosses_boundary = two_phase and start_epoch == phase1_epochs
+
+            if _landing_phase2:
+                # Restore the phase-2 freeze state (requires_grad is NOT carried
+                # by the checkpoint): init leaves frontend unfrozen/backend frozen
+                # (the phase-1 posture), but a mid-phase-2 checkpoint implies the
+                # opposite.  Without this the rebuilt backend optimizer would hold
+                # frozen params (dead groups) while the unfrozen frontend is not
+                # covered by any optimizer — silently training nothing.
+                for param in model.frontend.parameters():
+                    param.requires_grad = False
+                for param in model.backend.parameters():
+                    param.requires_grad = True
+                optimizer, scheduler = _build_phase2_optimizer_scheduler(
+                    model, config, start_epoch,
+                )
+                criterion = backend_criterion
+                current_phase = 2
+                load_checkpoint(
+                    path=ckpt_path,
+                    model=model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    map_location=device,
+                )
+            elif _crosses_boundary:
                 logger.info(
                     "Resume past phase boundary (start_epoch=%d >= "
                     "phase1_epochs=%d) — restoring model weights only; "

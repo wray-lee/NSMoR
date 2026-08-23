@@ -368,6 +368,38 @@ def test_resume_past_phase_boundary_restores_state(tmp_path, monkeypatch):
     assert _math.isfinite(summary.get("best_val_loss", float("nan")))
 
 
+def test_resume_within_phase2_preserves_optimizer_state(tmp_path, monkeypatch):
+    mod = _load_train_module()
+    ds_path = tmp_path / "nsmor_dataset.pt"
+    _make_synthetic_dataset(ds_path)
+    monkeypatch.setattr(mod, "_DATASET_PATH", str(ds_path))
+    run1 = tmp_path / "run1"
+    cfg = _tiny_config(mod, run1)
+    cfg.training.num_epochs = 3
+    mod.train(cfg, phase1_epochs=1)
+    ckpt_path = run1 / "epoch_2.pth"
+    assert ckpt_path.exists()
+    saved = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    saved_names = [g.get("name") for g in saved["optimizer_state_dict"]["param_groups"]]
+    assert saved_names == ["non_lif", "lif"], saved_names
+    saved_steps = sorted(int(s["step"]) for s in saved["optimizer_state_dict"]["state"].values())
+    run2 = tmp_path / "run2"
+    cfg2 = _tiny_config(mod, run2)
+    cfg2.training.num_epochs = 4
+    cfg2.checkpoint.resume_from = str(ckpt_path)
+    summary = mod.train(cfg2, phase1_epochs=1)
+    assert summary is not None
+    final_path = (run2 / "best_model.pth") if (run2 / "best_model.pth").exists() else (run2 / "epoch_4.pth")
+    final = torch.load(final_path, map_location="cpu", weights_only=False)
+    final_names = [g.get("name") for g in final["optimizer_state_dict"]["param_groups"]]
+    assert final_names == ["non_lif", "lif"], final_names
+    final_steps = sorted(int(s["step"]) for s in final["optimizer_state_dict"]["state"].values())
+    assert len(final_steps) == len(saved_steps), "param mismatch"
+    assert min(final_steps) >= max(saved_steps), "phase-2 optimizer reset on resume"
+    import math as _math
+    assert _math.isfinite(summary.get("best_val_loss", float("nan")))
+
+
 def test_resume_within_phase_preserves_optimizer_state(tmp_path, monkeypatch):
     # Complement to the boundary test: resuming WITHIN phase 1 must restore
     # the Adam moments and scheduler progress into the SAME optimizer (the
