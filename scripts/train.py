@@ -60,6 +60,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Opt-in escape-band sensitivity sweep list, set by build_config() from
+# --sweep_escape_band and consumed by train().  ``None`` disables (default).
+_SWEEP_BANDS: Optional[List[float]] = None
+
 
 # ═══════════════════════════════════════════════════════════════
 # 1.  Argument Parsing
@@ -222,6 +226,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Override output directory.",
     )
+    parser.add_argument(
+        "--sweep_escape_band",
+        type=str,
+        default=None,
+        help="Comma-separated escape-band thresholds (cm/s) for the "
+             "sensitivity sweep, e.g. '5,10,20,50'.  After training, "
+             "rescores the best model's validation metrics at every band "
+             "x min_run in {1,2,3} and writes "
+             "escape_sensitivity.csv to the output dir.  Requires a "
+             "completed training run with a val split.",
+    )
 
     return parser
 
@@ -274,6 +289,15 @@ def build_config(argv: Optional[Sequence[str]] = None) -> Tuple[ExperimentConfig
         config.checkpoint.resume_from = args.resume
     if args.output_dir is not None:
         config.checkpoint.output_dir = args.output_dir
+
+    # Sweep bands: parse the comma list into a module-level holder consumed
+    # by train() (kept out of ExperimentConfig — it is a reporting option,
+    # not a training hyperparameter).
+    global _SWEEP_BANDS
+    _SWEEP_BANDS = (
+        [float(b) for b in args.sweep_escape_band.split(",") if b.strip()]
+        if args.sweep_escape_band else None
+    )
 
     return config, args.lambda_reg, args.phase1_epochs
 
@@ -910,12 +934,14 @@ def train_one_epoch(
                 "Epoch %d batch %d: non-finite loss=%s — skipping step",
                 epoch, batch_idx, loss.item(),
             )
-            # Keep the GradScaler's internal scale bookkeeping consistent:
-            # a backward() ran above, so update() must run or a later
-            # unscale_() on the same iteration class would raise
-            # "unscale_() has already been called" / double-scale errors.
-            if scaler is not None and scaler.is_enabled():
-                scaler.update()
+            # Plain continue: no unscale_() ran on this iteration and
+            # step() was not called, so the GradScaler holds no per-iter
+            # state that update() could reconcile.  (Calling update() here
+            # would read an empty found_inf and GROW the scale, amplifying
+            # exactly the overflow that produced the non-finite loss.)
+            # AMP caveat: if the non-finite loss came from an FP16 forward
+            # overflow, the scale is NOT reduced on this path — documented
+            # limitation; the gradient sanitizer below is the backstop.
             continue  # skip optimizer.step()
 
         # ── Gradient clipping (unscale first for AMP) ──
@@ -1300,6 +1326,58 @@ def compute_metrics(
     return metrics
 
 
+def sweep_escape_sensitivity(
+    all_true: List[np.ndarray],
+    all_pred: List[np.ndarray],
+    bands_cm_s: List[float],
+    min_runs: List[int] = (1, 2, 3),
+) -> List[Dict[str, float]]:
+    """
+    Band x min_run sensitivity table for the escape audit.
+
+    Rescores the SAME per-sequence raw predictions/targets (as collected by
+    :func:`compute_metrics`) at every escape-band threshold and sustained-run
+    length, so the reported headline number can be shown to be robust (or
+    not) to its two free parameters rather than a single arbitrary-threshold
+    point estimate.
+
+    Returns one dict per (band, min_run) pair with keys ``band_cm_s``,
+    ``min_run``, ``n_escape_frames``, ``n_escape_events`` (number of
+    contiguous per-sequence runs — the event-level unit), ``escape_rmse``,
+    ``resting_rmse``, and ``escape_ratio``.
+    """
+    rows: List[Dict[str, float]] = []
+    y_pred_all_raw = np.concatenate(all_pred)
+    for band in bands_cm_s:
+        for mr in min_runs:
+            keep_seq = [
+                _sustained_run(np.abs(t) >= band, min_run=mr) for t in all_true
+            ]
+            is_escape = np.concatenate(keep_seq)
+            n_escape = int(is_escape.sum())
+            # Event count: transitions into an over-band kept run.
+            n_events = sum(
+                int(np.count_nonzero(k[1:] & ~k[:-1]) + int(k[0]))
+                for k in keep_seq
+            )
+            err_sq_all = (y_pred_all_raw - np.concatenate(all_true)) ** 2
+            esc = float(np.sqrt(err_sq_all[is_escape].mean())) if n_escape else float("nan")
+            rest = (
+                float(np.sqrt(err_sq_all[~is_escape].mean()))
+                if (~is_escape).any() else float("nan")
+            )
+            rows.append({
+                "band_cm_s": band,
+                "min_run": mr,
+                "n_escape_frames": n_escape,
+                "n_escape_events": n_events,
+                "escape_rmse": esc,
+                "resting_rmse": rest,
+                "escape_ratio": n_escape / max(1, is_escape.size),
+            })
+    return rows
+
+
 def plot_loss_curve(
     history: Dict[str, List[float]],
     output_dir: Path,
@@ -1344,6 +1422,11 @@ def train(
     lambda_reg: float = 0.01,
     phase1_epochs: Optional[int] = None,
 ) -> Dict[str, float]:
+    # Single source of truth for the train/val split fraction, threaded to
+    # BOTH build_dataloaders and compute_target_stats — otherwise a
+    # non-default split silently desynchronises the normalization statistics
+    # from the training set (validation leakage into target mean/std).
+    _VAL_SPLIT = 0.2
     """
     Full training pipeline.
 
@@ -1475,7 +1558,9 @@ def train(
     # warmup count so the cosine covers exactly the post-warmup horizon.)
     if not two_phase:
         pass  # criterion already set above
-    train_loader, val_loader = build_dataloaders(config)
+    train_loader, val_loader = build_dataloaders(
+        config, val_split=_VAL_SPLIT,
+    )
 
     if train_loader is None:
         raise ValueError(
@@ -1493,6 +1578,7 @@ def train(
     target_mean, target_std = compute_target_stats(
         "data/processed/nsmor_dataset.pt",
         config,
+        val_split=_VAL_SPLIT,
     )
 
     # Statistical coherence guard: normalizing without a target clip amplifies
@@ -1792,6 +1878,7 @@ def train(
             model, val_loader, device,
             target_mean=target_mean, target_std=target_std,
             target_clip_cm_s=config.training.target_clip_cm_s,
+            escape_band_cm_s=config.training.escape_band_cm_s,
         )
         logger.info(
             "Best model metrics — MSE: %.6f  RMSE: %.6f  MAE: %.6f  R²: %.4f",
@@ -1811,6 +1898,36 @@ def train(
         with open(metrics_path, "w") as f:
             json.dump(metrics, f, indent=2)
         logger.info("Metrics saved: %s", metrics_path)
+
+        # ── Band x min_run sensitivity sweep (opt-in) ──────────
+        if _SWEEP_BANDS:
+            all_true: List[np.ndarray] = []
+            all_pred: List[np.ndarray] = []
+            for batch in val_loader:
+                x_batch, y_batch, lengths = batch
+                x_batch = x_batch.to(device).contiguous()
+                lengths = lengths.to(device).contiguous()
+                y_pred, _ = model(x_batch, lengths, return_internals=True)
+                for i in range(x_batch.size(0)):
+                    n = int(lengths[i])
+                    p = y_pred[i, :n].cpu().numpy()
+                    if target_std != 1.0 or target_mean != 0.0:
+                        p = p * target_std + target_mean
+                    all_pred.append(p)
+                    all_true.append(y_batch[i, :n].cpu().numpy())
+            rows = sweep_escape_sensitivity(
+                all_true, all_pred, _SWEEP_BANDS,
+            )
+            sweep_path = output_dir / "escape_sensitivity.csv"
+            with open(sweep_path, "w", encoding="utf-8") as f:
+                keys = ["band_cm_s", "min_run", "n_escape_frames",
+                        "n_escape_events", "escape_rmse", "resting_rmse",
+                        "escape_ratio"]
+                f.write(",".join(keys) + "\n")
+                for r in rows:
+                    f.write(",".join(str(r[k]) for k in keys) + "\n")
+            logger.info("Escape sensitivity sweep (%d configs): %s",
+                        len(rows), sweep_path)
 
     return {
         "best_val_loss": best_val_loss,
