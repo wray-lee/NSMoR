@@ -199,6 +199,37 @@ def test_sustained_run_helper():
         [False, True, False]
 
 
+def test_escape_runs_do_not_span_sequence_boundaries(compute_metrics):
+    # ROUND-3 BLOCKER regression: the sustained-run guard must be applied
+    # PER SEQUENCE.  Here seq1 ends with a single over-band frame (150) and
+    # seq2 starts with one (-150); concatenated naively they form a spurious
+    # 2-frame "run" across the trial boundary and would be miscounted as
+    # escape.  Per-sequence masking keeps n_escape_frames == 0.
+    y_seq1 = np.array([0.0, 0.0, 150.0])          # trailing isolated spike
+    y_seq2 = np.array([-150.0, 0.0, 0.0])         # leading isolated spike
+    xs, ys, ls = [], [], []
+    for y in (y_seq1, y_seq2):
+        yt = torch.as_tensor(y, dtype=torch.float32)
+        xs.append(yt.unsqueeze(-1))               # (L, 1)
+        ys.append(yt)                             # (L,)
+        ls.append(len(y))
+    x = torch.stack(xs)                           # (B=2, L=3, 1)
+    y = torch.stack(ys)                           # (B=2, 3)
+    lengths = torch.tensor(ls, dtype=torch.long)
+    ds = torch.utils.data.TensorDataset(x, y, lengths)
+    loader = torch.utils.data.DataLoader(ds, batch_size=2)
+
+    m = compute_metrics(
+        _FakeModel(scale=1.0), loader, torch.device("cpu"),
+        target_mean=0.0, target_std=1.0, target_clip_cm_s=100.0,
+        escape_band_cm_s=10.0,
+    )
+    assert int(m["n_escape_frames"]) == 0, (
+        "cross-sequence run bridged two trials: "
+        f"n_escape_frames={m['n_escape_frames']}"
+    )
+
+
 def test_zero_escape_frames_handled_without_error(compute_metrics):
     # All-resting (no |y|>=10) -> escape_rmse must be NaN (documented) and
     # the dict still returns all nine keys (resting_rmse present).

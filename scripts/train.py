@@ -910,6 +910,12 @@ def train_one_epoch(
                 "Epoch %d batch %d: non-finite loss=%s — skipping step",
                 epoch, batch_idx, loss.item(),
             )
+            # Keep the GradScaler's internal scale bookkeeping consistent:
+            # a backward() ran above, so update() must run or a later
+            # unscale_() on the same iteration class would raise
+            # "unscale_() has already been called" / double-scale errors.
+            if scaler is not None and scaler.is_enabled():
+                scaler.update()
             continue  # skip optimizer.step()
 
         # ── Gradient clipping (unscale first for AMP) ──
@@ -1258,22 +1264,27 @@ def compute_metrics(
     # training-target clip; the band audit deliberately reports raw magnitude.)
     #
     # Sustained-membership guard: escape membership requires the frame to be
-    # part of a *run* of at least 2 consecutive |y_true|>=escape_band_cm_s
-    # frames (cricket escape is a ~10-100 ms kick = several samples at 500 Hz),
-    # so an isolated single-frame ~1e7 cm/s tracking-artifact spike — which the
-    # training-target clip removes but which would otherwise still land in the
-    # raw escape band — is excluded.  This decouples the audit from the very
-    # artifact the clip exists to suppress (artifact/escape collinearity).  A
-    # true escape kick has non-trivial temporal extent and survives.
-    escape_true = y_true_all_raw
-    escape_pred = y_pred_all_raw
-    over = np.abs(escape_true) >= escape_band_cm_s
-    is_escape = _sustained_run(over, min_run=2)
+    # part of a *run* of at least ``min_run=2`` consecutive
+    # |y_true|>=escape_band_cm_s frames.  min_run is a conservative artifact
+    # filter, NOT a biophysical timescale claim: tracking artifacts are
+    # single-frame sensor jumps, so min_run=2 already excludes them, while a
+    # larger value would start trimming genuine short escapes.  (At 500 Hz,
+    # 2 frames = 4 ms — well below the ~10-100 ms kick; the guard trades
+    # sensitivity for artifact-robustness.  Sweep band x min_run for
+    # sensitivity — see task/roadmap.)
+    #
+    # The guard is applied PER SEQUENCE, before concatenation: frame adjacency
+    # in the concatenated array is meaningless across trial boundaries, so a
+    # run computed post-concat could bridge two unrelated trials (false escape)
+    # or split one truncated at a boundary.
+    over_seq = [np.abs(t) >= escape_band_cm_s for t in all_true]
+    keep_seq = [_sustained_run(o, min_run=2) for o in over_seq]
+    is_escape = np.concatenate(keep_seq) if keep_seq else np.zeros(0, dtype=bool)
     n_escape = int(is_escape.sum())
     escape_rmse = float(np.sqrt(mean_squared_error(
-        escape_true[is_escape], escape_pred[is_escape]))) if n_escape else float("nan")
+        y_true_all_raw[is_escape], y_pred_all_raw[is_escape]))) if n_escape else float("nan")
     resting_rmse = float(np.sqrt(mean_squared_error(
-        escape_true[~is_escape], escape_pred[~is_escape]))) if (~is_escape).any() else float("nan")
+        y_true_all_raw[~is_escape], y_pred_all_raw[~is_escape]))) if (~is_escape).any() else float("nan")
 
     metrics: Dict[str, float] = {
         "mse": mse,
@@ -1516,6 +1527,7 @@ def train(
                 path=ckpt_path,
                 model=model,
                 optimizer=optimizer,
+                scheduler=scheduler,
                 map_location=device,
             )
             start_epoch = checkpoint["epoch"] + 1
@@ -1715,6 +1727,7 @@ def train(
             save_checkpoint(
                 model=model,
                 optimizer=optimizer,
+                scheduler=scheduler,
                 epoch=epoch,
                 loss=train_loss,
                 config=config.to_dict(),
@@ -1735,6 +1748,7 @@ def train(
             save_checkpoint(
                 model=model,
                 optimizer=optimizer,
+                scheduler=scheduler,
                 epoch=epoch,
                 loss=val_loss,
                 config=config.to_dict(),
@@ -1749,6 +1763,7 @@ def train(
     save_checkpoint(
         model=model,
         optimizer=optimizer,
+        scheduler=scheduler,
         epoch=config.training.num_epochs - 1,
         loss=train_loss,
         config=config.to_dict(),
