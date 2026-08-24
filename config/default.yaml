@@ -85,6 +85,25 @@ training:
   random_seed: 42
   max_seq_len: 1000        # crop sequences longer than this (cuDNN compatibility)
 
+  # CF: LR warmup (linear) — prevents cold-start overshoot of the shared
+  #     AdamW on the LIF surrogate-gradient + GRU composite loss surface.
+  lr_warmup_epochs: 0      # 0 disables (backward compatible; default off)
+
+  # CF: Regress on mean-centered, std-scaled velocity instead of raw cm/s.
+  #     The raw target is heavy-tailed (a few frames reach ~1e7 cm/s);
+  #     z-scoring reveals the resting-mode bulk where the escape response
+  #     lives, giving a well-conditioned, slowly-varying loss curve.
+  #     Statistics are fit on the training split only; predictions are
+  #     rescaled back to cm/s for reporting.
+  normalize_targets: false  # false = raw velocity objective (backward compatible; default off)
+
+  # CF: Robust clip of the velocity target before the loss.  A handful of
+  #     tracking-artifact frames (~10e6 cm/s) would otherwise dominate the
+  #     masked MSE.  100 cm/s keeps every real escape response while
+  #     removing the artifacts.  Symmetrically applied to predictions for
+  #     metric reporting.  0 = disabled (backward compatible; default off).
+  target_clip_cm_s: 0
+
 # ── Loss function ───────────────────────────────────────────
 loss:
   reduction: mean           # MSE reduction: 'mean' or 'sum'
