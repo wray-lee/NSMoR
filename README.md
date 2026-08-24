@@ -1,6 +1,6 @@
 # NSMoR — Hybrid Funnel Architecture
 
-**Bio-inspired Multi-sensory Object Recognition** for cricket neural modelling.
+**Neural Sensori-Motor Response** model for cricket escape behavior.
 
 NSMoR implements a **Mixture-of-Recursions (MoR)** dual-pathway recurrent
 network with a **Hybrid Funnel** training strategy that separates sensory
@@ -32,17 +32,13 @@ nsmor/
 ├── analysis/
 │   ├── dynamics.py           # FixedPointAdapter for dynamical systems analysis
 │   ├── gating_cluster.py     # Window-free unsupervised gating strategy clustering
-│   └── uq.py                 # Uncertainty quantification: bootstrap CI, Cohen's d
-├── analysis/
-│   ├── dynamics.py           # FixedPointAdapter for dynamical systems analysis
-│   ├── gating_cluster.py     # Window-free unsupervised gating strategy clustering
-│   └── uq.py                 # Uncertainty quantification: bootstrap CI, Cohen's d
+│   └── uq.py                 # Uncertainty quantification: bootstrap CI, Cohen's d, Holm correction
 ├── checkpoint.py             # Deterministic save/load with full RNG state
 ├── model_utils.py            # Canonical model loading from checkpoints
 ├── pipeline/
 │   ├── io.py                 # CSV loading, session concatenation, per-trial extraction
 │   ├── kinematics.py         # Savitzky-Golay / Gaussian smoothing, velocity / accel
-│   └── labeling.py           # Ground truth: Pre_Active, Startle, Walk, NoResponse
+│   └── labeling.py           # Ground truth: ESCAPE, PREWALK, PRE_ACTIVE, NO_RESPONSE
 ├── data_extractor.py         # TTC-50ms snapshot + Trial-Start anchored sequences
 ├── mcmc_module.py            # PyTorch nn.Module + sklearn wrapper + Markov estimator
 └── nsmor_dataloader.py       # PyTorch Dataset + DataLoader with shape assertions
@@ -67,11 +63,11 @@ NSMoR provides 6 analysis modules for mechanistic interpretation:
 | Command | Output | Description |
 |---------|--------|-------------|
 | `make dynamics` | `mechanism_analysis.png` | 3D phase-space manifold, routing gates |
-| `make jacobian` | `jacobian_spectrum.png` | Jacobian eigenvalue analysis |
+| `make jacobian` | `jacobian_spectrum.png` + `.json` | Jacobian eigenvalue spectrum with GMM+BIC gating |
 | `make integration` | `integration_window.png` | Multisensory integration window |
-| `make psychophysics` | `reliability_*.png` | Bayesian reliability analysis |
-| `make lesion` | `ablation_kinematics.png` | In-silico lesion effects |
-| `make cluster` | `gating_*.png, *.json` | **Unsupervised gating clustering** |
+| `make psychophysics` | `bayesian_reliability.png` + `.json` | Routing-gate noise sensitivity (Wilcoxon+HL) |
+| `make lesion` | `ablation_kinematics.png` + `.csv` | In-silico lesion (block-bootstrap CI) |
+| `make cluster` | `gating_*.png, *.json` | Unsupervised gating strategy clustering |
 
 Run all analyses:
 ```bash
@@ -103,17 +99,29 @@ load_and_concat_sessions()        →  pd.DataFrame
     ↓
 extract_trial_data()              →  Dict per trial
     ↓
-assign_ground_truth_labels()      →  Pre_Active / Startle / Walk / NoResponse
+assign_ground_truth_labels()      →  ESCAPE / PREWALK / PRE_ACTIVE / NO_RESPONSE
     ↓
 extract_mcmc_snapshot()           →  5-D vector at TTC − 50 ms
 extract_trial_sequence()          →  (X_seq, Y_seq) anchored at Trial Start
     ↓
-train_mcmc()                      →  Cross-Entropy trained MCMCPriorGenerator
+train_mcmc()                      →  Session-grouped 5-fold OOF priors (no leakage)
     ↓
 create_dataloader()               →  DataLoader yielding (X_batch, Y_batch)
     X: (batch, seq_len, 8)
     Y: (batch, seq_len)
 ```
+
+### Pipeline Semantics v2.1
+
+The dataset carries two provenance keys embedded at generation time:
+
+| Key | Value | Purpose |
+|-----|-------|---------|
+| `pipeline_semantics_version` | `"2.1"` | Labels use escape-first branch ordering (PREWALK recovery) |
+| `mcmc_prior_provenance` | `"oof_5fold_session_grouped_cv"` | Session-grouped OOF priors (no session-level leakage) |
+
+The version guard in `model_utils.validate_dataset_provenance()` refuses to load
+datasets generated under older semantics, preventing silent regression.
 
 ---
 
@@ -132,7 +140,7 @@ data = load_and_concat_sessions(
     events_paths=["data/session_0/events.csv"],
 )
 
-# 2. Extract trials and assign labels
+# 2. Extract trials and assign labels (v2.1: escape-first branch ordering)
 trials = [extract_trial_data(data, "session_0", t) for t in range(n_trials)]
 labeled = assign_ground_truth_labels(trials)
 
@@ -140,7 +148,7 @@ labeled = assign_ground_truth_labels(trials)
 snapshots, labels = build_snapshot_dataset(labeled)
 sequences = build_sequence_dataset(labeled)
 
-# 4. Train MCMC
+# 4. Train MCMC (session-grouped 5-fold OOF — no leakage)
 model = train_mcmc(snapshots, labels)
 
 # 5. Create DataLoader
@@ -196,22 +204,22 @@ Event types: `trial_start`, `stimulus_onset`, `wind_onset`, `response_detected`,
 | 1     | wind(t)       | Wind stimulus state (0 / 1)         |
 | 2     | v_kine(t-1)   | Previous-frame velocity (cm/s)      |
 | 3     | a_kine(t-1)   | Previous-frame acceleration (cm/s²) |
-| 4     | P_startle     | MCMC prior: P(Startle)              |
-| 5     | P_walk        | MCMC prior: P(Walk)                 |
-| 6     | P_pre_active  | MCMC prior: P(Pre_Active)           |
-| 7     | P_no_response | MCMC prior: P(NoResponse)           |
+| 4     | P_escape      | MCMC prior: P(ESCAPE)               |
+| 5     | P_prewalk     | MCMC prior: P(PREWALK)              |
+| 6     | P_pre_active  | MCMC prior: P(PRE_ACTIVE)           |
+| 7     | P_no_response | MCMC prior: P(NO_RESPONSE)          |
 
 ---
 
 ## MCMC Snapshot Features (dim = 5)
 
-| Index | Name                | Description                            |              |                    |
-| ----- | ------------------- | -------------------------------------- | ------------ | ------------------ |
-| 0     | visual_angle        | Instantaneous visual angle at TTC-50ms |              |                    |
-| 1     | looming_velocity    | l/v ratio at TTC-50ms                  |              |                    |
-| 2     | wind_state          | Wind stimulus state (0 / 1)            | ------------ | ------------------ |
-| 3     | avg_velocity_bg     | Mean                                   | velocity     | in preceding 200ms |
-| 4     | max_acceleration_bg | Max                                    | acceleration | in preceding 200ms |
+| Index | Name                | Description                                   |
+| ----- | ------------------- | --------------------------------------------- |
+| 0     | visual_angle        | Instantaneous visual angle at TTC-50ms        |
+| 1     | looming_velocity    | l/v ratio at TTC-50ms                         |
+| 2     | wind_state          | Wind stimulus state (0 / 1)                   |
+| 3     | avg_velocity_bg     | Mean velocity in preceding 200ms              |
+| 4     | max_acceleration_bg | Max acceleration in preceding 200ms           |
 
 ---
 
@@ -253,6 +261,42 @@ pytest tests/ -v
 ---
 
 ## Engineering & Architecture Capabilities
+
+### Biophysical Mechanisms (LIFCell)
+
+The LIF pathway implements five biologically grounded mechanisms beyond basic
+leaky integration, all parameterized in physical time (ms) via `dt_ms`:
+
+| Mechanism | Parameter | Default | Reference |
+|-----------|-----------|---------|-----------|
+| Synaptic delay (IIR low-pass) | `lif_tau_syn` | 5.0 ms | Destexhe et al. 1994 |
+| Absolute refractory period | `lif_abs_refract_ms` | 0.0 ms | Hodgkin & Huxley 1952 |
+| Relative refractory period | `lif_rel_refract_ms` | 20.0 ms | Bean 2007 |
+| Spike-frequency adaptation | `lif_tau_w` / `lif_b_adapt` | 100.0 ms / 0.5 | Brette & Gerstner 2005 |
+| Short-term plasticity (Tsodyks-Markram) | `tau_fac` / `tau_rec` | 0 (disabled) | Tsodyks et al. 1998 |
+| Lateral inhibition | `lif_lateral_inhibition` | 0.1 | Ritzmann & Camhi 1978 |
+| Stochastic resonance (sensory noise) | `sensory_noise_std` | 0.01 | Douglass et al. 1993 |
+
+All time constants are converted internally via `alpha = exp(-dt_ms / tau_ms)`.
+Changing the acquisition rate (`dt_ms`) rescales the per-step coefficients
+automatically — the declared biophysics are sampling-rate invariant.
+
+### Statistical Methodology (Uncertainty Quantification)
+
+The analysis pipeline uses `nsmor.analysis.uq` for publication-grade inference:
+
+- **Block bootstrap CI** (Künsch 1989) — preserves temporal autocorrelation in
+  per-trial MSE sequences; block_size=5 (fixed, conservative) with runtime
+  sensitivity check at block_size 2 and 10.
+- **BCa bootstrap** — bias-corrected and accelerated intervals with extreme-z
+  warning when |z₀| > 0.25.
+- **Paired Cohen's d** — effect size for lesion conditions vs intact.
+- **Holm-Bonferroni correction** — family-wise error rate control across multiple
+  lesion comparisons; NaN p-values excluded from the family.
+- **Wilcoxon signed-rank + Hodges-Lehmann estimator** — distribution-free test
+  for psychophysics (no Shapiro pre-screening; fixed nonparametric by design).
+- **Wilson score CI** — for Jacobian accept/reject proportions (small-sample
+  binomial).
 
 ### Hybrid Funnel Architecture (Frontend → .detach() → Backend)
 
@@ -585,7 +629,7 @@ make pipeline
 | `make load`          | Preload raw CSVs                                 |
 | `make data`          | ETL: raw CSVs → processed PyTorch dataset        |
 | `make train`         | Train NSMoR model (100 epochs by default)        |
-| `make analyze`       | Run all 5 analysis scripts sequentially          |
+| `make analyze`       | Run all 6 analysis scripts sequentially          |
 | `make dynamics`      | Dynamics & manifold visualisation                |
 | `make lesion`        | In-silico lesion (virtual ablation)              |
 | `make jacobian`      | Jacobian eigenvalue spectrum                     |
@@ -610,22 +654,25 @@ After `make pipeline`, all publication-ready figures (300 DPI, Lancet/Cell aesth
 
 | File                       | Analysis                        |
 | -------------------------- | ------------------------------- |
-| `dynamics_manifold.png`    | Neural state-space trajectories |
-| `lesion_comparison.png`    | Virtual ablation comparison     |
+| `mechanism_analysis.png`   | Neural state-space trajectories |
+| `ablation_kinematics.png`  | Virtual ablation comparison     |
 | `jacobian_spectrum.png`    | Eigenvalue complex plane        |
 | `integration_window.png`   | Chronometric + vigor curves     |
-| `bayesian_reliability.png` | Psychometric + gate modulation  |
+| `bayesian_reliability.png` | Routing-gate noise sensitivity  |
+| `gating_clusters_*.png`    | Unsupervised routing strategies |
 
 ### Data Outputs
 
-| File                         | Format                  |
-| ---------------------------- | ----------------------- |
-| `lesion_statistics.csv`      | CSV                     |
-| `jacobian_stats.csv`         | CSV                     |
-| `integration_summary.json`   | JSON                    |
-| `psychophysics_summary.json` | JSON                    |
-| `sim_session/events.csv`     | CSV (cercus-compatible) |
-| `sim_session/kinematics.csv` | CSV (cercus-compatible) |
+| File                                    | Format  |
+| --------------------------------------- | ------- |
+| `lesion_statistics.csv`                 | CSV     |
+| `lesion_statistics.block_sensitivity.json` | JSON |
+| `jacobian_spectrum.json`                | JSON    |
+| `integration_summary.json`              | JSON    |
+| `psychophysics_summary.json`            | JSON    |
+| `gating_cluster_summary.json`           | JSON    |
+| `sim_session/events.csv`                | CSV     |
+| `sim_session/kinematics.csv`            | CSV     |
 
 ### Docker & CI/CD
 
@@ -643,7 +690,7 @@ installing PyTorch, CUDA, or Python locally.
 ```bash
 git clone https://github.com/<your-org>/nsmor.git
 cd nsmor
-docker compose run --rm nsmor pipeline     # ETL → Train → 5 Analyses
+docker compose run --rm nsmor pipeline     # ETL → Train → 6 Analyses
 ```
 
 All figures and data outputs persist in the host `results/` directory via bind mounts.
@@ -655,7 +702,7 @@ All figures and data outputs persist in the host `results/` directory via bind m
 | `docker compose run --rm nsmor pipeline` | Full end-to-end experimental pipeline |
 | `docker compose run --rm nsmor test`     | Pytest suite                          |
 | `docker compose run --rm nsmor train`    | Training engine only                  |
-| `docker compose run --rm nsmor analyze`  | All 5 analysis scripts                |
+| `docker compose run --rm nsmor analyze`  | All 6 analysis scripts                |
 | `docker compose run --rm nsmor bash`     | Interactive shell inside container    |
 
 #### CI/CD
