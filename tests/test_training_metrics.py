@@ -290,6 +290,7 @@ def test_zero_escape_frames_handled_without_error(compute_metrics):
 
 def _make_synthetic_dataset(path: Path, n_seqs: int = 6, T: int = 12) -> None:
     """Write a minimal ``nsmor_dataset.pt``-shaped file."""
+    from nsmor.config import PIPELINE_SEMANTICS_VERSION
     rng = np.random.RandomState(0)
     X_seqs = [rng.randn(T, 8).astype(np.float32) for _ in range(n_seqs)]
     Y_seqs = [rng.randn(T).astype(np.float32) * 5 for _ in range(n_seqs)]
@@ -301,6 +302,8 @@ def _make_synthetic_dataset(path: Path, n_seqs: int = 6, T: int = 12) -> None:
         "mcmc_priors": priors,
         "labels": np.zeros(n_seqs, dtype=np.int64),
         "lengths": np.full(n_seqs, T, dtype=np.int64),
+        # Round-3 provenance guard: loaders reject unstamped artifacts.
+        "pipeline_semantics_version": PIPELINE_SEMANTICS_VERSION,
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(dataset, path)
