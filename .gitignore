@@ -6,3 +6,15 @@ data/processed/*
 runs
 results
 report.md
+# Claude session artifacts (reports whitelisted in repo, logs/scripts excluded)
+.claude/*
+!.claude/skills/
+!.claude/dev_round2_report.md
+!.claude/dev_round3_report.md
+!.claude/review_round1_A.md
+!.claude/review_round1_B.md
+!.claude/review_round2_A.md
+!.claude/review_round2_B.md
+!.claude/review_round3_A.md
+!.claude/review_round3_B.md
+!.claude/test_round3_report.md
