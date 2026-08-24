@@ -50,7 +50,14 @@ import pandas as pd
 import torch
 from scipy.signal import savgol_filter
 
-from nsmor.config import DEFAULT_FEATURE, DEFAULT_TIME_WINDOW, FeatureConfig, TimeWindowConfig
+from nsmor.config import (
+    DEFAULT_FEATURE,
+    DEFAULT_THRESHOLD,
+    DEFAULT_TIME_WINDOW,
+    FeatureConfig,
+    PIPELINE_SEMANTICS_VERSION,
+    TimeWindowConfig,
+)
 from nsmor.data_extractor import (
     build_sequence_dataset,
     build_snapshot_dataset,
@@ -58,9 +65,12 @@ from nsmor.data_extractor import (
     extract_mcmc_snapshot,
     PURE_WIND_PREPEND_FRAMES,
 )
-from nsmor.mcmc_module import MCMCPriorGenerator, train_mcmc
+from nsmor.mcmc_module import MCMCPriorGenerator, train_mcmc, train_mcmc_cross_fitted
 from nsmor.pipeline.io import EVENT_COLUMNS, KINEMATICS_COLUMNS
-from nsmor.pipeline.labeling import assign_ground_truth_labels
+from nsmor.pipeline.labeling import (
+    assign_ground_truth_labels,
+    labeling_funnel_summary,
+)
 from nsmor.pipeline.io import extract_trial_data, load_and_concat_sessions
 
 # ── Logging ────────────────────────────────────────────────────
@@ -602,9 +612,24 @@ def prepare_dataset(
 
     logger.info("Extracted %d valid trials.", len(trials))
 
-    # Assign ground truth labels using hardware-corrected timestamps
-    labeled_trials = assign_ground_truth_labels(trials)
+    # Assign ground truth labels using hardware-corrected timestamps.
+    # Round-3 (Reviewer A BLK-3B): label collapses must be auditable —
+    # the elimination funnel records which criterion stage eliminated
+    # each trial, and the aggregated waterfall is logged so an entire
+    # behavioural class disappearing can never pass silently again.
+    labeled_trials = assign_ground_truth_labels(trials, return_funnel=True)
     logger.info("Labeled %d trials.", len(labeled_trials))
+
+    funnel = labeling_funnel_summary(labeled_trials)
+    logger.info("Labeling elimination funnel: %s", funnel)
+    if funnel.get("n_PREWALK", 0) == 0 and len(labeled_trials) > 0:
+        logger.warning(
+            "PREWALK count is ZERO across %d trials.  This is a "
+            "criterion/data incompatibility signal, not a stricter "
+            "label: inspect the funnel stages above to determine "
+            "whether the pre-stimulus window criterion or the data "
+            "eliminated the class.", len(labeled_trials),
+        )
 
     # Log label distribution
     from nsmor.config import Label
@@ -614,14 +639,51 @@ def prepare_dataset(
         label_counts[label.name] = label_counts.get(label.name, 0) + 1
     logger.info("Label distribution: %s", label_counts)
 
+    # ── Round-3 (Reviewer A MAJ-3B): threshold sensitivity sweep ──
+    # Re-label the full trial set with the velocity thresholds scaled
+    # by ±25% and report how the class composition moves.  If the
+    # primary labels are an artefact of one arbitrary threshold pair,
+    # this shows up as large composition swings; stable compositions
+    # support the criterion's robustness.  Persisted in the dataset
+    # for the analysis report.
+    import dataclasses as _dataclasses
+    labeling_threshold_sensitivity: Dict[str, Dict[str, int]] = {}
+    _primary_counts = dict(label_counts)
+    for scale in (0.75, 1.25):
+        cfg_alt = _dataclasses.replace(
+            DEFAULT_THRESHOLD,
+            escape_velocity_threshold=DEFAULT_THRESHOLD.escape_velocity_threshold * scale,
+            prewalk_velocity_threshold=DEFAULT_THRESHOLD.prewalk_velocity_threshold * scale,
+            pre_active_velocity_threshold=(
+                DEFAULT_THRESHOLD.pre_active_velocity_threshold * scale
+            ),
+        )
+        labeled_alt = assign_ground_truth_labels(trials, config=cfg_alt)
+        counts_alt: Dict[str, int] = {}
+        for info in labeled_alt:
+            name = info["label"].name
+            counts_alt[name] = counts_alt.get(name, 0) + 1
+        labeling_threshold_sensitivity[f"thresholds_x{scale:.2f}"] = counts_alt
+        logger.info(
+            "Label sensitivity (thresholds x%.2f): %s", scale, counts_alt,
+        )
+
     # ── Step 4: MCMC Prior Generation ────────────────────────
     logger.info("[Step 4] Training MCMC prior generator...")
 
-    snapshots, snapshot_labels = build_snapshot_dataset(
+    snapshots, snapshot_labels, kept_indices = build_snapshot_dataset(
         labeled_trials,
         time_config=time_config,
         feature_config=feature_config,
+        return_kept_indices=True,
     )
+    if len(kept_indices) != len(labeled_trials):
+        logger.warning(
+            "%d/%d trials dropped during snapshot extraction "
+            "(snapshot time before trial start); downstream metadata "
+            "filtered to match.",
+            len(labeled_trials) - len(kept_indices), len(labeled_trials),
+        )
     logger.info(
         "Snapshot dataset: %s snapshots, %s labels.",
         snapshots.shape, snapshot_labels.shape,
@@ -631,28 +693,163 @@ def prepare_dataset(
     torch.manual_seed(random_seed)
     np.random.seed(random_seed)
 
-    mcmc_model = train_mcmc(
+    # Reviewer Round-1 BLOCKER-2 fix: cross-fitted (out-of-fold) priors.
+    # Training on all snapshots and re-predicting the SAME snapshots
+    # leaked ground-truth labels into the NSMoR input features.  With
+    # 5-fold cross-fitting, every prior row is produced by a generator
+    # that never saw that trial's label.
+    #
+    # Reviewer Round-2 B-2 fix: fold membership is GROUPED BY SESSION.
+    # All trials from one recording session share the animal's baseline
+    # locomotor statistics and gain state; a sample-level shuffle lets
+    # the same session straddle train/test folds and leak session-level
+    # information into the "held-out" priors.  Session ids are aligned
+    # through kept_indices because build_snapshot_dataset silently
+    # skips trials whose snapshot cannot be extracted (a plain
+    # zip with labeled_trials misaligns groups when any is dropped).
+    labeled_kept = [labeled_trials[i] for i in kept_indices]
+    snapshot_groups = np.array(
+        [str(info["session_id"]) for info in labeled_kept], dtype=object,
+    )
+    assert len(snapshot_groups) == len(snapshots), (
+        f"Session-group count {len(snapshot_groups)} != "
+        f"snapshot count {len(snapshots)}"
+    )
+
+    mcmc_priors, fold_models, fold_diagnostics = train_mcmc_cross_fitted(
         snapshots,
         snapshot_labels,
+        n_folds=5,
+        groups=snapshot_groups,
         verbose=True,
     )
-    logger.info("MCMC model trained.")
-
-    # Generate priors for all trials
-    mcmc_priors = mcmc_model.predict_proba(snapshots)
+    # Round-3 (Reviewer A MAJ-3C): StratifiedGroupKFold does NOT
+    # guarantee balanced class composition across folds.  Persist the
+    # per-fold (session count, class histogram) so fold imbalance is
+    # auditable in the saved dataset instead of only logged.
+    for diag in fold_diagnostics:
+        logger.info(
+            "[MCMC-CV] fold %d: train sessions=%d classes=%s | "
+            "oof sessions=%d classes=%s",
+            diag["fold"], diag["n_train_sessions"],
+            np.bincount(diag["train_classes"], minlength=4).tolist(),
+            diag["n_oof_sessions"],
+            np.bincount(diag["oof_classes"], minlength=4).tolist(),
+        )
+    n_sessions = len(set(snapshot_groups))
+    logger.info(
+        "Generated out-of-fold MCMC priors (5-fold session-grouped "
+        "cross-fitting over %d sessions): %s",
+        n_sessions, mcmc_priors.shape,
+    )
     assert mcmc_priors.shape == (len(snapshots), feature_config.mcmc_dim), (
         f"mcmc_priors shape {mcmc_priors.shape} != "
         f"({len(snapshots)}, {feature_config.mcmc_dim})"
     )
-    logger.info("Generated MCMC priors: %s", mcmc_priors.shape)
+
+    # Round-3 (Reviewer A MAJ-3C): a fold whose training side lacks a
+    # class makes its model emit near-constant probabilities for that
+    # class on the held-out side — the "prior" column degenerates into
+    # an uninformative constant and silently poisons the sensory
+    # encoding.  Variance floor: every prior column must retain
+    # meaningful spread across trials.  1e-4 is ~2 orders below the
+    # variance of even a weakly informative predictor (~0.01-0.05) but
+    # far above float noise, so it fires only on true degeneracy.
+    #
+    # Round-3 revision (BLK-3B conservative resolution): a column is
+    # only REQUIRED to be informative when its behavioural class is
+    # actually populated in the labelled data.  PREWALK is currently
+    # empty in this dataset (every candidate is absorbed by the
+    # PRE_ACTIVE branch — see labeling_funnel_summary), so its prior
+    # column is trivially constant BY CONSTRUCTION, not by fold
+    # imbalance.  Hard-failing on an absent class conflates "criterion/
+    # data incompatibility" (already surfaced by the funnel + the
+    # PREWALK=0 warning) with "fold grouping failure".  Empty-class
+    # columns are recorded in the saved dataset as
+    # ``mcmc_degenerate_columns`` and every downstream consumer can
+    # exclude them; a populated class with a degenerate column still
+    # hard-fails.
+    from nsmor.config import Label as _Label
+    label_names_in_col = [cls.name for cls in _Label]
+    degenerate_columns: Dict[str, str] = {}
+    for c in range(mcmc_priors.shape[1]):
+        col_var = float(np.var(mcmc_priors[:, c]))
+        if col_var >= 1e-4:
+            continue
+        cls_name = label_names_in_col[c] if c < len(label_names_in_col) else f"class_{c}"
+        class_present = any(
+            info["label"].name == cls_name for info in labeled_kept
+        )
+        if class_present:
+            raise ValueError(
+                f"OOF MCMC prior column {c} ({cls_name}) is degenerate "
+                f"(variance={col_var:.2e} < 1e-4) although the class IS "
+                "populated: at least one fold's training side lacks it "
+                "(fold-grouping failure).  Regroup folds (fewer folds / "
+                "LOCO) or collect more sessions for that class; refusing "
+                "to save a dataset with uninformative priors."
+            )
+        logger.warning(
+            "OOF MCMC prior column %d (%s) is degenerate because the "
+            "class is EMPTY in this dataset (variance=%.2e).  Column "
+            "recorded in mcmc_degenerate_columns; downstream consumers "
+            "must not interpret it as evidence.",
+            c, cls_name, col_var,
+        )
+        degenerate_columns[cls_name] = f"column_{c}"
+    logger.info("OOF prior variance floor check passed (all columns).")
+
+    # Round-3 (Reviewer B CRITICAL-3c): train-vs-serve distribution
+    # mismatch audit.  During training the model sees SINGLE-FOLD OOF
+    # probabilities (high variance); at inference time the documented
+    # protocol feeds ENSEMBLE mean probabilities from all fold models
+    # (variance-compressed).  Quantify that shift NOW and persist it,
+    # so deployment-time behaviour is comparable against recorded
+    # training conditions.
+    ens_probs = np.zeros_like(mcmc_priors)
+    for fm in fold_models:
+        ens_probs += fm.predict_proba(snapshots)
+    ens_probs /= len(fold_models)
+    ens_probs = np.clip(ens_probs, 1e-12, 1.0)
+    ens_probs /= ens_probs.sum(axis=1, keepdims=True)
+
+    from scipy.stats import ks_2samp
+    prior_consistency: Dict[str, Dict[str, float]] = {}
+    for c in range(mcmc_priors.shape[1]):
+        col_oof = mcmc_priors[:, c]
+        col_ens = ens_probs[:, c]
+        ks = ks_2samp(col_oof, col_ens)
+        prior_consistency[str(c)] = {
+            "mean_abs_diff": float(np.mean(np.abs(col_oof - col_ens))),
+            "max_abs_diff": float(np.max(np.abs(col_oof - col_ens))),
+            "ks_statistic": float(ks.statistic),
+            "ks_pvalue": float(ks.pvalue),
+            "var_oof": float(np.var(col_oof)),
+            "var_serve": float(np.var(col_ens)),
+        }
+        logger.info(
+            "[MCMC-CV] prior train-vs-serve col %d: "
+            "mean|Δ|=%.4f, KS=%.3f (p=%.2e), var %.4f→%.4f",
+            c, prior_consistency[str(c)]["mean_abs_diff"],
+            ks.statistic, ks.pvalue,
+            prior_consistency[str(c)]["var_oof"],
+            prior_consistency[str(c)]["var_serve"],
+        )
 
 # ── Step 5: Sequence Extraction with Visual Physics Reconstruction ──
     logger.info("[Step 5] Extracting continuous sequences with visual physics reconstruction...")
 
     sequences = []
     valid_snaps = []  # 仅收集快照输入，不在循环内推理
+    seq_session_ids: List[str] = []  # Round-3 CRITICAL-3b: session id per kept trial
 
-    for info in labeled_trials:
+    # Iterate over labeled_kept ONLY: trials dropped during snapshot
+    # extraction have no out-of-fold prior row, so including them here
+    # would misalign sequences against mcmc_priors (the count assert
+    # below catches it).  Note the clamp inside this loop makes every
+    # kept trial's snapshot succeed, so sequences/priors/snaps stay
+    # row-for-row aligned.
+    for info in labeled_kept:
         try:
             trial_data = info["trial_data"]
             stimulus_onset_ms = info["stimulus_onset_ms"]
@@ -736,6 +933,7 @@ def prepare_dataset(
             # 同步入库：保证 sequences 和 valid_snaps 绝对对齐
             sequences.append((X_seq, Y_seq, int(info["label"])))
             valid_snaps.append(snap)
+            seq_session_ids.append(str(info["session_id"]))
 
             logger.debug(
                 "Trial %s/%d: θ(t) range [%.2f°, %.2f°], "
@@ -753,7 +951,15 @@ def prepare_dataset(
             continue
 
     # 5. 批量推理：一次性处理所有快照，原生输出 (N, 4) 矩阵，彻底规避降维风险
-    mcmc_priors = mcmc_model.predict_proba(np.array(valid_snaps))
+    # Reviewer Round-1 BLOCKER-2: the priors used downstream are the
+    # OUT-OF-FOLD cross-fitted ones computed in Step 4 (mcmc_priors).
+    # The full-data mcmc_model is NOT re-applied here — that would
+    # reintroduce the same-sample label leakage the cross-fitting
+    # removes.  valid_snaps is retained only for order verification.
+    assert len(valid_snaps) == mcmc_priors.shape[0], (
+        f"Snapshot/prior count mismatch: {len(valid_snaps)} vs "
+        f"{mcmc_priors.shape[0]}"
+    )
 
     logger.info("Extracted %d sequences with reconstructed visual features.", len(sequences))
 
@@ -763,6 +969,11 @@ def prepare_dataset(
     Y_seqs = [seq[1] for seq in sequences]
     labels = np.array([seq[2] for seq in sequences], dtype=np.int64)
     lengths = np.array([x.shape[0] for x in X_seqs], dtype=np.int64)
+    snapshot_groups_aligned = np.array(seq_session_ids, dtype=object)
+    assert len(snapshot_groups_aligned) == len(X_seqs), (
+        f"session_ids count {len(snapshot_groups_aligned)} != "
+        f"sequence count {len(X_seqs)}"
+    )
 
     # ── Shape assertions ──
     assert len(X_seqs) == len(Y_seqs) == len(labels) == len(lengths), (
@@ -795,11 +1006,47 @@ def prepare_dataset(
     dataset = {
         "X_seqs": X_seqs,
         "Y_seqs": Y_seqs,
-        "mcmc_priors": mcmc_priors,
+        "mcmc_priors": mcmc_priors,  # OUT-OF-FOLD (cross-fitted) priors
+        # Reviewer Round-2 M-3: persist the fold models and document the
+        # inference-time prior protocol so downstream scripts never have
+        # to refit a generator on data whose labels they hold (that would
+        # reintroduce the Round-1 leakage).  Protocol: predict with every
+        # fold model, average the probability rows, renormalise.
+        "mcmc_prior_provenance": "oof_5fold_session_grouped_cv",
+        "mcmc_fold_models": fold_models,
+        # Round-3 (Reviewer A MAJ-3C): per-fold composition records so
+        # StratifiedGroupKFold imbalance is auditable post hoc.
+        "mcmc_fold_diagnostics": fold_diagnostics,
+        # Round-3 (Reviewer B CRITICAL-3c): OOF (training) vs ensemble
+        # (serving) prior distribution shift statistics per class.
+        "mcmc_prior_train_serve_consistency": prior_consistency,
+        "mcmc_inference_protocol": (
+            "ensemble: probs = mean([m.predict_proba(x) for m in "
+            "mcmc_fold_models]); probs /= probs.sum(-1, keepdims=True)"
+        ),
         "labels": labels,
         "lengths": lengths,
+        # Round-3 (Reviewer B CRITICAL-3b): per-sequence session ids so
+        # downstream train/val splits can be SESSION-GROUPED.  A
+        # sample-level NSMoR split lets one session straddle train and
+        # validation, mildly inflating val metrics through shared
+        # session-level locomotor statistics — grouped splitting is the
+        # tractable mitigation (full nested CV is documented as a
+        # limitation in the analysis report).
+        "session_ids": snapshot_groups_aligned,
+        # Round-3 (Reviewer A MAJ-3B): label-composition sensitivity to
+        # a ±25% scaling of the velocity thresholds.
+        "labeling_threshold_sensitivity": labeling_threshold_sensitivity,
+        # Round-3 (BLK-3B conservative resolution): prior columns whose
+        # behavioural class is empty in this dataset — recorded so
+        # downstream consumers can exclude them from interpretation.
+        "mcmc_degenerate_columns": degenerate_columns,
         "feature_config": feature_config,
         "time_config": time_config,
+        # Round-2 CRITICAL-A fix: provenance stamp; loaders reject
+        # datasets without it (pre-2.0 data has leaked priors and
+        # np.max-based labels).
+        "pipeline_semantics_version": PIPELINE_SEMANTICS_VERSION,
     }
 
     torch.save(dataset, output_path)

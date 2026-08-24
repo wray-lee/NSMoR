@@ -263,6 +263,7 @@ def build_snapshot_dataset(
     labeled_trials: List[Dict],
     time_config: TimeWindowConfig = DEFAULT_TIME_WINDOW,
     feature_config: FeatureConfig = DEFAULT_FEATURE,
+    return_kept_indices: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Build the full MCMC snapshot matrix and label vector.
@@ -271,16 +272,27 @@ def build_snapshot_dataset(
         labeled_trials: Output of :func:`labeling.assign_ground_truth_labels`.
         time_config: Time window configuration.
         feature_config: Feature dimension configuration.
+        return_kept_indices: If ``True``, additionally return the indices
+            into *labeled_trials* of the trials whose snapshot was
+            successfully extracted.  Trials whose snapshot time precedes
+            the first frame raise ValueError internally and are skipped,
+            so downstream per-trial metadata (e.g. session ids for
+            grouped cross-fitting) MUST be filtered with these indices —
+            assuming row-for-row alignment with *labeled_trials* silently
+            misaligns groups when any trial is dropped.
 
     Returns:
         ``(snapshots, labels)`` where
         snapshots has shape ``(n_valid, 5)`` and
-        labels has shape ``(n_valid,)``.
+        labels has shape ``(n_valid,)``;
+        or ``(snapshots, labels, kept_indices)`` when
+        *return_kept_indices* is set.
     """
     snapshots: List[np.ndarray] = []
     labels: List[int] = []
+    kept_indices: List[int] = []
 
-    for info in labeled_trials:
+    for info_idx, info in enumerate(labeled_trials):
         try:
             snap = extract_mcmc_snapshot(
                 info["trial_data"],
@@ -291,6 +303,7 @@ def build_snapshot_dataset(
             )
             snapshots.append(snap)
             labels.append(int(info["label"]))
+            kept_indices.append(info_idx)
         except ValueError:
             continue
 
@@ -302,6 +315,8 @@ def build_snapshot_dataset(
 
     assert snapshots_arr.shape == (len(snapshots), feature_config.snapshot_dim)
     assert labels_arr.shape == (len(snapshots),)
+    if return_kept_indices:
+        return snapshots_arr, labels_arr, kept_indices
     return snapshots_arr, labels_arr
 
 

@@ -413,19 +413,29 @@ class FixedPointAdapter:
                     return False, fixed_point_residual, False
 
                 # Compute Jacobian at h* to find principal perturbation directions
-                h_leaf = h_star.detach().clone().unsqueeze(0).requires_grad_(True)
-                h_input = h_leaf.unsqueeze(0)  # (1, 1, H)
+                # NOTE: the residual check above runs in eval mode, but
+                # cuDNN RNN backward can only be called in training mode —
+                # so this block switches to train() like the other
+                # Jacobian methods (compute_jacobian / batch variant),
+                # restoring eval afterwards.
+                prev_jac_mode = self._gru_cell.training
+                self._gru_cell.train()
+                try:
+                    h_leaf = h_star.detach().clone().unsqueeze(0).requires_grad_(True)
+                    h_input = h_leaf.unsqueeze(0)  # (1, 1, H)
 
-                output, _ = self._gru_cell(x_seq, h_input)
-                h_next = output.squeeze(0).squeeze(0)  # (H,)
+                    output, _ = self._gru_cell(x_seq, h_input)
+                    h_next = output.squeeze(0).squeeze(0)  # (H,)
 
-                # Compute Jacobian
-                J = torch.zeros(H, H, device=self.device)
-                for i in range(H):
-                    if h_leaf.grad is not None:
-                        h_leaf.grad.zero_()
-                    h_next[i].backward(retain_graph=True)
-                    J[i, :] = h_leaf.grad.detach()
+                    # Compute Jacobian
+                    J = torch.zeros(H, H, device=self.device)
+                    for i in range(H):
+                        if h_leaf.grad is not None:
+                            h_leaf.grad.zero_()
+                        h_next[i].backward(retain_graph=True)
+                        J[i, :] = h_leaf.grad.detach()
+                finally:
+                    self._gru_cell.train(prev_jac_mode)
 
             finally:
                 # Restore training mode GUARANTEED, even on exceptions.

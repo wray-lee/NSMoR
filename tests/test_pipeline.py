@@ -92,9 +92,12 @@ def _make_synthetic_csvs(
             # Post-stimulus response
             stim_idx = int(stimulus_onset / dt_ms)
             if t <= 2:
-                # Startle: sharp velocity spike
+                # Startle/Escape: sustained high velocity (>5 cm/s).
+                # Round-1 labeling fix requires >=50% of the 250 ms
+                # post-stimulus window above threshold, so the response
+                # must span >= ~13 frames; use 35 frames (350 ms).
                 spike_start = stim_idx + np.random.randint(5, 20)
-                spike_end = min(spike_start + 5, frames_per_trial)
+                spike_end = min(spike_start + 35, frames_per_trial)
                 velocity[spike_start:spike_end] = np.random.uniform(8.0, 15.0)
             elif 3 <= t <= 5:
                 # Walk: sustained moderate velocity
@@ -265,6 +268,63 @@ class TestLabeling:
         assert all(l == Label.ESCAPE for l in labels[:3])
         # Trials 6-7 should be Pre_Active
         assert all(l == Label.PRE_ACTIVE for l in labels[6:8])
+
+    def test_responder_first_branch_order(self) -> None:
+        """Round-3 BLK-3B regression test (root cause of PREWALK=0).
+
+        A trial with BOTH a stimulus-locked escape burst AND sustained
+        pre-stimulus walking must be labelled PREWALK.  Under the old
+        pre-active-first order the baseline check ran before the
+        response check and structurally absorbed every walking animal
+        into PRE_ACTIVE — "walking at some point in baseline" is a
+        strict superset of "walking in the last second before onset".
+        """
+        dt_ms = 10.0
+        n_frames = 400
+        time_ms = np.arange(n_frames) * dt_ms
+        onset_ms = 2000.0
+        stim_idx = int(onset_ms / dt_ms)
+
+        # Continuous walking from t=0 through stimulus onset and beyond.
+        velocity = np.full(n_frames, 1.5)
+        # Stimulus-locked escape burst at ~100 ms latency, 350 ms long.
+        velocity[stim_idx + 10:stim_idx + 45] = 8.0
+
+        label = assign_ground_truth_labels([{
+            "session_id": "s", "trial_id": 0,
+            "time_ms": time_ms, "velocity": velocity,
+            "event_types": np.array(["stimulus_onset"]),
+            "event_times": np.array([onset_ms]),
+        }])[0]["label"]
+        assert label == Label.PREWALK, (
+            "responder with sustained pre-stimulus walking must be "
+            "PREWALK, got %s" % label.name
+        )
+
+    def test_walking_non_responder_is_pre_active(self) -> None:
+        """Walking animal WITHOUT a stimulus-locked response is PRE_ACTIVE.
+
+        Completes the Round-3 BLK-3B semantics: PRE_ACTIVE is reserved
+        for non-responders; a responder that walked is PREWALK/ESCAPE.
+        """
+        dt_ms = 10.0
+        n_frames = 400
+        time_ms = np.arange(n_frames) * dt_ms
+        onset_ms = 2000.0
+        stim_idx = int(onset_ms / dt_ms)
+
+        # Walking everywhere EXCEPT no post-stimulus burst: keep velocity
+        # moderate (below escape threshold) after onset.
+        velocity = np.full(n_frames, 1.5)
+        velocity[stim_idx:] = 0.1  # animal stops at stimulus
+
+        label = assign_ground_truth_labels([{
+            "session_id": "s", "trial_id": 0,
+            "time_ms": time_ms, "velocity": velocity,
+            "event_types": np.array(["stimulus_onset"]),
+            "event_times": np.array([onset_ms]),
+        }])[0]["label"]
+        assert label == Label.PRE_ACTIVE
 
 
 class TestSnapshotExtraction:

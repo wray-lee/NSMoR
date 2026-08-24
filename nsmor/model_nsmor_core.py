@@ -225,8 +225,8 @@ class LIFCell(nn.Module):
         alpha: float = 0.9,
         v_threshold: float = 1.0,
         beta: float = 0.5,
-        abs_refract_steps: int = 0,
-        rel_refract_steps: int = 0,
+        abs_refract_ms: float = 0.0,
+        rel_refract_ms: float = 20.0,
         tau_syn: float = 0.0,
         v_rest: float = 0.0,
         v_reset: Optional[float] = None,
@@ -236,7 +236,9 @@ class LIFCell(nn.Module):
         tau_rec: float = 0.0,
         U_stp_init: float = 0.5,
         lateral_inhibition: float = 0.0,
+        inhib_tau_ms: float = 50.0,
         dendritic_tau: float = 0.0,
+        dt_ms: float = 10.0,
     ) -> None:
         """
         Args:
@@ -244,16 +246,23 @@ class LIFCell(nn.Module):
             alpha: Leak factor in (0, 1).  Higher -> slower decay.
             v_threshold: Baseline spike threshold.
             beta: Input scaling factor.
-            abs_refract_steps: Number of timesteps of absolute
-                refractory period after a spike (Na+ channel
-                inactivation).  0 disables.
+            abs_refract_ms: Duration of the absolute refractory period
+                in PHYSICAL time (ms) — Na+ channel inactivation.
+                Converted internally to whole steps via dt_ms (rounded
+                up; sub-frame durations round to 0 = disabled).
+                0 disables.
                 Ref: Hodgkin & Huxley 1952.
-            rel_refract_steps: Characteristic decay length (in
-                timesteps) for the relative refractory threshold.
+            rel_refract_ms: Characteristic decay length of the relative
+                refractory threshold elevation in PHYSICAL time (ms).
+                Converted internally to steps via
+                ``rel_refract_steps = ceil(rel_refract_ms / dt_ms)`` so
+                a change of sampling rate can never silently rescale
+                the biophysics (Round-3, Reviewer B MAJOR-1).
                 0 disables.
                 Ref: Bean 2007.
-            tau_syn: Synaptic time constant in dt units.  Controls
-                the IIR low-pass filter on input current.  0 bypasses
+            tau_syn: Synaptic time constant in PHYSICAL time (ms).
+                Converted internally to the per-step coefficient
+                ``alpha_syn = exp(-dt_ms / tau_syn)``.  0 bypasses
                 the filter (instantaneous, backward compatible).
                 Ref: Destexhe et al. 1994.
             v_rest: Resting membrane potential, used to clamp V
@@ -302,9 +311,16 @@ class LIFCell(nn.Module):
                 inhibition) and negative weights constrained via
                 ``-softplus``.  The ``spike_history`` is an
                 exponential moving average of recent spikes with
-                time constant ``tau_syn`` (reuses existing synaptic
-                filter).  0 disables (backward compatible).
+                time constant ``max(tau_syn, inhib_tau_ms)`` (Round-3,
+                Reviewer B MINOR-6: the 50 ms fallback window is now an
+                explicit parameter instead of a magic number).
+                0 disables (backward compatible).
                 Ref: Ritzmann & Camhi 1978, J. Comp. Physiol.
+            inhib_tau_ms: Spike-history EMA window for lateral
+                inhibition in PHYSICAL time (ms).  Used when tau_syn is
+                shorter than this; the longer of the two governs.
+                Default 50 ms — within the 20-100 ms window of
+                feedforward inhibition in cricket cercal pathways.
             dendritic_tau: Time constant for the dendritic low-pass
                 filter applied to visual inputs before somatic
                 integration.  Models the separate dendritic
@@ -324,9 +340,56 @@ class LIFCell(nn.Module):
         self.alpha = alpha
         self.v_threshold = v_threshold
         self.beta = beta
-        self.abs_refract_steps = abs_refract_steps
-        self.rel_refract_steps = rel_refract_steps
+
+        # Reviewer Round-1 BLOCKER-1: physical time base.
+        # All tau_* parameters are declared in milliseconds; the
+        # per-step decay coefficients are exp(-dt_ms / tau_ms).  The
+        # sampling interval MUST be provided explicitly so that a
+        # change of acquisition rate can never silently rescale the
+        # biophysics.
+        assert dt_ms > 0.0, (
+            f"dt_ms (sampling interval) must be > 0, got {dt_ms}"
+        )
+        self.dt_ms = float(dt_ms)
+
+        # Round-3 fix (Reviewer B MAJOR-1): refractory periods are also
+        # declared in PHYSICAL time (ms) and converted to whole steps
+        # here — closing the frame-unit loophole that BLOCKER-1 closed
+        # for the synaptic filters.  Absolute refractory rounds UP (a
+        # 2 ms physiological duration at dt=10 ms rounds to 1 step;
+        # sub-frame values round to 0 = disabled).  Relative refractory
+        # uses ceil so the declared decay length is never silently
+        # shortened by sampling.
+        assert abs_refract_ms >= 0.0, (
+            f"abs_refract_ms must be >= 0, got {abs_refract_ms}"
+        )
+        assert rel_refract_ms >= 0.0, (
+            f"rel_refract_ms must be >= 0, got {rel_refract_ms}"
+        )
+        self.abs_refract_steps = int(math.ceil(
+            float(abs_refract_ms) / self.dt_ms
+        )) if abs_refract_ms > 0.0 else 0
+        self.rel_refract_steps = int(math.ceil(
+            float(rel_refract_ms) / self.dt_ms
+        )) if rel_refract_ms > 0.0 else 0
+        # Physical-time records of the declarations (for checkpoints /
+        # introspection; the step counts above drive the dynamics).
+        self.abs_refract_ms = float(abs_refract_ms)
+        self.rel_refract_ms = float(rel_refract_ms)
         self.tau_syn = tau_syn
+
+        def _decay_per_step(tau_ms: float, name: str) -> float:
+            """Convert a physical time constant (ms) to a per-step
+            decay coefficient exp(-dt_ms/tau_ms).  Returns 0.0 for
+            tau_ms <= 0 (mechanism disabled)."""
+            if tau_ms <= 0.0:
+                return 0.0
+            c = math.exp(-self.dt_ms / tau_ms)
+            assert 0.0 < c < 1.0, (
+                f"{name}: decay coefficient {c} out of (0, 1) for "
+                f"tau={tau_ms} ms at dt={self.dt_ms} ms"
+            )
+            return c
 
         # CF1 fix: Membrane leak and input scaling constraints.
         # alpha in (0, 1): leak factor.  alpha=0 means instantaneous
@@ -395,38 +458,26 @@ class LIFCell(nn.Module):
         # Previously _delta_theta = v_threshold (100% elevation) which
         # exceeded biological measurements.
         self._delta_theta = 0.3 * v_threshold
-        if rel_refract_steps > 0:
-            self._k_rel = 1.0 / rel_refract_steps
+        if self.rel_refract_steps > 0:
+            self._k_rel = 1.0 / self.rel_refract_steps
         else:
             self._k_rel = 0.0
 
-        # Synaptic filter coefficient: alpha_syn = exp(-1/tau_syn)
+        # Synaptic filter coefficient: alpha_syn = exp(-dt_ms/tau_syn)
         # persistent=False: these are derived constants, not learnable
         # parameters.  Using persistent=False keeps them OUT of
         # state_dict(), so old checkpoints without these keys load
         # cleanly with load_state_dict(strict=True).
-        if tau_syn > 0.0:
-            self.register_buffer(
-                '_alpha_syn',
-                torch.tensor(torch.exp(torch.tensor(-1.0 / tau_syn)).item()),
-                persistent=False,
-            )
-        else:
-            self.register_buffer(
-                '_alpha_syn', torch.tensor(0.0), persistent=False,
-            )
+        _alpha_syn_val = _decay_per_step(tau_syn, "tau_syn")
+        self.register_buffer(
+            '_alpha_syn', torch.tensor(_alpha_syn_val), persistent=False,
+        )
 
-        # Adaptation decay coefficient: alpha_w = exp(-1/tau_w)
-        if tau_w > 0.0:
-            self.register_buffer(
-                '_decay_w',
-                torch.tensor(torch.exp(torch.tensor(-1.0 / tau_w)).item()),
-                persistent=False,
-            )
-        else:
-            self.register_buffer(
-                '_decay_w', torch.tensor(0.0), persistent=False,
-            )
+        # Adaptation decay coefficient: alpha_w = exp(-dt_ms/tau_w)
+        _decay_w_val = _decay_per_step(tau_w, "tau_w")
+        self.register_buffer(
+            '_decay_w', torch.tensor(_decay_w_val), persistent=False,
+        )
 
         # Short-Term Plasticity (Tsodyks-Markram)
         # STP is enabled only when BOTH time constants are positive.
@@ -443,18 +494,10 @@ class LIFCell(nn.Module):
                 torch.tensor(U_raw_init, dtype=torch.float32)
             )
 
-            # Pre-compute decay coefficients (scalars, not parameters)
-            self._decay_fac = math.exp(-1.0 / tau_fac)
-            self._decay_rec = math.exp(-1.0 / tau_rec)
-
-            assert 0.0 < self._decay_fac < 1.0, (
-                f"_decay_fac={self._decay_fac} must be in (0, 1) "
-                f"for tau_fac={tau_fac} > 0"
-            )
-            assert 0.0 < self._decay_rec < 1.0, (
-                f"_decay_rec={self._decay_rec} must be in (0, 1) "
-                f"for tau_rec={tau_rec} > 0"
-            )
+            # Pre-compute decay coefficients (scalars, not parameters;
+            # physical ms -> per-step conversion via _decay_per_step)
+            self._decay_fac = _decay_per_step(tau_fac, "tau_fac")
+            self._decay_rec = _decay_per_step(tau_rec, "tau_rec")
 
         # ── Lateral Inhibition (Gap A) ──
         # Ref: Ritzmann & Camhi 1978, J. Comp. Physiol.
@@ -479,9 +522,13 @@ class LIFCell(nn.Module):
             )
 
             # Spike history buffer (exponential moving average)
-            # Reuses tau_syn if available, else a fixed 5-step window
-            self._inhib_tau = max(tau_syn, 5.0)
-            self._decay_inhib = math.exp(-1.0 / self._inhib_tau)
+            # Reuses tau_syn if longer, else the explicit inhib_tau_ms
+            # fallback window (Round-3, Reviewer B MINOR-6: no magic
+            # number).
+            self._inhib_tau_ms = max(tau_syn, inhib_tau_ms)
+            self._decay_inhib = _decay_per_step(
+                self._inhib_tau_ms, "_inhib_tau_ms",
+            )
 
             # CF4 note: _spike_history is NOT registered as a buffer because
             # its shape is (B, H) — batch-dependent and not known at init.
@@ -499,7 +546,7 @@ class LIFCell(nn.Module):
         self.dendritic_tau = dendritic_tau
         self._dendritic_enabled = dendritic_tau > 0.0
         if self._dendritic_enabled:
-            self._alpha_dend = math.exp(-1.0 / dendritic_tau)
+            self._alpha_dend = _decay_per_step(dendritic_tau, "dendritic_tau")
 
         # Input projection
         self.W_in = nn.Linear(hidden_dim, hidden_dim, bias=True)
@@ -1121,6 +1168,7 @@ class FrontendEncoder(nn.Module):
         hidden_dim: int = 64,
         sensory_noise_std: float = 0.0,
         dendritic_tau: float = 0.0,
+        dt_ms: float = 10.0,
     ) -> None:
         """
         Args:
@@ -1128,9 +1176,12 @@ class FrontendEncoder(nn.Module):
             hidden_dim: Hidden representation dimensionality.
             sensory_noise_std: Gaussian noise std for stochastic resonance.
                 0 disables.  Ref: Douglass et al. 1993.
-            dendritic_tau: Time constant for dendritic IIR filter on
-                visual channels.  0 disables.
+            dendritic_tau: Time constant (ms) for dendritic IIR filter on
+                visual channels.  Converted to per-step coefficient via
+                ``exp(-dt_ms/tau_ms)``.  0 disables.
                 Ref: London & Hausser 2005.
+            dt_ms: Sampling interval in ms (physical time base for all
+                time constants).
         """
         super().__init__()
         self.sensory_dim = sensory_dim
@@ -1138,9 +1189,18 @@ class FrontendEncoder(nn.Module):
 
         # ── Dendritic compartmentalization ──
         # Ref: London & Hausser 2005, Annu. Rev. Neurosci.
+        # tau in PHYSICAL ms; per-step coefficient exp(-dt_ms/tau_ms)
+        # (Reviewer Round-1 BLOCKER-1).
+        assert dt_ms > 0.0, f"dt_ms must be > 0, got {dt_ms}"
+        self.dt_ms = float(dt_ms)
+        self.dendritic_tau = dendritic_tau
         self._dendritic_enabled = dendritic_tau > 0.0
         if self._dendritic_enabled:
-            self._alpha_dend = math.exp(-1.0 / dendritic_tau)
+            self._alpha_dend = math.exp(-self.dt_ms / dendritic_tau)
+            assert 0.0 < self._alpha_dend < 1.0, (
+                f"_alpha_dend={self._alpha_dend} out of (0, 1) for "
+                f"dendritic_tau={dendritic_tau} ms at dt={self.dt_ms} ms"
+            )
         else:
             self._alpha_dend = 0.0
 
@@ -1170,6 +1230,11 @@ class FrontendEncoder(nn.Module):
             alpha_dend = self._alpha_dend
 
             dend_state = getattr(self, '_dendritic_state', None)
+            # Round-1 BLOCKER-2 item 3: the caller (NSMoRCore.forward)
+            # now resets _dendritic_state to None at the start of every
+            # forward call unless it explicitly restores autoregressive
+            # state.  The shape check below remains as a secondary
+            # guard for direct FrontendEncoder use.
             if dend_state is None or dend_state.shape != (B, half_d):
                 dend_state = torch.zeros(B, half_d, device=device)
 
@@ -1252,8 +1317,8 @@ class BioDecisionCore(nn.Module):
         lif_alpha: float = 0.9,
         lif_threshold: float = 1.0,
         lif_beta: float = 0.5,
-        lif_abs_refract_steps: int = 0,
-        lif_rel_refract_steps: int = 0,
+        lif_abs_refract_ms: float = 0.0,
+        lif_rel_refract_ms: float = 20.0,
         lif_tau_syn: float = 0.0,
         lif_v_rest: float = 0.0,
         lif_v_reset: Optional[float] = None,
@@ -1263,8 +1328,10 @@ class BioDecisionCore(nn.Module):
         lif_tau_rec: float = 0.0,
         lif_U_stp_init: float = 0.5,
         lif_lateral_inhibition: float = 0.0,
+        lif_inhib_tau_ms: float = 50.0,
         gru_neuromod_gain: float = 0.0,
         lif_tbptt_steps: int = 64,
+        dt_ms: float = 10.0,
     ) -> None:
         """
         Args:
@@ -1275,28 +1342,31 @@ class BioDecisionCore(nn.Module):
             lif_alpha: LIF leak factor.
             lif_threshold: LIF spike threshold.
             lif_beta: LIF input scaling.
-            lif_abs_refract_steps: LIF absolute refractory period (timesteps; 0=disabled).
-            lif_rel_refract_steps: LIF relative refractory decay length (timesteps; 0=disabled).
-            lif_tau_syn: LIF synaptic time constant (dt units; 0=bypasses).
+            lif_abs_refract_ms: LIF absolute refractory period (ms; 0=disabled).
+            lif_rel_refract_ms: LIF relative refractory decay length (ms; 0=disabled).
+            lif_tau_syn: LIF synaptic time constant (ms; 0=bypasses).
             lif_v_rest: LIF resting membrane potential.
             lif_v_reset: LIF fixed reset potential (None=soft reset).
-            lif_tau_w: LIF adaptation time constant (0=disabled).
+            lif_tau_w: LIF adaptation time constant (ms; 0=disabled).
             lif_b_adapt: LIF spike-triggered adaptation increment (0=disabled).
             lif_tau_fac: LIF STP facilitation time constant (0=disabled).
-            lif_tau_rec: LIF STP recovery time constant (0=disabled).
+            lif_tau_rec: LIF STP recovery time constant (ms; 0=disabled).
             lif_U_stp_init: LIF STP baseline utilization.
             lif_lateral_inhibition: LIF lateral inhibition strength (0=disabled).
             gru_neuromod_gain: Neuromodulatory gain strength on GRU (0=disabled).
             lif_tbptt_steps: Truncated BPTT window for LIF (0=full BPTT).
+            dt_ms: Sampling interval in ms (physical time base for all
+                LIF time constants).
         """
         super().__init__()
         self.hidden_dim = hidden_dim
         self.mcmc_dim = mcmc_dim
+        self.dt_ms = float(dt_ms)
 
         self.lif_cell = LIFCell(
             hidden_dim, lif_alpha, lif_threshold, lif_beta,
-            abs_refract_steps=lif_abs_refract_steps,
-            rel_refract_steps=lif_rel_refract_steps,
+            abs_refract_ms=lif_abs_refract_ms,
+            rel_refract_ms=lif_rel_refract_ms,
             tau_syn=lif_tau_syn,
             v_rest=lif_v_rest,
             v_reset=lif_v_reset,
@@ -1306,7 +1376,9 @@ class BioDecisionCore(nn.Module):
             tau_rec=lif_tau_rec,
             U_stp_init=lif_U_stp_init,
             lateral_inhibition=lif_lateral_inhibition,
+            inhib_tau_ms=lif_inhib_tau_ms,
             dendritic_tau=0.0,  # dendritic filtering is in FrontendEncoder
+            dt_ms=dt_ms,
         )
         self.gru_unit = GRUUnit(hidden_dim, num_gru_layers, dropout)
         self.router = MoRRouter(hidden_dim, mcmc_dim)
@@ -1650,8 +1722,8 @@ class NSMoRCore(nn.Module):
         lif_alpha: float = 0.9,
         lif_threshold: float = 1.0,
         lif_beta: float = 0.5,
-        lif_abs_refract_steps: int = 0,
-        lif_rel_refract_steps: int = 0,
+        lif_abs_refract_ms: float = 0.0,
+        lif_rel_refract_ms: float = 20.0,
         lif_tau_syn: float = 0.0,
         lif_v_rest: float = 0.0,
         lif_v_reset: Optional[float] = None,
@@ -1661,15 +1733,18 @@ class NSMoRCore(nn.Module):
         lif_tau_rec: float = 0.0,
         lif_U_stp_init: float = 0.5,
         lif_lateral_inhibition: float = 0.0,
+        lif_inhib_tau_ms: float = 50.0,
         lif_dendritic_tau: float = 0.0,
         gru_neuromod_gain: float = 0.0,
         sensory_noise_std: float = 0.0,
         lif_tbptt_steps: int = 64,
+        dt_ms: float = 10.0,
     ) -> None:
         super().__init__()
         self.sensory_dim = sensory_dim
         self.mcmc_dim = mcmc_dim
         self.hidden_dim = hidden_dim
+        self.dt_ms = float(dt_ms)
 
         # ── Hybrid Funnel: two-stage composition ──
         self.frontend = FrontendEncoder(
@@ -1677,6 +1752,7 @@ class NSMoRCore(nn.Module):
             hidden_dim=hidden_dim,
             sensory_noise_std=sensory_noise_std,
             dendritic_tau=lif_dendritic_tau,
+            dt_ms=dt_ms,
         )
         self.backend = BioDecisionCore(
             hidden_dim=hidden_dim,
@@ -1686,8 +1762,8 @@ class NSMoRCore(nn.Module):
             lif_alpha=lif_alpha,
             lif_threshold=lif_threshold,
             lif_beta=lif_beta,
-            lif_abs_refract_steps=lif_abs_refract_steps,
-            lif_rel_refract_steps=lif_rel_refract_steps,
+            lif_abs_refract_ms=lif_abs_refract_ms,
+            lif_rel_refract_ms=lif_rel_refract_ms,
             lif_tau_syn=lif_tau_syn,
             lif_v_rest=lif_v_rest,
             lif_v_reset=lif_v_reset,
@@ -1697,8 +1773,10 @@ class NSMoRCore(nn.Module):
             lif_tau_rec=lif_tau_rec,
             lif_U_stp_init=lif_U_stp_init,
             lif_lateral_inhibition=lif_lateral_inhibition,
+            lif_inhib_tau_ms=lif_inhib_tau_ms,
             gru_neuromod_gain=gru_neuromod_gain,
             lif_tbptt_steps=lif_tbptt_steps,
+            dt_ms=dt_ms,
         )
 
         # ── Backward-compatible attribute aliases ──
@@ -1747,11 +1825,21 @@ class NSMoRCore(nn.Module):
         sensory_x = X_batch[:, :, :self.sensory_dim]
         mcmc_prior = X_batch[:, :, self.sensory_dim:]
 
-        # ── Restore frontend dendritic state (autoregressive mode) ──
-        if states is not None and self.frontend._dendritic_enabled:
-            dend_in = states.get("frontend_dendritic_state", None)
-            if dend_in is not None:
-                self.frontend._dendritic_state = dend_in
+        # ── Frontend dendritic state handling ────────────────────
+        # Round-1 BLOCKER-2 item 3: the module-level
+        # ``FrontendEncoder._dendritic_state`` persisted across forward
+        # calls, so batch N's end-of-sequence filter state leaked into
+        # batch N+1's first frames whenever batch sizes matched (the
+        # shape check inside FrontendEncoder.forward only re-initialises
+        # on mismatch).  Set it explicitly EVERY call: to the restored
+        # value in autoregressive mode, otherwise to None so the IIR
+        # starts from zero at each sequence.
+        if self.frontend._dendritic_enabled:
+            dend_in = (
+                states.get("frontend_dendritic_state", None)
+                if states is not None else None
+            )
+            self.frontend._dendritic_state = dend_in
 
         # ── Stage 1: Frontend encoding ──
         e_sensory = self.frontend(sensory_x, lengths)
@@ -1927,8 +2015,8 @@ def _test_forward_pass() -> None:
         sensory_dim=4, mcmc_dim=4, hidden_dim=H,
         num_gru_layers=1, dropout=0.1,
         lif_alpha=0.9, lif_threshold=1.0, lif_beta=0.5,
-        lif_abs_refract_steps=2,
-        lif_rel_refract_steps=5,
+        lif_abs_refract_ms=2.0,
+        lif_rel_refract_ms=50.0,
         lif_tau_syn=2.0,
         lif_v_rest=0.0,
     ).to(device)
@@ -2126,8 +2214,8 @@ def _test_forward_pass() -> None:
     print("\n  --- Autoregressive state (no STP) ---")
     model_ar = NSMoRCore(
         hidden_dim=H,
-        lif_abs_refract_steps=2,
-        lif_rel_refract_steps=5,
+        lif_abs_refract_ms=2.0,
+        lif_rel_refract_ms=50.0,
         lif_tau_syn=2.0,
     )
     model_ar.eval()

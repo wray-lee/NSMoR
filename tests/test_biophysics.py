@@ -190,14 +190,21 @@ class TestBiophysics:
         torch.manual_seed(42)
         baseline = 0.5
         delta_theta_ratio = 0.3  # matches the code: _delta_theta = 0.3 * v_threshold
-        rel_refract_steps = 5
+        # Round-3 (Reviewer B MAJOR-1): refractory declared in ms; the
+        # model converts to steps via ceil(ms / dt_ms).  50 ms at
+        # dt=10 ms -> rel_refract_steps == 5, matching the previous
+        # frame-unit declaration.
+        rel_refract_ms = 50.0
         expected_elevated = baseline + delta_theta_ratio * baseline  # 0.65
 
         model = NSMoRCore(
             hidden_dim=self.H,
-            lif_rel_refract_steps=rel_refract_steps,
+            lif_rel_refract_ms=rel_refract_ms,
             lif_beta=5.0,
             lif_threshold=baseline,
+        )
+        assert model.lif_cell.rel_refract_steps == 5, (
+            "ceil(50 ms / dt=10 ms) must yield 5 steps"
         )
         model.eval()
 
@@ -254,7 +261,7 @@ class TestBiophysics:
         # k_rel = 1/5 = 0.2, so after 25 steps: exp(-5) = 0.007 → threshold ≈ baseline.
         thresholds_over_time = []
         current_state = state_after2
-        for _ in range(rel_refract_steps * 5):
+        for _ in range(model.lif_cell.rel_refract_steps * 5):
             _, current_state = model.lif_cell(
                 torch.zeros(1, self.H), current_state,
             )
@@ -411,7 +418,7 @@ class TestBiophysics:
         contains the effective threshold values from the LIF cell."""
         model = NSMoRCore(
             hidden_dim=self.H,
-            lif_rel_refract_steps=5,
+            lif_rel_refract_ms=50.0,
             lif_lateral_inhibition=0.1,
             lif_beta=5.0,          # ensure spiking
             lif_threshold=0.5,     # ensure spiking
@@ -536,8 +543,8 @@ class TestBiophysics:
             lif_b_adapt=0.05,
             lif_tau_fac=20.0,
             lif_tau_rec=200.0,
-            lif_abs_refract_steps=2,
-            lif_rel_refract_steps=5,
+            lif_abs_refract_ms=20.0,
+            lif_rel_refract_ms=50.0,
             lif_beta=5.0,          # ensure spiking
             lif_threshold=0.5,     # ensure spiking
         )
@@ -1173,11 +1180,38 @@ class TestBiophysics:
         params = _extract_model_params(incomplete)
         assert len(params) == len(_NS_MOR_PARAM_DEFAULTS)
         # Verify defaults are filled
-        assert params["lif_abs_refract_steps"] == 0
+        assert params["lif_abs_refract_ms"] == 0.0
+        assert params["lif_rel_refract_ms"] == 20.0
         assert params["lif_tau_fac"] == 0.0
         assert params["lif_lateral_inhibition"] == 0.0
         assert params["gru_neuromod_gain"] == 0.0
         assert params["sensory_noise_std"] == 0.0
+
+    def test_model_utils_legacy_frame_unit_conversion(self):
+        """Round-3 (Reviewer B MAJOR-1): frame-unit checkpoint keys are
+        converted to ms via the checkpoint's own dt_ms, never silently
+        dropped or reinterpreted."""
+        from nsmor.model_utils import _extract_model_params
+        legacy = {
+            "hidden_dim": 32,
+            "dt_ms": 10.0,
+            "lif_abs_refract_steps": 2,
+            "lif_rel_refract_steps": 5,
+        }
+        params = _extract_model_params(legacy)
+        assert params["lif_abs_refract_ms"] == 20.0
+        assert params["lif_rel_refract_ms"] == 50.0
+
+        # Zero-step legacy values map to disabled (0.0 ms)
+        legacy_zero = {
+            "hidden_dim": 32,
+            "dt_ms": 10.0,
+            "lif_abs_refract_steps": 0,
+            "lif_rel_refract_steps": 0,
+        }
+        params_zero = _extract_model_params(legacy_zero)
+        assert params_zero["lif_abs_refract_ms"] == 0.0
+        assert params_zero["lif_rel_refract_ms"] == 0.0
 
     def test_model_utils_params_sync_with_constructor(self):
         """CF5: _NS_MOR_PARAM_DEFAULTS is always in sync with NSMoRCore.__init__."""

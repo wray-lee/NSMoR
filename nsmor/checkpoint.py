@@ -15,6 +15,51 @@ from typing import Any, Dict, Optional, Union
 import torch
 import torch.nn as nn
 
+from nsmor.config import PIPELINE_SEMANTICS_VERSION
+
+
+# ═══════════════════════════════════════════════════════════════
+# Provenance guard (Round-2 CRITICAL-A)
+# ═══════════════════════════════════════════════════════════════
+
+def _require_pipeline_version(
+    found: Optional[str],
+    artifact_description: str,
+) -> None:
+    """
+    Reject artifacts produced under a different (or unknown) pipeline
+    semantics version.
+
+    A pre-2.0 checkpoint interprets LIF time constants in FRAME units;
+    loading it under the ms-semantics code silently runs a different
+    biophysical system.  A pre-2.0 dataset carries same-sample-leaked
+    MCMC priors and np.max-based labels.  Both failure modes are silent
+    at load time, so the only safe behaviour is to refuse the artifact.
+
+    Args:
+        found: The version string stored in the artifact (may be None).
+        artifact_description: Human-readable identifier for error text.
+
+    Raises:
+        RuntimeError: If the version is missing or mismatched.
+    """
+    if found is None:
+        raise RuntimeError(
+            f"{artifact_description} has no 'pipeline_semantics_version' "
+            f"stamp: it was produced by pre-2.0 code whose scientific "
+            f"semantics (tau units, labeling criteria, MCMC prior "
+            f"generation) are INCOMPATIBLE with the current pipeline. "
+            f"Re-run data preparation / training with the current code "
+            f"before using this artifact."
+        )
+    if str(found) != PIPELINE_SEMANTICS_VERSION:
+        raise RuntimeError(
+            f"{artifact_description} was produced under pipeline "
+            f"semantics v{found}, but the running code implements "
+            f"v{PIPELINE_SEMANTICS_VERSION}. Refusing to mix semantics. "
+            f"Regenerate the artifact with the current pipeline."
+        )
+
 
 # ═══════════════════════════════════════════════════════════════
 # Save
@@ -73,6 +118,12 @@ def save_checkpoint(
         "loss": loss,
         "rng_state": torch.get_rng_state(),
         "config": config,
+        # Round-2 CRITICAL-A fix: provenance stamp.  Loaders reject
+        # checkpoints lacking this key or carrying a different
+        # semantics version — a pre-2.0 checkpoint interprets its
+        # time constants in FRAME units and would silently run a
+        # different biophysical system under the new code.
+        "pipeline_semantics_version": PIPELINE_SEMANTICS_VERSION,
     }
 
     if train_loss is not None:
@@ -131,6 +182,12 @@ def load_checkpoint(
         raise FileNotFoundError(f"Checkpoint not found: {path}")
 
     checkpoint = torch.load(path, map_location=map_location, weights_only=False)
+
+    # ── Provenance check (Round-2 CRITICAL-A) ──
+    _require_pipeline_version(
+        checkpoint.get("pipeline_semantics_version"),
+        f"checkpoint {path}",
+    )
 
     # ── Restore model ──
     model.load_state_dict(checkpoint["model_state_dict"])

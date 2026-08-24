@@ -11,7 +11,22 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional, Tuple
 
+import logging
+
 import numpy as np
+from scipy.stats import norm as _scipy_norm
+
+logger = logging.getLogger(__name__)
+
+
+def _norm_ppf(p: float) -> float:
+    """Standard normal quantile (scipy is a hard project dependency)."""
+    return float(_scipy_norm.ppf(p))
+
+
+def _norm_cdf(z: float) -> float:
+    """Standard normal CDF."""
+    return float(_scipy_norm.cdf(z))
 
 
 def bootstrap_ci(
@@ -21,6 +36,7 @@ def bootstrap_ci(
     ci_level: float = 0.95,
     seed: int = 42,
     block_size: Optional[int] = None,
+    method: str = "percentile",
 ) -> Tuple[float, float, float]:
     """
     Compute bootstrap confidence interval for a statistic.
@@ -42,21 +58,12 @@ def bootstrap_ci(
 
     .. note::
 
-        **Boundary behavior (Reviewer B #3):** When ``n`` is not evenly
-        divisible by ``block_size``, the concatenation of resampled
-        blocks is truncated to length ``n``.  This means the final
-        ``n % block_size`` observations may have different resampling
-        probabilities from the rest, introducing a minor but systematic
-        boundary bias.  The standard Künsch (1989) moving-blocks
-        bootstrap uses ``n - block_size + 1`` overlapping blocks and
-        always samples complete blocks; the circular bootstrap
-        (Politis & Romano 1992, JASA 87:130-138) wraps around to
-        eliminate boundary effects entirely.  The current implementation
-        is a valid but non-standard truncation variant.  For typical
-        ``block_size = 5-10`` with eigenvalue sequences of length
-        ~50-200, fewer than 20% of observations are affected.  For
-        stricter scientific requirements, consider switching to the
-        circular bootstrap.
+        **Boundary behavior (Reviewer B #3, Round-1 MINOR-C fix):** the
+        block resampling is *circular* (Politis & Romano 1992, JASA
+        87:130-138): block start indices wrap around the end of the
+        series, so every observation has identical marginal resampling
+        probability and the truncation boundary bias of a plain
+        moving-blocks scheme is eliminated entirely.
 
     Recommended block sizes for eigenvalue sequences:
         - Membrane time constant tau = -1/ln(alpha) ≈ 9.5 steps
@@ -73,10 +80,34 @@ def bootstrap_ci(
         block_size: Block length for block-bootstrap.  ``None``
             (default) uses standard i.i.d. bootstrap.  Typical: 5-10
             for temporally correlated eigenvalue sequences.
+        method: ``"percentile"`` (default) or ``"bca"``.  Round-2 fix
+            (Reviewer A MINOR-K): the percentile interval is only
+            second-order accurate; the bias-corrected and accelerated
+            (BCa) interval corrects for estimator bias and skewness of
+            the bootstrap distribution (Efron 1987, JASA 82:171-185)
+            and attains better coverage when the bootstrap distribution
+            is skewed — as it typically is for MSE statistics.
+            BCa requires jackknife recomputation, so it costs O(n)
+            extra statistic evaluations.  Only supported for the i.i.d.
+            branch; block-bootstrap callers keep percentile intervals.
 
     Returns:
         ``(point_estimate, ci_lower, ci_upper)`` tuple.
+
+    Raises:
+        ValueError: If ``method`` is unknown or ``method="bca"`` is
+            combined with ``block_size`` (not defined for circular
+            blocks), or if fewer than 3 observations are supplied for
+            BCa (acceleration undefined).
     """
+    if method not in ("percentile", "bca"):
+        raise ValueError(f"Unknown CI method: {method!r}")
+    if method == "bca" and block_size is not None:
+        raise ValueError(
+            "method='bca' is not defined for block-bootstrap; use "
+            "method='percentile' with block_size."
+        )
+
     rng = np.random.RandomState(seed)
     point = statistic_fn(data)
     n = len(data)
@@ -84,18 +115,18 @@ def bootstrap_ci(
     boot_stats = np.empty(n_bootstrap)
 
     if block_size is not None and block_size > 1 and block_size <= n:
-        # ── Block-bootstrap for correlated data ──────────────────
-        # Resample contiguous blocks of `block_size` observations.
-        # The number of possible block start indices is n - block_size + 1.
+        # ── Circular block-bootstrap for correlated data ─────────
+        # Politis & Romano 1992: block start indices are drawn from the
+        # full circular range [0, n-1]; blocks that run past the end of
+        # the series wrap around (index modulo n).  Every observation
+        # then has identical marginal resampling probability, removing
+        # the truncation boundary bias of the moving-blocks variant.
         n_blocks_needed = int(np.ceil(n / block_size))
-        max_start = n - block_size  # last valid start index
 
         for i in range(n_bootstrap):
-            # Sample block start indices with replacement
-            starts = rng.randint(0, max_start + 1, size=n_blocks_needed)
-            # Concatenate blocks and truncate to original length
+            starts = rng.randint(0, n, size=n_blocks_needed)
             indices = np.concatenate([
-                np.arange(s, s + block_size) for s in starts
+                (np.arange(s, s + block_size) % n) for s in starts
             ])[:n]
             sample = data[indices]
             boot_stats[i] = statistic_fn(sample)
@@ -106,8 +137,103 @@ def bootstrap_ci(
             boot_stats[i] = statistic_fn(sample)
 
     alpha = 1.0 - ci_level
-    ci_lower = float(np.percentile(boot_stats, 100 * alpha / 2))
-    ci_upper = float(np.percentile(boot_stats, 100 * (1 - alpha / 2)))
+
+    if method == "bca":
+        # ── BCa correction (Efron 1987) ─────────────────────────
+        # Bias correction z0: proportion of bootstrap statistics below
+        # the point estimate, mapped through the normal quantile.
+        #
+        # Round-3 fix (Reviewer A MAJ-3A): a degenerate bootstrap
+        # distribution (every replicate equal to the point estimate,
+        # e.g. constant data) previously fell through to z0=0 — the
+        # interval silently collapsed to the point value and LOOKED
+        # like high precision.  A zero-width "95% CI" is misinformation,
+        # not conservatism, so degeneracy now raises.
+        n_degenerate = int(np.sum(boot_stats == point))
+        if n_degenerate == n_bootstrap:
+            raise ValueError(
+                "BCa is undefined for a degenerate bootstrap "
+                f"distribution (all {n_bootstrap} replicates equal the "
+                "point estimate).  The CI would collapse to a single "
+                "value and masquerade as precision; check whether the "
+                "data are constant or the statistic is broken."
+            )
+
+        prop_below = float(np.mean(boot_stats < point))
+        # Round-3 fix (Reviewer B MINOR-1): prop_below ∈ {0, 1} is the
+        # EXTREME bias signal, not "no bias" — clamping z0 to 0 there
+        # pretends the estimator is unbiased exactly when it is most
+        # biased.  Keep the extreme z0 and warn; the interval widens
+        # honestly.
+        if prop_below <= 0.0:
+            logger.warning(
+                "BCa: no bootstrap replicate reached the point estimate "
+                "(prop_below=0) — extreme positive bias correction "
+                "applied (z0 = -8)."
+            )
+            z0 = -8.0
+        elif prop_below >= 1.0:
+            logger.warning(
+                "BCa: every bootstrap replicate below the point estimate "
+                "(prop_below=1) — extreme negative bias correction "
+                "applied (z0 = +8)."
+            )
+            z0 = 8.0
+        else:
+            z0 = _norm_ppf(prop_below)
+
+        # Acceleration a: from jackknife leave-one-out estimates,
+        # a = sum(tau_i - tau_dot)^3 / (6 * [sum(tau_i - tau_dot)^2]^1.5)
+        data_arr = np.asarray(data, dtype=np.float64)
+        if n < 3:
+            raise ValueError(
+                f"BCa requires at least 3 observations, got {n}."
+            )
+        jack = np.array([
+            statistic_fn(np.delete(data_arr, i)) for i in range(n)
+        ])
+        jack_mean = float(jack.mean())
+        d = jack - jack_mean
+        denom_sq = float(np.sum(d ** 2))
+        if denom_sq <= np.finfo(float).eps:
+            # Degenerate jackknife (statistic insensitive to single
+            # points): fall back to plain bias-corrected interval.
+            a = 0.0
+        else:
+            a = float(np.sum(d ** 3)) / (
+                6.0 * denom_sq ** 1.5
+            )
+
+        # Corrected percentiles
+        def _bca_pct(p_tail: float) -> float:
+            z_alpha = _norm_ppf(p_tail)
+            denom = 1.0 - a * (z0 + z_alpha)
+            # Round-3 fix (Reviewer B MINOR-1): a denominator crossing
+            # zero means the acceleration correction is singular — the
+            # BCa transform is undefined, not merely "extreme".  Warn;
+            # the sign of the residual denominator decides which side
+            # the percentile saturates to (clamped below).
+            if abs(denom) < 1e-8:
+                logger.warning(
+                    "BCa: acceleration correction singular "
+                    "(1 - a(z0+z_alpha) = 0 at tail %.3f); interval "
+                    "saturates to the nearest bootstrap order statistic.",
+                    p_tail,
+                )
+            adj = z0 + (z0 + z_alpha) / denom
+            return float(_norm_cdf(adj))
+
+        pct_lo = _bca_pct(alpha / 2)
+        pct_hi = _bca_pct(1 - alpha / 2)
+        # Clamp AFTER the singularity warning; saturation to 0/1 maps
+        # to the extreme bootstrap order statistics.
+        pct_lo = min(max(pct_lo, 0.0), 1.0)
+        pct_hi = min(max(pct_hi, 0.0), 1.0)
+        ci_lower = float(np.percentile(boot_stats, 100 * pct_lo))
+        ci_upper = float(np.percentile(boot_stats, 100 * pct_hi))
+    else:
+        ci_lower = float(np.percentile(boot_stats, 100 * alpha / 2))
+        ci_upper = float(np.percentile(boot_stats, 100 * (1 - alpha / 2)))
 
     return float(point), ci_lower, ci_upper
 
@@ -160,35 +286,54 @@ def cohens_d(group1: np.ndarray, group2: np.ndarray, paired: bool = False) -> fl
 
 def holm_bonferroni(p_values: Dict[str, float]) -> Dict[str, Tuple[float, bool]]:
     """
-    Apply Holm-Bonferroni correction for multiple comparisons.
+    Apply Holm-Bonferroni step-down correction for multiple comparisons.
 
     Controls the family-wise error rate (FWER) at the given alpha level.
+
+    Round-1 fix (Reviewer A MAJOR-1): the previous implementation only
+    enforced monotonicity of adjusted p-values and then compared every
+    hypothesis against alpha uniformly.  That is *not* the Holm
+    procedure: Holm is a step-down test where hypotheses are tested in
+    ascending p-order with per-rank thresholds alpha/(m - rank), and
+    the first non-rejection stops the procedure — all later (larger-p)
+    hypotheses are automatically non-significant regardless of their
+    individual adjusted p-values.  This implementation applies that
+    linkage explicitly.
 
     Args:
         p_values: Dict mapping test name to uncorrected p-value.
 
     Returns:
-        Dict mapping test name to ``(corrected_p, significant)`` tuple,
-        where ``significant`` is True if corrected_p < 0.05.
+        Dict mapping test name to ``(adjusted_p, significant)`` tuple,
+        where ``adjusted_p`` is the standard Holm-adjusted p-value and
+        ``significant`` reflects the full step-down rejection rule.
     """
     alpha = 0.05
     m = len(p_values)
     if m == 0:
         return {}
 
-    # Sort by p-value
+    # Sort by ascending p-value
     sorted_items = sorted(p_values.items(), key=lambda x: x[1])
 
     result: Dict[str, Tuple[float, bool]] = {}
     prev_adjusted = 0.0
+    rejecting = True  # step-down gate: once False, never reactivates
     for rank, (name, p) in enumerate(sorted_items):
-        # Holm-Bonferroni: adjusted_p = min(1, (m - rank) * p)
-        # CF2 fix: enforce monotonicity — adjusted p-values must be
-        # non-decreasing.  Without this, rank 2 could be significant
-        # while rank 1 is not, violating the step-down procedure.
+        # Standard Holm-adjusted p: max over j<=rank of (m - j) * p_j,
+        # enforced monotonically (Wright 1992).
         adjusted_p = min(1.0, max(prev_adjusted, (m - rank) * p))
-        result[name] = (adjusted_p, adjusted_p < alpha)
         prev_adjusted = adjusted_p
+
+        # Step-down rejection rule: reject rank r iff all ranks < r were
+        # rejected AND (m - rank) * p_r <= alpha.
+        if rejecting and (m - rank) * p <= alpha:
+            significant = True
+        else:
+            significant = False
+            rejecting = False
+
+        result[name] = (adjusted_p, significant)
 
     return result
 

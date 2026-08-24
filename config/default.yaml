@@ -16,6 +16,13 @@ model:
   hidden_dim: 64          # shared hidden dimension for LIF + GRU
   num_gru_layers: 1       # stacked GRU layers
   dropout: 0.1            # dropout in GRU and decoder
+
+  # Physical sampling interval (ms).  All lif_tau_* below are declared
+  # in PHYSICAL ms and converted internally via alpha = exp(-dt/tau).
+  # Reviewer Round-1 BLOCKER-1: changing the acquisition rate can no
+  # longer silently rescale the biophysics.
+  dt_ms: 10.0             # frame interval (100 Hz imaging)
+
   lif_alpha: 0.9          # LIF leak factor (higher = slower decay)
   lif_threshold: 0.5      # LIF spike threshold
   lif_beta: 2.0           # LIF input scaling
@@ -24,15 +31,21 @@ model:
   # CF9: Tightened to 32 for stability with new biophysical dynamics.
   lif_tbptt_steps: 32    # truncated BPTT window (0=full BPTT, risky for long seqs)
 
-  # CF9: Enable biophysical mechanisms ─────────────────────────
+  # CF9 / Round-1 BLOCKER-1: Enable biophysical mechanisms ──────
+  # All time constants in PHYSICAL milliseconds.
+  #
   # Synaptic delay (Destexhe et al. 1994): IIR low-pass filter on
-  # input current.  tau_syn=5ms at dt≈1ms → alpha_syn ≈ 0.82.
-  # Smooths sharp input transients, prevents membrane voltage spikes.
+  # input current.  tau_syn=5 ms at dt=10 ms → alpha_syn ≈ 0.37.
+  # Cricket escape latency is ~50-100 ms (GI→TTM/CoLa), so a 5 ms
+  # synaptic filter preserves the fast sensory transients that a
+  # frame-unit interpretation (=50 ms effective) would smear out.
   lif_tau_syn: 5.0         # synaptic time constant (ms); 0 = disabled
 
   # Spike-frequency adaptation (Brette & Gerstner 2005, AdEx):
   # Slow adaptation current w accumulates on spike, decays between.
-  # tau_w=100ms → neurons reduce firing during sustained input.
+  # tau_w=100 ms matches spike-frequency adaptation measured in LGI
+  # neurons (Benda & Herz 2003); the previous frame-unit reading
+  # (=1000 ms) exceeded the entire behavioural decision window.
   # b_adapt=0.5 → per-spike adaptation increment.
   lif_tau_w: 100.0         # adaptation time constant (ms); 0 = disabled
   lif_b_adapt: 0.5         # per-spike adaptation increment
@@ -41,6 +54,20 @@ model:
   # population spike history from membrane potential.
   # Strength 0.1 — moderate inhibition, sharpens population response.
   lif_lateral_inhibition: 0.1  # inhibition strength; 0 = disabled
+  # Round-3 (Reviewer B MINOR-6): the inhibitory synaptic decay length
+  # is configuration, not a magic number.  50 ms matches the slow
+  # GABAergic-like feedback window used to smooth the population spike
+  # history; effective tau = max(tau_syn, this value).
+  lif_inhib_tau_ms: 50.0   # lateral-inhibition decay length (ms)
+
+  # Relative refractory period (Bean 2007): threshold elevated up to
+  # 30% above baseline after a spike, decaying over a 20 ms window —
+  # within the 10-50 ms recovery measured in insect giant interneurons.
+  # Round-1 BLOCKER-1: default enabled so the LIF cannot fire every
+  # frame without limit.  Round-3 (Reviewer B MAJOR-1): declared in
+  # PHYSICAL time like every other tau_* parameter; the step count is
+  # derived inside the model via dt_ms.
+  lif_rel_refract_ms: 20.0  # relative refractory decay length (ms; 0 = disabled)
 
   # Stochastic resonance (Douglass et al. 1993): small Gaussian
   # noise injected during training improves subthreshold signal detection.

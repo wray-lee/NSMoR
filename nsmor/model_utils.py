@@ -85,6 +85,43 @@ def _extract_model_params(
     params: Dict[str, Any] = {}
     for key, default in _NS_MOR_PARAM_DEFAULTS.items():
         params[key] = config_dict.get(key, default)
+
+    # Round-3 fix (Reviewer B MAJOR-1): checkpoints saved by the
+    # frame-unit code carry ``lif_abs_refract_steps`` /
+    # ``lif_rel_refract_steps``.  Silently dropping them would disable
+    # the refractory mechanisms; silently reinterpreting them as ms
+    # would rescale the biophysics 5x at dt=10 ms.  Convert explicitly
+    # (steps -> ms via the checkpoint's own dt_ms) and record the
+    # conversion in the log so provenance stays auditable.
+    if "lif_rel_refract_ms" not in config_dict:
+        legacy_steps = config_dict.get("lif_rel_refract_steps")
+        if legacy_steps:
+            dt = float(config_dict.get("dt_ms", params.get("dt_ms", 10.0)))
+            converted_ms = float(legacy_steps) * dt
+            logger.warning(
+                "Checkpoint uses FRAME-unit 'lif_rel_refract_steps=%s'; "
+                "converting to lif_rel_refract_ms=%.1f via its "
+                "dt_ms=%.1f.  Re-save the checkpoint to silence this.",
+                legacy_steps, converted_ms, dt,
+            )
+            params["lif_rel_refract_ms"] = converted_ms
+        elif legacy_steps == 0:
+            params["lif_rel_refract_ms"] = 0.0
+    if "lif_abs_refract_ms" not in config_dict:
+        legacy_steps = config_dict.get("lif_abs_refract_steps")
+        if legacy_steps:
+            dt = float(config_dict.get("dt_ms", params.get("dt_ms", 10.0)))
+            converted_ms = float(legacy_steps) * dt
+            logger.warning(
+                "Checkpoint uses FRAME-unit 'lif_abs_refract_steps=%s'; "
+                "converting to lif_abs_refract_ms=%.1f via its "
+                "dt_ms=%.1f.  Re-save the checkpoint to silence this.",
+                legacy_steps, converted_ms, dt,
+            )
+            params["lif_abs_refract_ms"] = converted_ms
+        elif legacy_steps == 0:
+            params["lif_abs_refract_ms"] = 0.0
+
     return params
 
 
@@ -123,10 +160,35 @@ def load_model_from_checkpoint(
         checkpoint_path, map_location=device, weights_only=False,
     )
 
+    # ── Provenance check (Round-2 CRITICAL-A / m-2) ──
+    # Old checkpoints interpret time constants in FRAME units; loading
+    # them under ms-semantics code silently runs a different system.
+    from nsmor.checkpoint import _require_pipeline_version
+    _require_pipeline_version(
+        checkpoint.get("pipeline_semantics_version"),
+        f"checkpoint {checkpoint_path}",
+    )
+
     # Extract config from checkpoint
     config_dict = checkpoint.get("config", {})
     model_config = config_dict.get("model", {})
     finetune_config = config_dict.get("finetune", {})
+
+    # Round-2 fix (Reviewer B m-2), Round-3 hardening (Reviewer B
+    # MINOR-5): the provenance guard above guarantees a v2.0 stamp, and
+    # every v2.0 save path writes dt_ms explicitly.  A v2.0 checkpoint
+    # WITHOUT dt_ms is therefore corrupted data, not an old friend:
+    # falling back to the constructor default would rescale the
+    # biophysics silently — inconsistent with this pipeline's
+    # reject-don't-degrade philosophy.  Hard error.
+    if "dt_ms" not in model_config:
+        raise ValueError(
+            f"Checkpoint {checkpoint_path} passed the provenance guard "
+            "but its config lacks explicit 'dt_ms'.  Every v2.0 save "
+            "writes dt_ms; this checkpoint is incomplete or corrupted. "
+            "Refusing to fall back to the constructor default (that "
+            "would silently rescale all time constants)."
+        )
 
     # Build model with ALL saved parameters (fills defaults for missing)
     params = _extract_model_params(model_config)
@@ -151,6 +213,33 @@ def load_model_from_checkpoint(
     )
 
     return model
+
+
+# ═══════════════════════════════════════════════════════════════
+# 2b. Dataset provenance guard (Round-2 CRITICAL-A)
+# ═══════════════════════════════════════════════════════════════
+
+def validate_dataset_provenance(dataset: Dict[str, Any], path: Path) -> None:
+    """
+    Assert that a loaded ``nsmor_dataset.pt`` was produced by the
+    current pipeline semantics.
+
+    Pre-2.0 datasets contain same-sample-leaked MCMC priors and
+    ``np.max``-based labels; every downstream analysis run on them is
+    scientifically invalid, so loading must fail loudly.
+
+    Args:
+        dataset: The dict returned by ``torch.load`` on a dataset file.
+        path: File path (for error text only).
+
+    Raises:
+        RuntimeError: If the provenance stamp is missing or mismatched.
+    """
+    from nsmor.checkpoint import _require_pipeline_version
+    _require_pipeline_version(
+        dataset.get("pipeline_semantics_version"),
+        f"dataset {path}",
+    )
 
 
 # ═══════════════════════════════════════════════════════════════

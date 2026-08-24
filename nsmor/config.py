@@ -13,6 +13,33 @@ from typing import ClassVar, Tuple
 
 
 # ──────────────────────────────────────────────────────────────
+# Pipeline provenance (Round-2 CRITICAL-A / m-2)
+# ──────────────────────────────────────────────────────────────
+
+PIPELINE_SEMANTICS_VERSION: str = "2.1"
+"""
+Version tag for the CURRENT scientific semantics of the pipeline.
+
+Bumped to ``2.0`` at Reviewer Round 2 (tau units → physical ms;
+anchored sustained criteria; out-of-fold session-grouped priors).
+
+Bumped to ``2.1`` at Reviewer Round 3 because the labelling BRANCH
+ORDER changed (Reviewer A BLK-3B root-cause fix): classification now
+tests the stimulus-locked escape response FIRST and splits responders
+into PREWALK vs ESCAPE by pre-stimulus locomotion, reserving
+PRE_ACTIVE for non-responders.  The previous pre-active-first order
+structurally absorbed every walking animal into PRE_ACTIVE (the
+mechanism behind PREWALK=0).  Every label of every trial can change
+under this reordering, so all v2.0 datasets and checkpoints are
+scientifically invalid for v2.1 code.
+
+Every checkpoint written by :func:`nsmor.checkpoint.save_checkpoint`
+carries this key; loaders MUST reject artifacts whose version differs
+(or is absent) instead of silently reinterpreting them.
+"""
+
+
+# ──────────────────────────────────────────────────────────────
 # Label definitions
 # ──────────────────────────────────────────────────────────────
 
@@ -88,6 +115,52 @@ class ThresholdConfig:
 
     pre_active_velocity_threshold: float = 0.5
     """Velocity (cm/s) during baseline that indicates spontaneous activity."""
+
+    # Round-2 fix (Reviewer B m-3): sustained-criterion parameters were
+    # bare magic numbers inside labeling._check_sustained_speed; they
+    # are now configuration-owned so the classification semantics are
+    # fully declared and sensitivity-analysable.
+    sustained_min_fraction: float = 0.5
+    """Minimum fraction of frames above threshold within an anchored
+    sustained window.  0.5 tolerates brief sub-threshold dips (sensor
+    dropouts, stride pauses) while demanding genuine sustained
+    locomotion; sensitivity is covered in tests/test_pipeline.py."""
+
+    response_max_latency_ms: float = 200.0
+    """Maximum delay between window start and above-threshold response
+    initiation.  Insect escape latency is ~50-100 ms (GI→TTM/CoLa);
+    200 ms admits the physiological range while excluding late,
+    stimulus-unrelated locomotion.  NOTE: this parameter applies ONLY
+    to the POST-stimulus escape check — see Round-3 MAJ-3A below."""
+
+    # Round-3 fix (Reviewer A MAJ-3A): the PREWALK pre-stimulus check
+    # previously reused ``response_max_latency_ms`` as an anchor search
+    # band, which made "pre-stimulus walking" depend on the animal's
+    # motion state in exactly the 200 ms before onset (animals that
+    # started walking EARLIER were systematically classified as not
+    # prewalking — the mechanism behind the PREWALK=0 collapse).  The
+    # pre-stimulus criterion is now a plain WINDOW FRACTION over the
+    # whole ``[onset - prewalk_sustained_ms, onset)`` interval with its
+    # own configuration-owned parameters.
+    prewalk_min_fraction: float = 0.5
+    """Minimum fraction of frames above the prewalk velocity threshold
+    within the entire pre-stimulus window ``[onset-1000, onset)``.
+    Window-fraction semantics (not latency anchoring) match the
+    behavioural definition of ongoing locomotion."""
+
+    prewalk_min_coverage: float = 0.5
+    """Minimum fraction of the nominal pre-stimulus window that must be
+    populated by actual frames before the fraction criterion is
+    evaluated.  Trials whose recorded baseline covers less than this
+    share of the window cannot support a walking/non-walking decision
+    and fail the PREWALK check conservatively."""
+
+    sustained_anchor_min_frames: int = 2
+    """Minimum number of consecutive above-threshold frames required to
+    establish the response-initiation anchor of the POST-stimulus
+    sustained-speed check (Round-2 MAJOR-C).  2 frames = 20 ms at
+    dt=10 ms: long enough that a single-frame sensor glitch cannot
+    define the window, far below any behavioural timescale."""
 
 
 # ──────────────────────────────────────────────────────────────

@@ -41,6 +41,7 @@ from nsmor.nsmor_dataloader import (
 from nsmor.config import DEFAULT_FEATURE, Label
 from nsmor.model_nsmor_core import NSMoRCore
 from nsmor.model_utils import load_model_from_checkpoint as _shared_load_model
+from nsmor.model_utils import validate_dataset_provenance
 
 # -- Logging ----------------------------------------------------------------
 logging.basicConfig(
@@ -138,6 +139,9 @@ def load_dataset(
 
     logger.info("Loading dataset from %s", dataset_path)
     dataset = torch.load(dataset_path, weights_only=False)
+
+    # Round-2 CRITICAL-A: refuse pre-2.0 datasets (leaked priors, np.max labels)
+    validate_dataset_provenance(dataset, Path(dataset_path))
 
     X_seqs = dataset["X_seqs"]
     Y_seqs = dataset["Y_seqs"]

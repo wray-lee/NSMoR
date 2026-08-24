@@ -2,10 +2,12 @@
 NSMoR Jacobian Eigenvalue Spectrum Analysis — Phase 8.
 
 Computes the Jacobian of the GRU at different trial phases (epochs)
-and plots the eigenvalues on the complex plane (unit circle) to prove
-the continuous integration mechanics of the GRU pathway.
+and plots the eigenvalues on the complex plane (unit circle).
 
-Target: Label.PREWALK trials (sustained locomotion response).
+Target: Label.PREWALK trials (sustained locomotion response) by
+default — the "sustained" epoch hypothesis requires a behaviour that
+actually sustains locomotion.  ESCAPE trials may still be selected
+explicitly via ``--target_class 0``.
 
 Epochs relative to detected stimulus onset:
   1. Early (Baseline):     onset - 1000ms
@@ -15,14 +17,30 @@ Epochs relative to detected stimulus onset:
 Slow-point search: For each epoch, a ±5-frame window is searched to
 find the frame that minimises kinetic energy ||h_{t+1} - h_t||₂.
 
-Hypothesis: During the "Sustained" epoch, eigenvalues should cluster
-near the boundary of the unit circle (Real part ≈ 1), proving the GRU
-operates as a continuous integrator / line attractor.
+Round-1 fixes (Reviewer A BLOCKER-2 / Reviewer B MAJOR-1):
+  * Every candidate slow point is verified against a quasi-fixed-point
+    residual criterion ||GRU(x,h) - h|| < FP_RESIDUAL_THRESHOLD before
+    its spectrum is computed; states failing the check are excluded
+    and reported.  Eigenvalues at non-stationary points do NOT license
+    line-attractor claims.
+  * Surviving candidates additionally pass through
+    ``FixedPointAdapter.test_attractor_convergence`` (perturbation-
+    response verification along top eigendirections).
+  * The docstring/CLI default mismatch (PREWALK vs ESCAPE) is removed.
+  * Input-dependence vs state-dependence is separated: eigenvalue
+    statistics are also reported under a common frozen input (the
+    epoch-pooled median e_sensory), so spectral differences between
+    epochs reflect state changes under an identical map.
+
+Hypothesis: During the "Sustained" epoch, eigenvalues of VERIFIED
+slow points should cluster near the boundary of the unit circle,
+consistent with continuous integration / line attractor operation.
 
 Output: ``results/jacobian_spectrum.png`` at 300 DPI.
 
 Usage
 -----
+
 CLI::
 
     python scripts/analyze_jacobian.py --checkpoint runs/default/best_model.pth
@@ -32,7 +50,9 @@ CLI::
 from __future__ import annotations
 
 import argparse
+import json
 import logging
+import math
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -50,6 +70,7 @@ from nsmor.checkpoint import load_checkpoint
 from nsmor.config import DEFAULT_FEATURE, Label
 from nsmor.model_nsmor_core import NSMoRCore
 from nsmor.model_utils import load_model_from_checkpoint as _shared_load_model
+from nsmor.model_utils import validate_dataset_provenance
 
 # ── Logging ────────────────────────────────────────────────────
 logging.basicConfig(
@@ -110,6 +131,155 @@ EPOCH_DEFINITIONS: Dict[str, Dict[str, float]] = {
 # ── Slow-point search ────────────────────────────────────────
 SLOW_POINT_RADIUS: int = 5   # ±5 frames around each epoch centre
 
+# ── Quasi-fixed-point residual gate (Round-1 BLOCKER-2) ─────
+# Round-3 fix (Reviewer A BLK-3A / B-CRIT-1/2): the Round-2 "Kneedle
+# elbow" threshold was replaced by a 1-D two-component Gaussian mixture
+# model over the log-residuals with BIC model selection.  The elbow of
+# a sorted curve is a purely geometric construct: on the near-uniform
+# residual distributions actually observed it lands at an arbitrary
+# quantile (empirically ~p50), rejecting half of all candidates —
+# including every state in one epoch — while providing no evidence that
+# the rejected states are transients rather than slow points.  A
+# two-component GMM asks the statistically meaningful question: does
+# the residual distribution contain a distinct low-residual
+# subpopulation at all?  If YES (BIC prefers 2 components), the gate is
+# the posterior probability of the low component; if NO (BIC ties or
+# prefers 1 component), there is NO evidence for a slow manifold and
+# the analysis aborts loudly instead of silently keeping an arbitrary
+# subset.
+FP_GMM_RANDOM_SEED: int = 42
+# Sanity cap on the GMM-calibrated boundary: a residual above this value
+# means per-step state displacement comparable to the tanh-bounded state
+# magnitude — no quasi-fixed-point interpretation is possible (Round-3
+# Reviewer B CRIT-2: the cap must exist independently of the calibration
+# so the gate can never talk itself into accepting transients).
+FP_RESIDUAL_THRESHOLD_CAP: float = 0.3
+
+
+def _calibrate_fp_threshold(
+    residuals: np.ndarray,
+    context: str = "",
+) -> Tuple[float, Dict[str, float]]:
+    """
+    Calibrate the fixed-point residual gate by 2-component GMM +
+    BIC model selection on the pooled candidate residuals.
+
+    Args:
+        residuals: 1-D array of candidate residuals ||GRU(x,h) - h||.
+        context: Epoch label for error/log messages.
+
+    Returns:
+        ``(threshold, diagnostics)`` where *threshold* is the residual
+        value whose low-component posterior is 0.5 (the Bayes-optimal
+        separation boundary), and *diagnostics* reports the full
+        distribution (BIC1/BIC2, low-component weight, quantiles) so
+        the calibration is auditable in the persisted summary.
+
+    Raises:
+        ValueError: If fewer than 4 residuals are supplied, or BIC
+            favours ONE component (no distinct quasi-stationary
+            subpopulation exists in this state space), or the fitted
+            boundary exceeds ``FP_RESIDUAL_THRESHOLD_CAP``.
+    """
+    from sklearn.mixture import GaussianMixture
+
+    if residuals.size < 4:
+        raise ValueError(
+            f"Only {residuals.size} candidate residuals collected ({context}) — "
+            "cannot calibrate the fixed-point gate."
+        )
+    r = np.asarray(residuals, dtype=np.float64)
+    # Log-transform: residuals are strictly positive and typically
+    # right-skewed; the mixture structure lives in log space.
+    x_log = np.log(r)[:, None]
+
+    gm1 = GaussianMixture(
+        n_components=1, covariance_type="full", random_state=FP_GMM_RANDOM_SEED,
+    ).fit(x_log)
+    gm2 = GaussianMixture(
+        n_components=2, covariance_type="full", random_state=FP_GMM_RANDOM_SEED,
+    ).fit(x_log)
+
+    bic1, bic2 = float(gm1.bic(x_log)), float(gm2.bic(x_log))
+    diag: Dict[str, float] = {
+        "bic_1comp": bic1,
+        "bic_2comp": bic2,
+        "residual_min": float(r.min()),
+        "residual_p25": float(np.percentile(r, 25)),
+        "residual_median": float(np.median(r)),
+        "residual_p75": float(np.percentile(r, 75)),
+        "residual_max": float(r.max()),
+        "n_candidates": int(r.size),
+    }
+
+    # Model selection: the two-component mixture must WIN by a margin,
+    # not by noise.  ΔBIC > 10 is strong evidence (Kass & Raftery 1995).
+    if bic2 >= bic1 - 10.0:
+        raise ValueError(
+            f"[{context}] BIC does not support a bimodal residual "
+            f"distribution (BIC_1={bic1:.1f}, BIC_2={bic2:.1f}, "
+            f"delta={bic1 - bic2:.1f}, need > +10).  There is NO "
+            f"evidence for a distinct quasi-fixed-point subpopulation "
+            f"in this state space; eigenvalue spectra here cannot "
+            f"support stability claims.  Residual range "
+            f"[{r.min():.4g}, {r.max():.4g}]."
+        )
+
+    means = gm2.means_.ravel()
+    lo_idx, hi_idx = int(np.argmin(means)), int(np.argmax(means))
+    w_lo = float(gm2.weights_[lo_idx])
+    diag["low_component_weight"] = w_lo
+
+    # Boundary where the posterior of the LOW component equals 0.5:
+    # solve log N(x|mu_lo,s_lo) + log w_lo == log N(x|mu_hi,s_hi) + log w_hi.
+    mu_lo, mu_hi = float(means[lo_idx]), float(means[hi_idx])
+    s_lo = float(np.sqrt(gm2.covariances_[lo_idx, 0, 0]))
+    s_hi = float(np.sqrt(gm2.covariances_[hi_idx, 0, 0]))
+    # Quadratic from expanding the two log-densities; take the root
+    # BETWEEN the two means.
+    a = 0.5 / s_hi**2 - 0.5 / s_lo**2
+    b = mu_lo / s_lo**2 - mu_hi / s_hi**2
+    c = (
+        0.5 * mu_hi**2 / s_hi**2 - 0.5 * mu_lo**2 / s_lo**2
+        + np.log(s_lo / s_hi) - np.log(w_lo / gm2.weights_[hi_idx])
+    )
+    if abs(a) < 1e-12:
+        boundary_log = -c / b
+    else:
+        disc = b * b - 4 * a * c
+        if disc < 0:
+            raise ValueError(
+                f"[{context}] GMM components too separated to admit a "
+                f"posterior boundary — degenerate fit."
+            )
+        roots = ((-b - np.sqrt(disc)) / (2 * a),
+                 (-b + np.sqrt(disc)) / (2 * a))
+        between = [rt for rt in roots if mu_lo <= rt <= mu_hi]
+        if not between:
+            raise ValueError(
+                f"[{context}] no GMM posterior boundary between the "
+                f"component means — degenerate fit."
+            )
+        boundary_log = float(between[0])
+
+    threshold = float(np.exp(boundary_log))
+    diag["fp_threshold"] = threshold
+
+    if threshold > FP_RESIDUAL_THRESHOLD_CAP:
+        raise ValueError(
+            f"[{context}] calibrated residual boundary ({threshold:.3f}) "
+            f"exceeds the sanity cap {FP_RESIDUAL_THRESHOLD_CAP:.1f} — "
+            f"no usable quasi-fixed-point population exists in this "
+            f"state space; eigenvalue spectra here cannot support "
+            f"stability claims."
+        )
+    logger.info(
+        "[%s] FP gate CALIBRATED by GMM+BIC: threshold=%.4g, "
+        "BIC_1=%.1f, BIC_2=%.1f, low-comp weight=%.2f",
+        context, threshold, bic1, bic2, w_lo,
+    )
+    return threshold, diag
+
 
 # ═══════════════════════════════════════════════════════════════
 # 1.  Model Loading
@@ -157,6 +327,9 @@ def load_dataset(
 
     logger.info("Loading dataset from %s", dataset_path)
     dataset = torch.load(dataset_path, weights_only=False)
+
+    # Round-2 CRITICAL-A: refuse pre-2.0 datasets (leaked priors, np.max labels)
+    validate_dataset_provenance(dataset, Path(dataset_path))
 
     X_seqs = dataset["X_seqs"]
     Y_seqs = dataset["Y_seqs"]
@@ -304,13 +477,42 @@ def _find_slow_point(
     return slow_frame, gru_hidden[slow_frame]
 
 
+def _fixed_point_residual(
+    adapter: FixedPointAdapter,
+    h_slow: torch.Tensor,
+    x_slow: torch.Tensor,
+) -> float:
+    """
+    One-step GRU residual at a candidate slow point.
+
+    Computes ||GRU(x_slow, h_slow) - h_slow||_2 with the cell in eval
+    mode (no dropout noise).  Round-1 BLOCKER-2: this is the fixed-point
+    verification that was previously missing from the main analysis
+    path — eigenvalue spectra are only computed for candidates passing
+    the FP_RESIDUAL_THRESHOLD gate.
+    """
+    gru_cell = adapter._gru_cell
+    prev_mode = gru_cell.training
+    gru_cell.eval()
+    try:
+        with torch.no_grad():
+            x_seq = x_slow.detach().unsqueeze(0).unsqueeze(0)   # (1, 1, H)
+            h_in = h_slow.detach().unsqueeze(0).unsqueeze(0)    # (1, 1, H)
+            h_next, _ = gru_cell(x_seq, h_in.permute(1, 0, 2))
+            residual = float((h_next.squeeze(0).squeeze(0) - h_slow).norm().item())
+    finally:
+        gru_cell.train(prev_mode)
+    return residual
+
+
 def extract_gru_states_at_epochs(
     model: NSMoRCore,
     dataloader: torch.utils.data.DataLoader,
     device: torch.device,
     onset_frames: List[int],
-    target_class: int = Label.ESCAPE.value,
+    target_class: int = Label.PREWALK.value,
     dt_ms: float = 10.0,
+    adapter: Optional[FixedPointAdapter] = None,
 ) -> Dict[str, Tuple[torch.Tensor, torch.Tensor]]:
     """
     Extract GRU hidden states at specific trial epochs for a target class.
@@ -319,6 +521,25 @@ def extract_gru_states_at_epochs(
     **dynamically detected** stimulus onset, then searches a
     ±``SLOW_POINT_RADIUS`` window for the slow point (minimum
     kinetic energy).
+
+    Round-1 BLOCKER-2 fix: every candidate slow point must pass a
+    quasi-fixed-point residual check before being accepted.  Candidates
+    failing the gate are counted and logged; their spectra would be
+    invalid for line-attractor inference.
+
+    Round-2 fix (Reviewer B M-2a): the gate threshold is CALIBRATED
+    from the candidate-residual distribution instead of a hand-picked
+    constant — see :func:`_calibrate_fp_threshold`.
+
+    Round-3 fix (Reviewer A BLK-3A / B-CRIT-2): the gate is calibrated
+    PER EPOCH on each epoch's own residual distribution.  The previous
+    pooled-across-epochs threshold was statistically incoherent: if
+    epoch A's states are 10x slower than epoch B's, a pooled boundary
+    either rejects all of A or accepts transients from B — exactly
+    what happened (the Sustained epoch lost every one of its states).
+    Each epoch now stands or falls on its OWN distribution; an epoch
+    with no bimodal structure is dropped WITH its recorded reason,
+    never silently.
 
     The input passed to the Jacobian adapter is the **full sensory
     encoding** ``e_sensory_t`` (dim H), i.e. the exact vector the
@@ -331,21 +552,28 @@ def extract_gru_states_at_epochs(
         device: Computation device.
         onset_frames: Per-trial stimulus onset frame indices
             (from :func:`detect_stimulus_onset_frames`).
-        target_class: Label value to filter by (default: WALK).
+        target_class: Label value to filter by
+            (default: PREWALK — sustained locomotion).
         dt_ms: Frame interval in milliseconds.
+        adapter: FixedPointAdapter providing the GRU cell for the
+            residual check.  Created from *model* if omitted.
 
     Returns:
         Dictionary mapping epoch name to ``(h_states, x_inputs)``
-        tuples:
-        - ``h_states``: ``(N, H)`` tensor of hidden states at slow points.
-        - ``x_inputs``: ``(N, H)`` tensor of sensory encoding inputs
-          at those same slow points.
+        tuples, plus per-epoch gate diagnostics attached as
+        ``epoch name + "_gate_diag"`` keys (Round-3 BLK-3A: the
+        calibration evidence is returned alongside the accepted states
+        so the caller can persist it).
 
     Raises:
-        ValueError: If no valid states found for any epoch.
+        ValueError: If no valid states found for ANY epoch after the
+            per-epoch gates (each epoch's failure reason is logged).
     """
     logger.info("Extracting GRU states for class %d (%s) at target epochs...",
                 target_class, Label(target_class).name)
+
+    if adapter is None:
+        adapter = FixedPointAdapter(model, device=device)
 
     # Initialize storage for each epoch
     epoch_states: Dict[str, List[torch.Tensor]] = {
@@ -354,6 +582,8 @@ def extract_gru_states_at_epochs(
     epoch_inputs: Dict[str, List[torch.Tensor]] = {
         name: [] for name in EPOCH_DEFINITIONS
     }
+    n_candidates = 0
+    candidate_records: List[Tuple[str, torch.Tensor, torch.Tensor, float]] = []
 
     model.eval()
 
@@ -378,6 +608,14 @@ def extract_gru_states_at_epochs(
             # The GRU cell receives e_sensory = sensory_encoder(X[:, :, :4]).
             # We encode the FULL sensory slice so that x_t reflects
             # the exact input the GRU saw at each frame.
+            #
+            # Round-1 BLOCKER-2 item 3: FrontendEncoder's dendritic IIR
+            # keeps a module-level cache (_dendritic_state) that leaks
+            # ACROSS forward calls when dendritic filtering is enabled.
+            # Reset it before re-encoding so the filter history starts
+            # from the sequence start, matching the original forward.
+            if getattr(model.sensory_encoder, "_dendritic_enabled", False):
+                model.sensory_encoder._dendritic_state = None
             sensory_x = X_batch[:, :, :model.sensory_dim]  # (B, T, D_sensory)
             e_sensory = model.sensory_encoder(sensory_x)    # (B, T, H)
 
@@ -426,24 +664,93 @@ def extract_gru_states_at_epochs(
                         f"x_slow shape {tuple(x_slow.shape)} != (H={H},)"
                     )
 
-                    epoch_states[epoch_name].append(h_slow.cpu())
-                    epoch_inputs[epoch_name].append(x_slow.cpu())
-
-                    logger.debug(
-                        "  Trial %d epoch '%s': centre=%d, slow=%d, "
-                        "Δframe=%d",
-                        global_idx, epoch_name, centre_frame,
-                        slow_frame, slow_frame - centre_frame,
+                    # ── Round-1 BLOCKER-2: fixed-point residual gate ──
+                    # Round-2 (Reviewer B M-2a): collect ALL candidates
+                    # first; the gate is calibrated from the pooled
+                    # residual distribution after the sweep.
+                    n_candidates += 1
+                    residual = _fixed_point_residual(adapter, h_slow, x_slow)
+                    candidate_records.append(
+                        (epoch_name, h_slow.cpu(), x_slow.cpu(), float(residual))
                     )
 
                 global_idx += 1
 
-    # ── Stack into tensors ────────────────────────────────────
+    # ── Calibrate the fixed-point gate PER EPOCH and filter ──
+    # Round-3 (Reviewer A BLK-3A / B-CRIT-2): each epoch's own residual
+    # distribution is fitted with a 2-component GMM + BIC; an epoch
+    # without bimodal structure is dropped with a recorded reason.  The
+    # previous pooled threshold (a) crashed with NameError when zero
+    # candidates were collected, and (b) applied one boundary across
+    # epochs whose residual scales may differ by orders of magnitude.
+    gate_diagnostics: Dict[str, Dict[str, float]] = {}
+    by_epoch: Dict[str, List[Tuple[torch.Tensor, torch.Tensor, float]]] = {
+        name: [] for name in EPOCH_DEFINITIONS
+    }
+    for rec_epoch, h_slow, x_slow, residual in candidate_records:
+        by_epoch[rec_epoch].append((h_slow, x_slow, residual))
+
+    for epoch_name in EPOCH_DEFINITIONS:
+        recs = by_epoch[epoch_name]
+        if not recs:
+            logger.warning(
+                "Epoch '%s': no slow-point candidates collected — "
+                "dropped (gate reason: no_candidates).", epoch_name,
+            )
+            continue
+
+        res_epoch = np.array([rec[2] for rec in recs])
+        try:
+            fp_threshold, diag = _calibrate_fp_threshold(
+                res_epoch, context=f"epoch {epoch_name}",
+            )
+        except ValueError as exc:
+            # No bimodal structure / degenerate fit: this epoch provides
+            # no evidence for quasi-fixed points.  Drop it LOUDLY —
+            # its spectra would be invalid for stability claims.
+            logger.warning(
+                "Epoch '%s': fixed-point gate REJECTED all %d "
+                "candidates — %s",
+                epoch_name, len(recs), exc,
+            )
+            continue
+
+        keep = res_epoch < fp_threshold
+        n_rejected = int((~keep).sum())
+        logger.info(
+            "Epoch '%s': residual gate %.4g — %d accepted, %d rejected.",
+            epoch_name, fp_threshold,
+            int(keep.sum()), n_rejected,
+        )
+        # Round-3 (Reviewer B CRITICAL-2.ii): threshold sensitivity —
+        # how stable is the accepted set under a ±25% gate shift?  If
+        # the accepted count swings wildly the spectral comparison
+        # between epochs is fragile and this is recorded.
+        for scale in (0.75, 1.25):
+            n_alt = int((res_epoch < fp_threshold * scale).sum())
+            diag[f"n_accept_at_{int(scale*100)}pct"] = float(n_alt)
+        if any(
+            diag.get(f"n_accept_at_{int(s*100)}pct", int(keep.sum()))
+            == 0
+            for s in (0.75, 1.25)
+        ):
+            logger.warning(
+                "Epoch '%s': accepted set is EMPTY at a ±25%% gate "
+                "shift — spectral statistics for this epoch are "
+                "threshold-fragile.", epoch_name,
+            )
+        for h_slow, x_slow, residual in recs:
+            if residual < fp_threshold:
+                epoch_states[epoch_name].append(h_slow)
+                epoch_inputs[epoch_name].append(x_slow)
+        diag["n_accepted"] = int(keep.sum())
+        diag["n_rejected"] = n_rejected
+        gate_diagnostics[epoch_name] = diag
+
     result: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
 
     for epoch_name in EPOCH_DEFINITIONS:
         if not epoch_states[epoch_name]:
-            logger.warning("No valid states found for epoch '%s'.", epoch_name)
             continue
 
         h_stack = torch.stack(epoch_states[epoch_name], dim=0)  # (N, H)
@@ -461,7 +768,18 @@ def extract_gru_states_at_epochs(
         )
 
     if not result:
-        raise ValueError("No valid states found for any epoch.")
+        raise ValueError(
+            "No valid states found for any epoch after the per-epoch "
+            "fixed-point gates.  Gate diagnostics: "
+            + "; ".join(
+                f"{name}: {len(by_epoch[name])} candidates" for name in EPOCH_DEFINITIONS
+            )
+        )
+
+    # Round-3 (BLK-3A): attach per-epoch gate diagnostics under
+    # dedicated keys so the caller can persist the calibration evidence.
+    for epoch_name, diag in gate_diagnostics.items():
+        result[f"{epoch_name}__gate_diag"] = diag  # type: ignore[assignment]
 
     return result
 
@@ -475,7 +793,8 @@ def compute_eigenvalues_at_epochs(
     epoch_data: Dict[str, Tuple[torch.Tensor, torch.Tensor]],
     device: torch.device,
     max_states_per_epoch: int = 100,
-) -> Dict[str, np.ndarray]:
+) -> Tuple[Dict[str, np.ndarray], Dict[str, Dict[str, float]],
+           Dict[str, Dict[str, float]]]:
     """
     Compute Jacobian eigenvalues at each epoch.
 
@@ -487,13 +806,82 @@ def compute_eigenvalues_at_epochs(
             epoch (for computational efficiency).
 
     Returns:
-        Dictionary mapping epoch name to complex eigenvalue array (N, H).
+        ``(eigenvalue_results, attractor_stats, frozen_input_stats)``:
+        - ``eigenvalue_results`` maps epoch name to complex eigenvalue
+          array (N, H).
+        - ``attractor_stats`` maps epoch name to perturbation-response
+          verification counts (Round-2 M-2c: persisted so the attractor
+          claim can be audited alongside the spectra).
+        - ``frozen_input_stats`` maps epoch name to frozen-input control
+          statistics (pass counts + spectral magnitudes).
     """
     logger.info("Computing Jacobian eigenvalues at each epoch...")
 
+    # ── Round-1 BLOCKER-2: attractor verification of accepted states ──
+    # States already passed the quasi-fixed-point residual gate during
+    # extraction; here a subset additionally goes through the
+    # perturbation-response test (convergence along top eigendirections)
+    # so the report can state whether the verified slow points behave
+    # as attractors, not merely as stationary candidates.
+    #
+    # Round-2 fixes (Reviewer B M-2b/MINOR-E):
+    # * n_verified/n_tested are counted PER EPOCH (the previous
+    #   cumulative totals were logged under per-epoch names — misleading
+    #   from the second epoch on).
+    # * The verified subset is drawn RANDOMLY (seeded) rather than
+    #   taking the first min(10, N) states, which inherited
+    #   batch-ordering selection bias.
+    attractor_stats: Dict[str, Dict[str, float]] = {}
+    rng_check = np.random.default_rng(42)
+    # Round-3 (BLK-3A): skip gate-diagnostic entries — epoch_data now
+    # carries "<epoch>__gate_diag" keys alongside state tensors.
+    state_epochs = {
+        name: val for name, val in epoch_data.items()
+        if not name.endswith("__gate_diag")
+    }
+    for epoch_name, (h_states_v, x_inputs_v) in state_epochs.items():
+        Nv = h_states_v.shape[0]
+        n_check = min(10, Nv)
+        check_idx = rng_check.choice(Nv, size=n_check, replace=False)
+        ep_verified = 0
+        for vi in check_idx:
+            is_att, max_res, _mono = adapter.test_attractor_convergence(
+                h_states_v[int(vi)].to(device), x_inputs_v[int(vi)].to(device),
+            )
+            if is_att:
+                ep_verified += 1
+        attractor_stats[epoch_name] = {
+            "n_tested": int(n_check),
+            "n_verified": int(ep_verified),
+            "fraction": float(ep_verified / n_check) if n_check else 0.0,
+        }
+        # Round-3 (Reviewer B MINOR-3): n=10 cannot support a bare
+        # fraction claim — attach a Wilson score interval (Wilson 1927)
+        # so the reported proportion carries its sampling uncertainty.
+        if n_check > 0:
+            z95 = 1.959963984540054
+            p = ep_verified / n_check
+            denom = 1.0 + z95**2 / n_check
+            centre = (p + z95**2 / (2 * n_check)) / denom
+            half = (
+                z95 * math.sqrt(p * (1 - p) / n_check
+                                + z95**2 / (4 * n_check**2)) / denom
+            )
+            attractor_stats[epoch_name]["wilson_ci_95"] = [
+                float(max(0.0, centre - half)),
+                float(min(1.0, centre + half)),
+            ]
+        logger.info(
+            "  Epoch '%s': attractor verification %d/%d passed "
+            "(perturbation-response test)%s.",
+            epoch_name, ep_verified, n_check,
+            f" CI95={attractor_stats[epoch_name]['wilson_ci_95']}"
+            if n_check else "",
+        )
+
     eigenvalue_results: Dict[str, np.ndarray] = {}
 
-    for epoch_name, (h_states, x_inputs) in epoch_data.items():
+    for epoch_name, (h_states, x_inputs) in state_epochs.items():
         N = h_states.shape[0]
         H = h_states.shape[1]
 
@@ -574,7 +962,107 @@ def compute_eigenvalues_at_epochs(
             np.mean(real_parts), np.mean(imag_parts),
         )
 
-    return eigenvalue_results
+    # ── Round-1 fix (Reviewer B MAJOR-1): frozen-input control ──
+    # Re-evaluate every epoch's states under ONE common input (the
+    # epoch-pooled median e_sensory).  Spectral differences surviving
+    # this control are attributable to STATE changes, not to
+    # input-driven shifts of the map.
+    #
+    # Round-2 fix (Reviewer B M-2d): under the FROZEN input the states
+    # are generally no longer quasi-fixed points of the modified map
+    # (the gate was passed under each state's own input).  The control
+    # spectra must therefore be re-gated with the residual check under
+    # x_frozen; states failing it are excluded and the exclusion is
+    # reported.  Without this, frozen-input spectra of transient states
+    # would invite exactly the misreading the control was designed to
+    # rule out.
+    frozen_input_stats: Dict[str, Dict[str, float]] = {}
+    if state_epochs:
+        all_x = torch.cat(
+            [x for (_h, x) in state_epochs.values() if x.shape[0] > 0], dim=0,
+        )
+        x_frozen = all_x.median(dim=0).values.to(device)  # (H,)
+        logger.info(
+            "Frozen-input control: re-evaluating spectra under the "
+            "pooled-median e_sensory (input dependence removed); "
+            "states re-gated against the frozen map."
+        )
+        for epoch_name, (h_states_c, _x_inputs_c) in state_epochs.items():
+            N_c = h_states_c.shape[0]
+            if N_c == 0:
+                continue
+
+            # Re-check quasi-fixed-point residuals under the frozen map.
+            # Round-3 (B-CRIT-2): the frozen map is a DIFFERENT map from
+            # the one each state's gate was calibrated on, so its
+            # residuals get their OWN GMM+BIC calibration.  The Round-2
+            # code referenced a loop-local fp_threshold here that no
+            # longer existed after the Round-3 per-epoch refactor — a
+            # latent NameError, not a gate.  If the frozen-map residual
+            # distribution shows no bimodal structure the spectrum is
+            # withheld with the recorded reason.
+            res_frozen = []
+            for hi in range(N_c):
+                res_frozen.append(float(_fixed_point_residual(
+                    adapter, h_states_c[hi].to(device), x_frozen,
+                )))
+            res_frozen = np.array(res_frozen)
+            try:
+                frozen_threshold, frozen_diag = _calibrate_fp_threshold(
+                    res_frozen,
+                    context=f"frozen-input {epoch_name}",
+                )
+            except ValueError as exc:
+                logger.warning(
+                    "    [frozen-input] %s: re-gate failed — %s "
+                    "(spectrum withheld).",
+                    epoch_name, exc,
+                )
+                frozen_input_stats[epoch_name] = {
+                    "n_pass": 0, "n_total": int(N_c),
+                    "gate_status": 0.0,
+                }
+                continue
+            keep_mask = res_frozen < frozen_threshold
+            logger.info(
+                "    [frozen-input] %s: %d/%d states pass the residual "
+                "gate under the frozen map (median residual %.4f).",
+                epoch_name, int(keep_mask.sum()), N_c,
+                float(np.median(res_frozen)),
+            )
+
+            if keep_mask.sum() < 2:
+                logger.warning(
+                    "    [frozen-input] %s: too few stationary states "
+                    "under the frozen map — spectrum withheld.",
+                    epoch_name,
+                )
+                frozen_input_stats[epoch_name] = {
+                    "n_pass": int(keep_mask.sum()), "n_total": int(N_c),
+                }
+                continue
+
+            h_keep = h_states_c.to(device)[torch.from_numpy(
+                np.nonzero(keep_mask)[0]).to(device)]
+            x_rep = x_frozen.unsqueeze(0).expand(h_keep.shape[0], -1)
+            J_frozen = adapter.compute_jacobian_batch(h_keep, x_rep)
+            eig_frozen = torch.linalg.eigvals(J_frozen)
+            mags_frozen = eig_frozen.abs().flatten()
+            frozen_input_stats[epoch_name] = {
+                "n_pass": int(keep_mask.sum()),
+                "n_total": int(N_c),
+                "mag_mean": float(mags_frozen.mean()),
+                "mag_max": float(mags_frozen.max()),
+                # Round-3 (B-CRIT-2): persist the frozen-map gate
+                # threshold so the re-gating is auditable.
+                "frozen_gate_threshold": float(frozen_threshold),
+            }
+            logger.info(
+                "    [frozen-input] %s: |λ|_mean=%.4f, |λ|_max=%.4f",
+                epoch_name, float(mags_frozen.mean()), float(mags_frozen.max()),
+            )
+
+    return eigenvalue_results, attractor_stats, frozen_input_stats
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -587,7 +1075,7 @@ def compute_full_system_eigenvalues(
     dataloader: torch.utils.data.DataLoader,
     device: torch.device,
     onset_frames: List[int],
-    target_class: int = Label.ESCAPE.value,
+    target_class: int = Label.PREWALK.value,
     dt_ms: float = 10.0,
     max_states_per_epoch: int = 100,
 ) -> Dict[str, np.ndarray]:
@@ -926,8 +1414,14 @@ def plot_eigenvalue_spectrum(
         )
 
     # ── Suptitle ──────────────────────────────────────────────
+    # Round-1 fix (Reviewer B MAJOR-2): the figure title must state
+    # the mathematical scope explicitly.  This figure shows EXACT
+    # autograd Jacobian eigenvalues of the GRU pathway only; any
+    # full-system surrogate-gradient singular values belong to a
+    # separate figure and carry no stability interpretation.
     fig.suptitle(
-        "Jacobian Eigenvalue Spectrum — GRU Pathway Dynamics",
+        "Jacobian Eigenvalue Spectrum — GRU Pathway (exact, "
+        "autograd ∂h$_{t+1}$/∂h$_t$)",
         fontsize=14,
         fontweight="bold",
         color=AXIS_COLOR,
@@ -952,7 +1446,7 @@ def run_jacobian_analysis(
     checkpoint_path: Path,
     dataset_path: Path,
     output_path: Path,
-    target_class: int = Label.ESCAPE.value,
+    target_class: int = Label.PREWALK.value,
     batch_size: int = 32,
     max_seq_len: Optional[int] = 1000,
     dt_ms: float = 10.0,
@@ -966,7 +1460,9 @@ def run_jacobian_analysis(
         checkpoint_path: Path to the trained model checkpoint.
         dataset_path: Path to the preprocessed dataset.
         output_path: Path to save the spectrum figure.
-        target_class: Label value to analyze (default: WALK).
+        target_class: Label value to analyze (default: PREWALK=1,
+            sustained locomotion — required by the "Sustained epoch"
+            line-attractor hypothesis).
         batch_size: Batch size for data loading.
         dt_ms: Frame interval in milliseconds.
         max_states_per_epoch: Maximum states to process per epoch.
@@ -994,14 +1490,25 @@ def run_jacobian_analysis(
     adapter = FixedPointAdapter(model, device=device)
 
     # ── Extract GRU states at epochs (slow-point search) ──────
-    epoch_data = extract_gru_states_at_epochs(
+    epoch_data_full = extract_gru_states_at_epochs(
         model=model,
         dataloader=dataloader,
         device=device,
         onset_frames=onset_frames,
         target_class=target_class,
         dt_ms=dt_ms,
+        adapter=adapter,
     )
+    # Round-3 (BLK-3A): split per-epoch gate diagnostics from the
+    # state tensors before spectral computation.
+    gate_diagnostics: Dict[str, Dict[str, float]] = {
+        name: val for name, val in epoch_data_full.items()
+        if name.endswith("__gate_diag")
+    }
+    epoch_data = {
+        name: val for name, val in epoch_data_full.items()
+        if not name.endswith("__gate_diag")
+    }
 
     # ── Compute eigenvalues ───────────────────────────────────
     if full_system:
@@ -1019,15 +1526,27 @@ def run_jacobian_analysis(
         )
     else:
         # Default: GRU-only Jacobian (backward compatible)
-        eigenvalue_results = compute_eigenvalues_at_epochs(
-            adapter=adapter,
-            epoch_data=epoch_data,
-            device=device,
-            max_states_per_epoch=max_states_per_epoch,
+        eigenvalue_results, attractor_stats, frozen_input_stats = (
+            compute_eigenvalues_at_epochs(
+                adapter=adapter,
+                epoch_data=epoch_data,
+                device=device,
+                max_states_per_epoch=max_states_per_epoch,
+            )
         )
 
     # ── Log hypothesis verification ───────────────────────────
     logger.info("-" * 60)
+    if full_system:
+        # Round-1 fix (Reviewer B MAJOR-2): the two spectral objects are
+        # mathematically distinct.  Full-system surrogate-gradient SVD
+        # singular values quantify input sensitivity only; they must NOT
+        # be quoted for unit-circle / line-attractor stability claims.
+        logger.warning(
+            "FULL-SYSTEM mode: outputs are surrogate-gradient SVD "
+            "singular values (input sensitivity), NOT exact eigenvalues. "
+            "Do NOT use them for stability or line-attractor conclusions."
+        )
     logger.info("Hypothesis Verification:")
     for epoch_name, eigvals in eigenvalue_results.items():
         if full_system:
@@ -1055,6 +1574,46 @@ def run_jacobian_analysis(
         eigenvalue_results=eigenvalue_results,
         output_path=output_path,
     )
+
+    # ── Export JSON summary (Round-2 M-2c) ───────────────────
+    # The attractor verification and frozen-input control results are
+    # persisted next to the figure so spectral conclusions are auditable
+    # against the verification evidence, not just logged.
+    if not full_system:
+        json_path = output_path.with_suffix(".json")
+        epoch_summary: Dict[str, Dict[str, float]] = {}
+        for epoch_name, eigvals in eigenvalue_results.items():
+            magnitudes = np.abs(eigvals.flatten())
+            real_parts = np.real(eigvals.flatten())
+            epoch_summary[epoch_name] = {
+                "mag_mean": float(np.mean(magnitudes)),
+                "mag_max": float(np.max(magnitudes)),
+                "pct_near_unit_circle": float(
+                    np.mean(np.abs(magnitudes - 1.0) < 0.1) * 100
+                ),
+                "pct_near_real_one": float(
+                    np.mean(np.abs(real_parts - 1.0) < 0.1) * 100
+                ),
+                "n_states": int(eigvals.shape[0]),
+                "n_verified_attractors": attractor_stats.get(epoch_name, {}).get("n_verified", 0),
+                "n_tested_attractors": attractor_stats.get(epoch_name, {}).get("n_tested", 0),
+            }
+        summary = {
+            "target_class": int(target_class),
+            "dt_ms": dt_ms,
+            "epochs": EPOCH_DEFINITIONS,
+            "spectral_statistics": epoch_summary,
+            "attractor_verification": attractor_stats,
+            "frozen_input_control": frozen_input_stats,
+            # Round-3 (BLK-3A): per-epoch GMM+BIC gate calibration
+            # evidence — threshold, BIC values, residual quantiles and
+            # accept/reject counts are persisted so the gate is fully
+            # auditable.
+            "fp_gate_calibration": gate_diagnostics,
+        }
+        with open(json_path, "w") as f:
+            json.dump(summary, f, indent=2)
+        logger.info("JSON summary saved → %s", json_path)
 
     logger.info("=" * 60)
     logger.info("Jacobian analysis complete!")
@@ -1099,8 +1658,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--target_class",
         type=int,
-        default=0,
-        help="Label value to analyze (0=ESCAPE, 1=PREWALK, 2=PRE_ACTIVE, 3=NO_RESPONSE).",
+        default=Label.PREWALK.value,
+        help="Label value to analyze (0=ESCAPE, 1=PREWALK, 2=PRE_ACTIVE, "
+             "3=NO_RESPONSE).  Default PREWALK: the Sustained-epoch "
+             "line-attractor hypothesis requires sustained locomotion.",
     )
     parser.add_argument(
         "--batch_size",

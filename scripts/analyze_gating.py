@@ -50,6 +50,7 @@ from nsmor.analysis.gating_cluster import (
 from nsmor.config import Label
 from nsmor.config_parser import ExperimentConfig
 from nsmor.model_utils import load_model_from_checkpoint as _shared_load_model
+from nsmor.model_utils import validate_dataset_provenance
 from nsmor.nsmor_dataloader import NSMoRDataset, collate_variable_length
 
 # Use non-interactive backend for headless environments
@@ -118,6 +119,9 @@ def load_model_and_dataset(
 
     logger.info("Loading dataset from %s", dataset_path)
     dataset = torch.load(dataset_path, weights_only=False)
+
+    # Round-2 CRITICAL-A: refuse pre-2.0 datasets (leaked priors, np.max labels)
+    validate_dataset_provenance(dataset, Path(dataset_path))
 
     X_seqs = dataset["X_seqs"]
     Y_seqs = dataset["Y_seqs"]

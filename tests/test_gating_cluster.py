@@ -262,6 +262,9 @@ class TestCluster:
         result = cluster(data, config)
 
         for k, score in result["stability_scores"].items():
+            # Round-1: stability may be None (unmeasurable for small N)
+            if score is None:
+                continue
             assert 0.0 <= score <= 1.0, f"Stability score {score} out of [0,1] for k={k}"
 
     def test_stability_high_for_well_separated(self) -> None:
@@ -278,10 +281,19 @@ class TestCluster:
 
         result = cluster(data, config)
 
-        # For k=3, stability should be high (>0.6)
-        if 3 in result["stability_scores"]:
-            assert result["stability_scores"][3] >= 0.6, \
-                f"Expected high stability for k=3, got {result['stability_scores'][3]}"
+        # Round-3 (Reviewer A m-3b): with N=90 the stability estimator is
+        # measurable — a None here silently voids this test's protection.
+        assert 3 in result["stability_scores"], (
+            "k=3 missing from stability_scores for well-separated data"
+        )
+        score_3 = result["stability_scores"][3]
+        assert score_3 is not None, (
+            "stability must be computable at N=90; None silently "
+            "voids the well-separated protection"
+        )
+        # For k=3 on well-separated data, stability should be high (>0.6)
+        assert score_3 >= 0.6, \
+            f"Expected high stability for k=3, got {score_3}"
 
     def test_stability_fallback_when_low(self) -> None:
         """Test that k_opt falls back to silhouette when stability is low."""
@@ -295,9 +307,11 @@ class TestCluster:
 
         # Should still return a valid k_opt
         assert result["k_opt"] in config.n_clusters_range
-        # With pure noise, stability should be low for at least some k
-        assert any(s < 0.6 for s in result["stability_scores"].values()), \
-            "Expected low stability for noisy data"
+        # With pure noise, stability should be low (or None) for at
+        # least some k
+        assert any(
+            s is None or s < 0.6 for s in result["stability_scores"].values()
+        ), "Expected low/None stability for noisy data"
 
 
 class TestGatingClusterAdapter:

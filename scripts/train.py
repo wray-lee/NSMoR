@@ -247,11 +247,12 @@ def build_model(config: ExperimentConfig) -> NSMoRCore:
         hidden_dim=config.model.hidden_dim,
         num_gru_layers=config.model.num_gru_layers,
         dropout=config.model.dropout,
+        dt_ms=config.model.dt_ms,
         lif_alpha=config.model.lif_alpha,
         lif_threshold=config.model.lif_threshold,
         lif_beta=config.model.lif_beta,
-        lif_abs_refract_steps=config.model.lif_abs_refract_steps,
-        lif_rel_refract_steps=config.model.lif_rel_refract_steps,
+        lif_abs_refract_ms=config.model.lif_abs_refract_ms,
+        lif_rel_refract_ms=config.model.lif_rel_refract_ms,
         lif_tau_syn=config.model.lif_tau_syn,
         lif_v_rest=config.model.lif_v_rest,
         lif_v_reset=config.model.lif_v_reset,
@@ -261,6 +262,7 @@ def build_model(config: ExperimentConfig) -> NSMoRCore:
         lif_tau_rec=config.model.lif_tau_rec,
         lif_U_stp_init=config.model.lif_U_stp_init,
         lif_lateral_inhibition=config.model.lif_lateral_inhibition,
+        lif_inhib_tau_ms=config.model.lif_inhib_tau_ms,
         lif_dendritic_tau=config.model.lif_dendritic_tau,
         gru_neuromod_gain=config.model.gru_neuromod_gain,
         sensory_noise_std=config.model.sensory_noise_std,
@@ -372,6 +374,11 @@ def build_dataloaders(
     logger.info("Loading dataset from %s", dataset_file)
     dataset = torch.load(dataset_file, weights_only=False)
 
+    # Round-2 CRITICAL-A: refuse pre-2.0 datasets (leaked priors,
+    # np.max labels) — training on them is scientifically invalid.
+    from nsmor.model_utils import validate_dataset_provenance
+    validate_dataset_provenance(dataset, Path(dataset_file))
+
     X_seqs = dataset["X_seqs"]
     Y_seqs = dataset["Y_seqs"]
     mcmc_priors = dataset["mcmc_priors"]
@@ -385,15 +392,50 @@ def build_dataloaders(
     )
 
     # ── Deterministic train/val split ─────────────────────────
+    # Round-3 fix (Reviewer B CRITICAL-3b): the split is SESSION-GROUPED.
+    # A sample-level shuffle lets one recording session straddle train
+    # and validation — trials of the same session share the animal's
+    # baseline locomotor statistics and gain state, so val metrics were
+    # mildly inflated by session-level information.  Whole sessions are
+    # now assigned to one side.  (Full nested CV — outer NSMoR split,
+    # inner cross-fitting restricted to the outer-training sessions —
+    # remains a documented limitation; grouped splitting removes the
+    # dominant first-order channel at negligible cost.)
     rng = np.random.RandomState(config.training.random_seed)
-    indices = np.arange(n_total)
-    rng.shuffle(indices)
-
-    n_val = max(1, int(n_total * val_split))
-    n_train = n_total - n_val
-
-    train_indices = indices[:n_train]
-    val_indices = indices[n_train:]
+    session_ids = dataset.get("session_ids")
+    if session_ids is not None and len(session_ids) == n_total:
+        session_arr = np.asarray(session_ids)
+        unique_sessions = np.unique(session_arr)
+        rng.shuffle(unique_sessions)
+        n_val_sessions = max(1, int(len(unique_sessions) * val_split))
+        val_sessions = set(unique_sessions[:n_val_sessions].tolist())
+        is_val = np.array([s in val_sessions for s in session_arr])
+        val_indices = np.nonzero(is_val)[0]
+        train_indices = np.nonzero(~is_val)[0]
+        logger.info(
+            "Session-grouped split: %d train (%d sessions), "
+            "%d val (%d sessions)",
+            len(train_indices),
+            len(set(session_arr[train_indices].tolist())),
+            len(val_indices), n_val_sessions,
+        )
+    else:
+        # Fallback: sample-level shuffle (datasets without session ids;
+        # synthetic data only).  Warn loudly — this split is leak-prone.
+        logger.warning(
+            "Dataset lacks per-sequence 'session_ids'; falling back to "
+            "sample-level train/val split.  Session-level information "
+            "may inflate validation metrics.  Re-run prepare_data to "
+            "regenerate the dataset with session ids."
+        )
+        indices = np.arange(n_total)
+        rng.shuffle(indices)
+        n_val = max(1, int(n_total * val_split))
+        n_train = n_total - n_val
+        train_indices = indices[:n_train]
+        val_indices = indices[n_train:]
+    n_train = len(train_indices)
+    n_val = len(val_indices)
 
     logger.info(
         "Split: %d train, %d val (%.0f%% val)",

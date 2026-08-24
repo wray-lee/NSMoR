@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Phase 10 — In-Silico Psychophysics & Bayesian Reliability Analysis.
+Phase 10 — In-Silico Psychophysics: Routing-Gate Noise Sensitivity.
 
 Injects graded Gaussian noise into the visual input channel and quantifies
 the resulting shifts in MoR routing gates and kinematic latencies.
@@ -10,9 +10,25 @@ Key outputs:
     results/bayesian_reliability.png  — Dual-panel Lancet/Cell figure
     results/psychophysics_summary.json — Aggregated statistics
 
-Hypothesis:
-    Higher visual noise → delayed/suppressed GRU gating, systematic
-    latency shift reflecting Bayesian re-weighting of sensory evidence.
+Round-1 fix (Reviewer A MAJOR-2): the MCMC prior columns
+(X[:, :, 4:7]) are held FIXED across noise levels — only the visual
+channel degrades.  The router's response therefore demonstrates
+*input-noise sensitivity of the routing gate*, NOT Bayesian cue
+re-weighting (which would require the prior to degrade with evidence
+reliability).  Claims are scoped accordingly.
+
+Noise definition (SNR): sigma is in DEGREES of visual angle and is
+injected ADDITIVELY onto the raw visual-angle channel before sensory
+encoding.  The per-trial signal scale is the peak |visual_angle|
+excursion; SNR_dB = 20*log10(peak|angle| / sigma) is reported per
+condition so the physical meaning of each sigma is explicit.
+
+Hypothesis (scoped):
+    Higher visual noise → delayed/suppressed GRU gating and systematic
+    latency increase, consistent with reliability-dependent routing.
+    This is NECESSARY but not SUFFICIENT evidence for optimal cue
+    combination; a causal test would additionally require perturbing
+    prior reliability.
 
 Respects all BOUNDARY.md constraints — never modifies frozen core.
 """
@@ -22,6 +38,7 @@ import json
 import logging
 import os
 import sys
+from typing import Optional
 from pathlib import Path
 
 import numpy as np
@@ -83,6 +100,9 @@ def load_validation_data(device: torch.device, max_seq_len: int = 1000):
         sys.exit(1)
 
     data = torch.load(dataset_path, map_location="cpu", weights_only=False)
+    # Round-2 CRITICAL-A: refuse pre-2.0 datasets (leaked priors)
+    from nsmor.model_utils import validate_dataset_provenance
+    validate_dataset_provenance(data, Path(dataset_path))
     X_seqs = data["X_seqs"]
     Y_seqs = data["Y_seqs"]
     lengths = data["lengths"]
@@ -193,26 +213,58 @@ def find_multisensory_ttc0(
     return mask
 
 
+# Visual-angle channel index in the feature dimension (X[:, :, 0]).
+VISUAL_ANGLE_IDX = 0
+
+
 def inject_visual_noise(
     X_batch: torch.Tensor,
     lengths: torch.Tensor,
     sigma: float,
+    seed: int | None = None,
+    trial_seed_offset: int = 0,
 ) -> torch.Tensor:
     """
     Add N(0, σ²) noise to visual channel (X[:,:,0]).
 
     Noise is applied only to non-padded frames (respects sequence masks).
     Returns a new tensor (does not mutate the original).
+
+    Round-1 note (Reviewer A MAJOR-2): only this channel is degraded;
+    the MCMC prior columns are held fixed, so the experiment measures
+    gate sensitivity to evidence noise, not cue re-weighting.
+
+    Round-2 fix (Reviewer A MAJOR-D-3 / Reviewer B M-1a): noise is drawn
+    from an explicit ``torch.Generator`` — bare ``torch.randn`` left
+    results irreproducible.
+
+    Round-3 fix (Reviewer B MAJOR-2): *trial_seed_offset* gives each
+    σ level an independent, reproducible noise realisation.  The
+    previous design reused ONE seed across all σ levels, so the SAME
+    standard-normal draw was scaled by different σ — i.e. every
+    condition saw the identical noise realisation, not independent
+    ones.  That is not a paired design over independent noisy
+    presentations; it is one noise field repeatedly rescaled, and the
+    paired tests' error terms did not contain the between-condition
+    noise variance they claim to test.  With per-sigma offsets, each
+    trial keeps a fixed index across conditions (the pairing unit is
+    still the stimulus trial) while the noise realisations differ.
     """
     if sigma == 0.0:
         return X_batch.clone()
 
+    gen = torch.Generator(device=X_batch.device)
+    if seed is None:
+        gen.seed()
+    else:
+        # Large coprime stride decorrelates the per-sigma streams.
+        gen.manual_seed(int(seed) + 1_000_003 * int(trial_seed_offset))
+
     X_noisy = X_batch.clone()
-    B, T, _ = X_noisy.shape
-    for i in range(B):
+    for i in range(X_noisy.shape[0]):
         L = int(lengths[i].item())
-        noise = torch.randn(L, device=X_noisy.device) * sigma
-        X_noisy[i, :L, 0] += noise
+        noise = torch.randn(L, device=X_noisy.device, generator=gen) * sigma
+        X_noisy[i, :L, VISUAL_ANGLE_IDX] += noise
 
     return X_noisy
 
@@ -241,7 +293,11 @@ def extract_latency_to_peak(
     """
     Per-trial latency to peak velocity (ms) relative to stimulus onset.
 
-    Returns list of latencies (one per trial).
+    Trials whose global peak falls at or before stimulus onset (i.e.
+    peak occurred during the baseline epoch) are reported as NaN and
+    must be excluded from inferential statistics — clamping them to 0
+    (previous behaviour) artificially compressed the variance of the
+    clean-condition sample and biased the psychometric curve upward.
     """
     latencies = []
     B, T = Y_pred.shape
@@ -249,7 +305,11 @@ def extract_latency_to_peak(
         L = int(lengths[i].item())
         vel = Y_pred[i, :L]
         peak_frame = torch.argmax(vel.abs()).item()
-        latency_ms = max(0.0, (peak_frame - STIM_ONSET_FRAME) * dt_ms)
+        if peak_frame <= STIM_ONSET_FRAME:
+            # Pre-stimulus peak: no post-stimulus response measurable.
+            latencies.append(float("nan"))
+            continue
+        latency_ms = (peak_frame - STIM_ONSET_FRAME) * dt_ms
         latencies.append(latency_ms)
     return latencies
 
@@ -374,7 +434,9 @@ def create_figure(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Phase 10 — Bayesian Reliability & Optimal Cue Combination"
+        description="Phase 10 — In-Silico Psychophysics: "
+                    "Routing-Gate Noise Sensitivity "
+                    "(priors held fixed; NOT a cue-combination test)"
     )
     parser.add_argument(
         "--checkpoint",
@@ -400,6 +462,13 @@ def main() -> None:
         type=int,
         default=1000,
         help="Crop sequences longer than this (cuDNN compatibility). 0 = disable.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Seed for the visual-noise generator (paired design must be "
+             "reproducible; recorded in the JSON summary).",
     )
     args = parser.parse_args()
 
@@ -427,12 +496,42 @@ def main() -> None:
     # --- Run noise sweep ---
     gate_trajectories: dict[float, np.ndarray] = {}
     latency_stats: dict = {}
+    latency_arrays: dict[float, np.ndarray] = {}  # per-trial latencies (NaN=excluded)
+    snr_by_sigma: dict[float, float] = {}
+    derived_seeds: dict[float, Optional[int]] = {}  # Round-3 m-3a
     T = X_ttc0.shape[1]
 
-    for sigma in args.noise_levels:
-        logger.info("--- Noise level σ = %.1f° ---", sigma)
+    for sigma_idx, sigma in enumerate(args.noise_levels):
+        # the peak |visual_angle| excursion within the valid length;
+        # report the median SNR across trials so each sigma has an
+        # explicit physical meaning.  Round-2 fix (Reviewer A MAJOR-D-4):
+        # the per-sigma SNR value is persisted in the JSON summary, not
+        # only logged.
+        peak_excursions = []
+        for i in range(X_ttc0.shape[0]):
+            L = int(L_ttc0[i].item())
+            angle = X_ttc0[i, :L, VISUAL_ANGLE_IDX].cpu().numpy()
+            if angle.size:
+                peak_excursions.append(float(np.abs(angle).max()))
+        sig_scale = float(np.median(peak_excursions)) if peak_excursions else 0.0
+        snr_db = (
+            20.0 * np.log10(sig_scale / sigma)
+            if sigma > 0.0 and sig_scale > 0.0
+            else float("inf")
+        )
+        snr_by_sigma[sigma] = float(snr_db)
+        logger.info("--- Noise level σ = %.1f° (median SNR %.1f dB) ---", sigma, snr_db)
 
-        X_noisy = inject_visual_noise(X_ttc0, L_ttc0, sigma)
+        X_noisy = inject_visual_noise(
+            X_ttc0, L_ttc0, sigma, seed=args.seed,
+            trial_seed_offset=sigma_idx,
+        )
+        # Round-3 (Reviewer A m-3a): record the ACTUAL derived seed per
+        # σ so each condition is independently reproducible.
+        derived_seeds[sigma] = (
+            int(args.seed) + 1_000_003 * int(sigma_idx)
+            if sigma > 0.0 else None
+        )
 
         with torch.no_grad():
             Y_pred, internals = model(
@@ -449,19 +548,155 @@ def main() -> None:
 
         # Latency
         latencies = extract_latency_to_peak(Y_pred, L_ttc0)
-        mean_lat = float(np.mean(latencies))
-        sem_lat = float(np.std(latencies, ddof=1) / np.sqrt(len(latencies))) if len(latencies) > 1 else 0.0
+        latency_arrays[sigma] = np.asarray(latencies, dtype=np.float64)
+        valid = latency_arrays[sigma][~np.isnan(latency_arrays[sigma])]
+        mean_lat = float(np.mean(valid)) if valid.size else float("nan")
+        sem_lat = (
+            float(np.std(valid, ddof=1) / np.sqrt(valid.size))
+            if valid.size > 1 else 0.0
+        )
         latency_stats[sigma] = {
             "mean": mean_lat,
             "sem": sem_lat,
-            "n": len(latencies),
-            "std": float(np.std(latencies, ddof=1)) if len(latencies) > 1 else 0.0,
+            "n": int(valid.size),
+            "n_excluded_prestim_peak": int(np.isnan(latency_arrays[sigma]).sum()),
+            "std": float(np.std(valid, ddof=1)) if valid.size > 1 else 0.0,
         }
-        logger.info("  Latency: %.1f ± %.1f ms (n=%d)", mean_lat, sem_lat, len(latencies))
+        # Round-2 fix (Reviewer B M-1c): report the VALID count, not the
+        # raw array length (which includes NaN-excluded trials).
+        logger.info("  Latency: %.1f ± %.1f ms (n=%d)", mean_lat, sem_lat, int(valid.size))
 
         # Peak velocity
         peaks = extract_peak_velocity(Y_pred, L_ttc0)
         logger.info("  Peak Vel: %.2f cm/s", float(np.mean(peaks)))
+
+    # --- Inferential statistics (Reviewer Round-1 BLOCKER-3) ---
+    # Paired comparisons of per-trial latency against the clean
+    # condition (σ=0).  Trials are PAIRED (identical stimulus set at
+    # every noise level); noise realisations are independent across σ.
+    # Holm-Bonferroni controls the family-wise error rate across the
+    # multiple σ levels; the Hodges-Lehmann location shift quantifies
+    # effect size, matched to the Wilcoxon signed-rank test (Round-3
+    # CRITICAL-4B: single fixed test — no Shapiro pre-test gate).
+    #
+    # Round-2 fixes:
+    # * Reviewer B M-1a: p_values / effect_sizes / corrected are bound
+    #   unconditionally so the JSON construction below cannot hit a
+    #   NameError when σ=0 is absent from --noise_levels.
+    # * Reviewer B M-1b: exclusion is ANCHORED ON THE CLEAN CONDITION —
+    #   a trial excluded at σ=0 is excluded from every condition, so all
+    #   conditions are tested on the identical stimulus set.  Per-
+    #   condition exclusion counts are reported.
+    # * Reviewer A MAJOR-D-1/2: NaN p-values and zero-variance paired
+    #   differences are REMOVED from the Holm family (and counted),
+    #   never imputed as "no effect" — matching the lesion-script
+    #   standard adopted in this same PR.
+    from nsmor.analysis.uq import holm_bonferroni
+    from scipy import stats as sp_stats
+
+    p_values: dict[float, float] = {}
+    effect_sizes: dict[float, float] = {}
+    corrected: dict = {}
+
+    if 0.0 in latency_arrays:
+        baseline = latency_arrays[0.0]
+        clean_valid = ~np.isnan(baseline)
+
+        for sigma in args.noise_levels:
+            if sigma == 0.0:
+                continue
+            noisy = latency_arrays[sigma]
+            # Identical stimulus set across conditions: anchor on the
+            # clean-condition exclusions.
+            valid = clean_valid & ~np.isnan(noisy)
+            n_pairs = int(valid.sum())
+            latency_stats[sigma]["n_pairs_vs_clean"] = n_pairs
+            if n_pairs < 3:
+                logger.warning(
+                    "σ=%.1f°: only %d complete pairs — test skipped.",
+                    sigma, n_pairs,
+                )
+                continue
+            b, q = baseline[valid], noisy[valid]
+
+            diffs = q - b
+
+            # Zero-variance paired differences are degenerate samples:
+            # exclude from the family and count (Reviewer A MAJOR-D-2).
+            sd_diff = float(np.std(diffs, ddof=1))
+            if sd_diff <= 1e-12:
+                logger.warning(
+                    "σ=%.1f°: zero-variance paired differences "
+                    "(n=%d) — excluded from test family.",
+                    sigma, n_pairs,
+                )
+                latency_stats[sigma]["n_degenerate_zero_variance"] = n_pairs
+                latency_stats[sigma]["test"] = "excluded_zero_variance"
+                continue
+
+            # Round-3 fix (Reviewer B CRITICAL-4B): the Shapiro-Wilk
+            # pre-test gate inflates type-I error (pre-test dilemma) and
+            # mixing Wilcoxon p-values with Cohen's d_z is a paradigm
+            # mismatch.  The paired design now uses a SINGLE test:
+            # Wilcoxon signed-rank with the Hodges-Lehmann estimate as
+            # effect size (median of pairwise averages of the diffs) —
+            # distribution-free, no pre-test, effect and test measure
+            # the same quantity.  Normality is still REPORTED
+            # descriptively (Shapiro-Wilk W logged per condition) so
+            # readers can judge approximate symmetry, but it no longer
+            # selects the procedure.
+            stat, p_raw = sp_stats.wilcoxon(q, b)
+            test_name = "Wilcoxon_signed_rank"
+
+            # NaN p-values are numerical pathologies, not null results:
+            # exclude from the family and count (Reviewer A MAJOR-D-1).
+            if np.isnan(p_raw):
+                logger.warning(
+                    "σ=%.1f°: %s returned NaN p-value — excluded "
+                    "from Holm family.", sigma, test_name,
+                )
+                latency_stats[sigma]["n_nan_pvalue_excluded"] = 1
+                latency_stats[sigma]["test"] = f"{test_name}_nan_pvalue"
+                continue
+
+            # Hodges-Lehmann location shift: median over all pairwise
+            # averages of the differences — the effect measure matched
+            # to the Wilcoxon signed-rank test (Round-3 CRITICAL-4B).
+            pairwise_avg = (
+                diffs[:, None] + diffs[None, :]
+            )[np.triu_indices(n_pairs, k=1)]
+            hl = float(np.median(
+                np.concatenate([pairwise_avg, diffs])
+            )) if n_pairs > 1 else float(np.median(diffs))
+            p_values[sigma] = float(p_raw)
+            effect_sizes[sigma] = hl
+            latency_stats[sigma]["test"] = test_name
+            latency_stats[sigma]["hodges_lehmann_ms"] = hl
+            # Descriptive normality diagnostic (does NOT gate the test).
+            if n_pairs >= 3 and n_pairs <= 5000:
+                W_stat, W_p = sp_stats.shapiro(diffs)
+                latency_stats[sigma]["shapiro_W"] = float(W_stat)
+                latency_stats[sigma]["shapiro_p"] = float(W_p)
+
+        corrected = holm_bonferroni(p_values) if p_values else {}
+        logger.info("-" * 60)
+        logger.info(
+            "Inference: post-stimulus latency vs clean condition "
+            "(identical stimulus set anchored on σ=0 exclusions, "
+            "Holm-Bonferroni corrected):"
+        )
+        for sigma in sorted(p_values):
+            adj_p, sig = corrected.get(sigma, (1.0, False))
+            logger.info(
+                "  σ=%.1f° vs σ=0°: HL=%+.3f ms, %s p=%.4f (corrected), %s",
+                sigma, effect_sizes[sigma],
+                latency_stats[sigma].get("test", "Wilcoxon"),
+                adj_p, "*" if sig else "n.s.",
+            )
+    else:
+        logger.warning(
+            "σ=0 not among --noise_levels; no paired inference possible."
+        )
 
     # --- Create figure ---
     fig_path = os.path.join(args.output_dir, "bayesian_reliability.png")
@@ -472,6 +707,32 @@ def main() -> None:
         "noise_levels": args.noise_levels,
         "n_ttc0_trials": n_ttc0,
         "stim_onset_frame": STIM_ONSET_FRAME,
+        # Round-1 (Reviewer A MAJOR-2): explicit scope + SNR semantics
+        "scope": (
+            "Routing-gate sensitivity to VISUAL-channel noise. "
+            "MCMC prior columns held fixed across conditions; this is "
+            "NOT a Bayesian cue-combination test. Latencies are "
+            "post-stimulus-peak only (pre-stimulus peaks reported as "
+            "NaN and excluded)."
+        ),
+        "snr_definition": (
+            "SNR_dB = 20*log10(median peak |visual_angle| / sigma); "
+            "sigma is additive noise in degrees on the raw visual-angle "
+            "channel before sensory encoding."
+        ),
+        # Round-2 fix (Reviewer A MAJOR-D-4): per-sigma SNR values are
+        # persisted so the summary is statistically self-contained.
+        "snr_db_by_sigma": {str(k): v for k, v in snr_by_sigma.items()},
+        "noise_seed": args.seed,
+        # Round-3 (Reviewer A m-3a): per-σ derived seeds for exact
+        # per-condition reproduction.
+        "derived_seeds_by_sigma": {
+            str(k): v for k, v in derived_seeds.items()
+        },
+        "noise_realisations": (
+            "independent per sigma level (seed + 1000003*sigma_index); "
+            "pairing unit is the stimulus trial"
+        ),
         "latency_stats": {
             str(k): v for k, v in latency_stats.items()
         },
@@ -479,6 +740,22 @@ def main() -> None:
             str(sigma): float(gate_trajectories[sigma][STIM_ONSET_FRAME:].mean())
             for sigma in args.noise_levels
         },
+        "inference": {
+            "design": "paired per trial (identical stimulus set anchored "
+                      "on σ=0 exclusions), independent noise "
+                      "realisations across σ levels",
+            "correction": "Holm-Bonferroni step-down (FWER α=0.05)",
+            # Round-3 (CRITICAL-4B): single fixed test, no pre-test gate.
+            "test": "Wilcoxon signed-rank (paired)",
+            "effect_size": "Hodges-Lehmann location shift (ms)",
+            "p_values_uncorrected": {str(k): v for k, v in p_values.items()},
+            "p_values_holm_corrected": (
+                {str(k): v[0] for k, v in corrected.items()} if corrected else {}
+            ),
+            "effect_sizes_hodges_lehmann_ms": {
+                str(k): v for k, v in effect_sizes.items()
+            },
+        } if 0.0 in latency_arrays else {"design": "σ=0 absent — no paired inference"},
     }
     json_path = os.path.join(args.output_dir, "psychophysics_summary.json")
     with open(json_path, "w") as f:

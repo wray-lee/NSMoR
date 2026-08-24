@@ -35,34 +35,56 @@ class ModelConfig:
     hidden_dim: int = 64
     num_gru_layers: int = 1
     dropout: float = 0.1
+
+    # Physical sampling interval (ms).  ALL time constants below are
+    # declared in PHYSICAL TIME (ms) and converted internally via
+    #   alpha = exp(-dt_ms / tau_ms)
+    # so that changing the acquisition rate never silently rescales the
+    # biophysics (Reviewer Round-1 BLOCKER-1).  The default matches
+    # TimeWindowConfig.frame_interval_ms (100 Hz imaging).
+    dt_ms: float = 10.0
+
     lif_alpha: float = 0.9
     lif_threshold: float = 1.0
     lif_beta: float = 0.5
     # Refractory periods & synaptic dynamics (Hodgkin & Huxley 1952)
-    lif_abs_refract_steps: int = 0   # absolute refractory period (timesteps; 0=disabled)
-    lif_rel_refract_steps: int = 0   # relative refractory decay length (timesteps; 0=disabled)
-    lif_tau_syn: float = 0.0         # synaptic time constant (dt units; 0=disabled)
+    # Round-3 fix (Reviewer B MAJOR-1): refractory periods are declared
+    # in PHYSICAL time (ms) like every other tau_* parameter, closing
+    # the frame-unit loophole that BLOCKER-1 closed for the synaptic
+    # filters.  The relative refractory default (20 ms) matches the
+    # tens-of-ms threshold recovery measured in insect giant
+    # interneurons (Bean 2007 reports 20-50% threshold elevation over
+    # 10-50 ms).  Conversion to steps happens inside LIFCell via the
+    # explicitly provided dt_ms.
+    lif_abs_refract_ms: float = 0.0  # absolute refractory period (ms; 0=disabled)
+    lif_rel_refract_ms: float = 20.0  # relative refractory decay length (ms; 0=disabled)
+    lif_tau_syn: float = 0.0         # synaptic time constant (ms; 0=disabled)
     lif_v_rest: float = 0.0          # resting membrane potential (0=disabled)
     lif_v_reset: Optional[float] = None  # fixed reset potential (None=v_rest, standard AdEx)
 
     # Spike-frequency adaptation (AdEx model, Brette & Gerstner 2005)
-    lif_tau_w: float = 0.0       # adaptation time constant (dt units; 0=disabled)
+    lif_tau_w: float = 0.0       # adaptation time constant (ms; 0=disabled)
     lif_b_adapt: float = 0.0     # spike-triggered adaptation increment (0=disabled)
 
     # Short-Term Plasticity (Tsodyks-Markram model)
     # Ref: Tsodyks, Pawelzik & Markram 1998, Neural Computation.
     # When lif_tau_fac=0 AND lif_tau_rec=0, STP is fully disabled
     # (backward compatible: no extra parameters, no extra state).
-    lif_tau_fac: float = 0.0     # facilitation time constant (dt units; 0=disabled)
-    lif_tau_rec: float = 0.0     # recovery (depression) time constant (dt units; 0=disabled)
+    lif_tau_fac: float = 0.0     # facilitation time constant (ms; 0=disabled)
+    lif_tau_rec: float = 0.0     # recovery (depression) time constant (ms; 0=disabled)
     lif_U_stp_init: float = 0.5  # baseline utilization (U in TM model; only used when STP enabled)
 
     # Lateral inhibition (Ritzmann & Camhi 1978)
     # Inhibitory interneuron pool strength. 0 disables.
     lif_lateral_inhibition: float = 0.0
+    # Spike-history EMA window for lateral inhibition (ms). Round-3
+    # (Reviewer B MINOR-6): promoted from a hard-coded 50 ms fallback.
+    # Within the 20-100 ms window of feedforward inhibition in cricket
+    # cercal pathways.
+    lif_inhib_tau_ms: float = 50.0
 
     # Dendritic compartmentalization (London & Hausser 2005)
-    # Time constant for visual-input dendritic IIR filter. 0 disables.
+    # Time constant for visual-input dendritic IIR filter (ms). 0 disables.
     lif_dendritic_tau: float = 0.0
 
     # Neuromodulatory gain on GRU pathway (Rillich & Stevenson 2011)

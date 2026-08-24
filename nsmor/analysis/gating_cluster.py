@@ -23,6 +23,7 @@ References
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
@@ -43,6 +44,8 @@ except ImportError:
 
 from nsmor.config import Label
 from nsmor.nsmor_dataloader import collate_variable_length
+
+logger = logging.getLogger(__name__)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -576,43 +579,76 @@ class GatingClusterAdapter:
                 silhouette_scores[k] = float(score)
 
         # Bootstrap stability assessment for each k
-        stability_scores: Dict[int, float] = {}
+        # Round-1 fix (Reviewer A MAJOR-3 / Reviewer B MAJOR-3):
+        # 1. Small-N: if the sample cannot support a meaningful
+        #    bootstrap stability estimate, mark it explicitly as None
+        #    instead of emitting a plausible-looking 0.0.
+        # 2. Each bootstrap resample is re-scaled (StandardScaler refit)
+        #    and KMeans receives a *perturbed* init seed, so the
+        #    measured ARI reflects resampling variance PLUS
+        #    initialisation variance rather than only the former.
+        stability_scores: Dict[int, Optional[float]] = {}
         n_bootstrap = 100
+        min_n_for_stability = max(self.config.n_clusters_range) + 5
         for k in self.config.n_clusters_range:
             if k >= N:
                 continue
-            if N < max(self.config.n_clusters_range) + 5:
-                # Too few samples for reliable bootstrap with all k values
-                stability_scores[k] = 0.0
+            if N < min_n_for_stability:
+                # Too few samples for a reliable bootstrap — report None
+                # (rendered as "n/a") so downstream consumers cannot
+                # mistake it for an actual instability measurement.
+                logger.warning(
+                    "N=%d < %d required for bootstrap stability; "
+                    "stability[%d] reported as None.",
+                    N, min_n_for_stability, k,
+                )
+                stability_scores[k] = None
                 continue
 
             stability_values = []
-            rng = np.random.default_rng(self.config.random_state)
-            for _ in range(n_bootstrap):
-                # Bootstrap resample
+            rng = np.random.default_rng(self.config.random_state + k)
+            for b_i in range(n_bootstrap):
                 idx = rng.choice(N, size=N, replace=True)
                 idx_oob = np.setdiff1d(np.arange(N), np.unique(idx))
                 if len(idx_oob) < k:
                     continue
 
-                # Fit on bootstrap sample
+                # Re-scale within the resample (Reviewer B MAJOR-3):
+                # fitting the scaler once on the full data leaks global
+                # structure into every bootstrap draw.
+                boot_scaler = StandardScaler()
+                boot_scaled = boot_scaler.fit_transform(fingerprints[idx])
+
+                # Perturb the KMeans init seed per bootstrap replicate
+                # (Reviewer A MAJOR-3): with a fixed seed across all
+                # replicates, initialisation variance is removed by
+                # construction and the stability index is overestimated.
                 kmeans_boot = KMeans(
                     n_clusters=k,
-                    random_state=self.config.random_state,
+                    random_state=self.config.random_state + 1000 + b_i,
                     n_init=10,
                 )
-                labels_boot = kmeans_boot.fit_predict(fingerprints_scaled[idx])
+                labels_boot = kmeans_boot.fit_predict(boot_scaled)
 
-                # Predict on OOB samples
-                labels_oob_pred = kmeans_boot.predict(fingerprints_scaled[idx_oob])
+                # Round-2 fix (Reviewer A CRITICAL-B / Reviewer B B-1):
+                # OOB points MUST be projected with the *training-side*
+                # boot_scaler — refitting a separate scaler on the OOB
+                # subsample places the centroids (boot space) and the
+                # query points (OOB space) in incompatible coordinate
+                # systems, making the predict labels near-random.  The
+                # "re-estimate per resample" semantics apply to the fit
+                # side only; evaluation is strictly out-of-sample.
+                oob_scaled = boot_scaler.transform(fingerprints[idx_oob])
+                labels_oob_pred = kmeans_boot.predict(oob_scaled)
 
-                # Fit on OOB samples directly
+                # Fit on the identically projected OOB samples so both
+                # sides of the ARI live in the same feature space.
                 kmeans_oob = KMeans(
                     n_clusters=k,
-                    random_state=self.config.random_state,
+                    random_state=self.config.random_state + 2000 + b_i,
                     n_init=10,
                 )
-                labels_oob_true = kmeans_oob.fit_predict(fingerprints_scaled[idx_oob])
+                labels_oob_true = kmeans_oob.fit_predict(oob_scaled)
 
                 # Compute ARI between the two clusterings on OOB samples
                 if len(np.unique(labels_oob_pred)) > 1 and len(np.unique(labels_oob_true)) > 1:
@@ -622,17 +658,34 @@ class GatingClusterAdapter:
             if stability_values:
                 stability_scores[k] = float(np.median(stability_values))
             else:
-                stability_scores[k] = 0.0
+                stability_scores[k] = None
 
-        # Select optimal k: prefer highest silhouette among k with stability >= 0.6
-        # If no k meets stability threshold, fall back to highest silhouette
-        stable_ks = [k for k, s in stability_scores.items() if s >= 0.6]
-        if stable_ks and silhouette_scores:
+        # Select optimal k: prefer highest silhouette among k with
+        # stability >= 0.6 (None = unmeasurable, excluded from the
+        # stability-gated selection).  If no k meets the threshold,
+        # fall back to highest silhouette and flag it.
+        def _stable(k: int) -> bool:
+            s = stability_scores.get(k)
+            return s is not None and s >= 0.6
+
+        stable_ks = [k for k in silhouette_scores if _stable(k)]
+        k_selection_basis: str
+        if stable_ks:
             k_opt = max(stable_ks, key=lambda k: silhouette_scores.get(k, -1.0))
+            k_selection_basis = "silhouette among bootstrap-stable k"
         elif silhouette_scores:
             k_opt = max(silhouette_scores, key=silhouette_scores.get)
+            k_selection_basis = (
+                "silhouette fallback (no k passed the stability gate)"
+            )
+            logger.warning(
+                "No k satisfied the stability gate (>=0.6); k_opt=%d "
+                "selected by silhouette only — interpret cluster count "
+                "with caution.", k_opt,
+            )
         else:
             k_opt = self.config.n_clusters
+            k_selection_basis = "configured default (no valid silhouette)"
 
         # KMeans for k=4 and k=3
         kmeans_k4 = KMeans(
@@ -680,6 +733,7 @@ class GatingClusterAdapter:
 
         return {
             "k_opt": k_opt,
+            "k_selection_basis": k_selection_basis,
             "silhouette_scores": silhouette_scores,
             "stability_scores": stability_scores,
             "labels_k4": labels_k4,
