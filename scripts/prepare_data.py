@@ -752,9 +752,16 @@ def prepare_dataset(
     # class on the held-out side — the "prior" column degenerates into
     # an uninformative constant and silently poisons the sensory
     # encoding.  Variance floor: every prior column must retain
-    # meaningful spread across trials.  1e-4 is ~2 orders below the
-    # variance of even a weakly informative predictor (~0.01-0.05) but
-    # far above float noise, so it fires only on true degeneracy.
+    # meaningful spread across trials.
+    #
+    # Round-3 Flaw 3 fix (Reviewer task6): establish the variance
+    # threshold via bootstrap resampling of the empirical prior
+    # distribution, rather than using an arbitrary magic constant.
+    # Bootstrap estimates the sampling distribution of variance under
+    # the null hypothesis that the column is informative (non-degenerate).
+    # We set the floor at the 5th percentile of this bootstrap
+    # distribution, ensuring we reject only columns whose variance is
+    # statistically indistinguishable from zero.
     #
     # Round-3 revision (BLK-3B conservative resolution): a column is
     # only REQUIRED to be informative when its behavioural class is
@@ -772,29 +779,59 @@ def prepare_dataset(
     from nsmor.config import Label as _Label
     label_names_in_col = [cls.name for cls in _Label]
     degenerate_columns: Dict[str, str] = {}
+
+    # Bootstrap-based variance floor estimation (per class column)
+    n_bootstrap = 1000
+    variance_floors: Dict[int, float] = {}
+    for c in range(mcmc_priors.shape[1]):
+        col_data = mcmc_priors[:, c]
+
+        # Bootstrap: resample with replacement, compute variance
+        boot_vars = np.zeros(n_bootstrap)
+        rng = np.random.default_rng(seed=random_seed + c)
+        n_samples = len(col_data)
+        for b in range(n_bootstrap):
+            resample_idx = rng.choice(n_samples, size=n_samples, replace=True)
+            boot_vars[b] = np.var(col_data[resample_idx])
+
+        # 5th percentile as conservative floor (reject only extreme degeneracy)
+        var_floor = float(np.percentile(boot_vars, 5))
+        variance_floors[c] = var_floor
+
+        logger.debug(
+            "Bootstrap variance floor (col %d): 5th pctl=%.2e, "
+            "median=%.2e, 95th pctl=%.2e",
+            c, var_floor, float(np.median(boot_vars)),
+            float(np.percentile(boot_vars, 95)),
+        )
+
     for c in range(mcmc_priors.shape[1]):
         col_var = float(np.var(mcmc_priors[:, c]))
-        if col_var >= 1e-4:
+        var_floor = variance_floors[c]
+
+        if col_var >= var_floor:
             continue
+
         cls_name = label_names_in_col[c] if c < len(label_names_in_col) else f"class_{c}"
         class_present = any(
             info["label"].name == cls_name for info in labeled_kept
         )
         if class_present:
             raise ValueError(
-                f"OOF MCMC prior column {c} ({cls_name}) is degenerate "
-                f"(variance={col_var:.2e} < 1e-4) although the class IS "
-                "populated: at least one fold's training side lacks it "
-                "(fold-grouping failure).  Regroup folds (fewer folds / "
-                "LOCO) or collect more sessions for that class; refusing "
-                "to save a dataset with uninformative priors."
+                f"OOF MCMC prior column {c} ({cls_name}) is degenerate: "
+                f"variance={col_var:.2e} < bootstrap floor={var_floor:.2e} "
+                f"(5th percentile from {n_bootstrap} resamples). This "
+                f"indicates at least one fold's training side lacks the "
+                f"class (fold-grouping failure). Regroup folds (fewer "
+                f"folds / LOCO) or collect more sessions for that class; "
+                f"refusing to save a dataset with uninformative priors."
             )
         logger.warning(
             "OOF MCMC prior column %d (%s) is degenerate because the "
-            "class is EMPTY in this dataset (variance=%.2e).  Column "
-            "recorded in mcmc_degenerate_columns; downstream consumers "
-            "must not interpret it as evidence.",
-            c, cls_name, col_var,
+            "class is EMPTY in this dataset (variance=%.2e < floor=%.2e). "
+            "Column recorded in mcmc_degenerate_columns; downstream "
+            "consumers must not interpret it as evidence.",
+            c, cls_name, col_var, var_floor,
         )
         degenerate_columns[cls_name] = f"column_{c}"
     logger.info("OOF prior variance floor check passed (all columns).")
@@ -815,6 +852,18 @@ def prepare_dataset(
 
     from scipy.stats import ks_2samp
     prior_consistency: Dict[str, Dict[str, float]] = {}
+
+    # Round-3 Flaw 3 fix: establish rejection threshold for train-serve
+    # distribution mismatch.  If KS test rejects the null hypothesis
+    # that OOF and ensemble distributions are identical (at α=0.01
+    # Bonferroni-corrected for 4 classes → 0.01/4 = 0.0025 per test),
+    # the model will learn a prior-to-behavior mapping on one
+    # distribution but serve predictions on another — this invalidates
+    # the deployment protocol and must be flagged as a hard error.
+    ks_alpha = 0.01
+    ks_alpha_corrected = ks_alpha / mcmc_priors.shape[1]  # Bonferroni correction
+    mismatch_failures: List[str] = []
+
     for c in range(mcmc_priors.shape[1]):
         col_oof = mcmc_priors[:, c]
         col_ens = ens_probs[:, c]
@@ -827,13 +876,36 @@ def prepare_dataset(
             "var_oof": float(np.var(col_oof)),
             "var_serve": float(np.var(col_ens)),
         }
+
+        # Check for significant train-serve mismatch
+        cls_name = label_names_in_col[c] if c < len(label_names_in_col) else f"class_{c}"
+        if ks.pvalue < ks_alpha_corrected:
+            mismatch_failures.append(
+                f"col {c} ({cls_name}): KS p={ks.pvalue:.2e} < "
+                f"{ks_alpha_corrected:.2e} (Bonferroni α={ks_alpha})"
+            )
+
         logger.info(
-            "[MCMC-CV] prior train-vs-serve col %d: "
-            "mean|Δ|=%.4f, KS=%.3f (p=%.2e), var %.4f→%.4f",
-            c, prior_consistency[str(c)]["mean_abs_diff"],
+            "[MCMC-CV] prior train-vs-serve col %d (%s): "
+            "mean|Δ|=%.4f, KS=%.3f (p=%.2e%s), var %.4f→%.4f",
+            c, cls_name,
+            prior_consistency[str(c)]["mean_abs_diff"],
             ks.statistic, ks.pvalue,
+            " **REJECT**" if ks.pvalue < ks_alpha_corrected else "",
             prior_consistency[str(c)]["var_oof"],
             prior_consistency[str(c)]["var_serve"],
+        )
+
+    if mismatch_failures:
+        raise ValueError(
+            f"Train-serve prior distribution mismatch detected in "
+            f"{len(mismatch_failures)}/{mcmc_priors.shape[1]} classes. "
+            f"The model will train on OOF priors but serve ensemble "
+            f"priors with significantly different distributions, "
+            f"invalidating deployment: {'; '.join(mismatch_failures)}. "
+            f"This indicates fold imbalance or instability in the MCMC "
+            f"generator. Increase n_folds, balance session-level class "
+            f"composition, or revise the cross-fitting strategy."
         )
 
 # ── Step 5: Sequence Extraction with Visual Physics Reconstruction ──
@@ -842,6 +914,7 @@ def prepare_dataset(
     sequences = []
     valid_snaps = []  # 仅收集快照输入，不在循环内推理
     seq_session_ids: List[str] = []  # Round-3 CRITICAL-3b: session id per kept trial
+    kept_seq_indices: List[int] = []  # Track which trials succeed (Flaw 2 fix)
 
     # Iterate over labeled_kept ONLY: trials dropped during snapshot
     # extraction have no out-of-fold prior row, so including them here
@@ -849,7 +922,7 @@ def prepare_dataset(
     # below catches it).  Note the clamp inside this loop makes every
     # kept trial's snapshot succeed, so sequences/priors/snaps stay
     # row-for-row aligned.
-    for info in labeled_kept:
+    for trial_idx, info in enumerate(labeled_kept):
         try:
             trial_data = info["trial_data"]
             stimulus_onset_ms = info["stimulus_onset_ms"]
@@ -934,6 +1007,7 @@ def prepare_dataset(
             sequences.append((X_seq, Y_seq, int(info["label"])))
             valid_snaps.append(snap)
             seq_session_ids.append(str(info["session_id"]))
+            kept_seq_indices.append(trial_idx)  # Track successful trial index
 
             logger.debug(
                 "Trial %s/%d: θ(t) range [%.2f°, %.2f°], "
@@ -947,8 +1021,68 @@ def prepare_dataset(
             )
 
         except (ValueError, KeyError) as e:
-            logger.warning("Skipping trial: %s", e)
+            logger.warning(
+                "Skipping trial [%s, %d] in Step 5: %s",
+                info.get("session_id", "UNKNOWN"),
+                info.get("trial_id", -1),
+                e
+            )
             continue
+
+    # Round-3 Flaw 2 fix: if any trials failed during sequence extraction,
+    # filter mcmc_priors and ens_probs to maintain row-for-row alignment.
+    # The kept_seq_indices mask tracks which trials succeeded.
+    skipped_count = len(labeled_kept) - len(kept_seq_indices)
+    if skipped_count > 0:
+        logger.warning(
+            "Skipped %d/%d trials during sequence extraction; filtering "
+            "mcmc_priors to maintain alignment.",
+            skipped_count, len(labeled_kept),
+        )
+        mcmc_priors = mcmc_priors[kept_seq_indices]
+        ens_probs = ens_probs[kept_seq_indices]
+
+        # Recompute prior_consistency on the filtered set
+        prior_consistency_filtered: Dict[str, Dict[str, float]] = {}
+
+        # Bonferroni correction for multiple KS tests
+        alpha = 0.05
+        n_columns = mcmc_priors.shape[1]
+        alpha_corrected = alpha / n_columns
+
+        for c in range(n_columns):
+            col_oof = mcmc_priors[:, c]
+            col_ens = ens_probs[:, c]
+            ks = ks_2samp(col_oof, col_ens)
+            cls_name = label_names_in_col[c] if c < len(label_names_in_col) else f"class_{c}"
+
+            # Bonferroni-corrected rejection rule (Flaw 3-2 fix)
+            if ks.pvalue < alpha_corrected:
+                raise ValueError(
+                    f"OOF vs ensemble prior distribution mismatch (column {c}, class '{cls_name}'): "
+                    f"KS statistic={ks.statistic:.4f}, p-value={ks.pvalue:.2e} < "
+                    f"Bonferroni-corrected α={alpha_corrected:.2e} (α={alpha}/{n_columns} columns). "
+                    f"This indicates train-vs-serve distribution shift in MCMC priors."
+                )
+
+            prior_consistency_filtered[str(c)] = {
+                "mean_abs_diff": float(np.mean(np.abs(col_oof - col_ens))),
+                "max_abs_diff": float(np.max(np.abs(col_oof - col_ens))),
+                "ks_statistic": float(ks.statistic),
+                "ks_pvalue": float(ks.pvalue),
+                "var_oof": float(np.var(col_oof)),
+                "var_serve": float(np.var(col_ens)),
+            }
+
+            logger.info(
+                "Column %d (%s) KS test: statistic=%.4f, p=%.2e (α_corrected=%.2e) — PASS",
+                c, cls_name, ks.statistic, ks.pvalue, alpha_corrected
+            )
+
+        prior_consistency = prior_consistency_filtered
+        logger.info(
+            "Recomputed prior_consistency on %d kept trials.", len(kept_seq_indices)
+        )
 
     # 5. 批量推理：一次性处理所有快照，原生输出 (N, 4) 矩阵，彻底规避降维风险
     # Reviewer Round-1 BLOCKER-2: the priors used downstream are the

@@ -49,6 +49,7 @@ from tqdm import tqdm
 from nsmor.checkpoint import load_checkpoint, save_checkpoint
 from nsmor.config import DEFAULT_FEATURE
 from nsmor.config_parser import ExperimentConfig
+from nsmor.dataloader_factory import create_dataloaders_from_config
 from nsmor.loss import BioJointLoss, BioDecisionLoss, FrontendLoss
 from nsmor.model_nsmor_core import NSMoRCore
 
@@ -440,10 +441,7 @@ def build_dataloaders(
     Raises:
         FileNotFoundError: If the dataset file does not exist.
     """
-    from nsmor.nsmor_dataloader import (
-        NSMoRDataset,
-        collate_variable_length,
-    )
+    from nsmor.nsmor_dataloader import NSMoRDataset
 
     dataset_file = Path(dataset_path)
     if not dataset_file.exists():
@@ -579,35 +577,13 @@ def build_dataloaders(
         max_seq_len=max_seq_len,
     )
 
-    # ── Create dataloaders ────────────────────────────────────
-    # num_workers: auto-scale based on dataset size.  Small datasets
-    # (< 200 sequences) don't benefit from multiprocessing overhead;
-    # larger datasets need prefetching to keep GPU fed.
-    _n_train = len(train_dataset)
-    if _n_train < 200:
-        _nw = 0
-    else:
-        _nw = min(4, (os.cpu_count() or 2) - 1)
-
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset,
-        batch_size=config.training.batch_size,
-        shuffle=True,
-        num_workers=_nw,
-        collate_fn=collate_variable_length,
-        pin_memory=torch.cuda.is_available(),
-        persistent_workers=_nw > 0,
-        prefetch_factor=2 if _nw > 0 else None,
-    )
-    val_loader = torch.utils.data.DataLoader(
-        val_dataset,
-        batch_size=config.training.batch_size,
-        shuffle=False,
-        num_workers=_nw,
-        collate_fn=collate_variable_length,
-        pin_memory=torch.cuda.is_available(),
-        persistent_workers=_nw > 0,
-        prefetch_factor=2 if _nw > 0 else None,
+    # ── Create dataloaders (via factory) ──────────────────────
+    # Delegates to dataloader_factory for unified worker auto-scaling,
+    # pin_memory, and persistent_workers policy.
+    train_loader, val_loader, _ = create_dataloaders_from_config(
+        config,
+        train_dataset=train_dataset,
+        val_dataset=val_dataset,
     )
 
     logger.info(

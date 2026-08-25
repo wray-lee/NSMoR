@@ -164,6 +164,30 @@ class TrainingConfig:
     suppress.  We therefore strongly discourage enabling normalization without
     a non-zero clip; enable both together for a statistically coherent target."""
 
+    # ── DataLoader parallelism ──────────────────────────────────
+    num_workers: int = -1
+    """Worker processes for train/val/test DataLoaders.
+
+    ``-1`` (default) auto-scales to ``min(4, os.cpu_count())`` inside
+    :mod:`~nsmor.dataloader_factory`; ``0`` runs single-process (deterministic
+    and debuggable, no worker overhead).  Windows spawns workers via ``spawn``
+    so any worker-visible object must be import-top-level — the factory keeps
+    collate closures module-level for exactly this reason."""
+
+    pin_memory: bool = True
+    """Page-lock host memory before H2D transfer. Only meaningful on CUDA;
+    the factory silently disables it on CPU-only builds."""
+
+    persistent_workers: bool = True
+    """Keep worker processes alive across epochs (avoids ~seconds of
+    re-spawn per epoch on large datasets). Requires ``num_workers > 0``;
+    PyTorch raises if enabled with ``num_workers == 0``, so the factory
+    coerces it to ``False`` whenever the resolved worker count is 0."""
+
+    prefetch_factor: int = 2
+    """Batches pre-loaded per worker ahead of the consumer. Ignored (and
+    must not be forwarded) when ``num_workers == 0``; guarded by the factory."""
+
     escape_band_cm_s: float = 10.0
     """Absolute velocity-magnitude threshold (cm/s) defining the *high-velocity
     band* for the escape-signal audit in :func:`~scripts.train.compute_metrics`.

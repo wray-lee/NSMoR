@@ -35,10 +35,8 @@ import matplotlib.ticker as ticker
 import numpy as np
 import torch
 
-from nsmor.nsmor_dataloader import (
-    NSMoRDataset,
-    collate_variable_length,
-)
+from nsmor.nsmor_dataloader import NSMoRDataset
+from nsmor.dataloader_factory import create_optimized_dataloader
 from nsmor.checkpoint import load_checkpoint
 from nsmor.config import DEFAULT_FEATURE, Label
 from nsmor.model_nsmor_core import NSMoRCore
@@ -167,12 +165,11 @@ def load_dataset(
         max_seq_len=max_seq_len,
     )
 
-    dataloader = torch.utils.data.DataLoader(
+    dataloader = create_optimized_dataloader(
         bio_dataset,
         batch_size=batch_size,
         shuffle=False,  # Preserve ordering for label matching
-        num_workers=0,
-        collate_fn=collate_variable_length,
+        num_workers=-1,  # Auto-scale based on dataset size
     )
 
     lengths_list = [int(l) for l in lengths]

@@ -49,9 +49,10 @@ from nsmor.analysis.gating_cluster import (
 )
 from nsmor.config import Label
 from nsmor.config_parser import ExperimentConfig
+from nsmor.dataloader_factory import create_optimized_dataloader
 from nsmor.model_utils import load_model_from_checkpoint as _shared_load_model
 from nsmor.model_utils import validate_dataset_provenance
-from nsmor.nsmor_dataloader import NSMoRDataset, collate_variable_length
+from nsmor.nsmor_dataloader import NSMoRDataset
 
 # Use non-interactive backend for headless environments
 matplotlib.use("Agg")
@@ -145,12 +146,11 @@ def load_model_and_dataset(
         max_seq_len=max_seq_len,
     )
 
-    dataloader = torch.utils.data.DataLoader(
+    dataloader = create_optimized_dataloader(
         bio_dataset,
         batch_size=batch_size,
         shuffle=False,  # Required for deterministic ordering
-        num_workers=0,
-        collate_fn=collate_variable_length,
+        num_workers=-1,  # Auto-scale based on dataset size
     )
 
     return model, dataloader, labels

@@ -245,6 +245,8 @@ pip install -e ".[dev]"
 pytest tests/ -v
 ```
 
+**Current test coverage**: 114 tests covering core model, data pipeline, analysis modules, and v2.1 semantics.
+
 ---
 
 ## Requirements
@@ -257,6 +259,26 @@ pytest tests/ -v
 - SciPy ≥ 1.10
 - tqdm
 - matplotlib
+- umap-learn (for gating cluster analysis)
+- pyyaml (for configuration management)
+
+---
+
+## Recent Updates
+
+See [CHANGELOG.md](CHANGELOG.md) for detailed release notes.
+
+### Version 2.1 Highlights (Current)
+
+- **Pipeline semantics v2.1**: Fixed PREWALK label collapse via escape-first branch ordering; session-grouped 5-fold CV eliminates data leakage
+- **DataLoader factory**: Intelligent worker auto-scaling (datasets <200 sequences use single-process, larger datasets scale to 4 workers)
+- **Jacobian GMM+BIC calibration**: Replaces ad-hoc thresholds with principled Gaussian Mixture Model + Bayesian Information Criterion selection
+- **Two-phase Hybrid Funnel training**: Gradient-isolated frontend (Phase 1: MSE) → backend (Phase 2: bio-physical losses)
+- **MCMC cross-validation diagnostics**: Per-fold leakage detection, OOF prior variance checks, train-vs-serve distribution consistency tests
+- **Biophysical completeness**: Added `lif_rel_refract_ms`, `sensory_noise_std`, `lif_lateral_inhibition` with sampling-rate-invariant conversion
+- **Statistical rigor**: Fixed nonparametric psychophysics analysis (Wilcoxon + Hodges-Lehmann), Holm-Bonferroni FWER correction, Wilson score CIs
+
+**Performance**: Training with v2.1 semantics achieves **R² ≈ 0.37** (honest generalization without session leakage), compared to R² ≈ 0.47 in the pre-v2.1 inflated pipeline.
 
 ---
 
@@ -287,7 +309,7 @@ The analysis pipeline uses `nsmor.analysis.uq` for publication-grade inference:
 
 - **Block bootstrap CI** (Künsch 1989) — preserves temporal autocorrelation in
   per-trial MSE sequences; block_size=5 (fixed, conservative) with runtime
-  sensitivity check at block_size 2 and 10.
+  sensitivity check at block_size ∈ {2, 5, 10}.
 - **BCa bootstrap** — bias-corrected and accelerated intervals with extreme-z
   warning when |z₀| > 0.25.
 - **Paired Cohen's d** — effect size for lesion conditions vs intact.
@@ -297,6 +319,9 @@ The analysis pipeline uses `nsmor.analysis.uq` for publication-grade inference:
   for psychophysics (no Shapiro pre-screening; fixed nonparametric by design).
 - **Wilson score CI** — for Jacobian accept/reject proportions (small-sample
   binomial).
+- **GMM + BIC threshold calibration** — Gaussian Mixture Model with Bayesian
+  Information Criterion (ΔBIC > 10) for fixed-point residual thresholds in
+  dynamical systems analysis.
 
 ### Hybrid Funnel Architecture (Frontend → .detach() → Backend)
 
@@ -445,11 +470,13 @@ Single source of truth for all hyperparameters, dataset paths, and fine-tuning s
 model:
     hidden_dim: 64
     lif_alpha: 0.9
+    lif_rel_refract_ms: 20.0  # NEW in v2.1
 
 training:
     learning_rate: 0.001
     batch_size: 32
     num_epochs: 100
+    phase1_epochs: 30  # Hybrid Funnel: Phase 1 frontend epochs
 
 data:
     train_kinematics:
@@ -458,6 +485,7 @@ data:
     train_events:
         - data/session_0/events.csv
         - data/session_1/events.csv
+    num_workers: -1  # Auto-scaling (NEW: factory default)
 
 finetune:
     freeze_modules: ["lif_cell", "router"]
@@ -469,19 +497,21 @@ CLI overrides for rapid experimentation:
 ```bash
 python train.py --config config/base.yaml --lr 5e-4 --freeze lif_cell router
 python train.py --config config/base.yaml --hidden-dim 128 --epochs 200
+python train.py --config config/base.yaml --phase1_epochs 30  # Two-phase training
 ```
 
 Dynamic dataset combination for mixed experimental conditions:
 
 ```python
-from nsmor.nsmor_dataloader import combine_datasets, create_dataloader_from_config
+from nsmor.nsmor_dataloader import combine_datasets
+from nsmor.dataloader_factory import create_dataloader_from_config  # NEW
 
 # Combine pure wind baseline with looming datasets
 wind_seqs = build_sequence_dataset(wind_trials)
 looming_seqs = build_sequence_dataset(looming_trials)
 combined = combine_datasets(wind_seqs, looming_seqs)
 
-loader = create_dataloader_from_config(
+loader = create_dataloader_from_config(  # NEW: factory with auto-scaling
     config=cfg,
     sequences=combined,
     mcmc_priors=priors,
@@ -543,7 +573,7 @@ loss = criterion(y_pred, y_true, lengths, g_gru, lambda_reg=0.01)
 
 ### Main Training Engine (`scripts/train.py`)
 
-Full training pipeline with **two-phase** (Hybrid Funnel) or single-phase mode:
+Full training pipeline with **two-phase Hybrid Funnel** or single-phase mode:
 
 ```bash
 # Single-phase (backward compatible — all parameters trainable)
@@ -567,14 +597,17 @@ Features:
 
 - YAML config + CLI overrides via `config_parser`
 - Two-phase training with automatic phase transition (`--phase1_epochs`)
+- Gradient isolation via `requires_grad` toggling (not unconditional `.detach()`)
 - AdamW optimizer with per-pathway learning rates (LIF 0.3× base LR)
 - AMP (FP16 forward/backward, FP32 master weights) for RTX 5060 Ti
-- Cosine warmup for bio-loss regularization terms
+- Cosine warmup for bio-loss regularization terms with annealing factor
 - NaN/Inf loss guard and post-clip gradient finiteness check
 - Membrane health monitoring (V_max, spike_rate, w_adapt per epoch)
+- Escape-band sensitivity audit with sustained-membership guard
 - Best-model checkpoint (`best_model.pth`) on validation improvement
 - Periodic checkpoints (`epoch_X.pth`) at configurable intervals
 - Automatic unfreezing at scheduled epoch
+- DataLoader factory integration with worker auto-scaling
 
 ### Dynamical Systems Adapter (`nsmor.analysis.dynamics`)
 

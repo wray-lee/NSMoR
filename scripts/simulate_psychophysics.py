@@ -113,7 +113,8 @@ def load_validation_data(device: torch.device, max_seq_len: int = 1000):
     split = n_total - n_val
 
     # Use DataLoader with collate_variable_length for proper padding
-    from nsmor.nsmor_dataloader import NSMoRDataset, collate_variable_length
+    from nsmor.nsmor_dataloader import NSMoRDataset
+    from nsmor.dataloader_factory import create_optimized_dataloader
     from nsmor.config import DEFAULT_FEATURE
 
     sequences = [(X_seqs[i], Y_seqs[i], 0) for i in range(split, n_total)]
@@ -128,12 +129,11 @@ def load_validation_data(device: torch.device, max_seq_len: int = 1000):
     )
 
     # Create a single batch with all validation data
-    val_loader = torch.utils.data.DataLoader(
+    val_loader = create_optimized_dataloader(
         val_dataset,
         batch_size=len(val_dataset),
         shuffle=False,
-        num_workers=0,
-        collate_fn=collate_variable_length,
+        num_workers=-1,  # Auto-scale based on dataset size
     )
 
     X_val, Y_val, lengths_val = next(iter(val_loader))

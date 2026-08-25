@@ -104,6 +104,15 @@ training:
   #     metric reporting.  0 = disabled (backward compatible; default off).
   target_clip_cm_s: 0
 
+  # ── DataLoader parallelism ─────────────────────────────────
+  # num_workers: -1 auto-scales to min(4, cpu_count); 0 = single-process.
+  # persistent_workers requires workers > 0 (coerced by the factory).
+  # prefetch_factor is ignored when num_workers == 0.
+  num_workers: -1
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2
+
 # ── Loss function ───────────────────────────────────────────
 loss:
   reduction: mean           # MSE reduction: 'mean' or 'sum'
