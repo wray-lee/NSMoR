@@ -1,5 +1,12 @@
 # NSMoR — AI Context Harness
 
+## Git Identity & Commit Boundary (CRITICAL)
+- **Author / Committer**: MUST be `wray-lee <i@wray7.top>` (verified GitHub primary email).
+- **Rule**: Never override local `.git/config` with secondary or unlinked emails (e.g., `wray-lee@users.noreply.github.com` or `wray.lee@outlook.com`).
+- **Verification**: Always ensure `git config user.email` returns `i@wray7.top` before committing.
+
+---
+
 ## Project Goal
 
 NSMoR (Biological Mixture-of-Recursions) models **cricket multi-sensory integration** using a dual-pathway recurrent neural network:
