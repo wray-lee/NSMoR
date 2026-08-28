@@ -1,110 +1,78 @@
-# NSMoR — AI Context Harness
+# NSMoR — AI Context Harness & Engineering Guidelines
 
-## Git Identity & Commit Boundary (CRITICAL)
-- **Author / Committer**: MUST be `wray-lee <i@wray7.top>` (verified GitHub primary email).
-- **Rule**: Never override local `.git/config` with secondary or unlinked emails (e.g., `wray-lee@users.noreply.github.com` or `wray.lee@outlook.com`).
-- **Verification**: Always ensure `git config user.email` returns `i@wray7.top` before committing.
+## Multi-Agent Protocol & AGENTS.md (CRITICAL)
+- **Harness Specification**: Read `AGENTS.md` and `HARNESS.md` for full details on multi-agent execution rules, double-blind peer review protocols, and state machine loops.
+- **Git Author / Committer**: MUST be `wray-lee <i@wray7.top>` (verified GitHub primary email).
+- **Git Constraint**: Never commit under unverified emails or secondary aliases. Always verify `git config user.email` returns `i@wray7.top` before creating commits.
+- **WSL Execution Environment**: All python/pytest/bash operations run in WSL Zsh with `t` conda activate alias.
 
 ---
 
-## Project Goal
+## Project Architecture
 
 NSMoR (Biological Mixture-of-Recursions) models **cricket multi-sensory integration** using a dual-pathway recurrent neural network:
 
 - **LIF Pathway:** Leaky Integrate-and-Fire spiking neuron for fast, event-driven sensory transients.
-- **GRU Pathway:** Standard Gated Recurrent Unit for smooth, continuous temporal integration.
+- **GRU Pathway:** Gated Recurrent Unit for smooth, continuous temporal integration.
 - **MoR Router:** Learned causal inference gate that blends LIF and GRU outputs per timestep.
 
-The system is designed for **white-box dynamical systems analysis** — all internal states (routing gates, membrane potentials, spike events, GRU hidden states) are exposed for manifold and Jacobian analysis.
+Designed for **white-box dynamical systems analysis**: expose routing gates, membrane potentials, spike events, and GRU hidden states for fixed-point and Jacobian analysis.
 
 ---
 
-## Architectural Rules
-
-### Mandatory Coding Standards
+## Mandatory Engineering & Coding Standards
 
 1. **Strict Type Hinting:** All function signatures must have complete type annotations.
-2. **Tensor Shape Assertions:** Every `forward()` pass must include shape assertions at key points:
+2. **Tensor Shape Assertions:** Every `forward()` pass and state transformation must include explicit shape assertions:
     ```python
     assert tensor.shape == (B, T, H), f"Expected (B={B}, T={T}, H={H}), got {tensor.shape}"
     ```
-3. **Modular Design:** Sub-modules must be decoupled and independently testable.
-4. **Shape Documentation:** All tensors must be annotated with shape comments:
-    ```python
-    hidden = self.encoder(x)  # (B, T, H)
-    ```
-5. **Immutability of Frozen Core:** The `nsmor/` directory contains the frozen mathematical core. Changes require explicit user override.
-
-### Code Style
-
-- Follow PEP 8 with 88-character line limit (Black formatter compatible).
-- Use `from __future__ import annotations` in all modules.
-- Docstrings must follow Google style with Args/Returns/Raises sections.
+3. **Modular Design & Immutability:** Core mathematical code (`nsmor/model_nsmor_core.py`, `nsmor/loss.py`) is **frozen**. Modifications require explicit user override.
+4. **Statistical Rigor:** Multi-condition comparisons must calculate effect sizes (Cohen's $d$) and adjusted p-values (FDR/Bonferroni).
+5. **Code Style:** PEP 8 (88-char limit), `from __future__ import annotations`, Google-style docstrings.
 
 ---
 
-## AI Directives
+## Modification & Boundary Permissions
 
-### Critical Constraints
-
-1. **NEVER rewrite `nsmor/model_nsmor_core.py`** when asked to build analysis scripts, training pipelines, or testing infrastructure. This module is stable and frozen.
-
-2. **NEVER rewrite `nsmor/loss.py`** when asked to add new features or analysis tools. The loss function is mathematically verified and frozen.
-
-3. **ALWAYS check `BOUNDARY.md` files** in subdirectories before modifying code:
-    - `nsmor/BOUNDARY.md` — Frozen core (requires explicit override)
-    - `nsmor/pipeline/BOUNDARY.md` — Data pipeline (safe to extend)
-    - `nsmor/analysis/BOUNDARY.md` — Analysis sandbox (free to modify)
-
-4. **ALWAYS preserve tensor shape assertions** when refactoring. Do not remove `assert` statements in `forward()` methods.
-
-5. **ALWAYS maintain backward compatibility** when extending modules. Existing imports must continue to work.
-
-### Modification Permissions
-
-| Directory         | Permission | Notes                                               |
-| ----------------- | ---------- | --------------------------------------------------- |
-| `nsmor/`          | **Frozen** | Core architecture — requires explicit user override |
-| `nsmor/pipeline/` | **Extend** | Safe to add new extraction functions                |
-| `nsmor/analysis/` | **Free**   | Sandbox for dynamical systems tools                 |
-| `scripts/`        | **Free**   | Training and evaluation scripts                     |
-| `tests/`          | **Free**   | Test infrastructure                                 |
-| `config/`         | **Free**   | YAML configuration files                            |
-
-### When Building New Analysis Tools
-
-1. Create new files in `nsmor/analysis/` — do NOT add to `nsmor/` root.
-2. Import from frozen core modules — do NOT copy code:
-    ```python
-    from nsmor.model_nsmor_core import NSMoRCore
-    from nsmor.loss import BioJointLoss
-    ```
-3. Respect the I/O contracts defined in `BOUNDARY.md` files.
-4. Add shape assertions to all new functions.
+| Directory / Module | Status | Permission & Boundary File | Notes |
+| :--- | :--- | :--- | :--- |
+| `nsmor/` (Root Core) | **Frozen** | 🔒 `nsmor/BOUNDARY.md` | Frozen core architecture & loss — requires explicit user override |
+| `nsmor/pipeline/` | **Extend** | 🔓 `nsmor/pipeline/BOUNDARY.md` | Data ingestion, feature extraction, dataloader factory |
+| `nsmor/analysis/` | **Sandbox** | 🔓 `nsmor/analysis/BOUNDARY.md` | Fixed-point analysis, Jacobians, dynamical manifolds, UQ |
+| `scripts/` | **Editable** | — | Training, simulation, analysis scripts |
+| `tests/` | **Editable** | — | Pytest suite & integration fixtures |
+| `config/` | **Editable** | — | Model & dataset hyperparameter YAML files |
 
 ---
 
-## File Reference
+## AI Agent Workflow Protocol
 
-| File                         | Purpose                                                                       |
-| ---------------------------- | ----------------------------------------------------------------------------- |
-| `nsmor/model_nsmor_core.py`  | MoR architecture (SensoryEncoder, LIFCell, GRUUnit, MoRRouter, DirectionHead) |
-| `nsmor/loss.py`              | BioJointLoss (Masked MSE + Router Regularization)                             |
-| `nsmor/checkpoint.py`        | Deterministic checkpoint save/load                                            |
-| `nsmor/config_parser.py`     | YAML + argparse configuration management                                      |
-| `nsmor/nsmor_dataloader.py`  | PyTorch Dataset/DataLoader with variable-length collation                     |
-| `nsmor/analysis/dynamics.py` | FixedPointAdapter for Jacobian analysis                                       |
-| `scripts/train.py`           | Main training engine                                                          |
+```
+Developer (nsmor_developer) ── proposal ──> Reviewer #2 (nsmor_reviewer)
+      ▲                                                │
+      │                                       ACCEPT   │   REJECT (Critique)
+      └────────────────────────────────────────────────┴───────┐
+                                                               ▼
+Release Commit <── Pass Gate ── Tester (nsmor_tester) <── Fix Proposal
+```
+
+1. **`nsmor_developer`**: Implements code, ensuring shape assertions, numerical safety, and biological plausibility. Submit proposal to `nsmor_reviewer`.
+2. **`nsmor_reviewer`**: Conducts double-blind audit across (1) Biological Plausibility, (2) Mathematical Dynamics, (3) Statistical Rigor. Emits `**ACCEPT**` or `**REJECT**`.
+3. **`nsmor_tester`**: Executes data pipeline smoke test, 1-epoch train test, `pytest` suite, numerical `NaN`/`Inf` sweep, and performs Git rebase/commit/push with `Approved-by: Reviewer #2`.
 
 ---
 
-## Quick Commands
+## Quick Execution Commands
 
 ```bash
+# WSL Zsh Torch Environment Setup
+t  # alias for conda activate torch
+
 # Run training
 python scripts/train.py --config config/default.yaml
 
-# Run tests
+# Run test suite
 pytest tests/ -v
 
 # Run smoke tests
