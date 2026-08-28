@@ -8,10 +8,11 @@ This directory handles **data ingestion, feature extraction, labeling, and colla
 
 ## Key Modules
 
-- `io.py`: Raw dataset loading, file I/O, and raw tensor parsing.
-- `kinematics.py`: Kinematic calculations (velocities, accelerations, visual angles, turn rates).
-- `labeling.py`: MCMC prior estimation and categorical behavioral state annotations.
-- `dataloader_factory.py` (and `nsmor_dataloader.py`): Parallel preprocessing, batch collation, variable-length padding, and dataset fixtures.
+- `io.py`: Raw dataset loading (CSV), session concatenation, per-trial extraction, and first-frame spike sanitization.
+- `kinematics.py`: Savitzky-Golay / Gaussian smoothing, velocity / acceleration computation, visual angle derivation.
+- `labeling.py`: Ground truth label assignment (ESCAPE, PREWALK, PRE_ACTIVE, NO_RESPONSE) using v2.1 escape-first branch ordering.
+
+**Note**: `dataloader_factory.py` and `nsmor_dataloader.py` reside in `nsmor/` root (not `nsmor/pipeline/`), but collaborate closely with pipeline modules for batch collation and worker auto-scaling.
 
 ---
 
@@ -25,11 +26,13 @@ Input Feature Layout [B, T, 8]:
   [1] wind(t)         — wind stimulus state (0/1)
   [2] v_kine(t-1)     — previous velocity (cm/s)
   [3] a_kine(t-1)     — previous acceleration (cm/s²)
-  [4] P_startle       — MCMC startle prior
-  [5] P_walk          — MCMC walk prior
-  [6] P_pre_active    — MCMC pre-active prior
-  [7] P_no_response   — MCMC no-response prior
+  [4] P_escape        — MCMC prior: P(ESCAPE)
+  [5] P_prewalk       — MCMC prior: P(PREWALK)
+  [6] P_pre_active    — MCMC prior: P(PRE_ACTIVE)
+  [7] P_no_response   — MCMC prior: P(NO_RESPONSE)
 ```
+
+**Note on naming**: The README and v2.1 pipeline use behavioral-state naming (`P_escape`, `P_prewalk`, etc.) rather than the legacy `P_startle`/`P_walk` naming. Both refer to the same 4-class MCMC posterior probabilities.
 
 ---
 

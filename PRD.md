@@ -55,7 +55,7 @@ In computational neuroscience and animal behavior modeling, traditional neural n
 #### Non-Functional Requirements
 - **[P0] Mathematical & Shape Assertions**: Every `forward()` method must enforce runtime tensor shape assertions (`assert tensor.shape == (B, T, H)`).
 - **[P0] Numerical Overflow Interception**: 100% protection against `NaN`/`Inf` during loss computation and gradient clipping.
-- **[P1] Test Coverage**: Maintain passing status across the complete pytest suite ($\ge 114$ tests).
+- **[P1] Test Coverage**: Maintain passing status across the complete pytest suite ($\ge 131$ tests).
 
 ### Out-of-Scope
 - Direct closed-loop motor control of physical hardware (strictly simulated in-silico generation).
@@ -116,7 +116,7 @@ $$\mathbf{s}_{\text{TTC-50ms}} = [v_{\text{vis}}, l/v \text{ ratio}, \text{wind\
 - [x] **Data Pipeline**: v2.1 semantics validated with `pipeline_semantics_version="2.1"` and session-grouped 5-fold OOF priors.
 - [x] **Generalization Performance**: Model achieves honest validation $R^2 \approx 0.37 \pm 0.03$ without session leakage.
 - [x] **Analysis Pipeline**: All 6 analysis scripts (`make analyze`) run end-to-end and generate 300 DPI publication figures in `results/`.
-- [x] **Test Infrastructure**: `pytest tests/ -v` passes 100% of 114 test cases.
+- [x] **Test Infrastructure**: `pytest tests/ -v` passes 100% of 131 test cases.
 - [x] **Harness Governance**: 5-layer harness framework operational (`AGENTS.md`, `CLAUDE.md`, path `BOUNDARY.md` files, `HARNESS.md`, `.claude/`).
 
 ---

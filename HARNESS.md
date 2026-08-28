@@ -59,7 +59,11 @@ The harness consists of 5 tightly integrated governance layers:
 
 ## 3. Double-Blind Peer Review Protocol
 
-The reviewer agent (`nsmor_reviewer`, modeled after "Reviewer #2") audits all developer work prior to integration testing using three non-negotiable scientific criteria:
+The Orchestrator dispatches the developer's code snapshot to **two independent reviewer instances** (`nsmor_reviewer_A` and `nsmor_reviewer_B`) in isolated sandbox sessions. Neither reviewer sees the other's output — this implements true double-blind review.
+
+**Acceptance Gate**: Both reviewers must return `[is_accepted: TRUE]` for work to proceed to testing. If either returns `[is_accepted: FALSE]`, feedback from both is merged losslessly and sent back to the developer.
+
+Each reviewer audits against three non-negotiable scientific criteria:
 
 ### A. Biological Plausibility
 - Validate that parameters maintain physiological plausibility (LIF membrane dynamics, leakage rate, absolute/relative refractory periods, ATP metabolic consumption).
@@ -93,3 +97,16 @@ The tester agent (`nsmor_tester`) acts as the final gatekeeper before Git commit
 - **Loop Interception**: If Developer and Reviewer reach a 3-turn rejection loop, the Orchestrator interrupts to request human intervention or explicit scope adjustment.
 - **Numerical Overflow**: Any `NaN` or `Inf` immediately aborts the pipeline stage, triggering an automatic roll-back and sending log diagnostics back to `nsmor_developer`.
 - **Boundary Violation**: Unsanctioned attempts to modify frozen core files (`nsmor/model_nsmor_core.py`, `nsmor/loss.py`) without prior user authorization trigger hard failure.
+
+---
+
+## 6. Cross-Reference: Orchestrator Skill
+
+The full automated loop engine implementation lives in `.claude/skills/orchestrator/SKILL.md` and defines:
+
+- **WSL Atomic Command Chain**: `wsl -e zsh -i -c "source ~/.zshrc && openconda && conda activate torch && <cmd>"`
+- **Parallel Reviewer Dispatch**: Independent A/B sessions with no cross-contamination.
+- **Heartbeat Timeout**: 5 minutes without response triggers kill/restart.
+- **Long Task Watchdog Injection**: Forces epoch-level heartbeat logs for training runs.
+- **Breakpoint Report Protocol**: Structured emoji-tagged status updates (`💥 REJECT`, `⚠️ TEST FAIL`, `✅ SUCCESS`) to user.
+- **Dead-Loop Termination**: `MAX_ITER` (default 10) prevents infinite rejection loops.

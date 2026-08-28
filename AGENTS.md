@@ -17,17 +17,22 @@ This document defines the multi-agent operating rules, roles, permissions, execu
 
 ## 2. Multi-Agent Role Architecture
 
-The NSMoR harness defines three specialized roles for multi-agent development and quality assurance:
+The NSMoR harness defines three specialized roles (plus an optional Orchestrator coordinator) for multi-agent development and quality assurance:
 
 | Agent Role | Subagent Slug | Primary Responsibility | Permissions & Scope |
 | :--- | :--- | :--- | :--- |
 | **Developer** | `nsmor_developer` | Refactoring, feature implementation, PyTorch modeling, analysis tools. | Read/Write code in editable zones (`scripts/`, `nsmor/analysis/`, `nsmor/pipeline/`). **Core frozen code (`nsmor/model_nsmor_core.py`, `nsmor/loss.py`) requires user override.** |
 | **Reviewer (#2)** | `nsmor_reviewer` | Double-blind peer review across biological plausibility, mathematical stability, and statistical rigor. | Read-only code access. Must issue explicit `**ACCEPT**` or `**REJECT**` with structured critiques. *Prohibited from writing fix code directly.* |
 | **Tester** | `nsmor_tester` | Physical smoke testing, pipeline reset, numerical stability interception, regression testing, and Git release. | Run pipeline/tests (`pytest`, `train.py --epochs 1`, analysis scripts), perform data resets, execute Git commit/push upon zero-error gate pass. |
+| **Orchestrator** | `orchestrator` (skill) | Loop engine coordinating DEV→REVIEW→TEST→COMMIT state machine. | Dispatches tasks, merges feedback, enforces watchdog timeouts. See `.claude/skills/orchestrator/SKILL.md`. |
 
 ---
 
 ## 3. Mandatory State-Machine Workflow
+
+Every substantive code modification or refactoring must traverse the strict 4-stage state machine. The Orchestrator skill (`.claude/skills/orchestrator/SKILL.md`) automates this loop with watchdog timeouts, heartbeat monitoring, and breakpoint reports to the user.
+
+**Parallel Double-Blind Review**: The Orchestrator dispatches the developer's code snapshot to **two independent reviewer instances** (`nsmor_reviewer_A` and `nsmor_reviewer_B`) in isolated sessions. Both must return `ACCEPT` for the workflow to proceed. This prevents single-point-of-failure review bias.
 
 Every substantive code modification or refactoring must traverse the strict 4-stage state machine:
 
@@ -87,3 +92,34 @@ Agents must strictly respect path-level boundary declarations (`BOUNDARY.md`):
 - **Numerical Protection**: Defensive guards against division-by-zero, log-zero, and exploding gradients (`torch.clamp`, `torch.nan_to_num`).
 - **Statistical Audit**: Multi-condition evaluations must report effect sizes (Cohen's $d$ or $\eta^2$) and adjusted p-values (FDR/Bonferroni).
 - **Convergence Verification**: Core modifications must demonstrate stable loss convergence within 20 training epochs.
+
+---
+
+## 6. WSL Execution Command Template
+
+All subagents must use the following atomic command chain for any Python/pytest execution:
+
+```bash
+wsl -e zsh -i -c "source ~/.zshrc && openconda && conda activate torch && <command>"
+```
+
+**Requirements:**
+- Must use `-i` flag (interactive) to ensure `.zshrc` aliases load correctly.
+- Must NOT split the chain — keep atomic.
+- All Windows paths must be converted to WSL mount paths (`/mnt/d/...`).
+
+---
+
+## 7. Orchestrator Skill Reference
+
+The full loop engine, watchdog configuration, heartbeat protocol, and breakpoint reporting format are defined in:
+
+```
+.claude/skills/orchestrator/SKILL.md
+```
+
+Key parameters:
+- `MAX_ITER`: Maximum rejection loop iterations (default: 10)
+- **Heartbeat Timeout**: 5 minutes without response → kill and restart agent
+- **Long Task Injection**: Forces epoch-level progress logs for training runs
+- **Breakpoint Reports**: Structured emoji-tagged status updates to user on reject/fail/success

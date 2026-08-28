@@ -63,6 +63,30 @@ Release Commit <── Pass Gate ── Tester (nsmor_tester) <── Fix Propos
 
 ---
 
+## AI Directives — Critical Constraints
+
+1. **NEVER rewrite `nsmor/model_nsmor_core.py`** when asked to build analysis scripts, training pipelines, or testing infrastructure. This module is stable and frozen.
+2. **NEVER rewrite `nsmor/loss.py`** when asked to add new features or analysis tools. The loss function is mathematically verified and frozen.
+3. **ALWAYS check `BOUNDARY.md` files** in subdirectories before modifying code:
+    - `nsmor/BOUNDARY.md` — Frozen core (requires explicit override)
+    - `nsmor/pipeline/BOUNDARY.md` — Data pipeline (safe to extend)
+    - `nsmor/analysis/BOUNDARY.md` — Analysis sandbox (free to modify)
+4. **ALWAYS preserve tensor shape assertions** when refactoring. Do not remove `assert` statements in `forward()` methods.
+5. **ALWAYS maintain backward compatibility** when extending modules. Existing imports must continue to work.
+
+### When Building New Analysis Tools
+
+1. Create new files in `nsmor/analysis/` — do NOT add to `nsmor/` root.
+2. Import from frozen core modules — do NOT copy code:
+    ```python
+    from nsmor.model_nsmor_core import NSMoRCore
+    from nsmor.loss import BioJointLoss
+    ```
+3. Respect the I/O contracts defined in `BOUNDARY.md` files.
+4. Add shape assertions to all new functions.
+
+---
+
 ## Quick Execution Commands
 
 ```bash
