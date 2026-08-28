@@ -105,6 +105,9 @@ triggers:
   - **垂直切片约束**：同一拓扑层的票不得修改相同文件。违反时 orchestrator 检测并强制串行化。
   - 支持原生 blocking link 或本地文件回退。
 - 产出：拓扑有序的 `TICKET_DAG`（非线性队列）。
+- **DAG 校验**：orchestrator 接收 TICKET_DAG 后执行拓扑排序验证：
+  - 若检测到环依赖：自动断开环中权重最低的边（blocking edge 最少指向的票），记录日志，继续。
+  - 若 DAG 为空（to-tickets 未产出任何票）：orchestrator 将整个 spec 作为单票直接进入闭环。
 - 每张票附带 `affected_files`（声明预计修改的文件列表，用于冲突检测）。
 - orchestrator 在 tickets 产出后为每张票计算 `complexity_score`（1-5），评估依据：ticket 涉及文件数、跨模块依赖数、是否涉及新概念引入。≥ COMPLEXITY_THRESHOLD 时触发 @scout。
 
@@ -219,7 +222,11 @@ ENV_PROFILE 预设：
 执行前必须加载：
 1. `Skill("mattpocock-skills:domain-modeling")`
 
-审查模式：**非 git-diff 审查**。reviewer 审查的是 builder 的结构化 snapshot 产出（非 git diff），因此不加载完整 `code-review` skill（其内部流程依赖 git fixed point，与本场景冲突）。
+审查模式：**Diff-based 审查**。reviewer 审查的是 orchestrator 捕获的 git diff + builder 结构化报告的组合，因此不加载完整 `code-review` skill（其内部流程含 git fixed point 发现与 sub-agent 派发逻辑，与本场景冲突）。
+
+Reviewer 接收的 snapshot 包含：
+1. **结构化报告**：builder 的 [ARTIFACTS] / [CORE_CHANGES] / [DESIGN_RATIONALE] / [SELF_CHECK] / [VALIDATION_STEPS]
+2. **代码变更 diff**：orchestrator 在 BUILD→REVIEW_DISPATCH 转换时捕获的 `git diff`（见 §10.3.1）
 
 审查维度直接注入：
 - **Standards 轴**：是否符合编码规范、CONTEXT.md、Fowler 坏味道基线（Mysterious Name, Duplicated Code, Feature Envy, Data Clumps, Primitive Obsession, Repeated Switches, Shotgun Surgery, Divergent Change, Speculative Generality, Message Chains, Middle Man, Refused Bequest）。
@@ -227,7 +234,7 @@ ENV_PROFILE 预设：
 
 双盲隔离协议：
 - A 与 B 必须全新独立 subagent 会话。
-- 输入仅包含 TASK_GOAL、builder 快照、REVIEW_DIMENSIONS。
+- 输入仅包含 TASK_GOAL、snapshot（报告 + diff）、REVIEW_DIMENSIONS。
 - 禁止 A、B 间通信，禁止携带历史意见。
 
 强制输出格式：
@@ -250,6 +257,41 @@ minor_count: N
 weighted_score: <BLOCKER×3 + MAJOR×2 + MINOR×1>
 ```
 
+### 9.3.1 Reviewer 输出解析
+
+orchestrator 接收 reviewer 文本产出后，解析为结构化对象：
+
+```python
+def parse_reviewer_output(raw_text) -> ReviewResult:
+    return ReviewResult(
+        is_accepted = parse_bool(extract_field(raw_text, "is_accepted")),
+        blockers = extract_list(raw_text, "BLOCKERS"),
+        majors = extract_list(raw_text, "MAJORS"),
+        minors = extract_list(raw_text, "MINORS"),
+        weighted_score = parse_int(extract_field(raw_text, "weighted_score")),
+        # feedback = BLOCKERS + MAJORS + MINORS 的完整文本，用于 merge_lossless
+        feedback = extract_section(raw_text, "BLOCKERS") + extract_section(raw_text, "MAJORS") + extract_section(raw_text, "MINORS")
+    )
+```
+
+字段说明：
+- `is_accepted`: 从 `[is_accepted: TRUE|FALSE]` 行解析布尔值。
+- `blockers`: `[BLOCKERS]` 下的条目列表。
+- `feedback`: BLOCKERS + MAJORS + MINORS 的原始文本拼接，作为 `merge_lossless` 的输入（merge_lossless 负责去重 MAJOR/MINOR）。
+- `weighted_score`: 从 `[SCORE]` 段提取整数值。
+
+若解析失败（reviewer 未遵循格式），orchestrator 将整个输出视为：
+```python
+ReviewResult(
+    is_accepted=False,
+    blockers=["[FORMAT_ERROR] Reviewer 未遵循输出格式"],
+    majors=[], minors=[],
+    weighted_score=3,  # 视为 1 个 BLOCKER
+    feedback=raw_text  # 全文作为 feedback
+)
+```
+注意：`blockers` 非空确保 `current_blocker` 不为 None，渐进干预机制可正常运作。
+
 ### 9.4 @validator
 
 触发条件：仅当 A 与 B 均为 TRUE（或 orchestrator 降级验收时）。
@@ -257,9 +299,10 @@ weighted_score: <BLOCKER×3 + MAJOR×2 + MINOR×1>
 执行前加载：`Skill("mattpocock-skills:diagnosing-bugs")`
 
 职责：
-- 按 ENV_CONSTRAINT 执行 VALIDATION_CMD。
+- 在当前票分支（`orchestrator/{ticket_id}`）上执行 VALIDATION_CMD。
 - 失败时提取 stderr/stdout 尾部日志，按 diagnosing-bugs 格式提供复现路径，判定 FAILED。
-- 成功时执行交付：代码类执行 git diff 与 Conventional Commits 提交，文档类归档产物并提交。
+- 成功时执行交付：`git commit` 当前暂存区（Conventional Commits 格式），文档类归档产物并提交。
+- **注意**：merge 回主干由外层调度器（§10.1）负责，validator 仅在票分支上 commit。
 
 ### 9.5 TERM_PROPOSAL 机制
 
@@ -274,9 +317,16 @@ weighted_score: <BLOCKER×3 + MAJOR×2 + MINOR×1>
 ### 10.1 外层：DAG 流式调度
 
 ```python
+# spec 和 CONTEXT 在 Phase 0/Phase -1 中已产出，作为闭包变量传入
+# spec = Phase 0.1 to-spec 的产出内容（已存储于 issue tracker 或本地文件）
+# CONTEXT = Phase -1 产出的 CONTEXT.md 内容
+
 TICKET_DAG = to_tickets(spec).build_dag()
-active_tickets = {}  # ticket_id -> coroutine
+active_tickets = {}  # ticket_id -> TicketState(coroutine, branch, ticket)
 completed = set()
+base_branch = git_current_branch()  # 记录主干分支
+CONTEXT = read_file("CONTEXT.md")  # Phase -1 产出，全局注入
+SPEC = spec  # Phase 0.1 to-spec 产出的 spec 内容
 
 while not all_completed(TICKET_DAG, completed):
     # 解锁所有前置已完成的票
@@ -286,22 +336,63 @@ while not all_completed(TICKET_DAG, completed):
              and all(dep in completed for dep in t.blocking_deps)]
     
     # 文件冲突检测：基于 ticket.affected_files 声明，重叠票强制串行
+    # 同时检查与 active_tickets 中正在运行票的 affected_files 是否重叠
     ready = resolve_file_conflicts(ready, active_tickets)
     
     for ticket in ready:
-        active_tickets[ticket.id] = launch_closed_loop(ticket)
+        # 每张并行票在独立分支上工作（见 §10.1.1 分支隔离）
+        ticket.branch = create_ticket_branch(ticket.id, base_branch)
+        coro = launch_closed_loop(ticket, CONTEXT, SPEC)
+        active_tickets[ticket.id] = TicketState(coro=coro, branch=ticket.branch, ticket=ticket)
     
-    # 等待任一票完成
-    finished_id, result = await any_complete(active_tickets)
-    completed.add(finished_id)
-    del active_tickets[finished_id]
-    persist_state()  # 断点恢复
+    # 若无 ready 且无 active：说明存在不可解的依赖（理论上 DAG 校验已排除）
+    if not ready and not active_tickets:
+        report(type="DEADLOCK_UNRESOLVABLE", note="DAG 中存在无法解锁的票")
+        break
+    
+    # 等待任一票完成（仅当 active_tickets 非空时）
+    if active_tickets:
+        finished_id, result = await any_complete(active_tickets)
+        # 完成后 merge 回主干
+        merge_ticket_branch(active_tickets[finished_id].branch, base_branch)
+        completed.add(finished_id)
+        del active_tickets[finished_id]
+        persist_state()  # 断点恢复
 ```
+
+### 10.1.1 分支隔离策略
+
+解决并行票共享 git 工作目录导致 `git add -A` 污染 diff 的问题：
+
+1. **每张票创建独立分支 + worktree**：
+   - 分支：`orchestrator/{ticket_id}`，基于当前 `base_branch` HEAD 创建。
+   - Worktree：`git worktree add .orchestrator/worktrees/{ticket_id} orchestrator/{ticket_id}`
+   - Builder subagent 的工作目录设为该 worktree 路径（非主工作目录）。
+2. **capture_git_diff 安全性**：每个 worktree 是独立的文件系统视图，`git add -A` + `git diff --cached` 仅包含当前票的变更，不影响其他 worktree。
+3. **基线一致性说明**：并行票各自基于创建时的 `base_branch` HEAD。先完成的票 merge 回主干后，正在运行的票不执行 rebase（会打断进行中的构建）。这是安全的，因为：
+   - `affected_files` 不重叠保证文件级无冲突
+   - Git 3-way merge 在文件不重叠时总是干净合并
+   - 若后完成的票依赖先完成票的产出（有 blocking edge），DAG 已保证串行
+   - 万一出现意外冲突，第 4 点的冲突处理兜底
+3. **完成后合并 + 清理**：
+   - validator 通过后在 worktree 内 commit。
+   - 外层调度器执行：`git checkout {base_branch} && git merge orchestrator/{ticket_id} --no-ff`
+   - 清理：`git worktree remove .orchestrator/worktrees/{ticket_id} && git branch -d orchestrator/{ticket_id}`
+4. **冲突处理**：若 merge 产生冲突（理论上不应该，因为 affected_files 不重叠），执行以下策略：
+   - 尝试 `git merge --abort`，然后对冲突票执行 rebase：`git rebase {base_branch}`
+   - 若 rebase 后冲突仍无法自动解决，标记该票为 DELIVERED_WITH_LIMITATIONS 并在 report 中记录冲突文件列表
+   - 绝不阻塞后续票的执行
+5. **串行票简化**：当同一时间只有一张票在执行时（无并行），可直接在 base_branch 上工作，跳过 worktree 创建。
+6. **断点恢复**：worktree 路径记录在 state.json 中。恢复时检测 worktree 是否仍存在，若已丢失则重建。
+7. **统一清理保障**：
+   - 每张票闭环结束时（无论成功、限制交付、或强制交付），均执行 `git worktree remove` + `git branch -d`。
+   - ALL_COMPLETE 时执行全局扫描：`git branch --list 'orchestrator/*'` 删除所有残留分支；`rm -rf .orchestrator/worktrees/` 清理残留 worktree。
+   - 断点恢复时：若检测到孤立的 `orchestrator/*` 分支（不在 active_tickets 中），直接清理。
 
 ### 10.2 内层：单票闭环
 
 ```python
-def closed_loop(ticket):
+def closed_loop(ticket, CONTEXT, SPEC):
     round = 1
     feedback_history = []
     merged_feedback = ""
@@ -311,6 +402,7 @@ def closed_loop(ticket):
     scout_output = None  # None if scout was skipped
     was_override = False
     current_blocker = None
+    last_raw_output = "[NO_OUTPUT] Builder 未能产出任何内容"  # 安全默认值，确保永远交付
     state = "SCOUT" if ticket.complexity_score >= COMPLEXITY_THRESHOLD else "BUILD"
     
     # 渐进干预阈值（比例制）
@@ -331,11 +423,14 @@ def closed_loop(ticket):
                 round=round, feedback=merged_feedback,
                 history=feedback_history,
                 scout=scout_output)  # None if no scout ran
+            last_raw_output = snapshot  # 始终保留最后一次原始产出
             
             if not validate_snapshot(snapshot):
                 snapshot_retry += 1
                 if snapshot_retry >= 3:
-                    feedback_history.append("[SNAPSHOT_INVALID] 连续3次产出无效")
+                    # 更新 feedback 避免 builder 重复相同输出
+                    merged_feedback = "[SNAPSHOT_INVALID] 你的产出未通过完整性校验（连续" + str(snapshot_retry) + "次）。请确保：1) [ARTIFACTS] 列出的文件已实际创建 2) [SELF_CHECK] 所有项已勾选 3) [VALIDATION_STEPS] 非空。"
+                    feedback_history.append(merged_feedback)
                     round += 1
                     snapshot_retry = 0
                 continue
@@ -343,11 +438,15 @@ def closed_loop(ticket):
             snapshot_retry = 0
             snapshots[round] = snapshot  # 持久化用于 MAX_ITER fallback
             persist_snapshot(ticket.id, round, snapshot)
+            # 捕获 diff 供 reviewer 使用
+            code_diff = capture_git_diff()  # git diff HEAD
             state = "REVIEW_DISPATCH"
         
         elif state == "REVIEW_DISPATCH":
+            # snapshot 传入 reviewer = 结构化报告 + code_diff
+            review_payload = { "report": snapshot, "diff": code_diff }
             result_A, result_B = parallel_call(
-                @reviewer_A(snapshot), @reviewer_B(snapshot))
+                @reviewer_A(review_payload), @reviewer_B(review_payload))
             snapshot_scores[round] = min(
                 result_A.weighted_score, result_B.weighted_score)
             state = "DECISION"
@@ -359,7 +458,13 @@ def closed_loop(ticket):
             else:
                 # 提取当前主要 BLOCKER
                 all_blockers = result_A.blockers + result_B.blockers
-                current_blocker = all_blockers[0] if all_blockers else None
+                if all_blockers:
+                    current_blocker = all_blockers[0]
+                else:
+                    # reviewer 标记 FALSE 但无显式 BLOCKER（仅 MAJOR）
+                    # 将第一个 MAJOR 提升为 current_blocker 以驱动渐进干预
+                    all_majors = result_A.majors + result_B.majors
+                    current_blocker = all_majors[0] if all_majors else "[UNSPECIFIED_REJECTION]"
                 
                 # 计算同一 BLOCKER 连续出现次数
                 same_blocker_streak = count_consecutive_same_blocker(
@@ -399,10 +504,21 @@ def closed_loop(ticket):
                 snapshot=snapshot, cmd=ticket.validation_cmd)
             
             if validation_result.status == "FAILED":
-                feedback_history.append(validation_result.log_tail)
-                merged_feedback = validation_result.log_tail
-                round += 1
-                state = "BUILD"
+                if was_override:
+                    # orchestrator 已决定降级验收，validation 失败不阻塞交付
+                    unresolved_blockers = collect_unresolved(
+                        feedback_history, result_A, result_B)
+                    execute_delivery(snapshot, validation_result, force=True)
+                    report(type="DELIVERED_WITH_LIMITATIONS",
+                           ticket=ticket.id, round=round,
+                           limitations=unresolved_blockers,
+                           validation_failure=validation_result.log_tail)
+                    return
+                else:
+                    feedback_history.append(validation_result.log_tail)
+                    merged_feedback = validation_result.log_tail
+                    round += 1
+                    state = "BUILD"
             else:
                 execute_delivery(snapshot, validation_result)
                 if was_override:
@@ -417,15 +533,21 @@ def closed_loop(ticket):
                            commit=validation_result.commit_hash)
                 return
     
-    # MAX_ITER 到达：强制交付最佳历史 snapshot
-    best_round = min(snapshot_scores, key=snapshot_scores.get)
-    best_snapshot = snapshots[best_round]
+    # MAX_ITER 到达：orchestrator 行使最终决定权，强制交付最佳历史 snapshot（不再过 validator）
+    if snapshot_scores:
+        best_round = min(snapshot_scores, key=snapshot_scores.get)
+        best_snapshot = snapshots[best_round]
+    else:
+        # 所有轮次均未通过 validate_snapshot，无有效 snapshot
+        # 永远交付原则：取最后一次 builder 的原始产出（即使未通过校验）强制交付
+        best_snapshot = last_raw_output  # builder 最后一次的原始文本产出
+        best_round = round
     all_unresolved = collect_all_unresolved(feedback_history)
     execute_delivery(best_snapshot, force=True)
     report(type="DELIVERED_WITH_LIMITATIONS",
            ticket=ticket.id, round=MAX_ITER,
            limitations=all_unresolved,
-           note=f"MAX_ITER reached, delivered best available (round {best_round})")
+           note=f"MAX_ITER reached, delivered best available (round {best_round}), validator skipped")
 ```
 
 ### 10.3 validate_snapshot 定义
@@ -435,6 +557,16 @@ def closed_loop(ticket):
 2. `[SELF_CHECK]` 所有项已勾选。
 3. `[VALIDATION_STEPS]` 非空。
 4. 若以上任一不满足，返回 False。
+
+### 10.3.1 capture_git_diff
+
+在 BUILD→REVIEW_DISPATCH 转换时执行，捕获 builder 的实际代码变更：
+1. 确认当前在票的 worktree（`.orchestrator/worktrees/{ticket_id}`）中操作（见 §10.1.1）。
+2. 执行 `git add -A` 将 builder 改动暂存（worktree 隔离保证仅含当前票的变更）。
+3. 执行 `git diff --cached` 获取变更 diff。
+4. 若 diff 为空（builder 声明了 ARTIFACTS 但无实际文件变更），标记为异常并回退到 validate_snapshot 失败路径。
+5. diff 文本作为 `code_diff` 传入 reviewer 的 `review_payload`。
+6. 不执行 commit——commit 由 @validator 在验证通过后执行。
 
 ### 10.4 persist_snapshot
 
@@ -446,21 +578,75 @@ def closed_loop(ticket):
 
 基于 `ticket.affected_files`（to-tickets 阶段声明）检测冲突：
 1. 对 `ready` 列表中的票两两比较 `affected_files`。
-2. 若存在交集，保留拓扑序靠前的票进入并行，其余推迟到下一轮。
-3. 若 builder 实际修改了声明外的文件，在 validate_snapshot 后更新 `affected_files`，下轮调度时生效。
+2. **同时检查 `active_tickets` 中正在运行票的 `affected_files`**：若 ready 中的票与任何 active 票有文件重叠，推迟该 ready 票。
+3. 若存在交集（ready 内部），保留拓扑序靠前的票进入并行，其余推迟到下一轮。
+4. 若 builder 实际修改了声明外的文件，在 validate_snapshot 后更新 `affected_files`，下轮调度时生效。
+5. **运行时碰撞检测**：即使 worktree 隔离了文件系统，merge 阶段仍可能因未声明的文件重叠产生冲突。当 merge 冲突涉及未在 `affected_files` 中声明的文件时，orchestrator 将该文件追加到两张票的 `affected_files`，并对后完成的票触发冲突处理流程（§10.1.1 第 4 点）。
 
 ### 10.6 merge_lossless 规则
 
 保留所有 BLOCKER，去重 MAJOR/MINOR（相同文件+相同描述视为重复），按严重度排序，不丢失可执行信息。
 
-### 10.7 reframe_feedback
+### 10.7 reframe_feedback / format_scout_intervention
 
-当同一 BLOCKER 连续出现 REFRAME_AT 轮时，orchestrator 分析历史尝试模式，生成替代切入角度：
+**reframe_feedback(feedback_history, current_blocker)**：当同一 BLOCKER 连续出现 REFRAME_AT 轮时，orchestrator 分析历史尝试模式，生成替代切入角度：
 - 列出已尝试的方法
 - 排除已失败路径
 - 建议全新方向
+- 返回：格式化后的 feedback 字符串
 
-### 10.8 票拆分（优化手段）
+**format_scout_intervention(scout_output)**：将 @scout 的输出（[RECOMMENDED_PATH] + [PITFALLS] + [DEAD_ENDS]）转换为 builder 可消费的 feedback 格式：
+- 前缀 `[SCOUT_INTERVENTION]`
+- 原样包含 scout 的推荐路径和预警
+- 返回：格式化后的 feedback 字符串
+
+### 10.8 count_consecutive_same_blocker
+
+计算当前 BLOCKER 在 `feedback_history` 末尾连续出现的次数：
+```python
+def is_similar(entry, target, threshold=0.6):
+    """关键词重叠率相似度判定。
+    提取两个字符串的关键词集合（去除停用词、标点），
+    计算 Jaccard 相似度，>= threshold 视为相同 BLOCKER。
+    """
+    keywords_a = extract_keywords(entry)
+    keywords_b = extract_keywords(target)
+    if not keywords_b:
+        return False
+    overlap = len(keywords_a & keywords_b) / len(keywords_a | keywords_b)
+    return overlap >= threshold
+
+def count_consecutive_same_blocker(feedback_history, current_blocker):
+    """从 feedback_history 末尾向前扫描，计算与 current_blocker 描述相似的连续条目数。
+    相似度判定：current_blocker 的关键词（去除停用词后）与历史条目的关键词重叠率 >= 60%。
+    """
+    streak = 0
+    for entry in reversed(feedback_history):
+        if is_similar(entry, current_blocker, threshold=0.6):
+            streak += 1
+        else:
+            break
+    return streak
+```
+
+### 10.9 collect_unresolved / collect_all_unresolved
+
+从 feedback_history 和 reviewer 结果中提取未解决的问题清单：
+```python
+def collect_unresolved(feedback_history, result_A, result_B):
+    """提取最近一轮 reviewer 标记的所有 BLOCKER + MAJOR，作为限制清单。"""
+    return result_A.blockers + result_B.blockers + result_A.majors + result_B.majors
+
+def collect_all_unresolved(feedback_history):
+    """从完整 feedback_history 中提取所有曾出现的 BLOCKER（去重），用于 MAX_ITER 强制交付。"""
+    all_blockers = set()
+    for entry in feedback_history:
+        if "[BLOCKER]" in entry or "[SNAPSHOT_INVALID]" in entry:
+            all_blockers.add(entry)
+    return list(all_blockers)
+```
+
+### 10.10 票拆分（优化手段）
 
 在 SCOUT_INTERVENE_AT 阶段，若 @scout 判断当前票过大或包含不可分割的架构冲突：
 - Orchestrator 将该票拆为子票
@@ -472,7 +658,7 @@ def closed_loop(ticket):
 
 监控机制通过 orchestrator 主循环内的超时竞赛实现（非独立进程）。
 
-1. **Heartbeat Timeout**: 对每个 `agent()` 调用设置 120s 超时。超时判定失联。动作：Kill 并重建全新会话，重发任务，round 不增加。实现方式：workflow `agent()` 调用外层包裹超时逻辑，超时后重试同一 prompt。
+1. **Heartbeat Timeout**: 对每个 `agent()` 调用设置 120s 超时。超时判定失联。动作：Kill 并重建全新会话，重发任务，round 不增加。**最大重试次数：3**。超过 3 次连续超时视为该 agent 不可用，等同于 validate_snapshot 失败，round+1 并在 feedback 中记录 `[AGENT_UNAVAILABLE]`。
 2. **Long Task Hang**: 检测到长耗时关键词（如大规模重构、全量测试）时，在 builder prompt 中注入心跳要求，要求每 30s 输出进度标记。若最终产出无进度标记且耗时 > 60s，标记为可疑但不阻塞。
 3. **Output Integrity**: 即 validate_snapshot（§10.3）。失败则不进入 REVIEW。连续 3 次失败时 round+1。
 
@@ -505,10 +691,11 @@ def closed_loop(ticket):
 {
   "task_goal": "...",
   "phase": "PHASE_1",
+  "base_branch": "main",
   "ticket_dag": { ... },
   "completed_tickets": ["T1", "T2"],
   "active_tickets": {
-    "T3": { "round": 4, "state": "BUILD", "feedback_history": [...], "was_override": false }
+    "T3": { "round": 4, "state": "BUILD", "branch": "orchestrator/T3", "feedback_history": [...], "was_override": false }
   },
   "snapshot_scores": { "T3": { "1": 8, "2": 5, "3": 3 } },
   "context_md_hash": "sha256:..."
@@ -523,6 +710,7 @@ Snapshot 内容单独存储于 `.orchestrator/snapshots/` 目录（见 §10.4）
 2. 若存在且 `task_goal` 匹配当前 TASK_GOAL：
    - 跳过已完成的 Phase 和 tickets。
    - 从 `active_tickets` 中最后已知状态恢复闭环。
+   - **恢复安全性**：恢复时始终将 `state` 重置为 `"BUILD"`（而非恢复到 DECISION/VALIDATE 等中间态），因为 `snapshot`、`code_diff`、`result_A`、`result_B` 等瞬态变量不持久化。这意味着恢复后会重新执行当前 round 的 BUILD，代价是一轮 builder 重跑，但保证不会因缺失中间变量而崩溃。
 3. 若 `task_goal` 不匹配：视为新任务，备份旧状态文件后重新开始。
 
 ### 13.3 持久化时机
@@ -539,6 +727,10 @@ Snapshot 内容单独存储于 `.orchestrator/snapshots/` 目录（见 §10.4）
 | validate_snapshot | 校验 builder 产出完整性的门控函数 |
 | persist_snapshot | 每轮 BUILD 成功后持久化 snapshot 到磁盘 |
 | resolve_file_conflicts | 基于 affected_files 声明检测并行票文件冲突 |
+| 分支隔离 | 每张并行票在独立 git 分支 `orchestrator/{ticket_id}` 上工作，防止 diff 污染 |
+| capture_git_diff | 在票分支上执行 git add -A + git diff --cached，安全捕获当前票变更 |
+| review_payload | 传入 reviewer 的数据包：结构化报告 + 代码 diff |
+| parse_reviewer_output | 将 reviewer 文本产出解析为结构化 ReviewResult 对象 |
 | TERM_PROPOSAL | builder 发现新领域术语时的提案机制 |
 | 垂直切片 | 每张票修改独立的文件集合，不与同层票交叉 |
 | same_blocker_streak | 同一 BLOCKER（按描述相似度判定）在 feedback_history 中连续出现的次数，非轮次编号 |
