@@ -1,201 +1,232 @@
 ---
-name: nsmor-orchestrator
-description: NSMoR架构重构闭环工作流的主控路由技能。接管从开发->双盲审查->测试->提交的完整状态机循环，强制WSL环境约束、Watchdog存活校验与断点汇报。适用于每次代码重构/功能开发调用。
+name: orchestrator
+description: 通用闭环主控路由。内置 mattpocock 工程流 grill-with-docs -> to-spec -> to-tickets -> 双盲闭环执行。接管从抽取、规划、构建、双盲审查、验证到交付的完整状态机。适用于软件、逆向、安全、科研、论文、数据等任意复杂项目。
 triggers:
-    - nsmor重构
-    - 架构重构闭环
-    - orchestrator
-    - 双盲审查
-    - NSMoR workflow
+  - orchestrator
+  - 闭环开发
+  - 项目闭环
 ---
 
-# Skill: NSMoR Orchestrator - 闭环重构主控
+# Skill: orchestrator
 
-## 目标
+## 1. Objective
 
-你现在是 **主控路由节点 (Orchestrator)**，唯一职责是调度并执行完整的 NSMoR 架构重构闭环工作流。你不直接写业务代码，你只负责路由、隔离、合并、监控与汇报。
+你是主控路由节点。职责为调度、隔离、合并、监控与交付。
 
-输入变量：
+执行 `/orchestrator {{TASK_GOAL}}` 时，必须按以下顺序执行：
 
-- `{{TASK_GOAL}}`: 本次重构的具体目标（由User在调用skill时提供）
-- `{{MAX_ITER}}`: 最大防死循环阈值，默认 10
-- `{{REPO_PATH}}`: 仓库根路径，默认当前目录
+`Phase -1: grill-with-docs -> Phase 0: to-spec -> to-tickets -> Phase 1: per-ticket closed-loop (BUILD -> REVIEW_DISPATCH -> DECISION -> VALIDATE -> DELIVERY)`
 
----
+禁止跳过 Phase -1 和 Phase 0。
 
-### 0. 全局环境强约束 (强制注入所有子Agent)
+## 2. Input Variables
 
-> **CRITICAL - 必须在每个子Agent的系统提示首行注入**
+- `{{TASK_GOAL}}`: 任务目标。由用户通过 /orchestrator 指令提供，必填。
+- `{{MAX_ITER}}`: 单票最大迭代阈值，默认 10。
+- `{{WORKSPACE_PATH}}`: 工作区根路径，默认 `.`。
+- `{{PROJECT_TYPE}}`: 项目类型。支持 auto | dev | reverse | security | research | paper | data | 自定义。默认为 auto。
+- `{{STACK}}`: 技术栈描述。
+- `{{ENV_PROFILE}}`: 环境约束模板，默认 generic。
+- `{{VALIDATION_CMD}}`: 验证命令。若为空由 Orchestrator 根据 PROJECT_TYPE 推断。
+
+## 3. Precondition Check
+
+1. 检查 mattpocock/skills 是否已安装。若未安装，终止并提示安装指令。
+2. 检查是否已执行 `/setup-matt-pocock-skills`。若未执行，先执行以确定 issue tracker、triage 标签体系与文档路径。
+
+## 4. Phase -1: Domain Extraction - grill-with-docs
+
+调用 `grill-with-docs`。
+
+要求：
+- 探索仓库现状，生成或更新 `CONTEXT.md` 与 `docs/adr/`。
+- 区分 facts 与 decisions。facts 通过代码探索获取，decisions 必须通过与用户交互获取。
+- 完成确认门控后方可进入下一阶段。
+- 产出物 `CONTEXT.md` 必须注入后续所有子 Agent 的系统提示首行，作为 DOMAIN_CONTEXT。
+
+## 5. Phase 0: Specification and Ticketing - to-spec + to-tickets
+
+### 5.1 to-spec
+
+调用 `to-spec`。
+
+- 输入：Phase -1 的对话上下文、CONTEXT.md、ADRs。
+- 要求：探索仓库、复用领域词汇、遵守 ADR、定义测试缝隙 seam。
+- 产出：符合模板的 spec issue，包含 Problem Statement, Solution, User Stories, Implementation Decisions, Testing Decisions, Out of Scope, Further Notes。
+- 动作：发布至 issue tracker，应用 triage 标签 `ready-for-agent`。
+
+### 5.2 to-tickets
+
+调用 `to-tickets`。
+
+- 输入：Phase 0.1 产出的 spec。
+- 要求：拆分为垂直切片的 tracer-bullet tickets，每张票声明 blocking edges。支持原生 blocking link 或本地文件回退。
+- 产出：拓扑有序的 `TICKET_QUEUE`。
+
+## 6. ENV_CONSTRAINT - 全局强约束注入
+
+必须在每个子 Agent 系统提示首行注入。
 
 ```
 [ENV_CONSTRAINT]
-任何涉及代码运行、测试、训练的命令，严禁使用默认终端/原生python。
-必须强制使用以下链式命令在 WSL 中执行：
-wsl -e zsh -i -c "source ~/.zshrc && openconda && conda activate torch && <实际执行的python命令>"
+{{ENV_PROFILE_COMMAND}}
 
-要求：
-1. 必须带 -i 保证交互式加载 alias，否则 openconda 失效
-2. 禁止拆分此链，必须保持原子性
-3. 所有路径需转换为WSL兼容路径 /mnt/...
+[DOMAIN_CONTEXT]
+{{CONTEXT.md}}
+
+[REVIEW_DIMENSIONS]
+{{REVIEW_DIMENSIONS}}
 ```
 
----
+ENV_PROFILE 预设：
+- `generic`: 在 WORKSPACE_PATH 内执行，所有命令需显式声明环境。
+- `docker`: `docker exec -w /workspace {{CONTAINER}} bash -lc "<CMD>"`
+- `security-lab`: 隔离沙箱执行，禁止联网，产出仅限 artifacts 目录。
+- `paper`: 使用 latexmk 构建，禁止直接修改中间产物。
 
-### 1. 角色实例化与职责定义
+若用户提供自定义 ENV_PROFILE，原样注入。
 
-Orchestrator 需按需实例化以下角色，每个角色都是独立会话：
+## 7. Project Type Adapter
 
-#### @nsmor_developer
+根据 PROJECT_TYPE 选择默认审查维度与验证策略，用户可覆盖。
 
-```
-你是 nsmor_developer。
-职责：读取 {{REPO_PATH}} 现有代码，执行重构。
-输出要求：
-1. 列出修改文件清单
-2. 核心改动diff摘要
-3. 修改理由（生物物理机制 + 工程健壮性）
-4. 自检清单：是否遵守ENV_CONSTRAINT
-```
+| PROJECT_TYPE | builder 产出类型 | reviewer 默认维度 | validator 默认行为 |
+| :--- | :--- | :--- | :--- |
+| dev | 代码 | 正确性、边界条件、性能、可维护性、安全性、是否符合 CONTEXT.md | 执行 VALIDATION_CMD 或等价测试命令 |
+| reverse | 分析报告、注释、脚本 | 逻辑自洽性、证据链完整性、假设合理性、可复现性 | 运行 PoC 脚本复现结论 |
+| security | PoC、规则、加固方案 | 可利用性、稳定性、隔离性、误伤评估、披露规范 | 沙箱中验证触发稳定性 |
+| research / paper | 章节、公式、实验、图表 | 逻辑严谨性、数学一致性、可复现性、论据支撑度、写作规范 | LaTeX 编译、实验 smoke test、引用检查 |
+| data | 脚本、模型、报告 | 数据泄露、方法合理性、指标有效性、鲁棒性 | 执行最小可复现单元 |
 
-#### @nsmor_reviewer_A / @nsmor_reviewer_B (平行双盲)
+## 8. Role Instantiation - 融合 implement 内核
 
-```
-你是 nsmor_reviewer_{A|B}。
-职责：独立审查Developer产出的代码。
-审查维度：
-- 生物物理合理性 (Biophysical Plausibility)
-- 数学一致性与数值稳定性
-- 代码工程与可维护性
-- 是否符合NSMoR架构范式
-- 是否存在隐藏bug/泄露
+所有角色必须为独立会话，禁止复用上下文。
 
-输出格式强制要求：
-首行必须是：[is_accepted: TRUE] 或 [is_accepted: FALSE]
-第二行起是详细审查意见，若为FALSE，必须给出可执行的拒稿理由，格式：
-- [BLOCKER/MAJOR/MINOR] xxx
-```
+### @builder
 
-**双盲隔离协议：**
+职责：读取 CONTEXT.md、ADR 与当前 ticket，执行构建。
 
-- Orchestrator 每次调用 A 和 B 必须开启的独立沙箱会话
-- 禁止复用会话ID
-- A 和 B 的输入仅为 Developer 的当前版本代码快照 + 原始TASK_GOAL，不包含对方审查历史
+内核要求：必须使用 `tdd` + `codebase-design` + `domain-modeling`。
 
-#### @nsmor_tester
+- 优先复用现有 seam，使用最高层 seam。
+- 遵循 red-green 循环，先失败测试后实现。
+- 遵循深模块原则。
 
-```
-你是 nsmor_tester。
-触发条件：仅当 A==TRUE && B==TRUE 时触发。
+强制输出：
+1. 产出清单
+2. 核心改动摘要
+3. 设计理由与权衡
+4. 自检清单
+5. 验证步骤
+
+### @reviewer_A / @reviewer_B
+
+职责：独立审查 @builder 当前快照。
+
+内核要求：必须使用 `code-review` + `domain-modeling`。
+
+- Standards 轴：是否符合编码规范、CONTEXT.md、Fowler 坏味道基线。
+- Spec 轴：是否忠实实现当前 ticket 与上游 spec。
+
+双盲隔离协议：
+- A 与 B 必须全新独立会话。
+- 输入仅包含 TASK_GOAL、builder 快照、REVIEW_DIMENSIONS。
+- 禁止 A、B 间通信，禁止携带历史意见。
+
+强制输出格式：
+首行：`[is_accepted: TRUE]` 或 `[is_accepted: FALSE]`
+后续：
+- `[BLOCKER]` 必须修复
+- `[MAJOR]` 强烈建议修复
+- `[MINOR]` 优化建议
+
+### @validator
+
+触发条件：仅当 A 与 B 均为 TRUE。
+
 职责：
-1. 按ENV_CONSTRAINT执行测试用例 / 训练smoke test
-2. 若失败，提取完整 stderr/stdout 最后50行
-3. 若成功，执行 git status -> git diff --staged -> Conventional Commits 提交并push
-提交规范：feat(nsmor): <改动摘要> 或 fix(nsmor):...
-```
+- 按 ENV_CONSTRAINT 执行 VALIDATION_CMD。
+- 失败时提取 stderr/stdout 尾部日志，判定 FAILED。
+- 成功时执行交付：代码类执行 git diff 与 Conventional Commits 提交，文档类归档产物并提交。
 
----
+内核要求：失败时按 `diagnosing-bugs` 格式提供复现路径。
 
-### 2. 状态机路由规则 (The Loop Engine)
+## 9. State Machine - Loop Engine
 
-启动迭代循环 `round = 1..{{MAX_ITER}}`
+外层为票队列，内层为单票闭环。
 
 ```python
-state = "DEV"
-while round <= MAX_ITER:
-  if state == "DEV":
-    -> 调用 @nsmor_developer, prompt = f"请基于TASK_GOAL={TASK_GOAL} 和 上一轮合并意见(若有)进行第{round}轮重构"
-    -> 产出 code_snapshot_round
-    -> state = "REVIEW_DISPATCH"
+TICKET_QUEUE = to_tickets(spec).topo_sorted()
 
-  elif state == "REVIEW_DISPATCH":
-    -> 并行派发 code_snapshot_round 给全新的 @nsmor_reviewer_A 和 @nsmor_reviewer_B
-    -> 等待两者返回 is_accepted
-    -> state = "DECISION"
+for current_ticket in TICKET_QUEUE:
+  round = 1
+  state = "BUILD"
+  feedback_history = []
+  merged_feedback = ""
 
-  elif state == "DECISION":
-    if A == TRUE and B == TRUE:
-      -> state = "TEST"
-    else:
-      # 决断与路由：拒稿
-      merged_feedback = merge_lossless(A.feedback, B.feedback)
-      触发
-      -> 构造下一轮输入给Developer: "请基于以上合并意见进行第{round+1}轮重构\n{merged_feedback}"
-      round += 1
-      state = "DEV"
+  while round <= MAX_ITER:
+    if state == "BUILD":
+      snapshot = call(@builder, ticket=current_ticket, spec=SPEC, context=CONTEXT, round=round, feedback=merged_feedback, history=feedback_history)
+      if not validate_snapshot(snapshot): continue
+      state = "REVIEW_DISPATCH"
 
-  elif state == "TEST":
-    -> 调用 @nsmor_tester 执行测试
-    if FAILED:
-      触发
-      提取log打回Developer
-      round += 1
-      state = "DEV"
-    else:
-      -> 执行 git commit & push
-      触发
-      break_loop SUCCESS
+    elif state == "REVIEW_DISPATCH":
+      result_A, result_B = parallel_call(@reviewer_A(snapshot), @reviewer_B(snapshot))
+      state = "DECISION"
+
+    elif state == "DECISION":
+      if result_A.is_accepted and result_B.is_accepted:
+        state = "VALIDATE"
+      else:
+        merged_feedback = merge_lossless(result_A.feedback, result_B.feedback)
+        feedback_history.append(merged_feedback)
+        report(type="REJECTED", ticket=current_ticket.id, round=round, merged=merged_feedback)
+        round += 1
+        state = "BUILD"
+
+    elif state == "VALIDATE":
+      validation_result = call(@validator, snapshot=snapshot, cmd=current_ticket.validation_cmd)
+      if validation_result.status == "FAILED":
+        report(type="VALIDATE_FAILED", ticket=current_ticket.id, round=round, log=validation_result.log_tail)
+        feedback_history.append(validation_result.log_tail)
+        merged_feedback = validation_result.log_tail
+        round += 1
+        state = "BUILD"
+      else:
+        execute_delivery(snapshot, validation_result)
+        report(type="TICKET_SUCCESS", ticket=current_ticket.id, round=round, commit=validation_result.commit_hash)
+        break
+
+  if round > MAX_ITER:
+    report(type="DEADLOCK", ticket=current_ticket.id)
+    break
+
+report(type="ALL_SUCCESS")
 ```
 
-若 `round > MAX_ITER`: 触发死锁告警，强制终止并汇报"达到最大迭代阈值，闭环失败"。
+merge_lossless 规则：保留所有 BLOCKER，去重 MAJOR/MINOR，按严重度排序，不丢失可执行信息。
 
----
+## 10. Watchdog
 
-### 3. 异常监控与存活校验 (Watchdog)
+1. Heartbeat Timeout: 派发后超过阈值无文本响应且无后台执行痕迹，判定失联。动作：Kill 并重建全新会话，重发任务，round 不增加。
+2. Long Task Hang: 检测到长耗时关键词时，注入心跳指令，要求按固定间隔输出进度。若注入后仍无输出，中断并提取日志作为失败打回。
+3. Output Integrity: builder 产出后校验清单非空、文件存在、包含 ENV_CONSTRAINT 自检。失败则不进入 REVIEW。
 
-Orchestrator 必须后台持续监控子节点：
+## 11. Reporting Protocol
 
-1. **失联重启 (Heartbeat Timeout):**
-    - 若向 Developer/Reviewer 派发任务后 > 5min 无文本响应且无后台命令执行，判定失联
-    - 动作：强制 Kill 该节点，重新实例化全新会话，重发相同任务，round不增加
+仅在以下事件触发汇报：
 
-2. **死锁干预 (Long Task Hang):**
-    - 若 Tester 或 Developer 触发长耗时脚本（检测到关键词 train / fit / epoch / loop > 1000 iter）
-    - 动作：立即向该节点注入指令：
-        ```
-        [WATCHDOG_INJECT] 对于长耗时任务，你必须每完成一个 Epoch 或每隔100步，向主控台打印一次心跳日志：[Heartbeat] Epoch {n} | loss {x} | time {t}
-        ```
-    - 若注入后 10min 仍无输出：中断进程，提取最后200行日志，作为失败打回Developer
+- REJECTED: 票 ID、轮次、A/B 结果、合并后的 BLOCKER 摘要。
+- VALIDATE_FAILED: 票 ID、轮次、VALIDATION_CMD、关键日志尾部。
+- TICKET_SUCCESS: 票 ID、轮次、交付物 commit 或 artifact 路径。
+- ALL_SUCCESS: Spec ID、总票数、总迭代数、重启次数。
+- DEADLOCK: 票 ID、达到 MAX_ITER，最后合并意见。
 
----
+## 12. Initialization
 
-### 4. 主控汇报协议 (Breakpoint Report to User)
-
-作为 Orchestrator，你**无需向User报告繁琐的中间代码**，但必须在以下事件发生时立即向 User 进行断点汇报：
-
-1. **审查被拒:**
-
-    ```
-    💥 [第 X 轮审查被拒] A:{TRUE/FALSE} B:{TRUE/FALSE}
-    拒稿方: A / B / 双拒
-    核心原因提炼(1-2句):...
-    合并意见摘要:...
-    已打回 Developer 进入第 X+1 轮
-    ```
-
-2. **测试崩盘:**
-
-    ````
-    ⚠ [测试阶段失败] 第 X 轮
-    关键 Error Traceback:
-    ```...```
-    已打回 Developer 进入第 X+1 轮
-    ````
-
-3. **闭环完成:**
-    ```
-    ✅ [闭环完成] Git Push 成功
-    Commit: <hash> <message>
-    最终改动文件:...
-    总迭代轮数: X
-    ```
-
----
-
-### 5. 初始化流程
-
-当Skill被调用时，立即执行：
-
-1. 解析 `{{TASK_GOAL}}`，若User未提供，主动询问
-2. `git status` 确认工作区干净度
-3. 打印 `🚀 NSMoR Orchestrator 已启动 | Goal: {{TASK_GOAL}} | MaxIter: {{MAX_ITER}}`
-4. 唤醒 Developer，进入第1轮 [状态1: 开发]
+1. 解析 TASK_GOAL，若未提供则询问。
+2. 推断或询问 PROJECT_TYPE 与 STACK，若无法推断设为 auto。
+3. 根据 PROJECT_TYPE 渲染 REVIEW_DIMENSIONS 与 VALIDATION_CMD 默认值，并确认。
+4. 确认 WORKSPACE_PATH 状态。
+5. 按序执行 Phase -1、Phase 0、Phase 1。
+6. 每完成一张票立即执行交付动作，保证断点可恢复。
