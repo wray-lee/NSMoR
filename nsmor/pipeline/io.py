@@ -176,11 +176,27 @@ def load_kinematics_csv(
         is_trial_first = df["time_ms"] == first_frame
         is_artifact = is_trial_first & (df["velocity"].abs() >= artifact_velocity_cm_s)
         df.loc[is_artifact, "velocity"] = 0.0
-        # Recompute acceleration as per-trial diff of the cleaned velocity;
-        # artifact first frames are 0 by construction, others keep theirs.
-        df["acceleration"] = df.groupby(["session_id", "trial_id"], sort=False)["velocity"].transform(
-            lambda v: v.diff().fillna(0.0)
-        )
+        # Recompute acceleration as the true time derivative dv/dt
+        # (cm/s²) using the ACTUAL per-sample interval from time_ms.
+        # Why recompute ALL rows (not just artifact rows): a zeroed
+        # artifact velocity at frame 0 changes the diff at frame 1
+        # (the echo spike), so downstream frames are affected too.
+        # The cleanest invariant is: acceleration is ALWAYS the
+        # physical dv/dt of the cleaned velocity column.
+        acc_out = np.zeros(len(df), dtype=np.float64)
+        for _, grp in df.groupby(["session_id", "trial_id"], sort=False):
+            idx = grp.index
+            v = grp["velocity"].values
+            t = grp["time_ms"].values
+            dv = np.concatenate([[0.0], np.diff(v)])           # cm/s
+            dt_ms_arr = np.concatenate([[0.0], np.diff(t)])    # ms
+            pos_gaps = dt_ms_arr[dt_ms_arr > 0]
+            floor_ms = float(np.min(pos_gaps)) if pos_gaps.size > 0 else 1.0
+            dt_safe = np.where(dt_ms_arr > 0, dt_ms_arr, floor_ms)
+            acc = dv / (dt_safe / 1000.0)  # cm/s²
+            acc[0] = 0.0  # first frame: no prior sample
+            acc_out[idx] = acc
+        df["acceleration"] = acc_out
     return df
 
 

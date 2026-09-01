@@ -286,8 +286,13 @@ class TestPipelineIO:
         )
         # Recomputed acceleration must also be finite/bounded (no diff-echo).
         assert np.isfinite(df["acceleration"]).all()
-        assert float(df["acceleration"].abs().max()) < 1e3, (
-            f"Acceleration still carries a spike after recompute: "
+        # Physical bound: synthetic escape velocity jumps from ~0.2 to
+        # ~15 cm/s in one dt=10 ms frame -> dv/dt ~ 1500 cm/s^2.  The
+        # spiked artifact (5 M cm/s in one frame -> 5e8 cm/s^2) is the
+        # only thing that should be removed; normal escape accelerations
+        # are O(10^3) cm/s^2 and must be preserved.
+        assert float(df["acceleration"].abs().max()) < 1e5, (
+            f"Acceleration still carries an artifact-scale spike after recompute: "
             f"{df['acceleration'].abs().max()}"
         )
 

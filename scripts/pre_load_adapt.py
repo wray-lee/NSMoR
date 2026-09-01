@@ -201,9 +201,29 @@ def adapt_cercus_to_nsmor(raw_dir="data/raw"):
             # velocity in mm/s, then convert to cm/s
             df_k["velocity"] = (step_dist_mm / dt_s.to_numpy()) / 10.0
 
-            # Compute acceleration as diff of velocity
-            df_k["acceleration"] = df_k.groupby("trial_id")["velocity"].transform(
-                lambda x: x.diff().fillna(0)
+            # Compute acceleration as the true time derivative of velocity:
+            # a(t) = dv/dt in cm/s².  The raw sensor cadence is irregular
+            # (~250 Hz median with a long tail), so we must divide each
+            # velocity increment by the ACTUAL per-sample interval.  Using
+            # a bare .diff() (units cm/s per frame) would underestimate
+            # acceleration by a factor equal to the sampling rate.
+            def _acceleration_cm_s2(grp: pd.DataFrame) -> pd.Series:
+                v = grp["velocity"].values
+                t = grp["abs_time"].values  # ms
+                dv = np.concatenate([[0.0], np.diff(v)])           # cm/s
+                dt_ms_arr = np.concatenate([[0.0], np.diff(t)])    # ms
+                # Guard: zero/negative gaps get floored to the minimum
+                # positive gap in this trial (documented, not silent).
+                pos_gaps = dt_ms_arr[dt_ms_arr > 0]
+                floor_ms = float(np.min(pos_gaps)) if pos_gaps.size > 0 else 1.0
+                dt_safe = np.where(dt_ms_arr > 0, dt_ms_arr, floor_ms)
+                acc = dv / (dt_safe / 1000.0)  # cm/s²
+                acc[0] = 0.0  # first frame: no prior sample
+                return pd.Series(acc, index=grp.index)
+
+            df_k["acceleration"] = (
+                df_k.groupby("trial_id", group_keys=False)
+                .apply(_acceleration_cm_s2)
             )
 
             df_k["visual_angle"] = 0.0
@@ -262,10 +282,35 @@ def adapt_cercus_to_nsmor(raw_dir="data/raw"):
                         "event_value": '{"source": "kinematics_injected"}'
                     })
             elif has_visual:
+                # Use parsed looming_onset_ms when available (the
+                # phase_transition → Looming timestamp from events).
+                # Fall back to 0.0 only when the field is absent.
+                parsed_onset = info.get('looming_onset_ms')
+                if parsed_onset is not None and parsed_onset >= 0:
+                    onset_val = float(parsed_onset)
+                    # Guard: warn if parsed onset deviates from trial
+                    # start (time_ms ≈ 0) by more than one median frame
+                    # gap — signals a timing mismatch that downstream
+                    # analysis should investigate.
+                    pos_gaps = np.diff(time_vals)
+                    pos_gaps = pos_gaps[pos_gaps > 0]
+                    median_gap = float(np.median(pos_gaps)) if pos_gaps.size > 0 else 4.0
+                    if abs(onset_val - time_vals[0]) > median_gap:
+                        import warnings as _w
+                        _w.warn(
+                            f"[{session_id}/trial {tid}] parsed looming_onset_ms "
+                            f"({onset_val:.3f}) deviates from trial start "
+                            f"({time_vals[0]:.3f}) by "
+                            f"{abs(onset_val - time_vals[0]):.3f} ms "
+                            f"(> 1 median gap {median_gap:.3f} ms)",
+                            stacklevel=2,
+                        )
+                else:
+                    onset_val = 0.0
                 stim_starts.append({
                     "session_id": session_id,
                     "trial_id": tid,
-                    "time_ms": 0.0,
+                    "time_ms": onset_val,
                     "event_type": "stimulus_onset",
                     "event_value": '{"source": "kinematics_injected"}'
                 })
