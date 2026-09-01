@@ -1,3 +1,4 @@
+LICENSE
 README.md
 pyproject.toml
 nsmor/__init__.py
@@ -5,6 +6,7 @@ nsmor/checkpoint.py
 nsmor/config.py
 nsmor/config_parser.py
 nsmor/data_extractor.py
+nsmor/dataloader_factory.py
 nsmor/loss.py
 nsmor/mcmc_module.py
 nsmor/model_nsmor_core.py
@@ -17,10 +19,17 @@ nsmor.egg-info/requires.txt
 nsmor.egg-info/top_level.txt
 nsmor/analysis/__init__.py
 nsmor/analysis/dynamics.py
+nsmor/analysis/gating_cluster.py
 nsmor/analysis/uq.py
 nsmor/pipeline/io.py
 nsmor/pipeline/kinematics.py
 nsmor/pipeline/labeling.py
 tests/test_biophysics.py
+tests/test_cli_contract.py
+tests/test_gating_cluster.py
+tests/test_kinematics_semantics.py
 tests/test_loss.py
 tests/test_pipeline.py
+tests/test_prior_shift_audit.py
+tests/test_train_checkpoint.py
+tests/test_training_metrics.py

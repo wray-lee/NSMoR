@@ -88,7 +88,11 @@ class NSMoRDataset(Dataset):
 
         self.feature_config = feature_config
         self.max_seq_len = max_seq_len
-        self.sequences = list(sequences)  # defensive copy
+        # Deep-copy each (X_seq, Y_seq, label) tuple so that _fill_priors
+        # writes into private arrays and never corrupts the caller's data.
+        self.sequences = [
+            (X.copy(), Y.copy(), lbl) for X, Y, lbl in sequences
+        ]
 
         n = len(sequences)
         expected_shape = (n, feature_config.mcmc_dim)
@@ -103,9 +107,38 @@ class NSMoRDataset(Dataset):
     # ── Internal helpers ─────────────────────────────────────
 
     def _fill_priors(self, priors: np.ndarray) -> None:
-        """Write the static prior vector into every frame of each sequence."""
+        """Write the static prior vector into every frame of each sequence.
+
+        Each row of *priors* must sum to 1 (valid probability simplex).
+        The method writes into the deep-copied ``self.sequences`` arrays,
+        so the caller's original data is never mutated.
+        """
         for i, (X_seq, Y_seq, label) in enumerate(self.sequences):
-            X_seq[:, 4:8] = priors[i]
+            # Guard: detect if MCMC columns already hold a valid probability
+            # simplex (every row sums to ~1), which indicates a double-fill
+            # bug or caller passed pre-filled sequences.
+            existing_row0 = X_seq[0, 4:8]
+            existing_sum = float(existing_row0.sum())
+            if (
+                np.all(existing_row0 >= 0.0)
+                and abs(existing_sum - 1.0) < 1e-4
+            ):
+                raise ValueError(
+                    f"[_fill_priors] trial {i}: MCMC columns (4:8) already "
+                    f"contain a valid probability simplex "
+                    f"(row-0 sum={existing_sum:.6f}).  Source sequences may "
+                    f"have been mutated by a previous DataLoader — ensure a "
+                    f"fresh deep copy."
+                )
+            prior_vec = priors[i]
+            prior_sum = float(prior_vec.sum())
+            if abs(prior_sum - 1.0) > 1e-4:
+                raise ValueError(
+                    f"[_fill_priors] trial {i}: prior sum={prior_sum:.6f} "
+                    f"deviates from 1.0 by {abs(prior_sum - 1.0):.6f} "
+                    f"(tolerance=1e-4).  Upstream MCMC priors may be corrupt."
+                )
+            X_seq[:, 4:8] = prior_vec
             self.sequences[i] = (X_seq, Y_seq, label)
 
     # ── Dataset interface ────────────────────────────────────

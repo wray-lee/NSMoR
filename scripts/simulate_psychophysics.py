@@ -92,9 +92,27 @@ def load_checkpoint(ckpt_path: str, device: torch.device):
     return load_model_from_checkpoint(Path(ckpt_path), device)
 
 
-def load_validation_data(device: torch.device, max_seq_len: int = 1000):
-    """Load nsmor_dataset.pt and return validation split."""
-    dataset_path = os.path.join(_PROJECT_ROOT, "data", "processed", "nsmor_dataset.pt")
+def load_validation_data(
+    device: torch.device,
+    max_seq_len: int = 1000,
+    dataset_path: Optional[str] = None,
+):
+    """
+    Load ``nsmor_dataset.pt`` and return the validation split.
+
+    ``dataset_path`` defaults to the in-repo processed dataset so existing
+    callers keep working, but the pipeline passes the dataset the current
+    run produced — otherwise this stage silently scores whatever file is
+    left over in ``data/processed`` from an earlier run.
+
+    NOTE (open provenance gap): the split here is the trailing 20% by
+    position, which is NOT the session-grouped split train.py uses.  Fix
+    that with the trial-key work, not here.
+    """
+    if dataset_path is None:
+        dataset_path = os.path.join(
+            _PROJECT_ROOT, "data", "processed", "nsmor_dataset.pt"
+        )
     if not os.path.exists(dataset_path):
         logger.error("Dataset not found: %s", dataset_path)
         sys.exit(1)
@@ -452,6 +470,20 @@ def main() -> None:
         help="Visual noise σ values in degrees.",
     )
     parser.add_argument(
+        "--dataset",
+        type=str,
+        default=None,
+        help="Path to the processed dataset (default: "
+             "<repo>/data/processed/nsmor_dataset.pt).",
+    )
+    parser.add_argument(
+        "--raw_dir",
+        type=str,
+        default=os.path.join(_PROJECT_ROOT, "data", "raw"),
+        help="Raw session directory whose events CSVs identify the "
+             "multisensory_ttc_0ms condition.",
+    )
+    parser.add_argument(
         "--output_dir",
         type=str,
         default=os.path.join(_PROJECT_ROOT, "results"),
@@ -479,10 +511,12 @@ def main() -> None:
     # --- Load model & data ---
     model = load_checkpoint(args.checkpoint, device)
     max_seq_len = args.max_seq_len if args.max_seq_len > 0 else None
-    X_val, Y_val, lengths_val = load_validation_data(device, max_seq_len=max_seq_len)
+    X_val, Y_val, lengths_val = load_validation_data(
+        device, max_seq_len=max_seq_len, dataset_path=args.dataset,
+    )
 
     # --- Filter to multisensory_ttc_0ms ---
-    ttc0_mask = find_multisensory_ttc0(X_val, lengths_val)
+    ttc0_mask = find_multisensory_ttc0(X_val, lengths_val, raw_dir=args.raw_dir)
     n_ttc0 = ttc0_mask.sum().item()
     logger.info("multisensory_ttc_0ms trials found: %d / %d", n_ttc0, X_val.shape[0])
     if n_ttc0 == 0:

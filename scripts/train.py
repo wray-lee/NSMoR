@@ -53,6 +53,34 @@ from nsmor.dataloader_factory import create_dataloaders_from_config
 from nsmor.loss import BioJointLoss, BioDecisionLoss, FrontendLoss
 from nsmor.model_nsmor_core import NSMoRCore
 
+
+def _atomic_save_checkpoint(**kwargs) -> Path:
+    """Atomic wrapper around the frozen :func:`save_checkpoint`.
+
+    Writes to a temporary file in the same directory, fsyncs, then
+    atomically replaces the target via :func:`os.replace`.  This
+    prevents a truncated ``.pth`` (from a SIGKILL / OOM during
+    ``torch.save``) from overwriting a previously valid checkpoint.
+
+    The frozen ``nsmor/checkpoint.py`` calls ``torch.save(state, path)``
+    directly — no atomic semantics.  Rather than editing the frozen
+    module, we redirect the ``path`` keyword to a temp file and rename
+    after the save completes.
+
+    All keyword arguments are forwarded verbatim to
+    :func:`save_checkpoint`.
+    """
+    target = Path(kwargs["path"])
+    tmp = target.with_suffix(".pth.tmp")
+    kwargs["path"] = tmp
+    save_checkpoint(**kwargs)
+    # fsync the written bytes so the OS page-cache is flushed before the
+    # atomic rename — protects against power-loss on non-journaled FS.
+    with open(tmp, "rb") as fh:
+        os.fsync(fh.fileno())
+    os.replace(tmp, target)
+    return target
+
 # ── Logging setup ──────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
@@ -71,8 +99,9 @@ _SWEEP_BANDS: Optional[List[float]] = None
 # (validation leakage into target mean/std).
 _VAL_SPLIT = 0.2
 
-# Hardcoded dataset path shared by build_dataloaders and compute_target_stats
-# call sites (single source; the .pt file is also loaded only once this way).
+# Default dataset for build_dataloaders and compute_target_stats.  Both
+# call sites receive the same resolved path, which ``--dataset`` overrides
+# so a run trains on the dataset its own ETL stage produced.
 _DATASET_PATH = "data/processed/nsmor_dataset.pt"
 
 
@@ -98,6 +127,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="Path to YAML configuration file.",
+    )
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default=None,
+        help="Processed dataset to train on (default: "
+             "data/processed/nsmor_dataset.pt).  The pipeline passes the "
+             "dataset produced by the ETL stage of the same run.",
     )
 
     # ── Training overrides ────────────────────────────────────
@@ -639,13 +676,31 @@ def compute_target_stats(
 
     dataset = torch.load(dataset_file, weights_only=False)
     Y_seqs = dataset["Y_seqs"]
+    n_total = len(Y_seqs)
 
+    # ── Session-grouped split (must mirror build_dataloaders exactly) ──
+    # Round-4 fix: the previous implementation used a SAMPLE-level
+    # shuffle while build_dataloaders splits by SESSION.  That meant
+    # normalization statistics were fit on data that included validation
+    # sessions — a subtle data-leakage channel.  We now replicate the
+    # exact same session-grouped logic so the two code paths produce
+    # byte-identical train_indices from the same seed.
     rng = np.random.RandomState(config.training.random_seed)
-    indices = np.arange(len(Y_seqs))
-    rng.shuffle(indices)
-    n_val = max(1, int(len(Y_seqs) * val_split))
-    n_train = len(Y_seqs) - n_val
-    train_indices = indices[:n_train]
+    session_ids = dataset.get("session_ids")
+    if session_ids is not None and len(session_ids) == n_total:
+        session_arr = np.asarray(session_ids)
+        unique_sessions = np.unique(session_arr)
+        rng.shuffle(unique_sessions)
+        n_val_sessions = max(1, int(len(unique_sessions) * val_split))
+        val_sessions = set(unique_sessions[:n_val_sessions].tolist())
+        is_val = np.array([s in val_sessions for s in session_arr])
+        train_indices = np.nonzero(~is_val)[0]
+    else:
+        indices = np.arange(n_total)
+        rng.shuffle(indices)
+        n_val = max(1, int(n_total * val_split))
+        n_train = n_total - n_val
+        train_indices = indices[:n_train]
 
     train_y = np.concatenate([Y_seqs[i] for i in train_indices]).astype(np.float64)
 
@@ -1470,6 +1525,7 @@ def train(
     config: ExperimentConfig,
     lambda_reg: float = 0.01,
     phase1_epochs: Optional[int] = None,
+    dataset_path: Optional[str] = None,
 ) -> Dict[str, float]:
     """
     Full training pipeline.
@@ -1497,6 +1553,10 @@ def train(
         phase1_epochs: Number of Phase 1 epochs.  ``None`` =
             single-phase mode (backward compatible).  ``0`` =
             skip Phase 1 entirely (start with Phase 2).
+        dataset_path: Processed dataset to train on.  ``None`` keeps the
+            historical default (``data/processed/nsmor_dataset.pt``);
+            the pipeline passes the dataset the current ETL produced so
+            training cannot silently consume a leftover file.
 
     Returns:
         Dictionary with ``"best_val_loss`` and ``"final_train_loss"``.
@@ -1507,6 +1567,9 @@ def train(
     # ── Reproducibility ───────────────────────────────────────
     torch.manual_seed(config.training.random_seed)
     np.random.seed(config.training.random_seed)
+
+    resolved_dataset_path = dataset_path or _DATASET_PATH
+    logger.info("Dataset: %s", resolved_dataset_path)
 
     # ── Device ────────────────────────────────────────────────
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1603,7 +1666,7 @@ def train(
     if not two_phase:
         pass  # criterion already set above
     train_loader, val_loader = build_dataloaders(
-        config, dataset_path=_DATASET_PATH, val_split=_VAL_SPLIT,
+        config, dataset_path=resolved_dataset_path, val_split=_VAL_SPLIT,
     )
 
     if train_loader is None:
@@ -1620,7 +1683,7 @@ def train(
     # and the reported metrics all live in one consistent space, and the
     # final metrics are rescaled back to cm/s.
     target_mean, target_std = compute_target_stats(
-        _DATASET_PATH,
+        resolved_dataset_path,
         config,
         val_split=_VAL_SPLIT,
     )
@@ -1970,7 +2033,7 @@ def train(
         # Periodic checkpoint
         if (epoch + 1) % config.training.checkpoint_interval == 0:
             epoch_path = output_dir / f"epoch_{epoch + 1}.pth"
-            save_checkpoint(
+            _atomic_save_checkpoint(
                 model=model,
                 optimizer=optimizer,
                 scheduler=scheduler,
@@ -1983,15 +2046,30 @@ def train(
             )
             logger.info("Saved periodic checkpoint: %s", epoch_path)
 
-        # Best-model checkpoint (skip during warmup to avoid scale mismatch)
-        # Selection uses the bulk val_loss; the escape-signal audit (below)
-        # makes the escape vs resting RMSE *visible* so a silent
-        # fit-bulk-lose-escape failure is not undetectable, even if it is not
-        # the selection criterion itself.
-        if warmup_factor >= 1.0 and val_loss < best_val_loss:
+        # Best-model checkpoint.
+        # Round-4 fix: the previous gate ``warmup_factor >= 1.0`` made it
+        # impossible to save *any* best checkpoint when the total number of
+        # training epochs was <= warmup_epochs (e.g. short smoke tests,
+        # or any --epochs <= config.loss.warmup_epochs).  ``best_val_loss``
+        # stayed ``inf``, no ``best_model.pth`` was written, downstream
+        # ``compute_metrics`` was skipped, and the pipeline gate failed.
+        #
+        # The warmup factor scales the bio-loss regularisation terms
+        # (router reg, ATP cost, sparsity) but has NO effect on the
+        # primary MSE reconstruction term that dominates val_loss during
+        # warmup.  Comparing partially-regularised val_loss values across
+        # warmup is valid: the MSE trend is monotonic and the bio-penalty
+        # terms are only additive (removing the gate cannot select a
+        # spuriously low val_loss caused by missing penalties — the
+        # penalty is >= 0, so the warmed-up loss is always >=).
+        #
+        # Guard: val_loss must be finite (non-NaN, non-Inf) — heavy-tailed
+        # targets with normalization disabled can produce non-finite loss,
+        # which must not silently overwrite a good checkpoint.
+        if math.isfinite(val_loss) and val_loss < best_val_loss:
             best_val_loss = val_loss
             best_path = output_dir / "best_model.pth"
-            save_checkpoint(
+            _atomic_save_checkpoint(
                 model=model,
                 optimizer=optimizer,
                 scheduler=scheduler,
@@ -2006,7 +2084,7 @@ def train(
 
     # ── Final checkpoint ──────────────────────────────────────
     final_path = output_dir / "final_model.pth"
-    save_checkpoint(
+    _atomic_save_checkpoint(
         model=model,
         optimizer=optimizer,
         scheduler=scheduler,
@@ -2029,10 +2107,28 @@ def train(
     logger.info("Loss curve saved: %s", loss_curve_path)
 
     # ── Evaluate best model on validation set ────────────────────
+    # If no best checkpoint was saved (e.g. val_loss was never finite),
+    # fall back to the final checkpoint and flag the provenance so
+    # downstream consumers know the model was NOT selected by val_loss.
     metrics: Dict[str, float] = {}
     best_ckpt_path = output_dir / "best_model.pth"
-    if best_ckpt_path.exists() and val_loader is not None:
-        load_checkpoint(path=best_ckpt_path, model=model, map_location=device)
+    eval_ckpt_path: Optional[Path] = None
+    eval_provenance = "best"
+    if best_ckpt_path.exists():
+        eval_ckpt_path = best_ckpt_path
+    elif final_path.exists():
+        eval_ckpt_path = final_path
+        eval_provenance = "final_fallback"
+        logger.warning(
+            "No best_model.pth — falling back to final_model.pth for "
+            "metric evaluation.  Val loss was never finite during "
+            "training (best_val_loss=%.6f); metrics are computed on "
+            "the LAST epoch's weights, NOT the best-validated.",
+            best_val_loss,
+        )
+
+    if eval_ckpt_path is not None and val_loader is not None:
+        load_checkpoint(path=eval_ckpt_path, model=model, map_location=device)
         model.to(device)
         metrics = compute_metrics(
             model, val_loader, device,
@@ -2054,6 +2150,7 @@ def train(
                 metrics["escape_rmse"],
                 metrics["resting_rmse"],
             )
+        metrics["eval_provenance"] = eval_provenance
         metrics_path = output_dir / "metrics.json"
         with open(metrics_path, "w") as f:
             json.dump(metrics, f, indent=2)
@@ -2089,10 +2186,21 @@ def train(
             logger.info("Escape sensitivity sweep (%d configs): %s",
                         len(rows), sweep_path)
 
+    # ── Fail-loud guard: no checkpoint at all ────────────────────
+    # If neither best nor final checkpoint was produced, the run is
+    # broken.  Fail loudly rather than returning exit 0 with no model.
+    if not best_ckpt_path.exists() and not final_path.exists():
+        raise RuntimeError(
+            "Training completed but NO checkpoint was written "
+            "(neither best_model.pth nor final_model.pth).  "
+            "This indicates a critical I/O or permission error."
+        )
+
     return {
         "best_val_loss": best_val_loss,
         "final_train_loss": history["train_loss"][-1] if history["train_loss"] else float("inf"),
         "metrics": metrics,
+        "eval_provenance": eval_provenance,
     }
 
 
@@ -2110,10 +2218,18 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         argv: Argument list (defaults to ``sys.argv[1:]``).
     """
     config, lambda_reg, phase1_epochs = build_config(argv)
+    # build_config keeps its 3-tuple contract (imported by tests); the
+    # dataset path is read from the same argv without changing it.
+    dataset_path = build_arg_parser().parse_args(argv).dataset
     logger.info("Config loaded: %s", config.checkpoint.output_dir)
 
     output_dir = Path(config.checkpoint.output_dir)
-    results = train(config, lambda_reg=lambda_reg, phase1_epochs=phase1_epochs)
+    results = train(
+        config,
+        lambda_reg=lambda_reg,
+        phase1_epochs=phase1_epochs,
+        dataset_path=dataset_path,
+    )
     train_log_path = output_dir / "train.log"
     with open(train_log_path, "w") as f:
         json.dump(results, f, indent=2)

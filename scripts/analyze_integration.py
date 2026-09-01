@@ -575,8 +575,10 @@ def create_integration_figure(
     setup_lancet_style()
 
     # ── Prepare data for plotting ─────────────────────────────
-    # Filter conditions that have multisensory data with valid delta_t
-    # We need conditions with known wind onset times
+    # Preferred multisensory conditions for the chronometric curve.
+    # When the dataset lacks these (e.g. smoke / synthetic data that
+    # contains only visual_only and wind_only), fall back to whatever
+    # conditions exist so the pipeline is not blocked.
     plot_conditions = [
         "visual_only",
         "multisensory_ttc_-373ms",
@@ -588,6 +590,7 @@ def create_integration_figure(
     # X-axis values: Wind onset time relative to TTC (ms)
     delta_t_mapping: Dict[str, float] = {
         "visual_only": 0.0,  # Reference point (no wind)
+        "wind_only": -500.0,  # Arbitrary x for wind-only
         "multisensory_ttc_-373ms": -373.0,
         "multisensory_ttc_-119ms": -119.0,
         "multisensory_ttc_0ms": 0.0,
@@ -600,6 +603,7 @@ def create_integration_figure(
     latency_sems: List[float] = []
     velocity_means: List[float] = []
     velocity_sems: List[float] = []
+    cond_labels: List[str] = []
 
     for cond in plot_conditions:
         if cond not in condition_stats:
@@ -622,6 +626,28 @@ def create_integration_figure(
         latency_sems.append(latency["sem"])
         velocity_means.append(velocity["mean"])
         velocity_sems.append(velocity["sem"])
+        cond_labels.append(cond)
+
+    # Fallback: if none of the preferred conditions were found, use
+    # ALL conditions present in condition_stats (sorted by name) so
+    # the analysis always produces an artefact.
+    if not x_values:
+        logger.warning(
+            "None of the preferred multisensory conditions found; "
+            "falling back to all %d available conditions.",
+            len(condition_stats),
+        )
+        for idx, (cond, stats) in enumerate(sorted(condition_stats.items())):
+            latency = stats.get("latency", {"mean": 0.0, "sem": 0.0, "n": 0})
+            velocity = stats.get("peak_velocity", {"mean": 0.0, "sem": 0.0, "n": 0})
+            if latency["n"] == 0:
+                continue
+            x_values.append(delta_t_mapping.get(cond, float(idx)))
+            latency_means.append(latency["mean"])
+            latency_sems.append(latency["sem"])
+            velocity_means.append(velocity["mean"])
+            velocity_sems.append(velocity["sem"])
+            cond_labels.append(cond)
 
     if not x_values:
         raise ValueError("No valid conditions found for plotting.")

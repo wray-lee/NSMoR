@@ -389,14 +389,21 @@ def run_analysis(
     output_dir: Path,
     batch_size: int = 32,
     max_seq_len: Optional[int] = 1000,
+    config_path: Optional[Path] = None,
 ) -> None:
     """Run the full gating cluster analysis pipeline."""
     logger.info("=" * 60)
     logger.info("NSMoR Gating Strategy Clustering Analysis")
     logger.info("=" * 60)
 
-    # Load experiment config
-    exp_config = ExperimentConfig.from_yaml("config/default.yaml")
+    # Load experiment config.  The path used to be hardcoded and
+    # cwd-relative, so the clustering silently used the repo default
+    # config no matter which config trained the checkpoint — and the
+    # script could only run from the repository root.
+    if config_path is None:
+        config_path = Path(__file__).resolve().parents[1] / "config" / "default.yaml"
+    logger.info("Cluster config: %s", config_path)
+    exp_config = ExperimentConfig.from_yaml(config_path)
     cluster_config = exp_config.cluster_gating
 
     # Load model and dataset
@@ -506,6 +513,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to preprocessed dataset.",
     )
     parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="YAML config supplying cluster_gating settings "
+             "(default: <repo>/config/default.yaml).",
+    )
+    parser.add_argument(
         "--output_dir",
         type=str,
         default="results",
@@ -538,6 +552,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         output_dir=Path(args.output_dir),
         batch_size=args.batch_size,
         max_seq_len=max_seq_len,
+        config_path=Path(args.config) if args.config else None,
     )
 
 
