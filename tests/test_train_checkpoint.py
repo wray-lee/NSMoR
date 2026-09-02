@@ -472,3 +472,269 @@ def test_provenance_with_normalization(tmp_path: Path) -> None:
         f"target_std mismatch: {ckpt['target_std']} vs {expected_std}"
     )
     assert ckpt["target_clip_cm_s"] == 100.0
+
+
+# ═════════════════════════════════════════════════════════════
+# Test 7: split cross-verification dry
+# ═════════════════════════════════════════════════════════════
+
+def test_split_cross_verification_dry(tmp_path: Path) -> None:
+    """Cross-verify that build_dataloaders and compute_target_stats extract the
+    EXACT same train indices under the same configuration."""
+    from scripts.train import (
+        build_dataloaders,
+        compute_target_stats,
+        _VAL_SPLIT,
+    )
+
+    ds_path = _make_synthetic_dataset(tmp_path)
+    dataset = torch.load(ds_path, weights_only=False)
+    n_total = len(dataset["X_seqs"])
+
+    config = _make_config(tmp_path, epochs=1, normalize_targets=True)
+
+    # 1. Call build_dataloaders and extract actual train indices
+    train_loader, val_loader = build_dataloaders(
+        config, dataset_path=str(ds_path), val_split=_VAL_SPLIT,
+    )
+    assert train_loader is not None
+
+    train_indices_from_loader = []
+    for seq in train_loader.dataset.sequences:
+        matched = [
+            i for i in range(n_total)
+            if np.array_equal(seq[1], dataset["Y_seqs"][i])
+        ]
+        assert len(matched) == 1
+        train_indices_from_loader.append(matched[0])
+    train_indices_from_loader = np.array(train_indices_from_loader)
+
+    # 2. Call compute_target_stats and extract actual train indices via spy
+    captured_indices_from_stats = []
+    orig_concatenate = np.concatenate
+
+    def _spy_concatenate(arrays, *args, **kwargs):
+        nonlocal captured_indices_from_stats
+        matched_indices = []
+        for arr in arrays:
+            matched = [
+                i for i in range(n_total)
+                if np.array_equal(arr, dataset["Y_seqs"][i])
+            ]
+            if matched:
+                matched_indices.append(matched[0])
+        if matched_indices:
+            captured_indices_from_stats = matched_indices
+        return orig_concatenate(arrays, *args, **kwargs)
+
+    with mock.patch("scripts.train.np.concatenate", side_effect=_spy_concatenate):
+        compute_target_stats(str(ds_path), config, val_split=_VAL_SPLIT)
+
+    assert len(captured_indices_from_stats) > 0
+
+    # 3. Assert EXACT identity
+    np.testing.assert_array_equal(
+        np.sort(train_indices_from_loader),
+        np.sort(captured_indices_from_stats),
+        err_msg="build_dataloaders and compute_target_stats used different train indices",
+    )
+    assert set(train_indices_from_loader) == set(captured_indices_from_stats)
+
+
+# Alias to match both 'split_cross_verify' and 'split_cross_verification' test filters
+test_split_cross_verify_dry = test_split_cross_verification_dry
+
+
+# ═════════════════════════════════════════════════════════════
+# Test 8: resume within phase 1
+# ═════════════════════════════════════════════════════════════
+
+def test_resume_within_phase1(tmp_path: Path) -> None:
+    """Save at epoch 5 (phase1_epochs=10), resume, and verify run completes."""
+    from scripts.train import train
+
+    ds_path = _make_synthetic_dataset(tmp_path)
+    config = _make_config(tmp_path, epochs=5, warmup_epochs=0)
+    config.training.checkpoint_interval = 5
+
+    # Initial 5 epochs (epochs 0..4 in Phase 1)
+    results_init = train(
+        config, lambda_reg=0.01, phase1_epochs=10, dataset_path=str(ds_path),
+    )
+
+    output_dir = Path(config.checkpoint.output_dir)
+    ckpt_path = output_dir / "epoch_5.pth"
+    assert ckpt_path.exists(), "epoch_5.pth was not saved"
+
+    ckpt = torch.load(ckpt_path, weights_only=False)
+    assert ckpt["epoch"] == 4  # 0-indexed, 5th epoch completed
+    assert ckpt["training_phase"] == 1
+
+    # Resume from epoch 5 to epoch 7
+    resume_output_dir = tmp_path / "resume_phase1_run"
+    config_resume = _make_config(tmp_path, epochs=7, warmup_epochs=0)
+    config_resume.checkpoint.output_dir = str(resume_output_dir)
+    config_resume.checkpoint.resume_from = str(ckpt_path)
+
+    results_resume = train(
+        config_resume,
+        lambda_reg=0.01,
+        phase1_epochs=10,
+        dataset_path=str(ds_path),
+    )
+
+    assert np.isfinite(results_resume["best_val_loss"])
+    assert "final_train_loss" in results_resume
+    final_path = resume_output_dir / "final_model.pth"
+    assert final_path.exists(), "final_model.pth was not written after resume"
+
+    final_ckpt = torch.load(final_path, weights_only=False)
+    assert final_ckpt["epoch"] == 6  # 0-indexed, 7 total epochs
+
+
+# ═════════════════════════════════════════════════════════════
+# Test 9: resume boundary landing
+# ═════════════════════════════════════════════════════════════
+
+def test_resume_boundary_landing(tmp_path: Path) -> None:
+    """Save at epoch 10 (phase1_epochs=10 boundary), resume, and verify Phase 2
+    optimizer has 2 parameter groups."""
+    from scripts.train import train, train_one_epoch
+
+    ds_path = _make_synthetic_dataset(tmp_path)
+    config = _make_config(tmp_path, epochs=10, warmup_epochs=0)
+    config.training.checkpoint_interval = 10
+
+    # Initial 10 epochs (epochs 0..9 in Phase 1)
+    results_init = train(
+        config, lambda_reg=0.01, phase1_epochs=10, dataset_path=str(ds_path),
+    )
+
+    output_dir = Path(config.checkpoint.output_dir)
+    ckpt_path = output_dir / "epoch_10.pth"
+    assert ckpt_path.exists(), "epoch_10.pth was not saved"
+
+    ckpt = torch.load(ckpt_path, weights_only=False)
+    assert ckpt["epoch"] == 9  # 0-indexed, 10th epoch
+    assert ckpt["training_phase"] == 1
+    assert len(ckpt["optimizer_state_dict"]["param_groups"]) == 1
+
+    # Resume from epoch 10 to epoch 12 (crossing into Phase 2)
+    resume_output_dir = tmp_path / "resume_boundary_run"
+    config_resume = _make_config(tmp_path, epochs=12, warmup_epochs=0)
+    config_resume.checkpoint.output_dir = str(resume_output_dir)
+    config_resume.checkpoint.resume_from = str(ckpt_path)
+
+    observed_optimizers = []
+    orig_train_one_epoch = train_one_epoch
+
+    def _spy_train_one_epoch(*args, **kwargs):
+        opt = kwargs.get("optimizer") if "optimizer" in kwargs else args[3]
+        observed_optimizers.append(opt)
+        return orig_train_one_epoch(*args, **kwargs)
+
+    with mock.patch("scripts.train.train_one_epoch", side_effect=_spy_train_one_epoch):
+        results_resume = train(
+            config_resume,
+            lambda_reg=0.01,
+            phase1_epochs=10,
+            dataset_path=str(ds_path),
+        )
+
+    # Verify that Phase 2 optimizer created upon landing has 2 param groups
+    assert len(observed_optimizers) > 0
+    phase2_opt = observed_optimizers[0]
+    assert len(phase2_opt.param_groups) == 2, (
+        f"Expected 2 param groups in Phase 2 optimizer, got {len(phase2_opt.param_groups)}"
+    )
+    group_names = [g.get("name") for g in phase2_opt.param_groups]
+    assert group_names == ["non_lif", "lif"]
+
+    # Check final checkpoint
+    final_path = resume_output_dir / "final_model.pth"
+    assert final_path.exists()
+    final_ckpt = torch.load(final_path, weights_only=False)
+    assert len(final_ckpt["optimizer_state_dict"]["param_groups"]) == 2
+    assert final_ckpt["training_phase"] == 2
+
+
+# ═════════════════════════════════════════════════════════════
+# Test 10: resume mid-phase 2
+# ═════════════════════════════════════════════════════════════
+
+def test_resume_mid_phase2(tmp_path: Path) -> None:
+    """Save at epoch 15 (mid-Phase 2), resume, and verify 2 param groups and
+    momentum buffers are restored."""
+    from scripts.train import train, train_one_epoch
+
+    ds_path = _make_synthetic_dataset(tmp_path)
+    config = _make_config(tmp_path, epochs=15, warmup_epochs=0)
+    config.training.checkpoint_interval = 15
+
+    # Initial 15 epochs (Phase 1: 0..9, Phase 2: 10..14)
+    results_init = train(
+        config, lambda_reg=0.01, phase1_epochs=10, dataset_path=str(ds_path),
+    )
+
+    output_dir = Path(config.checkpoint.output_dir)
+    ckpt_path = output_dir / "epoch_15.pth"
+    assert ckpt_path.exists(), "epoch_15.pth was not saved"
+
+    ckpt = torch.load(ckpt_path, weights_only=False)
+    assert ckpt["epoch"] == 14  # 0-indexed, 15th epoch
+    assert ckpt["training_phase"] == 2
+    assert len(ckpt["optimizer_state_dict"]["param_groups"]) == 2
+
+    ckpt_opt_state = ckpt["optimizer_state_dict"]["state"]
+    assert len(ckpt_opt_state) > 0, "No optimizer state saved in epoch_15.pth"
+    has_exp_avg = any(
+        "exp_avg" in s and s["exp_avg"].norm() > 0
+        for s in ckpt_opt_state.values()
+    )
+    assert has_exp_avg, "No momentum buffer (exp_avg) in checkpoint"
+
+    # Resume from epoch 15 to epoch 17
+    resume_output_dir = tmp_path / "resume_mid_phase2_run"
+    config_resume = _make_config(tmp_path, epochs=17, warmup_epochs=0)
+    config_resume.checkpoint.output_dir = str(resume_output_dir)
+    config_resume.checkpoint.resume_from = str(ckpt_path)
+
+    restored_opt_before_step = None
+    orig_train_one_epoch = train_one_epoch
+
+    def _spy_train_one_epoch(*args, **kwargs):
+        nonlocal restored_opt_before_step
+        opt = kwargs.get("optimizer") if "optimizer" in kwargs else args[3]
+        if restored_opt_before_step is None:
+            restored_opt_before_step = {
+                "num_groups": len(opt.param_groups),
+                "group_names": [g.get("name") for g in opt.param_groups],
+                "state_len": len(opt.state),
+                "has_exp_avg": any("exp_avg" in s for s in opt.state.values()),
+                "has_exp_avg_sq": any("exp_avg_sq" in s for s in opt.state.values()),
+            }
+        return orig_train_one_epoch(*args, **kwargs)
+
+    with mock.patch("scripts.train.train_one_epoch", side_effect=_spy_train_one_epoch):
+        results_resume = train(
+            config_resume,
+            lambda_reg=0.01,
+            phase1_epochs=10,
+            dataset_path=str(ds_path),
+        )
+
+    assert restored_opt_before_step is not None
+    assert restored_opt_before_step["num_groups"] == 2
+    assert restored_opt_before_step["group_names"] == ["non_lif", "lif"]
+    assert restored_opt_before_step["state_len"] > 0
+    assert restored_opt_before_step["has_exp_avg"]
+    assert restored_opt_before_step["has_exp_avg_sq"]
+
+    assert np.isfinite(results_resume["best_val_loss"])
+    final_path = resume_output_dir / "final_model.pth"
+    assert final_path.exists()
+    final_ckpt = torch.load(final_path, weights_only=False)
+    assert final_ckpt["epoch"] == 16  # 0-indexed, 17 total epochs
+    assert final_ckpt["training_phase"] == 2
+    assert len(final_ckpt["optimizer_state_dict"]["param_groups"]) == 2
+
