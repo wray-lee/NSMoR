@@ -57,14 +57,28 @@ def surrogate_spike(v: jnp.ndarray, v_th: jnp.ndarray, in_abs: jnp.ndarray, scal
 # ===============================================================
 
 class SensoryEncoderJAX(nn.Module):
-    """Sensory projection: Linear(4, H) -> LayerNorm -> ReLU."""
+    """Sensory projection: Linear(4, H) -> LayerNorm -> ReLU.
+
+    Optionally injects Gaussian noise during training to model intrinsic
+    neural variability and stochastic resonance.
+    Ref: Douglass et al. 1993, Nature 365:721-723.
+    """
     hidden_dim: int = 64
+    sensory_noise_std: float = 0.0
 
     @nn.compact
-    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+    def __call__(self, x: jnp.ndarray, deterministic: bool = True) -> jnp.ndarray:
+        assert x.ndim >= 2, f"SensoryEncoderJAX input must be >= 2-D, got {x.ndim}-D"
         h = nn.Dense(self.hidden_dim, name="dense")(x)
         h = nn.LayerNorm(name="ln")(h)
-        return nn.relu(h)
+        h = nn.relu(h)
+        # MINOR-4 fix: Stochastic resonance noise injection (training only)
+        if not deterministic and self.sensory_noise_std > 0.0:
+            noise = jax.random.normal(
+                self.make_rng("dropout"), h.shape
+            ) * self.sensory_noise_std
+            h = h + noise
+        return h
 
 
 class MoRRouterJAX(nn.Module):
@@ -124,9 +138,13 @@ class NSMoRModel(nn.Module):
     # Neuromodulatory gain on GRU
     gru_neuromod_gain: float = 0.0
     dropout_rate: float = 0.1
+    sensory_noise_std: float = 0.0
 
     def setup(self) -> None:
-        self.sensory_encoder = SensoryEncoderJAX(hidden_dim=self.hidden_dim)
+        self.sensory_encoder = SensoryEncoderJAX(
+            hidden_dim=self.hidden_dim,
+            sensory_noise_std=self.sensory_noise_std,
+        )
         self.router = MoRRouterJAX()
         self.direction_head = DirectionHeadJAX(hidden_dim=self.hidden_dim, dropout_rate=self.dropout_rate)
 
@@ -203,6 +221,8 @@ class NSMoRModel(nn.Module):
             y_pred: (B, T) predicted velocity.
             internals (optional): dictionary of internal tensors.
         """
+        # MINOR-5 fix: Shape assertions on critical tensors
+        assert x.ndim == 3, f"Input must be 3-D (B, T, D), got {x.ndim}-D"
         B, T, D = x.shape
         H = self.hidden_dim
         dt = self.dt_ms
@@ -212,8 +232,9 @@ class NSMoRModel(nn.Module):
         sensory_x = x[:, :, :self.sensory_dim]
         mcmc_prior = x[:, :, self.sensory_dim:]
 
-        # 1. Sensory Encoder
-        e_sensory = self.sensory_encoder(sensory_x)  # (B, T, H)
+        # 1. Sensory Encoder (pass deterministic for noise gating)
+        e_sensory = self.sensory_encoder(sensory_x, deterministic=deterministic)  # (B, T, H)
+        assert e_sensory.shape == (B, T, H), f"e_sensory shape {e_sensory.shape} != ({B}, {T}, {H})"
 
         # 2. Precompute decay constants
         alpha_syn = compute_decay_factor(self.lif_tau_syn, dt)
@@ -222,8 +243,11 @@ class NSMoRModel(nn.Module):
         k_rel = dt / self.lif_rel_refract_ms if self.lif_rel_refract_ms > 0.0 else 0.0
         delta_theta = 0.3 * self.lif_threshold
         v_thresh = self.lif_threshold
-        v_clamp_max = 5.0 * self.lif_threshold
-        i_syn_clamp = 10.0 * self.lif_threshold
+        # BLOCKER-2 fix: Match PyTorch clamp thresholds exactly.
+        # PyTorch uses 3.0 * v_threshold and 5.0 * v_threshold
+        # (model_nsmor_core.py:436,442).
+        v_clamp_max = 3.0 * self.lif_threshold
+        i_syn_clamp = 5.0 * self.lif_threshold
         abs_refract_steps = round(self.lif_abs_refract_ms / dt) if self.lif_abs_refract_ms > 0.0 else 0.0
 
         if self.lif_lateral_inhibition > 0.0 and self.lif_w_inhib is not None:
@@ -314,16 +338,27 @@ class NSMoRModel(nn.Module):
             # Padded sequence masking
             m_2d = mask_t[:, None]
             out_lif_t = spike * m_2d
-            out_pot_t = v_new * m_2d
+            # MINOR-2 fix: Export post-reset potentials to align with PyTorch
+            # which exports lif_state[0] (= post-reset v) in
+            # model_nsmor_core.py:1651.
+            out_pot_t = v_reset * m_2d
             out_spk_t = spike * m_2d
             out_gru_t = h_gru_next * m_2d
 
-            # Sequence length boundary: don't advance GRU state for padded frames
+            # MAJOR-4 fix: Gate ALL carry states by padding mask.
+            # Padded frames must not advance LIF state — matching the
+            # GRU h_gru_state treatment already applied below.
             h_gru_state = jnp.where(m_2d > 0.5, h_gru_next, h_gru)
+            v_reset_gated = jnp.where(m_2d > 0.5, v_reset, v)
+            i_syn_gated = jnp.where(m_2d > 0.5, i_syn_new, i_syn)
+            w_gated = jnp.where(m_2d > 0.5, w_new, w)
+            ref_gated = jnp.where(m_2d > 0.5, ref_new, ref)
+            rel_ref_gated = jnp.where(m_2d > 0.5, rel_ref_new, rel_ref)
+            spk_hist_gated = jnp.where(m_2d > 0.5, spk_hist_new, spk_hist)
 
             next_carry = (
-                v_reset, i_syn_new, ref_new, rel_ref_new, w_new,
-                spk_hist_new, h_gru_state, t_step + 1,
+                v_reset_gated, i_syn_gated, ref_gated, rel_ref_gated, w_gated,
+                spk_hist_gated, h_gru_state, t_step + 1,
             )
             step_outputs = (out_lif_t, out_pot_t, out_spk_t, out_gru_t)
             return next_carry, step_outputs
@@ -380,6 +415,10 @@ class NSMoRModel(nn.Module):
         # 6. DirectionHead Decoding
         h_fused = g_lif * out_lif + g_gru * out_gru
         y_pred = self.direction_head(h_fused, deterministic=deterministic)  # (B, T)
+
+        # MINOR-5 fix: Output shape assertions
+        assert y_pred.shape == (B, T), f"y_pred shape {y_pred.shape} != ({B}, {T})"
+        assert effective_gates.shape == (B, T, 2), f"gates shape {effective_gates.shape} != ({B}, {T}, 2)"
 
         if return_internals:
             internals = {
@@ -536,8 +575,19 @@ def to_torch_state_dict(flax_params: Dict[str, Any]) -> Dict[str, torch.Tensor]:
     sd["backend.direction_head.net.3.weight"] = _t(p["direction_head"]["dense"]["kernel"]).T
     sd["backend.direction_head.net.3.bias"] = _t(p["direction_head"]["dense"]["bias"])
 
-    # Duplicate to top-level aliases for full backward compatibility
+    # Neuromodulatory gain parameters (BLOCKER-1 fix)
+    if "gain_scale" in p:
+        sd["backend._gain_scale"] = _t(p["gain_scale"])
+        sd["backend._gain_bias"] = _t(p["gain_bias"])
+
+    # Duplicate to top-level aliases for full backward compatibility.
+    # NOTE: gain parameters only exist under backend.* in PyTorch
+    # (they are nn.Parameters on BioDecisionCore, not legacy flat keys),
+    # so we must NOT create top-level aliases for them.
+    _no_alias = {"backend._gain_scale", "backend._gain_bias"}
     for k in list(sd.keys()):
+        if k in _no_alias:
+            continue
         if k.startswith("frontend."):
             sd[k.replace("frontend.", "")] = sd[k]
         elif k.startswith("backend."):

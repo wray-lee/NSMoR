@@ -204,7 +204,7 @@ def train_jax(
     output_dir: Optional[str] = None,
     num_epochs: Optional[int] = None,
     batch_size: Optional[int] = None,
-    learning_rate: Optional[int] = None,
+    learning_rate: Optional[float] = None,
     grad_accum_steps: int = 1,
     val_split: float = 0.2,
     resume_from: Optional[str] = None,
@@ -340,8 +340,10 @@ def train_jax(
     state = JAXTrainState(params=params, opt_state=opt_state, rng=train_rng)
 
     # 4. JIT-compiled Train and Eval Steps
-    lambda_reg = config.loss.lambda_energy  # or default 0.01
-    lambda_reg_val = 0.01
+    # MAJOR-2 fix: Read lambda_reg from config instead of hardcoding.
+    # Previously lambda_reg was set to config.loss.lambda_energy (wrong field)
+    # and then overridden by a hardcoded 0.01.
+    lambda_reg_val = getattr(config.loss, "lambda_reg", 0.01)
     lambda_energy_val = getattr(config.loss, "lambda_energy", 0.001)
     lambda_sparse_val = getattr(config.loss, "lambda_sparse", 0.005)
     lambda_jerk_val = getattr(config.loss, "lambda_jerk", 0.005)
@@ -472,8 +474,9 @@ def train_jax(
         is_best = val_loss < state.best_val_loss
         if is_best:
             state = state.replace(best_val_loss=val_loss)
-            # Save PyTorch-compatible best_model.pth
+            # MINOR-3 fix: Atomic write via .tmp + os.replace
             best_pth = out_path / "best_model.pth"
+            best_tmp = out_path / "best_model.pth.tmp"
             torch_sd = to_torch_state_dict(state.params)
             torch.save({
                 "model_state_dict": torch_sd,
@@ -482,18 +485,23 @@ def train_jax(
                 "train_loss": train_loss,
                 "target_mean": target_mean,
                 "target_std": target_std,
-            }, best_pth)
+            }, best_tmp)
+            os.replace(best_tmp, best_pth)
             logger.info("Saved new best model checkpoint to %s (val_loss=%.4f)", best_pth, val_loss)
 
         if ep % config.training.checkpoint_interval == 0 or ep == epochs:
             ep_pth = out_path / f"epoch_{ep}.pth"
+            ep_tmp = out_path / f"epoch_{ep}.pth.tmp"
             torch_sd = to_torch_state_dict(state.params)
             torch.save({
                 "model_state_dict": torch_sd,
                 "epoch": ep,
                 "val_loss": val_loss,
                 "train_loss": train_loss,
-            }, ep_pth)
+                "target_mean": target_mean,
+                "target_std": target_std,
+            }, ep_tmp)
+            os.replace(ep_tmp, ep_pth)
 
     avg_ep_time = np.mean(epoch_times[1:]) if len(epoch_times) > 1 else epoch_times[0]
     logger.info("=" * 60)

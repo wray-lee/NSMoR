@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -154,6 +154,8 @@ class JAXDataset:
         target_std: float = 1.0,
         normalize_targets: bool = False,
         target_clip_cm_s: float = 0.0,
+        anchor_frames: Optional[Sequence[int]] = None,
+        pre_anchor_frames: int = 1200,
     ) -> None:
         if indices is None:
             indices = list(range(len(X_seqs)))
@@ -173,6 +175,22 @@ class JAXDataset:
             prior = np.asarray(mcmc_priors[idx], dtype=np.float32)
 
             orig_len = len(y_seq)
+
+            # MAJOR-1 fix: Anchor-aligned cropping matching PyTorch
+            # nsmor_dataloader.py:202-220.  When anchor_frames is provided
+            # and the sequence exceeds max_seq_len, crop around the anchor
+            # to guarantee stimulus capture.
+            if orig_len > max_seq_len and anchor_frames is not None:
+                anchor_frame = int(anchor_frames[idx])
+                start = max(0, anchor_frame - pre_anchor_frames)
+                end = min(orig_len, start + max_seq_len)
+                # Adjust start if end clamped (keeps window size consistent)
+                if end - start < max_seq_len:
+                    start = max(0, end - max_seq_len)
+                x_seq = x_seq[start:end]
+                y_seq = y_seq[start:end]
+                orig_len = len(y_seq)
+
             actual_len = min(orig_len, max_seq_len)
             self.lengths[i] = actual_len
 

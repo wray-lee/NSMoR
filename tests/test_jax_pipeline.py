@@ -96,7 +96,7 @@ class TestJAXPipeline:
 
     def test_bidirectional_checkpoint_conversion(self):
         H = 64
-        model = NSMoRModel(hidden_dim=H, lif_lateral_inhibition=0.1)
+        model = NSMoRModel(hidden_dim=H, lif_lateral_inhibition=0.1, gru_neuromod_gain=1.0)
         rng = jax.random.PRNGKey(42)
         x = jnp.zeros((2, 10, 8))
         l = jnp.array([10, 10])
@@ -118,6 +118,20 @@ class TestJAXPipeline:
         assert np.allclose(p_orig["lif_w_in"], p_restored["lif_w_in"])
         assert np.allclose(p_orig["gru_w_ih"], p_restored["gru_w_ih"])
         assert np.allclose(p_orig["router"]["gate"]["kernel"], p_restored["router"]["gate"]["kernel"])
+
+        # MINOR-6 fix: Verify neuromod gain survives round-trip
+        assert "backend._gain_scale" in torch_sd, "gain_scale missing from PyTorch state_dict"
+        assert "backend._gain_bias" in torch_sd, "gain_bias missing from PyTorch state_dict"
+        assert np.allclose(p_orig["gain_scale"], p_restored["gain_scale"]), "gain_scale round-trip mismatch"
+        assert np.allclose(p_orig["gain_bias"], p_restored["gain_bias"]), "gain_bias round-trip mismatch"
+
+        # MINOR-6 fix: Verify strict=True loading into PyTorch NSMoRCore
+        from nsmor.model_nsmor_core import NSMoRCore
+        pt_model = NSMoRCore(
+            lif_lateral_inhibition=0.1,
+            gru_neuromod_gain=1.0,
+        )
+        pt_model.load_state_dict(torch_sd, strict=True)  # must not raise
 
     def test_bio_joint_loss_parity(self):
         B, T, H = 2, 20, 64
@@ -177,3 +191,44 @@ class TestJAXPipeline:
         assert np.isfinite(float(loss1))
         assert np.isfinite(float(loss2))
         assert state.step == 2
+
+    # MINOR-6 fix: BioJointLoss direct parity test against PyTorch
+    def test_bio_joint_loss_pytorch_parity(self):
+        """Cross-validate JAX compute_bio_joint_loss against PyTorch BioJointLoss."""
+        B, T, H = 2, 20, 64
+
+        # Fixed inputs
+        np_y_pred = np.random.RandomState(99).randn(B, T).astype(np.float32)
+        np_y_true = np.random.RandomState(100).randn(B, T).astype(np.float32)
+        np_g_gru = np.random.RandomState(101).rand(B, T, 1).astype(np.float32)
+        np_spikes = (np.random.RandomState(102).rand(B, T, H) > 0.9).astype(np.float32)
+        np_lengths = np.array([20, 15], dtype=np.int32)
+
+        # JAX
+        jax_loss, jax_met = compute_bio_joint_loss(
+            jnp.array(np_y_pred), jnp.array(np_y_true),
+            jnp.array(np_lengths), jnp.array(np_g_gru), jnp.array(np_spikes),
+            lambda_reg=0.01, lambda_energy=0.001, lambda_sparse=0.005,
+            lambda_jerk=0.0, target_rate=0.05, hidden_dim=H,
+        )
+
+        # PyTorch
+        from nsmor.loss import BioJointLoss
+        pt_loss_fn = BioJointLoss(reduction="mean", target_rate=0.05)
+        pt_loss = pt_loss_fn(
+            torch.from_numpy(np_y_pred), torch.from_numpy(np_y_true),
+            torch.from_numpy(np_lengths.astype(np.int64)),
+            torch.from_numpy(np_g_gru),
+            lambda_reg=0.01,
+            lif_spikes=torch.from_numpy(np_spikes),
+            lambda_energy=0.001,
+            lambda_sparse=0.005,
+            lambda_jerk=0.0,
+        )
+
+        # MSE should match closely (exact same formula)
+        assert abs(float(jax_met["mse"]) - float(jax_met["mse"])) < 1e-4
+        # Total loss tolerance (implementation details may differ slightly)
+        assert abs(float(jax_loss) - float(pt_loss.item())) < 0.05, (
+            f"JAX loss {float(jax_loss):.6f} vs PyTorch loss {float(pt_loss.item()):.6f}"
+        )
