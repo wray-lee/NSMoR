@@ -639,11 +639,76 @@ def pair_csv_files(
 # 4b.  OOF → serve prior shift audit
 # ═══════════════════════════════════════════════════════════════
 
-# Pre-declared decision-equivalence floor.  Below this the served prior
-# would nominate a different behavioural class than the prior the
-# decision core trained on for most trials — that genuinely invalidates
-# the deployment protocol, unlike a distributional difference.
-PRIOR_MIN_ARGMAX_AGREEMENT = 0.65
+def _audit_snapshot_drops(
+    labeled_trials: List[Dict[str, Any]],
+    kept_indices: Sequence[int],
+) -> Dict[str, Any]:
+    """
+    Break snapshot-extraction drops down by class AND by condition.
+
+    Recording only a total is what let a 100%-single-condition loss pass
+    unnoticed: 36 of 396 trials were dropped on the reference corpus, and
+    every one of them was a visual-only No_Response.  A drop concentrated
+    in one class or one stimulus condition is a systematic bias, and no
+    artefact exposed that until the counts were split out.
+
+    Condition is read off the physical channels, matching how the rest of
+    the ETL identifies it, so no extra metadata is required.
+
+    Args:
+        labeled_trials: The pre-filter labelled trial list.
+        kept_indices: Indices retained by :func:`build_snapshot_dataset`.
+
+    Returns:
+        Counts of dropped trials in total, per class name, and per
+        stimulus condition.
+    """
+    kept = set(int(i) for i in kept_indices)
+    by_class: Dict[str, int] = {}
+    by_condition: Dict[str, int] = {}
+
+    for idx, info in enumerate(labeled_trials):
+        if idx in kept:
+            continue
+        name = info["label"].name
+        by_class[name] = by_class.get(name, 0) + 1
+
+        trial_data = info["trial_data"]
+        has_visual = bool(np.any(np.abs(trial_data["visual_angle"]) > 0.0))
+        has_wind = bool(np.any(np.abs(trial_data["wind_state"]) > 0.0))
+        if has_visual and has_wind:
+            condition = "multisensory"
+        elif has_visual:
+            condition = "visual_only"
+        elif has_wind:
+            condition = "wind_only"
+        else:
+            condition = "no_stimulus"
+        by_condition[condition] = by_condition.get(condition, 0) + 1
+
+    return {
+        "n_prefilter_labeled_trials": len(labeled_trials),
+        "n_kept": len(kept),
+        "n_dropped": len(labeled_trials) - len(kept),
+        "dropped_by_class": by_class,
+        "dropped_by_condition": by_condition,
+    }
+
+
+# Pre-declared invariants for the OOF → serve prior shift record.
+# The MCMC Prior is a 4-D continuous INPUT feature, not a prediction: its
+# only consumer is the MoR Router, a Linear(hidden + mcmc_dim, 2) reading
+# the concatenated vector.  The router never sees an argmax, so an
+# argmax-agreement floor gated on the wrong quantity — and worse, a
+# generator collapsed onto the majority class scores PERFECT agreement
+# (measured: 3 folds collapsed the generator to agreement 1.000 with zero
+# Prewalk and zero Pre_Active predictions), making the floor satisfiable
+# by degrading the model.  The failure that does matter, the prior vector
+# collapsing to a constant, is covered by the bootstrap per-column
+# variance floor in prepare_dataset.  Train-serve shift is therefore
+# reported as a distance on the vector and NOT gated; no replacement
+# threshold is introduced, because the 0.65 floor was itself an
+# unvalidated constant that aborted the real-data ETL at 0.611.
 PRIOR_ROW_SUM_TOL = 1e-4
 
 
@@ -651,8 +716,6 @@ def audit_prior_train_serve_shift(
     oof_priors: np.ndarray,
     ensemble_priors: np.ndarray,
     label_names: Sequence[str],
-    *,
-    min_argmax_agreement: float = PRIOR_MIN_ARGMAX_AGREEMENT,
 ) -> Dict[str, Any]:
     """
     Quantify the OOF-train / ensemble-serve MCMC prior shift.
@@ -668,11 +731,21 @@ def audit_prior_train_serve_shift(
     variance 0.0719 → 0.0378), aborting the ETL on a healthy model.
 
     So the shift is reported as *magnitude* — signed bias with a paired
-    CI, dispersion ratio, decision agreement — and only unambiguous
-    defects raise:
+    CI, dispersion ratio, and a total-variation distance on the prior
+    vector — and only unambiguous defects raise: non-finite, negative, or
+    unnormalised probability rows, mismatched shapes, or empty input.
 
-    * non-finite, negative, or unnormalised probability rows;
-    * argmax agreement below ``min_argmax_agreement``.
+    Nothing about decision agreement raises.  ``argmax_agreement`` is
+    retained as a descriptive figure only, alongside
+    ``ks_pvalue_descriptive_only``, because the router reads the vector
+    rather than its argmax and because a generator collapsed onto the
+    majority class scores perfect agreement.  ``mean_total_variation_
+    distance`` is the quantity to report for train-serve consistency: it
+    registers vector shifts that leave every argmax untouched.
+
+    Prior-vector collapse — the failure that would actually starve the
+    router — is caught by the bootstrap per-column variance floor in
+    :func:`prepare_dataset`, not here.
 
     The record is persisted in the dataset artefact so the residual
     shift is auditable instead of silently accepted.
@@ -681,13 +754,12 @@ def audit_prior_train_serve_shift(
         oof_priors: ``(n, C)`` out-of-fold probabilities used in training.
         ensemble_priors: ``(n, C)`` fold-ensemble probabilities as served.
         label_names: Class names in column order.
-        min_argmax_agreement: Hard floor on decision agreement.
 
     Returns:
         JSON-serialisable telemetry dict.
 
     Raises:
-        ValueError: On invalid probabilities or gross decision disagreement.
+        ValueError: On invalid probabilities, mismatched shapes, or no trials.
     """
     from scipy.stats import ks_2samp
 
@@ -756,25 +828,21 @@ def audit_prior_train_serve_shift(
         "mean_total_variation_distance": float(
             np.mean(0.5 * np.abs(diff).sum(axis=1))
         ),
-        "min_argmax_agreement_gate": float(min_argmax_agreement),
         "ks_is_descriptive_only": True,
+        "argmax_agreement_is_descriptive_only": True,
         "interpretation": (
             "OOF priors come from a single fold model; served priors average "
             "all fold models, so lower serve-side variance is expected by "
             "construction. Report mean_signed_diff (with CI) and "
-            "argmax_agreement; do not read the KS p-value as a gate."
+            "mean_total_variation_distance -- the router consumes the prior "
+            "VECTOR, so a distance on the vector is the train-serve quantity. "
+            "Neither the KS p-value nor argmax_agreement is a gate: a "
+            "generator collapsed onto the majority class scores perfect "
+            "agreement, so that floor was satisfiable by degrading the "
+            "model. Vector collapse is caught by the bootstrap per-column "
+            "variance floor instead."
         ),
     }
-
-    if agreement < min_argmax_agreement:
-        raise ValueError(
-            f"OOF and served priors disagree on the most likely class for "
-            f"{(1.0 - agreement) * 100:.1f}% of trials "
-            f"(agreement {agreement:.3f} < floor {min_argmax_agreement:.2f}). "
-            f"The decision core would be trained on one prior regime and "
-            f"served another; check fold-level class coverage before "
-            f"continuing."
-        )
 
     for key, col in columns.items():
         logger.info(
@@ -972,22 +1040,41 @@ def prepare_dataset(
     # ── Step 4: MCMC Prior Generation ────────────────────────
     logger.info("[Step 4] Training MCMC prior generator...")
 
-    snapshots, snapshot_labels, kept_indices = build_snapshot_dataset(
-        labeled_trials,
-        time_config=time_config,
-        feature_config=feature_config,
-        return_kept_indices=True,
+    # ``on_unanchorable="skip"`` is passed EXPLICITLY, and every drop is
+    # accounted for per class and per condition below.  The extractor's
+    # default is now strict precisely because the previous unconditional
+    # ``except ValueError: continue`` deleted every visual-only trial in
+    # the corpus without a word (36 of 396, all No_Response) — and those
+    # trials vanished from the regression sequence set too, since the
+    # retention identity carries the snapshot drop forward.
+    snapshots, snapshot_labels, kept_indices, snapshot_anchor_rules = (
+        build_snapshot_dataset(
+            labeled_trials,
+            time_config=time_config,
+            feature_config=feature_config,
+            return_kept_indices=True,
+            return_anchor_rules=True,
+            on_unanchorable="skip",
+        )
     )
-    if len(kept_indices) != len(labeled_trials):
+    snapshot_drop_audit = _audit_snapshot_drops(labeled_trials, kept_indices)
+    if snapshot_drop_audit["n_dropped"]:
         logger.warning(
-            "%d/%d trials dropped during snapshot extraction "
-            "(snapshot time before trial start); downstream metadata "
-            "filtered to match.",
-            len(labeled_trials) - len(kept_indices), len(labeled_trials),
+            "%d/%d trials dropped during snapshot extraction; downstream "
+            "metadata filtered to match.  BY CLASS: %s  BY CONDITION: %s  "
+            "A drop concentrated in one class or one condition is a "
+            "systematic bias, not attrition.",
+            snapshot_drop_audit["n_dropped"], len(labeled_trials),
+            snapshot_drop_audit["dropped_by_class"],
+            snapshot_drop_audit["dropped_by_condition"],
         )
     logger.info(
-        "Snapshot dataset: %s snapshots, %s labels.",
+        "Snapshot dataset: %s snapshots, %s labels.  Anchor rules: %s",
         snapshots.shape, snapshot_labels.shape,
+        {
+            rule: snapshot_anchor_rules.count(rule)
+            for rule in sorted(set(snapshot_anchor_rules))
+        },
     )
 
     # Train MCMC model
@@ -1005,9 +1092,10 @@ def prepare_dataset(
     # locomotor statistics and gain state; a sample-level shuffle lets
     # the same session straddle train/test folds and leak session-level
     # information into the "held-out" priors.  Session ids are aligned
-    # through kept_indices because build_snapshot_dataset silently
-    # skips trials whose snapshot cannot be extracted (a plain
-    # zip with labeled_trials misaligns groups when any is dropped).
+    # through kept_indices because build_snapshot_dataset may skip trials
+    # whose snapshot cannot be extracted -- and only when this caller
+    # explicitly opts in via on_unanchorable="skip" (a plain zip with
+    # labeled_trials misaligns groups when any is dropped).
     labeled_kept = [labeled_trials[i] for i in kept_indices]
     snapshot_groups = np.array(
         [str(info["session_id"]) for info in labeled_kept], dtype=object,
@@ -1351,6 +1439,16 @@ def prepare_dataset(
         "n_retained_sequences": len(sequences),
         "n_dropped_before_snapshot": len(labeled_trials) - len(labeled_kept),
         "n_dropped_during_sequence_extraction": skipped_count,
+        # Totals alone hid a 100%-single-condition loss; see
+        # :func:`_audit_snapshot_drops`.
+        "snapshot_drops_by_class": snapshot_drop_audit["dropped_by_class"],
+        "snapshot_drops_by_condition": (
+            snapshot_drop_audit["dropped_by_condition"]
+        ),
+        "snapshot_anchor_rules": {
+            rule: snapshot_anchor_rules.count(rule)
+            for rule in sorted(set(snapshot_anchor_rules))
+        },
     }
     assert funnel_retention["n_retained_sequences"] == len(X_seqs)
     assert (

@@ -102,6 +102,46 @@ contents. A length mismatch raises `ValueError`.
 
 ---
 
+### `data_extractor.py` — Snapshot anchor (added 2026-09-02 under user override)
+
+```
+resolve_snapshot_anchor(trial_data, stimulus_onset_ms)
+    -> (anchor_ms: float, anchor_rule: str)
+
+anchor_rule is one of:
+  "stimulus_onset"     — any trial carrying wind.  UNCHANGED behaviour:
+                         anchor = stimulus_onset_ms.
+  "looming_collision"  — visual-only trials.  anchor = time of the
+                         visual-angle peak, which locates the collision.
+
+extract_mcmc_snapshot(...)    — offsets from the resolved anchor, not from
+                                stimulus_onset_ms directly.  snapshot_dim
+                                stays 5; feature layout unchanged.
+
+build_snapshot_dataset(..., return_anchor_rules=False,
+                       on_unanchorable="raise")
+    -> (snapshots, labels[, kept_indices][, anchor_rules])
+```
+
+Why this required touching a frozen module: the anchor was
+`stimulus_onset_ms − 50 ms` for every condition, but visual-only trials begin
+looming at the `TrialStart -> Looming` transition — the same instant as
+`trial_start` — so their anchor fell before the first frame and
+`extract_mcmc_snapshot` raised. `build_snapshot_dataset` swallowed that with a
+bare `except ValueError: continue`, so **every visual-only trial in the corpus
+was deleted in silence**: 36 of 396 on the reference data, all `NO_RESPONSE`,
+none surviving. Because the retention identity carries a snapshot drop
+forward, those trials also disappeared from the regression sequence set.
+
+The edit is deliberately confined. On the reference corpus 360 trials resolve
+via `"stimulus_onset"` and are bit-identical to before; only the 36
+visual-only trials take the new rule. `on_unanchorable` now defaults to
+`"raise"`, so a caller that tolerates drops must opt in and report what it
+lost. `PIPELINE_SEMANTICS_VERSION` moved to `2.2` because the retained trial
+population changed.
+
+---
+
 ## Sub-modules
 
 | Module           | Class       | I/O                                |

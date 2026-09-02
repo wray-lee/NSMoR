@@ -9,6 +9,7 @@ all tensor shapes and invariants.
 from __future__ import annotations
 
 import dataclasses
+import math
 import os
 import tempfile
 from pathlib import Path
@@ -229,6 +230,75 @@ def _make_pure_wind_csvs(
     return kin_path, evt_path
 
 
+def _make_visual_only_csvs(
+    tmp_dir: Path,
+    n_trials: int = 3,
+    dt_ms: float = 4.0,
+    lv_ratio_ms: float = 120.0,
+) -> tuple[Path, Path]:
+    """
+    Write synthetic CSVs for visual-only trials, reproducing the real corpus.
+
+    The defining property, measured on ``data/raw``: looming begins at the
+    ``TrialStart -> Looming`` transition, which is the same instant as
+    ``trial_start``, so ``stimulus_onset_ms`` is 0 and any negative offset
+    from it lands before the first frame.  Every visual-only trial in the
+    corpus was silently dropped for exactly this reason -- 36 of 396, all
+    of them No_Response, with zero visual-only trials surviving.
+
+    The looming trace peaks at the collision.  Measured: the visual angle
+    argmax sits at 6873.0 ms (median) against a geometric collision time
+    of 6874.8 ms for l/v = 120 ms and a 2 deg initial angle -- inside one
+    250 Hz frame.  So the peak locates the collision without assuming any
+    geometry constant.
+    """
+    t_col_ms = (lv_ratio_ms / 1000.0) / math.tan(math.radians(1.0)) * 1000.0
+    frames_per_trial = int((t_col_ms + 2500.0) / dt_ms)
+
+    kin_rows: list[dict] = []
+    evt_rows: list[dict] = []
+
+    for t in range(n_trials):
+        time_ms = np.arange(frames_per_trial) * dt_ms
+        # theta(t) = 2*atan(lv / (t_col - t)), clamped past collision.
+        delta_s = np.clip((t_col_ms - time_ms) / 1000.0, 1e-6, None)
+        visual_angle = np.degrees(2.0 * np.arctan((lv_ratio_ms / 1000.0) / delta_s))
+        visual_angle[time_ms > t_col_ms] = 0.0
+
+        velocity = np.random.uniform(0.0, 0.15, size=frames_per_trial)
+        acceleration = np.gradient(velocity, dt_ms / 1000.0)
+
+        for f in range(frames_per_trial):
+            kin_rows.append({
+                "session_id": "visual_session",
+                "trial_id": t,
+                "time_ms": float(time_ms[f]),
+                "x_pos": float(f * 0.01),
+                "y_pos": float(f * 0.005),
+                "heading": 0.0,
+                "velocity": float(velocity[f]),
+                "acceleration": float(acceleration[f]),
+                "visual_angle": float(visual_angle[f]),
+                "wind_state": 0.0,          # <- visual only: no wind, ever
+                "l_v_ratio": float(lv_ratio_ms),
+            })
+
+        for event_type in ("trial_start", "stimulus_onset"):
+            evt_rows.append({
+                "session_id": "visual_session",
+                "trial_id": t,
+                "time_ms": 0.0,             # <- looming starts at trial start
+                "event_type": event_type,
+                "event_value": 1,
+            })
+
+    kin_path = tmp_dir / "kinematics_visual.csv"
+    evt_path = tmp_dir / "events_visual.csv"
+    pd.DataFrame(kin_rows).to_csv(kin_path, index=False)
+    pd.DataFrame(evt_rows).to_csv(evt_path, index=False)
+    return kin_path, evt_path
+
+
 # ═══════════════════════════════════════════════════════════════
 # Tests
 # ═══════════════════════════════════════════════════════════════
@@ -425,6 +495,95 @@ class TestSnapshotExtraction:
         snapshots, labels = build_snapshot_dataset(labeled)
         assert snapshots.shape == (10, 5)
         assert labels.shape == (10,)
+
+    def test_visual_only_trial_survives_snapshot_extraction(
+        self, tmp_path: Path,
+    ) -> None:
+        """
+        A visual-only trial must produce a Snapshot, not vanish.
+
+        Its stimulus onset is 0 because looming begins at trial start, so
+        anchoring at ``stimulus_onset - 50 ms`` lands before frame one and
+        the trial used to be swallowed by a bare ``except ValueError:
+        continue``.  Measured on ``data/raw``: 36 of 396 trials dropped,
+        every one visual-only, every one No_Response, zero visual-only
+        trials surviving -- and the drop removes them from the regression
+        sequence set too, not merely from the prior generator's input.
+        """
+        kin_path, evt_path = _make_visual_only_csvs(tmp_path, n_trials=3)
+        data = load_and_concat_sessions([kin_path], [evt_path])
+        trials = [extract_trial_data(data, "visual_session", t) for t in range(3)]
+        labeled = assign_ground_truth_labels(trials)
+
+        snapshots, labels, kept = build_snapshot_dataset(
+            labeled, return_kept_indices=True,
+        )
+
+        assert len(kept) == 3, (
+            "visual-only trials were dropped from the Snapshot dataset; "
+            f"kept {len(kept)} of 3"
+        )
+        assert snapshots.shape == (3, 5)
+        assert np.isfinite(snapshots).all()
+
+    def test_visual_only_snapshot_is_anchored_at_the_collision(
+        self, tmp_path: Path,
+    ) -> None:
+        """
+        The visual-only anchor sits 50 ms before the looming collision.
+
+        The collision is located by the visual-angle peak, which measured
+        6873.0 ms (median) against a 6874.8 ms geometric collision time --
+        within one 250 Hz frame -- so no geometry constant is assumed.
+        The expected feature values are read straight off the trace here,
+        independently of how the extractor finds them.
+        """
+        kin_path, evt_path = _make_visual_only_csvs(tmp_path, n_trials=1)
+        data = load_and_concat_sessions([kin_path], [evt_path])
+        trial = extract_trial_data(data, "visual_session", 0)
+
+        time_ms = trial["time_ms"]
+        collision_ms = float(time_ms[int(np.argmax(trial["visual_angle"]))])
+        expected_idx = int(np.argmin(np.abs(time_ms - (collision_ms - 50.0))))
+
+        snapshot = extract_mcmc_snapshot(trial, stimulus_onset_ms=0.0)
+
+        assert snapshot[0] == pytest.approx(
+            float(trial["visual_angle"][expected_idx])
+        )
+        assert snapshot[2] == 0.0, "visual-only trial must report no wind"
+
+    def test_wind_bearing_snapshot_stays_anchored_at_stimulus_onset(
+        self, tmp_path: Path,
+    ) -> None:
+        """
+        Trials carrying wind keep the stimulus-onset anchor, bit for bit.
+
+        The collision fix is deliberately confined to the visual-only case:
+        it is the minimal edit to a frozen module, and it leaves the 288
+        multisensory plus 72 pure-wind Snapshots of the real corpus
+        unchanged.  This test is the guard rail on that promise.
+        """
+        kin_path, evt_path = _make_pure_wind_csvs(tmp_path)
+        data = load_and_concat_sessions([kin_path], [evt_path])
+        trial = extract_trial_data(data, "wind_session", 0)
+
+        time_ms = trial["time_ms"]
+        stimulus_onset_ms = 2000.0
+        expected_idx = int(
+            np.argmin(np.abs(time_ms - (stimulus_onset_ms - 50.0)))
+        )
+
+        snapshot = extract_mcmc_snapshot(
+            trial, stimulus_onset_ms=stimulus_onset_ms,
+        )
+
+        assert snapshot[0] == pytest.approx(
+            float(trial["visual_angle"][expected_idx])
+        )
+        assert snapshot[2] == pytest.approx(
+            float(trial["wind_state"][expected_idx])
+        )
 
 
 class TestSequenceExtraction:
@@ -1036,6 +1195,14 @@ def test_label_audit_metadata_round_trips_through_artifact(
         "n_retained_sequences": len(independent_trials),
         "n_dropped_before_snapshot": 0,
         "n_dropped_during_sequence_extraction": 0,
+        # Totals alone once hid a 100%-single-condition loss: 36 of 396
+        # trials dropped on the real corpus, every one visual-only and
+        # every one No_Response, with nothing in any artefact saying so.
+        # The breakdowns are empty here because nothing was dropped, and
+        # asserting that explicitly is the point.
+        "snapshot_drops_by_class": {},
+        "snapshot_drops_by_condition": {},
+        "snapshot_anchor_rules": {"stimulus_onset": len(independent_trials)},
     }
     expected_sensitivity = {
         f"thresholds_x{scale:.2f}": _expected_sensitivity_record(

@@ -8,8 +8,26 @@ model, serving averages K of them, and averaging shrinks variance by
 construction.  On the real 360-trial dataset every class rejected
 (p = 9e-26 … 1e-31), so no dataset could be built at all.
 
-These tests pin the replacement: expected shrinkage is recorded, and
-only genuinely invalid priors or a collapse in decision agreement raise.
+The KS gate was replaced by an argmax-agreement floor, and that floor has
+now been removed too, for a reason the tests below pin down.  The MCMC
+Prior is a 4-D continuous *input feature*: its only consumer is the MoR
+Router, a ``Linear(hidden + mcmc_dim, 2)`` reading the concatenated
+vector.  The router never sees an argmax.  So
+
+* argmax *collapse* is not a failure mode for this consumer — and it
+  trivially satisfies an agreement floor, which made the floor
+  satisfiable by degrading the generator;
+* the failure that does matter, the prior vector collapsing to a
+  constant, is already covered by the bootstrap per-column variance
+  floor in ``prepare_dataset`` — left untouched;
+* the honest train-serve quantity is a distance on the *vector*, which
+  the record already carries as ``mean_total_variation_distance``.
+
+These tests pin: invalid priors still raise, everything else is recorded,
+and total-variation distance sees changes that argmax agreement is blind
+to.  No new threshold is introduced — deliberately.  The 0.65 floor was
+itself an unvalidated constant that aborted the real-data ETL at 0.611,
+and replacing it with another guessed number would repeat that.
 """
 
 from __future__ import annotations
@@ -19,10 +37,7 @@ import json
 import numpy as np
 import pytest
 
-from scripts.prepare_data import (
-    PRIOR_MIN_ARGMAX_AGREEMENT,
-    audit_prior_train_serve_shift,
-)
+from scripts.prepare_data import audit_prior_train_serve_shift
 
 CLASS_NAMES = ["ESCAPE", "PREWALK", "PRE_ACTIVE", "NO_RESPONSE"]
 
@@ -126,21 +141,26 @@ def test_shape_mismatch_is_rejected() -> None:
         audit_prior_train_serve_shift(oof, ensemble[:16], CLASS_NAMES)
 
 
-def test_decision_collapse_still_aborts_the_etl() -> None:
+def test_maximal_decision_disagreement_is_recorded_not_fatal() -> None:
     """
-    The gate that survives: if the served prior nominates a different
-    class than the trained-on prior for most trials, the deployment
-    protocol really is broken.
+    Reversed priors — near-total argmax disagreement — are recorded.
+
+    This replaces a test formerly named for "decision collapse".  It never
+    built a collapsed generator: it reverses the columns, which is maximal
+    *disagreement*, the opposite of collapse.  Neither condition is a gate
+    any more, so what it pins now is that even the most extreme argmax
+    divergence returns a record, and that the vector distance registers it.
     """
     oof, _ = _oof_and_ensemble(n=200)
     reversed_priors = oof[:, ::-1].copy()
     agreement = float(
         np.mean(oof.argmax(axis=1) == reversed_priors.argmax(axis=1))
     )
-    assert agreement < PRIOR_MIN_ARGMAX_AGREEMENT, "fixture must disagree"
+    assert agreement < 0.65, "fixture must disagree"
 
-    with pytest.raises(ValueError, match="most likely class"):
-        audit_prior_train_serve_shift(oof, reversed_priors, CLASS_NAMES)
+    record = audit_prior_train_serve_shift(oof, reversed_priors, CLASS_NAMES)
+    assert record["argmax_agreement"] == agreement
+    assert record["mean_total_variation_distance"] > 0.0
 
 
 def test_empty_input_is_rejected() -> None:
@@ -149,17 +169,24 @@ def test_empty_input_is_rejected() -> None:
         audit_prior_train_serve_shift(empty, empty, CLASS_NAMES)
 
 
-# ── Boundary-condition tests for PRIOR_MIN_ARGMAX_AGREEMENT ──────────
+# ── Why the argmax floor was removed ─────────────────────────────────
 #
-# CONTEXT.md defines Argmax Agreement as "Fraction of trials where OOF
-# and ensemble priors agree on the most-likely behavioral class. Hard
-# floor at 0.65; below this the deployment protocol is invalidated."
-# The constant PRIOR_MIN_ARGMAX_AGREEMENT = 0.65 implements that floor.
+# Three properties, each a separate test below:
 #
-# These tests exercise the exact boundary (0.65 passes) and the first
-# value below it (0.64 raises) using synthetic priors with surgically
-# controlled argmax agreement.  100 trials give agreement = k/100 so
-# the boundary can be expressed as an exact IEEE-754 float.
+#   1. The real-data value that used to abort the ETL (0.611) must now
+#      produce a record.
+#   2. A mode-collapsed generator — argmax constant across every trial,
+#      predicting zero instances of the minority classes — scores PERFECT
+#      agreement.  Measured on real data: forcing 3 folds collapsed the
+#      generator and drove agreement to 1.000 while Prewalk and
+#      Pre_Active each received zero predictions.  A floor satisfiable by
+#      degrading the model is worse than no floor.
+#   3. Total-variation distance registers vector changes that leave every
+#      argmax untouched — i.e. it sees what the MoR Router reads and
+#      argmax agreement does not.
+#
+# 100 trials give agreement = k/100, so a target is an exact IEEE-754
+# float.
 
 
 def _make_controlled_agreement_priors(
@@ -220,43 +247,60 @@ def _make_controlled_agreement_priors(
     return oof, ensemble
 
 
-def test_exact_floor_agreement_passes() -> None:
-    """agreement = 0.65 (the hard floor) must NOT raise.
-
-    CONTEXT.md: 'Hard floor at 0.65' means >= 0.65 is valid.
-    100 trials, 65 agreeing => agreement = 65/100 = 0.65 exactly.
+def test_real_data_agreement_is_recorded_not_fatal() -> None:
     """
-    n, n_agree = 100, 65
-    oof, ensemble = _make_controlled_agreement_priors(n, n_agree)
+    0.611 — the value measured on the real corpus — must not abort.
 
-    # Pre-condition: agreement is exactly at the floor
+    This is the exact number that made ``scripts/prepare_data.py`` raise on
+    ``data/raw``, blocking the only end-to-end path through the pipeline.
+    Everything downstream of the ETL ran fine once the abort was bypassed,
+    so this single comparison was the whole blockage.
+    """
+    n, n_agree = 1000, 611
+    oof, ensemble = _make_controlled_agreement_priors(n, n_agree)
     assert float(
         np.mean(oof.argmax(axis=1) == ensemble.argmax(axis=1))
-    ) == PRIOR_MIN_ARGMAX_AGREEMENT
+    ) == 0.611
 
-    # Must return a record without raising
     record = audit_prior_train_serve_shift(oof, ensemble, CLASS_NAMES)
-    assert record["argmax_agreement"] == PRIOR_MIN_ARGMAX_AGREEMENT
+    assert record["argmax_agreement"] == 0.611
     assert record["n_trials"] == n
-    assert record["min_argmax_agreement_gate"] == PRIOR_MIN_ARGMAX_AGREEMENT
+    assert record["argmax_agreement_is_descriptive_only"] is True
 
 
-def test_below_floor_agreement_raises_with_most_likely_class() -> None:
-    """agreement = 0.64 (one trial below the floor) must raise ValueError.
-
-    CONTEXT.md: 'below this the deployment protocol is invalidated.'
-    The error message must mention 'most likely class' per the existing
-    gate in audit_prior_train_serve_shift.
+def test_mode_collapse_scores_perfect_agreement() -> None:
     """
-    n, n_agree = 100, 64
-    oof, ensemble = _make_controlled_agreement_priors(n, n_agree)
+    A collapsed generator satisfies an agreement floor trivially.
 
-    # Pre-condition: agreement is strictly below the floor
-    actual_agreement = float(
-        np.mean(oof.argmax(axis=1) == ensemble.argmax(axis=1))
-    )
-    assert actual_agreement == 0.64
-    assert actual_agreement < PRIOR_MIN_ARGMAX_AGREEMENT
+    Both sides nominate class 0 for every trial, exactly as a generator
+    that has collapsed onto the majority class would.  Agreement is 1.0 —
+    the best possible score — while the generator is at its least
+    informative.  Pinning this keeps the removed floor from being
+    reintroduced as an apparent safety improvement.
+    """
+    n = 200
+    oof, ensemble = _make_controlled_agreement_priors(n, n)
+    assert np.all(oof.argmax(axis=1) == 0)
+    assert np.all(ensemble.argmax(axis=1) == 0)
 
-    with pytest.raises(ValueError, match="most likely class"):
-        audit_prior_train_serve_shift(oof, ensemble, CLASS_NAMES)
+    record = audit_prior_train_serve_shift(oof, ensemble, CLASS_NAMES)
+    assert record["argmax_agreement"] == 1.0
+
+
+def test_total_variation_sees_what_argmax_agreement_cannot() -> None:
+    """
+    Perfect argmax agreement, materially different vectors.
+
+    The MoR Router consumes the prior vector, so ``[0.97, 0.01, 0.01, 0.01]``
+    and ``[0.40, 0.20, 0.20, 0.20]`` are different inputs even though both
+    nominate class 0.  Argmax agreement scores this pair 1.0 and is blind
+    to the shift; total-variation distance is not.
+    """
+    n = 128
+    confident = np.tile([0.97, 0.01, 0.01, 0.01], (n, 1))
+    diffuse = np.tile([0.40, 0.20, 0.20, 0.20], (n, 1))
+
+    record = audit_prior_train_serve_shift(confident, diffuse, CLASS_NAMES)
+
+    assert record["argmax_agreement"] == 1.0, "argmax is blind here"
+    assert record["mean_total_variation_distance"] == pytest.approx(0.57)

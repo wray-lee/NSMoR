@@ -1,3 +1,4 @@
+import argparse
 import shutil
 import re
 from pathlib import Path
@@ -25,5 +26,22 @@ def organize_raw_data(raw_dir: str = "data/raw"):
                 shutil.move(str(csv_file), str(target_path))
                 print(f"归档: {csv_file.name} -> {session_folder_name}/")
 
+def build_parser() -> argparse.ArgumentParser:
+    """Build CLI argument parser."""
+    parser = argparse.ArgumentParser(
+        description=(
+            "Archive loose raw CSVs into one directory per recording session."
+        ),
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "raw_dir",
+        nargs="?",
+        default="data/raw",
+        help="Root directory containing raw session CSVs to archive.",
+    )
+    return parser
+
+
 if __name__ == "__main__":
-    organize_raw_data()
+    organize_raw_data(build_parser().parse_args().raw_dir)

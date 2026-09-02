@@ -48,6 +48,60 @@ def _find_nearest_index(time_ms: np.ndarray, target_ms: float) -> int:
     return int(np.argmin(np.abs(time_ms - target_ms)))
 
 
+def resolve_snapshot_anchor(
+    trial_data: Dict[str, np.ndarray],
+    stimulus_onset_ms: float,
+) -> Tuple[float, str]:
+    """
+    Locate the reference instant the MCMC Snapshot is offset from.
+
+    Two rules, because the two stimulus conditions put their decisive
+    moment in different places:
+
+    ``"stimulus_onset"``
+        Any trial carrying wind.  ``stimulus_onset_ms`` is the first
+        wind-on frame, which for the real corpus already sits close to the
+        looming collision (measured median 6714 ms against a collision at
+        6873 ms).  Wind is the potent escape trigger, so its arrival is
+        the decision-relevant instant, and this rule is left exactly as it
+        was — the 288 multisensory and 72 pure-wind Snapshots of the real
+        corpus are unchanged by this function's introduction.
+
+    ``"looming_collision"``
+        Visual-only trials.  Their looming begins at the ``TrialStart ->
+        Looming`` transition, i.e. the same instant as ``trial_start``, so
+        ``stimulus_onset_ms`` is 0 and offsetting backwards from it lands
+        before the first frame.  Every visual-only trial in the corpus was
+        therefore dropped: 36 of 396, all No_Response, none surviving —
+        and because the drop happens before sequence extraction, those
+        trials disappear from the regression training set as well.  The
+        collision is located by the visual-angle peak, which measured
+        6873.0 ms (median) against a geometric collision time of 6874.8 ms
+        for l/v = 120 ms at a 2 deg initial angle — inside one 250 Hz
+        frame — so no stimulus-geometry constant is assumed here.
+
+    Args:
+        trial_data: From :func:`pipeline.io.extract_trial_data`.
+        stimulus_onset_ms: Absolute time of stimulus onset.
+
+    Returns:
+        ``(anchor_ms, anchor_rule)``.  The rule is returned rather than
+        inferred so a mixed-anchor dataset stays auditable.
+    """
+    visual_angle = np.asarray(trial_data["visual_angle"], dtype=np.float64)
+    wind_state = np.asarray(trial_data["wind_state"], dtype=np.float64)
+
+    has_looming = bool(np.any(np.abs(visual_angle) > 0.0))
+    has_wind = bool(np.any(np.abs(wind_state) > 0.0))
+
+    if has_looming and not has_wind:
+        time_ms = np.asarray(trial_data["time_ms"], dtype=np.float64)
+        collision_idx = int(np.argmax(visual_angle))
+        return float(time_ms[collision_idx]), "looming_collision"
+
+    return float(stimulus_onset_ms), "stimulus_onset"
+
+
 def _extract_background_features(
     velocity: np.ndarray,
     acceleration: np.ndarray,
@@ -100,7 +154,13 @@ def extract_mcmc_snapshot(
     feature_config: FeatureConfig = DEFAULT_FEATURE,
 ) -> np.ndarray:
     """
-    Extract a 5-D MCMC snapshot at TTC + *ttc_offset_ms*.
+    Extract a 5-D MCMC snapshot at the trial's anchor + *ttc_offset_ms*.
+
+    The anchor is condition-dependent — see :func:`resolve_snapshot_anchor`.
+    Trials carrying wind are offset from ``stimulus_onset_ms`` exactly as
+    before; visual-only trials are offset from the looming collision,
+    because their stimulus onset coincides with trial start and offsetting
+    backwards from it fell outside the trial.
 
     Features
     --------
@@ -112,8 +172,8 @@ def extract_mcmc_snapshot(
 
     Args:
         trial_data: From :func:`pipeline.io.extract_trial_data`.
-        stimulus_onset_ms: Absolute time of stimulus onset (TTC reference).
-        ttc_offset_ms: Offset from TTC for snapshot (default −50 ms).
+        stimulus_onset_ms: Absolute time of stimulus onset.
+        ttc_offset_ms: Offset from the anchor (default −50 ms).
         time_config: Time window config.
         feature_config: Feature dimension config.
 
@@ -123,13 +183,18 @@ def extract_mcmc_snapshot(
     Raises:
         ValueError: If the snapshot time precedes the first frame.
     """
-    snapshot_time_ms = stimulus_onset_ms + ttc_offset_ms
+    anchor_ms, anchor_rule = resolve_snapshot_anchor(
+        trial_data, stimulus_onset_ms,
+    )
+    snapshot_time_ms = anchor_ms + ttc_offset_ms
     time_ms = trial_data["time_ms"]
 
     if snapshot_time_ms < time_ms[0]:
         raise ValueError(
             f"Snapshot time {snapshot_time_ms:.1f} ms is before trial "
-            f"start {time_ms[0]:.1f} ms."
+            f"start {time_ms[0]:.1f} ms "
+            f"(anchor={anchor_ms:.1f} ms by rule '{anchor_rule}', "
+            f"offset={ttc_offset_ms:.1f} ms)."
         )
 
     idx = _find_nearest_index(time_ms, snapshot_time_ms)
@@ -264,7 +329,9 @@ def build_snapshot_dataset(
     time_config: TimeWindowConfig = DEFAULT_TIME_WINDOW,
     feature_config: FeatureConfig = DEFAULT_FEATURE,
     return_kept_indices: bool = False,
-) -> Tuple[np.ndarray, np.ndarray]:
+    return_anchor_rules: bool = False,
+    on_unanchorable: str = "raise",
+) -> Tuple[np.ndarray, ...]:
     """
     Build the full MCMC snapshot matrix and label vector.
 
@@ -274,23 +341,44 @@ def build_snapshot_dataset(
         feature_config: Feature dimension configuration.
         return_kept_indices: If ``True``, additionally return the indices
             into *labeled_trials* of the trials whose snapshot was
-            successfully extracted.  Trials whose snapshot time precedes
-            the first frame raise ValueError internally and are skipped,
-            so downstream per-trial metadata (e.g. session ids for
+            extracted.  Downstream per-trial metadata (e.g. session ids for
             grouped cross-fitting) MUST be filtered with these indices —
             assuming row-for-row alignment with *labeled_trials* silently
-            misaligns groups when any trial is dropped.
+            misaligns groups whenever a trial is dropped.
+        return_anchor_rules: If ``True``, additionally return the anchor
+            rule name per retained trial (see
+            :func:`resolve_snapshot_anchor`).  The anchor is
+            condition-dependent, so recording which rule applied keeps a
+            mixed-anchor dataset auditable instead of leaving it implicit.
+        on_unanchorable: ``"raise"`` (default) propagates the ValueError
+            from a trial whose snapshot time falls outside the trial;
+            ``"skip"`` drops it.  The default is strict because the
+            previous unconditional ``except ValueError: continue`` deleted
+            an entire experimental condition in silence — every
+            visual-only trial in the corpus, 36 of 396, all No_Response.
+            A caller that genuinely tolerates drops must say so and report
+            what it lost.
 
     Returns:
-        ``(snapshots, labels)`` where
-        snapshots has shape ``(n_valid, 5)`` and
-        labels has shape ``(n_valid,)``;
-        or ``(snapshots, labels, kept_indices)`` when
-        *return_kept_indices* is set.
+        ``(snapshots, labels)``, with ``kept_indices`` appended when
+        *return_kept_indices* is set and ``anchor_rules`` appended when
+        *return_anchor_rules* is set, in that order.
+
+    Raises:
+        ValueError: If *on_unanchorable* is unrecognised, if a trial
+            cannot be anchored while *on_unanchorable* is ``"raise"``, or
+            if no snapshot could be extracted at all.
     """
+    if on_unanchorable not in ("raise", "skip"):
+        raise ValueError(
+            f"on_unanchorable must be 'raise' or 'skip', got "
+            f"{on_unanchorable!r}."
+        )
+
     snapshots: List[np.ndarray] = []
     labels: List[int] = []
     kept_indices: List[int] = []
+    anchor_rules: List[str] = []
 
     for info_idx, info in enumerate(labeled_trials):
         try:
@@ -301,11 +389,23 @@ def build_snapshot_dataset(
                 time_config=time_config,
                 feature_config=feature_config,
             )
-            snapshots.append(snap)
-            labels.append(int(info["label"]))
-            kept_indices.append(info_idx)
-        except ValueError:
+        except ValueError as exc:
+            if on_unanchorable == "raise":
+                raise ValueError(
+                    f"labeled_trials[{info_idx}] "
+                    f"(session={info.get('session_id')!r}, "
+                    f"trial={info.get('trial_id')!r}) could not be "
+                    f"anchored: {exc}  Pass on_unanchorable='skip' to "
+                    f"tolerate this, and report what was dropped."
+                ) from exc
             continue
+        _, anchor_rule = resolve_snapshot_anchor(
+            info["trial_data"], info["stimulus_onset_ms"],
+        )
+        snapshots.append(snap)
+        labels.append(int(info["label"]))
+        kept_indices.append(info_idx)
+        anchor_rules.append(anchor_rule)
 
     if not snapshots:
         raise ValueError("No valid snapshots could be extracted.")
@@ -315,9 +415,13 @@ def build_snapshot_dataset(
 
     assert snapshots_arr.shape == (len(snapshots), feature_config.snapshot_dim)
     assert labels_arr.shape == (len(snapshots),)
+
+    out: List[object] = [snapshots_arr, labels_arr]
     if return_kept_indices:
-        return snapshots_arr, labels_arr, kept_indices
-    return snapshots_arr, labels_arr
+        out.append(kept_indices)
+    if return_anchor_rules:
+        out.append(anchor_rules)
+    return tuple(out)  # type: ignore[return-value]
 
 
 def build_sequence_dataset(

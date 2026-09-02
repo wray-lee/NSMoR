@@ -420,3 +420,108 @@ def test_makefile_pipeline_dry_run_forwards_all_required_variables() -> None:
         "scripts/simulate_autoregressive.py",
     ):
         assert _arg_value(stages[script], "--dt_ms") == "10.00"
+
+
+# ── Loader entry points must honour the raw_dir they are given ───────
+#
+# ``Makefile`` passes ``$(RAW)`` to both pre-load scripts, but their
+# ``__main__`` blocks used to call the worker with no arguments and never
+# read ``sys.argv`` -- so ``make load RAW=/somewhere/else`` archived and
+# converted ``data/raw`` instead, printed a success line, and exited 0.
+# A silent no-op on the directory the operator named is the worst
+# possible failure mode for an ingestion step, and nothing asserted that
+# the argument was used at all.
+#
+# Both tests run with ``cwd`` set to a scratch directory so the buggy
+# behaviour cannot reach the repository's real ``data/raw``.
+
+_LEGACY_KIN_CSV = "sys_time,ard_time,dx,dy,dz,stim_state,global_trial_id\n" + "".join(
+    # Two trials so the converter's per-trial groupby sees more than one
+    # group; a single-group frame is not what the real corpus looks like
+    # (18 trials per session block).
+    f"{t * 0.004:.3f},{t * 0.004:.3f},{t % 3},{(t + 1) % 3},0,"
+    f"{1 if t % 5 == 0 else 0},{trial}\n"
+    for trial in (1, 2)
+    for t in range(12)
+)
+_LEGACY_EVT_CSV = (
+    "event_name,timestamp,session_num,trial_in_session,global_trial_id,details\n"
+    'trial_start,0.0,1,1,1,"{""type"": ""baseline_wind"", ""wind_dir"": ""left""}"\n'
+    'trial_start,0.048,1,2,2,"{""type"": ""baseline_wind"", ""wind_dir"": ""right""}"\n'
+)
+
+_SESSION_STEM = "0.500cricket_001_20260101_000000_session_1"
+
+
+def _seed_legacy_session(root: Path) -> Tuple[Path, Path]:
+    """Drop an unarchived legacy kinematics/events pair into *root*."""
+    root.mkdir(parents=True, exist_ok=True)
+    kin = root / f"{_SESSION_STEM}_kinematics.csv"
+    evt = root / f"{_SESSION_STEM}_events.csv"
+    kin.write_text(_LEGACY_KIN_CSV, encoding="utf-8")
+    evt.write_text(_LEGACY_EVT_CSV, encoding="utf-8")
+    return kin, evt
+
+
+def _run_entry_script(script: str, cwd: Path, *args: str) -> subprocess.CompletedProcess:
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(REPO_ROOT) + (
+        os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""
+    )
+    env["MPLBACKEND"] = "Agg"
+    return subprocess.run(
+        [sys.executable, str(REPO_ROOT / script), *args],
+        cwd=str(cwd),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+
+
+def test_pre_load_data_archives_into_the_raw_dir_it_is_given(
+    tmp_path: Path,
+) -> None:
+    """``pre_load_data.py <raw_dir>`` must archive inside *that* directory."""
+    staging = tmp_path / "staging"
+    _seed_legacy_session(staging)
+
+    result = _run_entry_script("scripts/pre_load_data.py", tmp_path, str(staging))
+    assert result.returncode == 0, (
+        f"pre_load_data.py failed:\n{result.stdout}\n{result.stderr}"
+    )
+
+    archived_dir = staging / _SESSION_STEM
+    assert archived_dir.is_dir(), (
+        "pre_load_data.py ignored the raw_dir argument: no session folder was "
+        f"created under {staging}. Directory now holds: "
+        f"{sorted(p.name for p in staging.iterdir())}"
+    )
+    assert (archived_dir / f"{_SESSION_STEM}_kinematics.csv").is_file()
+    assert (archived_dir / f"{_SESSION_STEM}_events.csv").is_file()
+    # The default tree must not have been touched or invented.
+    assert not (tmp_path / "data").exists()
+
+
+def test_pre_load_adapt_converts_the_raw_dir_it_is_given(
+    tmp_path: Path,
+) -> None:
+    """``pre_load_adapt.py <raw_dir>`` must convert inside *that* directory."""
+    staging = tmp_path / "staging"
+    session_dir = staging / _SESSION_STEM
+    _seed_legacy_session(session_dir)
+
+    result = _run_entry_script("scripts/pre_load_adapt.py", tmp_path, str(staging))
+    assert result.returncode == 0, (
+        f"pre_load_adapt.py failed:\n{result.stdout}\n{result.stderr}"
+    )
+
+    kin_text = (session_dir / f"{_SESSION_STEM}_kinematics.csv").read_text(
+        encoding="utf-8"
+    )
+    header = kin_text.splitlines()[0]
+    assert "session_id" in header and "time_ms" in header, (
+        "pre_load_adapt.py ignored the raw_dir argument: the legacy schema "
+        f"was never rewritten. Header is still: {header!r}"
+    )
+    assert not (tmp_path / "data").exists()

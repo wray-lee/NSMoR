@@ -16,7 +16,7 @@ from typing import ClassVar, Tuple
 # Pipeline provenance (Round-2 CRITICAL-A / m-2)
 # ──────────────────────────────────────────────────────────────
 
-PIPELINE_SEMANTICS_VERSION: str = "2.1"
+PIPELINE_SEMANTICS_VERSION: str = "2.2"
 """
 Version tag for the CURRENT scientific semantics of the pipeline.
 
@@ -32,6 +32,19 @@ structurally absorbed every walking animal into PRE_ACTIVE (the
 mechanism behind PREWALK=0).  Every label of every trial can change
 under this reordering, so all v2.0 datasets and checkpoints are
 scientifically invalid for v2.1 code.
+
+Bumped to ``2.2`` because the SET OF RETAINED TRIALS changed.  The MCMC
+Snapshot anchor was ``stimulus_onset_ms − 50 ms`` for every condition,
+but visual-only trials begin looming at the ``TrialStart -> Looming``
+transition, i.e. the same instant as ``trial_start``, so their anchor
+landed before the first frame and every one of them was silently
+dropped — 36 of 396 on the reference corpus, all No_Response, none
+surviving, and dropped from the regression sequence set as well, not
+merely from the prior generator's input.  Visual-only trials are now
+anchored 50 ms before the looming collision (located by the visual-angle
+peak).  A v2.1 dataset is missing those trials entirely, so its
+snapshots, priors, sequences, and target statistics are all computed
+over a different population.
 
 Every checkpoint written by :func:`nsmor.checkpoint.save_checkpoint`
 carries this key; loaders MUST reject artifacts whose version differs

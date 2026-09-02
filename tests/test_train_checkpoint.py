@@ -25,7 +25,7 @@ import numpy as np
 import pytest
 import torch
 
-from nsmor.config import FeatureConfig
+from nsmor.config import PIPELINE_SEMANTICS_VERSION, FeatureConfig
 
 # ── Fixtures ────────────────────────────────────────────────────────
 
@@ -67,7 +67,11 @@ def _make_synthetic_dataset(tmp_path: Path) -> Path:
         "mcmc_priors": mcmc_priors,
         "session_ids": session_ids,
         "feature_config": FeatureConfig(),
-        "pipeline_semantics_version": "2.1",
+        # Track the constant, never a literal: a semantics bump is a
+        # deliberate scientific event, and hardcoding the version here
+        # turns every legitimate bump into a suite-wide failure that says
+        # nothing about the code under test.
+        "pipeline_semantics_version": PIPELINE_SEMANTICS_VERSION,
     }
     path = tmp_path / "test_dataset.pt"
     torch.save(dataset, path)

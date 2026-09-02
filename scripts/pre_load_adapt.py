@@ -1,3 +1,4 @@
+import argparse
 import json
 import math
 import numpy as np
@@ -357,5 +358,27 @@ def adapt_cercus_to_nsmor(raw_dir="data/raw"):
 
     print(f"绝对对齐完毕: 重构 {count_k} 份轨迹, 覆盖 {count_e} 份基准事件。")
 
+def build_parser() -> argparse.ArgumentParser:
+    """Build CLI argument parser."""
+    parser = argparse.ArgumentParser(
+        description=(
+            "Convert archived legacy-schema session CSVs to the canonical "
+            "NSMoR schema, rewriting them in place."
+        ),
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "raw_dir",
+        nargs="?",
+        default="data/raw",
+        help=(
+            "Root directory of archived session folders to convert.  NOTE: "
+            "conversion rewrites the CSVs IN PLACE, so stage a copy first "
+            "and never point this at an original recording tree."
+        ),
+    )
+    return parser
+
+
 if __name__ == "__main__":
-    adapt_cercus_to_nsmor()
+    adapt_cercus_to_nsmor(build_parser().parse_args().raw_dir)
