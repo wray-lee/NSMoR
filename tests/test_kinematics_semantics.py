@@ -13,6 +13,7 @@ All tests use small synthetic DataFrames — no real data dependency.
 from __future__ import annotations
 
 import warnings
+from pathlib import Path
 from typing import Dict
 
 import numpy as np
@@ -382,3 +383,186 @@ class TestSamplingDiagnostics:
 
         assert np.isnan(diag["observed_median_ms"])
         assert diag["mismatch_flag"] is True
+
+
+# ═══════════════════════════════════════════════════════════════
+# F. Cross-path consistency: load_kinematics_csv vs
+#    apply_hardware_time_correction on same trajectory
+# ═══════════════════════════════════════════════════════════════
+
+class TestCrossPathConsistency:
+    """Both public kinematics paths agree with one analytical 2-D trajectory.
+
+    The same irregularly sampled trajectory is sent through both public
+    loaders.  It is a circular arc around a *displaced* centre with a linearly
+    increasing angular speed:
+
+        x(t) = c_x + R cos(theta(t))
+        y(t) = c_y + R sin(theta(t))
+        theta(t) = theta_0 + omega_0 t + 0.5 alpha t²
+
+    Therefore the independently derived Cartesian path-speed oracle is
+    ``|dr/dt| = R (omega_0 + alpha t)`` and its derivative is
+    ``d|dr/dt|/dt = R alpha``.  The centre is offset from the origin, so the
+    radial derivative ``d|r|/dt`` is a different quantity and cannot satisfy
+    the speed oracle.
+
+    Timestamps have positive 12 +/- 3 ms gaps while ``dt_ms=4`` is passed to
+    the correction path.  A nominal-dt implementation therefore has a large,
+    detectable scale error rather than being hidden by near-uniform jitter.
+
+    Biological basis: a cercal recording can contain frame-drop / USB timing
+    jitter, while escape trajectories are genuinely two-dimensional and may
+    curve as the animal turns.  Kinematic units remain physical (cm/s and
+    cm/s²) by differentiating against the observed hardware timestamps.
+    """
+
+    @pytest.fixture()
+    def trajectory(self) -> Dict[str, np.ndarray]:
+        """Return one non-radial 2-D trajectory and its analytical oracle."""
+        n: int = 180
+        radius_cm: float = 5.0
+        center_x_cm: float = 1.0
+        center_y_cm: float = -0.5
+        theta_0_rad: float = 0.31
+        omega_0_rad_s: float = 0.4
+        alpha_rad_s2: float = 0.2
+
+        # Positive, strongly nonuniform gaps: observed median is ~12 ms,
+        # whereas the correction path receives a deliberately stale 4 ms
+        # nominal configuration.  The 41-frame period avoids repeating a
+        # two-point alternation that could look deceptively uniform.
+        gaps_ms = 12.0 + 3.0 * np.sin(
+            2.0 * np.pi * np.arange(n - 1) / 41.0
+        )
+        assert np.all(gaps_ms > 0.0), "All synthetic timestamp gaps must be positive"
+        time_ms = np.concatenate([[0.0], np.cumsum(gaps_ms)])
+        t_s = time_ms / 1000.0
+
+        theta_rad = (
+            theta_0_rad
+            + omega_0_rad_s * t_s
+            + 0.5 * alpha_rad_s2 * t_s**2
+        )
+        x_pos = center_x_cm + radius_cm * np.cos(theta_rad)
+        y_pos = center_y_cm + radius_cm * np.sin(theta_rad)
+
+        # Analytical oracle, derived from d[x(t), y(t)]/dt rather than any
+        # implementation under test.
+        angular_speed_rad_s = omega_0_rad_s + alpha_rad_s2 * t_s
+        expected_velocity = radius_cm * angular_speed_rad_s
+        expected_acceleration = np.full(n, radius_cm * alpha_rad_s2)
+
+        unique_gaps = np.unique(np.round(np.diff(time_ms), 8))
+        assert len(unique_gaps) >= 7, (
+            f"Timestamps must be genuinely irregular, got {len(unique_gaps)} gaps"
+        )
+
+        return {
+            "n": n,
+            "time_ms": time_ms,
+            "t_s": t_s,
+            "x_pos": x_pos,
+            "y_pos": y_pos,
+            "velocity": expected_velocity,
+            "acceleration": expected_acceleration,
+        }
+
+    def test_fixture_separates_real_time_and_path_speed_semantics(
+        self, trajectory: Dict[str, np.ndarray],
+    ) -> None:
+        """Guard that both requested mutants are far outside acceptance."""
+        time_ms = trajectory["time_ms"]
+        t_s = trajectory["t_s"]
+        expected_velocity = trajectory["velocity"]
+        gaps_ms = np.diff(time_ms)
+        interior = slice(15, -15)
+
+        assert np.all(gaps_ms > 0.0)
+        assert np.ptp(gaps_ms) > 5.9
+        # The configured nominal interval is deliberately about 3x too short.
+        assert np.median(gaps_ms) / 4.0 > 2.9
+
+        # d|r|/dt is analytically distinct from Cartesian path speed because
+        # the circle is not centred on the coordinate origin.
+        radial_speed = np.abs(
+            np.gradient(np.hypot(trajectory["x_pos"], trajectory["y_pos"]), t_s)
+        )
+        assert np.max(radial_speed[interior] / expected_velocity[interior]) < 0.25
+
+    def test_both_public_paths_match_independent_oracle(
+        self, tmp_path: Path, trajectory: Dict[str, np.ndarray],
+    ) -> None:
+        """Both paths recover physical units from one irregular 2-D trace."""
+        from scripts.prepare_data import apply_hardware_time_correction
+
+        n = len(trajectory["time_ms"])
+        expected_velocity = trajectory["velocity"]
+        expected_acceleration = trajectory["acceleration"]
+
+        # Public path 1: load measured speed and derive dv/dt from timestamps.
+        csv_path = _make_kin_csv(
+            tmp_path,
+            time_ms=trajectory["time_ms"],
+            x_pos=trajectory["x_pos"],
+            y_pos=trajectory["y_pos"],
+            velocity=expected_velocity,
+        )
+        loaded = load_kinematics_csv(
+            csv_path, artifact_velocity_cm_s=float("inf"),
+        )
+
+        # Public path 2: derive 2-D speed and acceleration from positions.
+        kinematics = pd.DataFrame({
+            "session_id": ["s0"] * n,
+            "trial_id": [0] * n,
+            "time_ms": trajectory["time_ms"],
+            "x_pos": trajectory["x_pos"],
+            "y_pos": trajectory["y_pos"],
+            "heading": np.zeros(n),
+            "velocity": np.zeros(n),
+            "acceleration": np.zeros(n),
+            "visual_angle": np.zeros(n),
+            "wind_state": np.zeros(n, dtype=int),
+            "l_v_ratio": np.zeros(n),
+        })
+        events = pd.DataFrame({
+            "session_id": ["s0"],
+            "trial_id": [0],
+            "time_ms": [0.0],
+            "event_type": ["stimulus_onset"],
+            "event_value": ["{}"],
+        })
+        corrected, _ = apply_hardware_time_correction(
+            kinematics, events, hw_triggers={}, dt_ms=4.0,
+        )
+
+        loaded_acceleration = loaded["acceleration"].to_numpy()
+        corrected_velocity = corrected["velocity"].to_numpy()
+        corrected_acceleration = corrected["acceleration"].to_numpy()
+        assert loaded_acceleration.shape == (n,)
+        assert corrected_velocity.shape == (n,)
+        assert corrected_acceleration.shape == (n,)
+
+        assert loaded_acceleration[0] == pytest.approx(0.0, abs=1e-12)
+        np.testing.assert_allclose(
+            loaded_acceleration[1:],
+            expected_acceleration[1:],
+            rtol=1e-10,
+            atol=1e-10,
+        )
+
+        # Exclude SavGol/gradient boundary support; the oracle itself is exact.
+        interior = slice(15, -15)
+        np.testing.assert_allclose(
+            corrected_velocity[interior],
+            expected_velocity[interior],
+            rtol=0.01,
+            atol=0.01,
+        )
+        np.testing.assert_allclose(
+            corrected_acceleration[interior],
+            expected_acceleration[interior],
+            rtol=0.05,
+            atol=0.01,
+        )
