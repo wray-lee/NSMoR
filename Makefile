@@ -17,11 +17,15 @@ PYTHON   ?= python
 RAW	 ?= data/raw
 DATA	 ?= data/processed/nsmor_dataset.pt
 PRE_EPOCHS ?= 150
+# Public pipeline override; PRE_EPOCHS remains a backward-compatible alias.
+PHASE1_EPOCHS ?= $(PRE_EPOCHS)
 EPOCHS   ?= 300
 CONFIG   ?= config/default.yaml
 RUN_DIR  ?= runs/default
 OUTPUT   ?= results
 SEED     ?= 42
+BATCH_SIZE ?=
+LR       ?=
 BEST     := $(RUN_DIR)/best_model.pth
 
 # Frame interval used by the ETL and by every analysis that converts
@@ -106,7 +110,8 @@ generate: $(BEST) ## Run autoregressive closed-loop generation
 pipeline: ## Execute full end-to-end experimental pipeline
 	PYTHON="$(PYTHON)" CONFIG="$(CONFIG)" RAW_DIR="$(RAW)" DATASET="$(DATA)" \
 	RUN_DIR="$(RUN_DIR)" OUTPUT_DIR="$(OUTPUT)" DT_MS="$(DT_MS)" \
-	EPOCHS="$(EPOCHS)" PHASE1_EPOCHS="$(PRE_EPOCHS)" \
+	EPOCHS="$(EPOCHS)" PHASE1_EPOCHS="$(PHASE1_EPOCHS)" \
+	BATCH_SIZE="$(BATCH_SIZE)" LR="$(LR)" SEED="$(SEED)" \
 	bash run_pipeline.sh
 
 # ── Cleanup ──────────────────────────────────────────────────
