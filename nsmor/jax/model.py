@@ -545,7 +545,7 @@ def load_from_torch_state_dict(
     return {"params": params}
 
 
-def to_torch_state_dict(flax_params: Dict[str, Any]) -> Dict[str, torch.Tensor]:
+def to_torch_state_dict(flax_params: Dict[str, Any]) -> Dict[str, Any]:
     """
     Convert Flax parameter PyTree back to a PyTorch state_dict.
 
