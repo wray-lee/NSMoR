@@ -314,3 +314,109 @@ def test_runner_forwards_two_phase_training_when_requested() -> None:
     assert train is not None, "training stage missing from the plan"
     assert "--phase1_epochs" in train and "150" in train
     assert "--epochs" in train and "300" in train
+
+
+def test_runner_forwards_batch_size_lr_seed() -> None:
+    """The runner forwards training, ETL, and psychophysics overrides."""
+    result = _run_runner(
+        EPOCHS="300",
+        PHASE1_EPOCHS="150",
+        BATCH_SIZE="32",
+        LR="0.001",
+        SEED="99",
+    )
+    assert result.returncode == 0, (
+        f"DRY_RUN=1 failed:\n{result.stdout}\n{result.stderr}"
+    )
+    stages = _planned_stage_map(result.stdout)
+    train = stages["scripts/train.py"]
+    assert _arg_value(train, "--batch_size") == "32"
+    assert _arg_value(train, "--lr") == "0.001"
+    etl = stages["scripts/prepare_data.py"]
+    assert _arg_value(etl, "--seed") == "99"
+    psych = stages["scripts/simulate_psychophysics.py"]
+    assert _arg_value(psych, "--seed") == "99"
+
+
+def _run_make_pipeline(**make_overrides: str) -> subprocess.CompletedProcess:
+    """Execute the public Makefile pipeline seam in dry-run mode."""
+    make = shutil.which("make")
+    if make is None:
+        pytest.skip("make unavailable")
+
+    env = dict(os.environ)
+    env["DRY_RUN"] = "1"
+    if sys.executable.startswith("/"):
+        env["PYTHON"] = sys.executable
+    arguments = [
+        make,
+        "--no-print-directory",
+        "pipeline",
+        *(f"{key}={value}" for key, value in make_overrides.items()),
+    ]
+    return subprocess.run(
+        arguments,
+        cwd=str(REPO_ROOT),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+
+
+def _planned_stage_map(output: str) -> dict[str, List[str]]:
+    """Parse runner ``PLAN`` lines into ``script -> argv`` entries."""
+    stages: dict[str, List[str]] = {}
+    for line in output.splitlines():
+        if not line.startswith("PLAN "):
+            continue
+        tokens = line.split()
+        assert len(tokens) >= 3, f"malformed plan line: {line}"
+        stages[tokens[2]] = tokens[3:]
+    assert stages, "pipeline emitted no planned stages"
+    return stages
+
+
+def _arg_value(tokens: List[str], flag: str) -> str:
+    """Return the value following a unique CLI flag."""
+    index = tokens.index(flag)
+    assert index + 1 < len(tokens), f"{flag} has no value in {tokens}"
+    return tokens[index + 1]
+
+
+def test_makefile_pipeline_dry_run_forwards_all_required_variables() -> None:
+    """Distinct Make overrides must reach the runner's planned script argv."""
+    result = _run_make_pipeline(
+        EPOCHS="301",
+        PHASE1_EPOCHS="17",
+        PRE_EPOCHS="23",
+        BATCH_SIZE="37",
+        LR="0.0123",
+        SEED="99",
+        DT_MS="10.00",
+    )
+    assert result.returncode == 0, (
+        f"DRY_RUN=1 make pipeline failed:\n{result.stdout}\n{result.stderr}"
+    )
+    stages = _planned_stage_map(result.stdout)
+
+    train = stages["scripts/train.py"]
+    assert _arg_value(train, "--epochs") == "301"
+    assert _arg_value(train, "--phase1_epochs") == "17"
+    assert _arg_value(train, "--batch_size") == "37"
+    assert _arg_value(train, "--lr") == "0.0123"
+
+    etl = stages["scripts/prepare_data.py"]
+    assert _arg_value(etl, "--seed") == "99"
+    assert _arg_value(etl, "--dt_ms") == "10.00"
+
+    psych = stages["scripts/simulate_psychophysics.py"]
+    assert _arg_value(psych, "--seed") == "99"
+
+    for script in (
+        "scripts/simulate_lesion.py",
+        "scripts/analyze_jacobian.py",
+        "scripts/analyze_integration.py",
+        "scripts/simulate_autoregressive.py",
+    ):
+        assert _arg_value(stages[script], "--dt_ms") == "10.00"
