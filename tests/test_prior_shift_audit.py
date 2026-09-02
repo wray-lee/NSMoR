@@ -147,3 +147,116 @@ def test_empty_input_is_rejected() -> None:
     empty = np.zeros((0, 4))
     with pytest.raises(ValueError, match="at least one trial"):
         audit_prior_train_serve_shift(empty, empty, CLASS_NAMES)
+
+
+# ── Boundary-condition tests for PRIOR_MIN_ARGMAX_AGREEMENT ──────────
+#
+# CONTEXT.md defines Argmax Agreement as "Fraction of trials where OOF
+# and ensemble priors agree on the most-likely behavioral class. Hard
+# floor at 0.65; below this the deployment protocol is invalidated."
+# The constant PRIOR_MIN_ARGMAX_AGREEMENT = 0.65 implements that floor.
+#
+# These tests exercise the exact boundary (0.65 passes) and the first
+# value below it (0.64 raises) using synthetic priors with surgically
+# controlled argmax agreement.  100 trials give agreement = k/100 so
+# the boundary can be expressed as an exact IEEE-754 float.
+
+
+def _make_controlled_agreement_priors(
+    n: int,
+    n_agree: int,
+    *,
+    seed: int = 99,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build valid (n, 4) probability pairs with exact argmax agreement.
+
+    For the first ``n_agree`` trials, both arrays share the same argmax
+    (class 0 dominant).  For the remaining ``n - n_agree`` trials, the
+    ensemble argmax is rotated to class 1, guaranteeing disagreement.
+
+    Both arrays are strictly positive, finite, and row-normalised.
+
+    Args:
+        n: Total number of synthetic trials.
+        n_agree: Number of trials whose argmax agrees.
+        seed: RNG seed for reproducibility.
+
+    Returns:
+        ``(oof, ensemble)`` each of shape ``(n, 4)``.
+    """
+    assert 0 <= n_agree <= n, f"n_agree={n_agree} out of [0, {n}]"
+    rng = np.random.default_rng(seed)
+
+    # -- OOF priors: class-0 dominant for every trial --
+    # Start with a small uniform floor, then boost class 0.
+    oof = rng.uniform(0.01, 0.05, size=(n, 4))
+    oof[:, 0] += 0.80  # class 0 is always argmax for OOF
+    oof /= oof.sum(axis=1, keepdims=True)
+    assert np.all(oof.argmax(axis=1) == 0), "OOF fixture: class 0 must dominate"
+
+    # -- Ensemble priors: agree on first n_agree, disagree on the rest --
+    ensemble = oof.copy()
+    n_disagree = n - n_agree
+    if n_disagree > 0:
+        # For disagreeing trials, swap mass from class 0 to class 1.
+        disagree_block = ensemble[n_agree:].copy()
+        disagree_block[:, 0] = 0.02
+        disagree_block[:, 1] = 0.85
+        disagree_block[:, 2] = 0.08
+        disagree_block[:, 3] = 0.05
+        # Re-normalise to guarantee row sums == 1.
+        disagree_block /= disagree_block.sum(axis=1, keepdims=True)
+        assert np.all(
+            disagree_block.argmax(axis=1) == 1
+        ), "Ensemble disagree fixture: class 1 must dominate"
+        ensemble[n_agree:] = disagree_block
+
+    # Sanity: exact agreement fraction
+    actual = float(np.mean(oof.argmax(axis=1) == ensemble.argmax(axis=1)))
+    expected = n_agree / n
+    assert actual == expected, (
+        f"Fixture agreement {actual} != expected {expected}"
+    )
+    return oof, ensemble
+
+
+def test_exact_floor_agreement_passes() -> None:
+    """agreement = 0.65 (the hard floor) must NOT raise.
+
+    CONTEXT.md: 'Hard floor at 0.65' means >= 0.65 is valid.
+    100 trials, 65 agreeing => agreement = 65/100 = 0.65 exactly.
+    """
+    n, n_agree = 100, 65
+    oof, ensemble = _make_controlled_agreement_priors(n, n_agree)
+
+    # Pre-condition: agreement is exactly at the floor
+    assert float(
+        np.mean(oof.argmax(axis=1) == ensemble.argmax(axis=1))
+    ) == PRIOR_MIN_ARGMAX_AGREEMENT
+
+    # Must return a record without raising
+    record = audit_prior_train_serve_shift(oof, ensemble, CLASS_NAMES)
+    assert record["argmax_agreement"] == PRIOR_MIN_ARGMAX_AGREEMENT
+    assert record["n_trials"] == n
+    assert record["min_argmax_agreement_gate"] == PRIOR_MIN_ARGMAX_AGREEMENT
+
+
+def test_below_floor_agreement_raises_with_most_likely_class() -> None:
+    """agreement = 0.64 (one trial below the floor) must raise ValueError.
+
+    CONTEXT.md: 'below this the deployment protocol is invalidated.'
+    The error message must mention 'most likely class' per the existing
+    gate in audit_prior_train_serve_shift.
+    """
+    n, n_agree = 100, 64
+    oof, ensemble = _make_controlled_agreement_priors(n, n_agree)
+
+    # Pre-condition: agreement is strictly below the floor
+    actual_agreement = float(
+        np.mean(oof.argmax(axis=1) == ensemble.argmax(axis=1))
+    )
+    assert actual_agreement == 0.64
+    assert actual_agreement < PRIOR_MIN_ARGMAX_AGREEMENT
+
+    with pytest.raises(ValueError, match="most likely class"):
+        audit_prior_train_serve_shift(oof, ensemble, CLASS_NAMES)
