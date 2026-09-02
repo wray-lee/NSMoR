@@ -5,6 +5,7 @@ Covers:
 - A completed run always yields a loadable best checkpoint.
 - Non-finite val loss is surfaced rather than silently swallowed.
 - Target-stats split matches the dataloader split (session-disjoint).
+- Deployment provenance fields in all checkpoint types.
 
 All tests use tiny synthetic data to run in <10s on CPU.
 """
@@ -26,7 +27,7 @@ import torch
 
 from nsmor.config import FeatureConfig
 
-# ── Fixtures ──────────────────────────────────────────────────
+# ── Fixtures ────────────────────────────────────────────────────────
 
 _HIDDEN = 16
 _SENSORY = 4
@@ -103,9 +104,9 @@ def _make_config(
     return config
 
 
-# ═══════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════
 # Test 1: completed run always produces a loadable best checkpoint
-# ═══════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════
 
 def test_best_checkpoint_always_written(tmp_path: Path) -> None:
     """A 1-epoch run with warmup_epochs=20 (>> epochs) must still produce
@@ -134,9 +135,9 @@ def test_best_checkpoint_always_written(tmp_path: Path) -> None:
     assert "mse" in results["metrics"]
 
 
-# ═══════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════
 # Test 2: atomic-write — no partial file left on interrupted save
-# ═══════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════
 
 def test_atomic_save_no_partial_file(tmp_path: Path) -> None:
     """If torch.save raises mid-write, the TARGET path must not exist
@@ -179,9 +180,9 @@ def test_atomic_save_no_partial_file(tmp_path: Path) -> None:
     )
 
 
-# ═══════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════
 # Test 3: non-finite val loss is surfaced, not silently swallowed
-# ═══════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════
 
 def test_nonfinite_val_loss_handled(tmp_path: Path) -> None:
     """When val_loss is NaN/Inf, the run must still complete and:
@@ -215,9 +216,9 @@ def test_nonfinite_val_loss_handled(tmp_path: Path) -> None:
     )
 
 
-# ═══════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════
 # Test 4: target-stats split matches the dataloader split
-# ═══════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════
 
 def test_target_stats_split_matches_dataloader(tmp_path: Path) -> None:
     """compute_target_stats and build_dataloaders must use the SAME
@@ -266,9 +267,9 @@ def test_target_stats_split_matches_dataloader(tmp_path: Path) -> None:
     )
 
 
-# ═══════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════
 # Test 5: multi-epoch warmup still produces best checkpoint
-# ═══════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════
 
 def test_warmup_longer_than_epochs(tmp_path: Path) -> None:
     """Even when warmup_epochs (20) far exceeds total epochs (2),
@@ -284,3 +285,190 @@ def test_warmup_longer_than_epochs(tmp_path: Path) -> None:
     assert best_path.exists(), "best_model.pth not written with warmup > epochs"
     assert np.isfinite(results["best_val_loss"])
     assert results["metrics"], "metrics dict empty"
+
+
+# ═════════════════════════════════════════════════════════════
+# Test 6: deployment provenance fields in all checkpoint types
+# ═════════════════════════════════════════════════════════════
+
+def _assert_provenance_fields(
+    ckpt: dict,
+    ckpt_label: str,
+    *,
+    expected_phase: int,
+    expected_dataset_path: str,
+) -> None:
+    """Assert the five deployment provenance fields exist and have
+    correct types/values in a loaded checkpoint dict."""
+    # target_mean: float
+    assert "target_mean" in ckpt, (
+        f"{ckpt_label}: missing 'target_mean'"
+    )
+    assert isinstance(ckpt["target_mean"], float), (
+        f"{ckpt_label}: target_mean should be float, got {type(ckpt['target_mean'])}"
+    )
+
+    # target_std: float
+    assert "target_std" in ckpt, (
+        f"{ckpt_label}: missing 'target_std'"
+    )
+    assert isinstance(ckpt["target_std"], float), (
+        f"{ckpt_label}: target_std should be float, got {type(ckpt['target_std'])}"
+    )
+
+    # target_clip_cm_s: float
+    assert "target_clip_cm_s" in ckpt, (
+        f"{ckpt_label}: missing 'target_clip_cm_s'"
+    )
+    assert isinstance(ckpt["target_clip_cm_s"], float), (
+        f"{ckpt_label}: target_clip_cm_s should be float, got {type(ckpt['target_clip_cm_s'])}"
+    )
+
+    # training_phase: int in {0, 1, 2}
+    assert "training_phase" in ckpt, (
+        f"{ckpt_label}: missing 'training_phase'"
+    )
+    assert isinstance(ckpt["training_phase"], int), (
+        f"{ckpt_label}: training_phase should be int, got {type(ckpt['training_phase'])}"
+    )
+    assert ckpt["training_phase"] in {0, 1, 2}, (
+        f"{ckpt_label}: training_phase should be in {{0,1,2}}, got {ckpt['training_phase']}"
+    )
+    assert ckpt["training_phase"] == expected_phase, (
+        f"{ckpt_label}: training_phase={ckpt['training_phase']} != expected {expected_phase}"
+    )
+
+    # dataset_path: str
+    assert "dataset_path" in ckpt, (
+        f"{ckpt_label}: missing 'dataset_path'"
+    )
+    assert isinstance(ckpt["dataset_path"], str), (
+        f"{ckpt_label}: dataset_path should be str, got {type(ckpt['dataset_path'])}"
+    )
+    assert ckpt["dataset_path"] == expected_dataset_path, (
+        f"{ckpt_label}: dataset_path={ckpt['dataset_path']!r} != expected {expected_dataset_path!r}"
+    )
+
+
+def test_provenance_single_phase(tmp_path: Path) -> None:
+    """Single-phase 1-epoch run: best_model.pth and final_model.pth
+    must carry all five deployment provenance fields with
+    training_phase=0 and correct target stats."""
+    from scripts.train import train
+
+    ds_path = _make_synthetic_dataset(tmp_path)
+    config = _make_config(tmp_path, epochs=1, warmup_epochs=0)
+    ds_path_str = str(ds_path)
+
+    results = train(config, lambda_reg=0.01, dataset_path=ds_path_str)
+
+    output_dir = Path(config.checkpoint.output_dir)
+
+    # Both best and final must exist for a healthy single-phase run
+    for name in ("best_model.pth", "final_model.pth"):
+        ckpt_path = output_dir / name
+        assert ckpt_path.exists(), f"{name} not found"
+        ckpt = torch.load(ckpt_path, weights_only=False)
+        _assert_provenance_fields(
+            ckpt,
+            name,
+            expected_phase=0,
+            expected_dataset_path=ds_path_str,
+        )
+
+        # target_mean and target_std must match compute_target_stats
+        # For normalize_targets=False, they should be (0.0, 1.0)
+        assert ckpt["target_mean"] == 0.0, (
+            f"{name}: target_mean should be 0.0 (normalization disabled)"
+        )
+        assert ckpt["target_std"] == 1.0, (
+            f"{name}: target_std should be 1.0 (normalization disabled)"
+        )
+        assert ckpt["target_clip_cm_s"] == 0.0, (
+            f"{name}: target_clip_cm_s should be 0.0 (clipping disabled)"
+        )
+
+
+def test_provenance_two_phase(tmp_path: Path) -> None:
+    """Two-phase run: final_model.pth must carry training_phase=2,
+    periodic checkpoint in phase 1 must carry training_phase=1."""
+    from scripts.train import train
+
+    ds_path = _make_synthetic_dataset(tmp_path)
+    config = _make_config(tmp_path, epochs=3, warmup_epochs=0)
+    # Enable periodic checkpoint every epoch so we get a phase-1 ckpt
+    config.training.checkpoint_interval = 1
+    ds_path_str = str(ds_path)
+
+    results = train(
+        config, lambda_reg=0.01,
+        phase1_epochs=1,  # 1 epoch phase 1, 2 epochs phase 2
+        dataset_path=ds_path_str,
+    )
+
+    output_dir = Path(config.checkpoint.output_dir)
+
+    # Phase 1 periodic checkpoint (epoch 1)
+    epoch1_ckpt_path = output_dir / "epoch_1.pth"
+    assert epoch1_ckpt_path.exists(), "epoch_1.pth not found for phase-1 check"
+    epoch1_ckpt = torch.load(epoch1_ckpt_path, weights_only=False)
+    _assert_provenance_fields(
+        epoch1_ckpt,
+        "epoch_1.pth",
+        expected_phase=1,
+        expected_dataset_path=ds_path_str,
+    )
+
+    # Final checkpoint must be phase 2
+    final_path = output_dir / "final_model.pth"
+    assert final_path.exists(), "final_model.pth not found"
+    final_ckpt = torch.load(final_path, weights_only=False)
+    _assert_provenance_fields(
+        final_ckpt,
+        "final_model.pth",
+        expected_phase=2,
+        expected_dataset_path=ds_path_str,
+    )
+
+
+def test_provenance_with_normalization(tmp_path: Path) -> None:
+    """When target normalization is enabled, the provenance fields
+    must carry the actual computed target_mean/target_std (not the
+    identity defaults)."""
+    from scripts.train import train, compute_target_stats, _VAL_SPLIT
+
+    ds_path = _make_synthetic_dataset(tmp_path)
+    config = _make_config(
+        tmp_path, epochs=1, warmup_epochs=0, normalize_targets=True,
+    )
+    # Need a nonzero clip to avoid the coherence warning path
+    config.training.target_clip_cm_s = 100.0
+    ds_path_str = str(ds_path)
+
+    # Pre-compute expected stats so we can cross-check
+    expected_mean, expected_std = compute_target_stats(
+        ds_path_str, config, val_split=_VAL_SPLIT,
+    )
+
+    results = train(config, lambda_reg=0.01, dataset_path=ds_path_str)
+
+    output_dir = Path(config.checkpoint.output_dir)
+    best_path = output_dir / "best_model.pth"
+    assert best_path.exists(), "best_model.pth not found"
+    ckpt = torch.load(best_path, weights_only=False)
+
+    _assert_provenance_fields(
+        ckpt,
+        "best_model.pth (normalized)",
+        expected_phase=0,
+        expected_dataset_path=ds_path_str,
+    )
+
+    # target_mean and target_std must match compute_target_stats output
+    assert ckpt["target_mean"] == pytest.approx(expected_mean, abs=1e-6), (
+        f"target_mean mismatch: {ckpt['target_mean']} vs {expected_mean}"
+    )
+    assert ckpt["target_std"] == pytest.approx(expected_std, abs=1e-6), (
+        f"target_std mismatch: {ckpt['target_std']} vs {expected_std}"
+    )
+    assert ckpt["target_clip_cm_s"] == 100.0

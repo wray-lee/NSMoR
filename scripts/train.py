@@ -31,7 +31,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import math
 from contextlib import nullcontext
@@ -54,6 +54,21 @@ from nsmor.loss import BioJointLoss, BioDecisionLoss, FrontendLoss
 from nsmor.model_nsmor_core import NSMoRCore
 
 
+# ── Deployment provenance keys ────────────────────────────────
+# These keys are injected into every checkpoint by
+# _atomic_save_checkpoint but are NOT part of the frozen
+# save_checkpoint signature.  The wrapper pops them before
+# forwarding kwargs, then patches them into the saved state
+# dict on disk before the atomic rename.
+_PROVENANCE_KEYS = frozenset({
+    "target_mean",
+    "target_std",
+    "target_clip_cm_s",
+    "training_phase",
+    "dataset_path",
+})
+
+
 def _atomic_save_checkpoint(**kwargs) -> Path:
     """Atomic wrapper around the frozen :func:`save_checkpoint`.
 
@@ -67,13 +82,33 @@ def _atomic_save_checkpoint(**kwargs) -> Path:
     module, we redirect the ``path`` keyword to a temp file and rename
     after the save completes.
 
-    All keyword arguments are forwarded verbatim to
-    :func:`save_checkpoint`.
+    Deployment provenance fields (``target_mean``, ``target_std``,
+    ``target_clip_cm_s``, ``training_phase``, ``dataset_path``) are
+    popped from *kwargs* before forwarding to :func:`save_checkpoint`
+    (which has a fixed signature), then patched into the on-disk state
+    dict before the fsync + atomic rename.  This keeps the frozen
+    ``nsmor/checkpoint.py`` untouched while guaranteeing every
+    checkpoint carries the provenance metadata a downstream consumer
+    needs to correctly rescale predictions and audit lineage.
     """
     target = Path(kwargs["path"])
     tmp = target.with_suffix(".pth.tmp")
     kwargs["path"] = tmp
+
+    # Pop provenance fields before forwarding to frozen save_checkpoint.
+    provenance: Dict[str, Any] = {}
+    for key in _PROVENANCE_KEYS:
+        if key in kwargs:
+            provenance[key] = kwargs.pop(key)
+
     save_checkpoint(**kwargs)
+
+    # Patch provenance fields into the saved state dict on disk.
+    if provenance:
+        state = torch.load(tmp, map_location="cpu", weights_only=False)
+        state.update(provenance)
+        torch.save(state, tmp)
+
     # fsync the written bytes so the OS page-cache is flushed before the
     # atomic rename — protects against power-loss on non-journaled FS.
     with open(tmp, "rb") as fh:
@@ -2043,6 +2078,11 @@ def train(
                 path=epoch_path,
                 train_loss=train_loss,
                 val_loss=val_loss if val_loss != float("inf") else None,
+                target_mean=float(target_mean),
+                target_std=float(target_std),
+                target_clip_cm_s=float(config.training.target_clip_cm_s),
+                training_phase=int(current_phase),
+                dataset_path=str(resolved_dataset_path),
             )
             logger.info("Saved periodic checkpoint: %s", epoch_path)
 
@@ -2079,6 +2119,11 @@ def train(
                 path=best_path,
                 train_loss=train_loss,
                 val_loss=val_loss,
+                target_mean=float(target_mean),
+                target_std=float(target_std),
+                target_clip_cm_s=float(config.training.target_clip_cm_s),
+                training_phase=int(current_phase),
+                dataset_path=str(resolved_dataset_path),
             )
             logger.info("Saved best model (val_loss=%.6f): %s", val_loss, best_path)
 
@@ -2094,6 +2139,11 @@ def train(
         path=final_path,
         train_loss=train_loss,
         val_loss=val_loss if val_loss != float("inf") else None,
+        target_mean=float(target_mean),
+        target_std=float(target_std),
+        target_clip_cm_s=float(config.training.target_clip_cm_s),
+        training_phase=int(current_phase),
+        dataset_path=str(resolved_dataset_path),
     )
     logger.info("Saved final model: %s", final_path)
 
