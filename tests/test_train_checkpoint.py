@@ -221,8 +221,14 @@ def test_nonfinite_val_loss_handled(tmp_path: Path) -> None:
 # ═════════════════════════════════════════════════════════════
 
 def test_target_stats_split_matches_dataloader(tmp_path: Path) -> None:
-    """compute_target_stats and build_dataloaders must use the SAME
-    session-grouped split (no data leakage)."""
+    """``build_dataloaders`` and ``compute_target_stats`` must agree on the
+    session-grouped split at SESSION granularity (no data leakage).
+
+    Both real functions are called and nothing is replicated locally.  The
+    previous version of this test compared two identically-seeded local
+    copies of the split logic to each other, so it could not fail no matter
+    what the production functions did.
+    """
     from scripts.train import (
         build_dataloaders,
         compute_target_stats,
@@ -231,39 +237,56 @@ def test_target_stats_split_matches_dataloader(tmp_path: Path) -> None:
 
     ds_path = _make_synthetic_dataset(tmp_path)
     config = _make_config(tmp_path, epochs=1, normalize_targets=True)
-
-    # Get the train indices from build_dataloaders
     dataset = torch.load(ds_path, weights_only=False)
-    n_total = len(dataset["X_seqs"])
+    Y_ref = dataset["Y_seqs"]
     session_arr = np.asarray(dataset["session_ids"])
-    unique_sessions = np.unique(session_arr)
-    rng = np.random.RandomState(config.training.random_seed)
-    rng.shuffle(unique_sessions)
-    n_val_sessions = max(1, int(len(unique_sessions) * _VAL_SPLIT))
-    val_sessions_build = set(unique_sessions[:n_val_sessions].tolist())
-    is_val_build = np.array([s in val_sessions_build for s in session_arr])
-    train_indices_build = np.nonzero(~is_val_build)[0]
+    all_sessions = set(np.unique(session_arr).tolist())
 
-    # Get the train indices from compute_target_stats
-    # We replicate the SAME logic that compute_target_stats now uses
-    rng2 = np.random.RandomState(config.training.random_seed)
-    unique_sessions2 = np.unique(session_arr)
-    rng2.shuffle(unique_sessions2)
-    n_val_sessions2 = max(1, int(len(unique_sessions2) * _VAL_SPLIT))
-    val_sessions_stats = set(unique_sessions2[:n_val_sessions2].tolist())
-    is_val_stats = np.array([s in val_sessions_stats for s in session_arr])
-    train_indices_stats = np.nonzero(~is_val_stats)[0]
+    def _sessions_of(loader) -> set:
+        """Map a loader's sequences back to their source session ids."""
+        found = set()
+        for seq in loader.dataset.sequences:
+            matches = [
+                i for i in range(len(Y_ref))
+                if np.array_equal(seq[1], Y_ref[i])
+            ]
+            assert len(matches) == 1, (
+                f"expected a unique Y_seq match, got {len(matches)}"
+            )
+            found.add(session_arr[matches[0]])
+        return found
 
-    # The two sets of train indices must be identical
-    np.testing.assert_array_equal(
-        np.sort(train_indices_build),
-        np.sort(train_indices_stats),
-        err_msg="compute_target_stats and build_dataloaders use different splits",
+    # Real call 1 — the loaders define the split.
+    train_loader, val_loader = build_dataloaders(
+        config, dataset_path=str(ds_path), val_split=_VAL_SPLIT,
     )
+    assert train_loader is not None and val_loader is not None
+    train_sessions_build = _sessions_of(train_loader)
+    val_sessions_build = _sessions_of(val_loader)
 
-    # Also verify the session sets are identical
+    # Real call 2 — the returned train indices define the train sessions.
+    _mean, _std, train_indices_stats = compute_target_stats(
+        str(ds_path), config, val_split=_VAL_SPLIT,
+    )
+    assert train_indices_stats.size > 0, (
+        "compute_target_stats returned no train indices"
+    )
+    train_sessions_stats = set(session_arr[train_indices_stats].tolist())
+    val_sessions_stats = all_sessions - train_sessions_stats
+
+    # build_dataloaders must not put one session on both sides.
+    assert not (train_sessions_build & val_sessions_build), (
+        "build_dataloaders leaked sessions across the split: "
+        f"{sorted(train_sessions_build & val_sessions_build)}"
+    )
+    # The two independent code paths must agree, session for session.
+    assert train_sessions_build == train_sessions_stats, (
+        f"train sessions differ: build={sorted(train_sessions_build)} "
+        f"vs stats={sorted(train_sessions_stats)}"
+    )
     assert val_sessions_build == val_sessions_stats, (
-        f"Val sessions differ: build={val_sessions_build} vs stats={val_sessions_stats}"
+        f"val sessions differ: build={sorted(val_sessions_build)} "
+        f"vs stats={sorted(val_sessions_stats)}"
     )
 
 
