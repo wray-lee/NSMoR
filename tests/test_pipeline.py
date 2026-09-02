@@ -1058,6 +1058,77 @@ def test_label_audit_metadata_round_trips_through_artifact(
     )
 
 
+def test_label_audit_retention_with_drops(tmp_path: Path) -> None:
+    """Retention arithmetic under actual snapshot and extraction drops."""
+    from scripts.prepare_data import prepare_dataset
+
+    raw_dir = tmp_path / "raw_with_drops"
+    # Use the same fixture generator with >=5 sessions for 5-fold cross-fitting
+    _make_label_audit_csvs(raw_dir, n_sessions=5, frames_per_trial=400)
+
+    # Add one session with trials that fail filters:
+    # - Trial with insufficient post-stim frames (will fail snapshot gate)
+    # - Trial with malformed kinematics (will fail extraction)
+    session_id = "drop_session"
+    session_dir = raw_dir / session_id
+    session_dir.mkdir(parents=True)
+
+    # Short trial: only 50 frames, stimulus at 20 ms -> snapshot at -30 ms < 0 ms
+    short_trial_kin = pd.DataFrame({
+        "session_id": [session_id] * 50,
+        "trial_id": [999] * 50,
+        "time_ms": np.arange(50) * 10.0,
+        "x_pos": np.linspace(0, 0.5, 50),
+        "y_pos": np.linspace(0, 0.5, 50),
+        "heading": np.zeros(50),
+        "velocity": np.full(50, 5.0),
+        "acceleration": np.zeros(50),
+        "visual_angle": np.zeros(50),
+        "wind_state": np.zeros(50, dtype=int),
+        "l_v_ratio": np.zeros(50),
+    })
+    short_trial_evt = pd.DataFrame({
+        "session_id": [session_id, session_id],
+        "trial_id": [999, 999],
+        "time_ms": [0.0, 20.0],  # stimulus at 20 ms -> snapshot time before trial start
+        "event_type": ["trial_start", "stimulus_onset"],
+        "event_value": [1, 1],
+    })
+
+    # Combine with existing sessions' data (updating session_id)
+    existing_kin = pd.read_csv(raw_dir / "audit_session_0" / "kinematics.csv")
+    existing_kin["session_id"] = session_id
+    combined_kin = pd.concat([existing_kin, short_trial_kin], ignore_index=True)
+    combined_kin.to_csv(session_dir / "kinematics.csv", index=False)
+
+    existing_evt = pd.read_csv(raw_dir / "audit_session_0" / "events.csv")
+    existing_evt["session_id"] = session_id
+    combined_evt = pd.concat([existing_evt, short_trial_evt], ignore_index=True)
+    combined_evt.to_csv(session_dir / "events.csv", index=False)
+
+    output = tmp_path / "dataset_drops.pt"
+    prepare_dataset(raw_dir=raw_dir, output_path=output, random_seed=42)
+
+    dataset = torch.load(output, weights_only=False)
+    retention = dataset["labeling_funnel_retention"]
+
+    # The short trial should have been dropped
+    assert retention["n_dropped_before_snapshot"] > 0 or \
+           retention["n_dropped_during_sequence_extraction"] > 0, (
+        "Expected at least one trial to be dropped, but all were retained"
+    )
+
+    # Verify arithmetic holds
+    prefilter = retention["n_prefilter_labeled_trials"]
+    retained = retention["n_retained_sequences"]
+    drop_snapshot = retention["n_dropped_before_snapshot"]
+    drop_extraction = retention["n_dropped_during_sequence_extraction"]
+
+    assert prefilter - drop_snapshot - drop_extraction == retained, (
+        f"Retention arithmetic failed: {prefilter} - {drop_snapshot} - {drop_extraction} != {retained}"
+    )
+
+
 # ═══════════════════════════════════════════════════════════════
 # CLI Override Tests (Flaw #2: regression guard for build_config)
 # ═══════════════════════════════════════════════════════════════

@@ -446,7 +446,7 @@ def test_provenance_with_normalization(tmp_path: Path) -> None:
     ds_path_str = str(ds_path)
 
     # Pre-compute expected stats so we can cross-check
-    expected_mean, expected_std = compute_target_stats(
+    expected_mean, expected_std, _ = compute_target_stats(
         ds_path_str, config, val_split=_VAL_SPLIT,
     )
 
@@ -679,44 +679,27 @@ def test_split_cross_verification_dry(tmp_path: Path) -> None:
 
     train_indices_from_loader = []
     for seq in train_loader.dataset.sequences:
+        y_seq = seq[1]
         matched = [
             i for i in range(n_total)
-            if np.array_equal(seq[1], dataset["Y_seqs"][i])
+            if np.array_equal(y_seq, dataset["Y_seqs"][i])
         ]
         assert len(matched) == 1
         train_indices_from_loader.append(matched[0])
     train_indices_from_loader = np.array(train_indices_from_loader)
 
-    # 2. Call compute_target_stats and extract actual train indices via spy
-    captured_indices_from_stats = []
-    orig_concatenate = np.concatenate
-
-    def _spy_concatenate(arrays, *args, **kwargs):
-        nonlocal captured_indices_from_stats
-        matched_indices = []
-        for arr in arrays:
-            matched = [
-                i for i in range(n_total)
-                if np.array_equal(arr, dataset["Y_seqs"][i])
-            ]
-            if matched:
-                matched_indices.append(matched[0])
-        if matched_indices:
-            captured_indices_from_stats = matched_indices
-        return orig_concatenate(arrays, *args, **kwargs)
-
-    with mock.patch("scripts.train.np.concatenate", side_effect=_spy_concatenate):
-        compute_target_stats(str(ds_path), config, val_split=_VAL_SPLIT)
-
-    assert len(captured_indices_from_stats) > 0
+    # 2. Call compute_target_stats which now returns train indices directly
+    target_mean, target_std, train_indices_from_stats = compute_target_stats(
+        str(ds_path), config, val_split=_VAL_SPLIT,
+    )
 
     # 3. Assert EXACT identity
     np.testing.assert_array_equal(
         np.sort(train_indices_from_loader),
-        np.sort(captured_indices_from_stats),
+        np.sort(train_indices_from_stats),
         err_msg="build_dataloaders and compute_target_stats used different train indices",
     )
-    assert set(train_indices_from_loader) == set(captured_indices_from_stats)
+    assert set(train_indices_from_loader) == set(train_indices_from_stats)
 
 
 # ═════════════════════════════════════════════════════════════

@@ -670,7 +670,7 @@ def compute_target_stats(
     dataset_path: str,
     config: ExperimentConfig,
     val_split: float = 0.2,
-) -> Tuple[float, float]:
+) -> Tuple[float, float, np.ndarray]:
     """
     Compute training-split velocity mean and std for target normalization.
 
@@ -694,12 +694,13 @@ def compute_target_stats(
             :func:`build_dataloaders`).
 
     Returns:
-        ``(train_mean, train_std)`` in cm/s.  When normalization is
-        disabled this returns ``(0.0, 1.0)`` so callers can pass the
-        values unconditionally as the identity transform.
+        ``(train_mean, train_std, train_indices)`` where ``train_indices``
+        is an ``int64`` array of dataset sequence indices included in the
+        train split. When normalization is disabled or data is missing,
+        returns ``(0.0, 1.0, np.empty(0, dtype=np.int64))``.
     """
     if not config.training.normalize_targets:
-        return 0.0, 1.0
+        return 0.0, 1.0, np.empty(0, dtype=np.int64)
 
     dataset_file = Path(dataset_path)
     if not dataset_file.exists():
@@ -707,7 +708,7 @@ def compute_target_stats(
             "Dataset not found for target stats: %s — using identity.",
             dataset_file,
         )
-        return 0.0, 1.0
+        return 0.0, 1.0, np.empty(0, dtype=np.int64)
 
     dataset = torch.load(dataset_file, weights_only=False)
     Y_seqs = dataset["Y_seqs"]
@@ -729,9 +730,9 @@ def compute_target_stats(
         n_val_sessions = max(1, int(len(unique_sessions) * val_split))
         val_sessions = set(unique_sessions[:n_val_sessions].tolist())
         is_val = np.array([s in val_sessions for s in session_arr])
-        train_indices = np.nonzero(~is_val)[0]
+        train_indices = np.nonzero(~is_val)[0].astype(np.int64)
     else:
-        indices = np.arange(n_total)
+        indices = np.arange(n_total, dtype=np.int64)
         rng.shuffle(indices)
         n_val = max(1, int(n_total * val_split))
         n_train = n_total - n_val
@@ -759,7 +760,7 @@ def compute_target_stats(
     if std < 1e-3:
         # Degenerate constant target — fall back to identity.
         logger.warning("Target std near zero (%.6f) — using identity transform.", std)
-        return 0.0, 1.0
+        return 0.0, 1.0, train_indices
 
     logger.info(
         "Target normalization on train split: mean=%.4f cm/s  std=%.4f cm/s  "
@@ -767,7 +768,7 @@ def compute_target_stats(
         mean, std, int(bulk.size),
         f"{lo:.4f}", f"{hi:.4f}",
     )
-    return mean, std
+    return mean, std, train_indices
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1717,7 +1718,7 @@ def train(
     # validate, and compute_metrics so the loss, the selection-criteria,
     # and the reported metrics all live in one consistent space, and the
     # final metrics are rescaled back to cm/s.
-    target_mean, target_std = compute_target_stats(
+    target_mean, target_std, _train_indices = compute_target_stats(
         resolved_dataset_path,
         config,
         val_split=_VAL_SPLIT,
