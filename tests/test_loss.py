@@ -200,34 +200,6 @@ class TestBioJointLoss:
 
         assert has_nonzero_grad, "No valid region received gradients"
 
-    # ── Mask construction tests ───────────────────────────────
-
-    def test_mask_construction(
-        self,
-        lengths: torch.Tensor,
-        seq_len: int,
-    ) -> None:
-        """
-        Verify the canonical mask construction matches manual expectation.
-
-        mask[i, t] = (t < lengths[i])
-        """
-        B = lengths.shape[0]
-        arange_t = torch.arange(seq_len)
-        mask = (arange_t.unsqueeze(0) < lengths.unsqueeze(1))
-
-        for i in range(B):
-            valid_len = lengths[i].item()
-            # First valid_len positions should be True
-            assert mask[i, :valid_len].all(), (
-                f"Sample {i}: mask[{i}, :{valid_len}] should be all True"
-            )
-            # Remaining positions should be False
-            if valid_len < seq_len:
-                assert not mask[i, valid_len:].any(), (
-                    f"Sample {i}: mask[{i}, {valid_len}:] should be all False"
-                )
-
     # ── Regularization tests ──────────────────────────────────
 
     def test_router_regularization_effect(

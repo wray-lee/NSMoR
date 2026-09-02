@@ -12,6 +12,7 @@ All tests use small synthetic DataFrames — no real data dependency.
 
 from __future__ import annotations
 
+import json
 import warnings
 from pathlib import Path
 from typing import Dict
@@ -22,6 +23,7 @@ import pytest
 
 # ── Subjects under test ────────────────────────────────────────
 from nsmor.pipeline.io import load_kinematics_csv, KINEMATICS_COLUMNS
+from scripts.pre_load_adapt import adapt_cercus_to_nsmor, parse_trial_events
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -237,72 +239,142 @@ class TestDtScaling:
 class TestLoomingOnset:
     """Visual onset must prefer parsed looming_onset_ms over hardcoded 0."""
 
-    def test_parsed_onset_used(self):
-        """When looming_onset_ms is present, stimulus_onset_ms == that value."""
-        from scripts.pre_load_adapt import parse_trial_events, adapt_cercus_to_nsmor  # noqa: F401
+    def test_parsed_onset_used(self, tmp_path: Path):
+        """When looming_onset_ms is present, parse_trial_events extracts it."""
+        evt_path = tmp_path / "test_events.csv"
+        evt_df = pd.DataFrame([
+            {
+                "session_id": "s0",
+                "trial_id": 0,
+                "time_ms": 0.0,
+                "event_type": "trial_start",
+                "event_value": json.dumps({
+                    "type": "baseline_visual",
+                    "lv_ratio_ms": 40.0,
+                    "wind_dir": "none",
+                }),
+            },
+            {
+                "session_id": "s0",
+                "trial_id": 0,
+                "time_ms": 137.5,
+                "event_type": "phase_transition",
+                "event_value": json.dumps({
+                    "from_phase": "Baseline",
+                    "to_phase": "Looming",
+                }),
+            },
+        ])
+        evt_df.to_csv(evt_path, index=False)
 
-        # Directly test the onset injection logic by building
-        # the trial_info dict as parse_trial_events would.
-        trial_info = {
-            0: {
-                'type': 'baseline_visual',
-                'lv_ratio_ms': 40.0,
-                'target_ttc_ms': None,
-                'wind_dir': 'none',
-                'stimulus_onset_ms': None,
-                'looming_onset_ms': 0.194,  # parsed from events
-                'ttc_ms': None,
-            }
-        }
-        # Simulate the onset selection logic from adapt_cercus_to_nsmor
-        info = trial_info[0]
-        parsed_onset = info.get('looming_onset_ms')
-        assert parsed_onset is not None
-        assert parsed_onset >= 0
-        onset_val = float(parsed_onset)
-        assert onset_val == pytest.approx(0.194)
+        trial_info = parse_trial_events(evt_path)
+        assert 0 in trial_info
+        assert trial_info[0]["looming_onset_ms"] == pytest.approx(137.5)
 
-    def test_guard_fires_on_large_deviation(self):
+    def test_guard_fires_on_large_deviation(self, tmp_path: Path):
         """Warning emitted when parsed onset deviates from trial start
         by more than one median frame gap.
         """
-        # Simulate: trial starts at t=0, parsed onset at t=100 ms,
-        # median gap = 4 ms → deviation = 100 >> 4 → warning.
-        time_vals = np.arange(0, 200, 4.0)  # 0, 4, 8, ..., 196
-        parsed_onset = 100.0
+        session_dir = tmp_path / "session_001"
+        session_dir.mkdir()
+        evt_path = session_dir / "session_001_events.csv"
+        kin_path = session_dir / "session_001_kinematics.csv"
 
-        pos_gaps = np.diff(time_vals)
-        pos_gaps = pos_gaps[pos_gaps > 0]
-        median_gap = float(np.median(pos_gaps))
+        # Events with Looming transition at 100.0 ms (> 1 median gap of 4.0 ms)
+        evt_df = pd.DataFrame([
+            {
+                "session_id": "session_001",
+                "trial_id": 0,
+                "time_ms": 0.0,
+                "event_type": "trial_start",
+                "event_value": json.dumps({
+                    "type": "baseline_visual",
+                    "lv_ratio_ms": 40.0,
+                    "wind_dir": "none",
+                }),
+            },
+            {
+                "session_id": "session_001",
+                "trial_id": 0,
+                "time_ms": 100.0,
+                "event_type": "phase_transition",
+                "event_value": json.dumps({
+                    "from_phase": "Baseline",
+                    "to_phase": "Looming",
+                }),
+            },
+        ])
+        evt_df.to_csv(evt_path, index=False)
 
-        deviation = abs(parsed_onset - time_vals[0])
-        assert deviation > median_gap, "Test setup: deviation must exceed gap"
+        n_samples = 50
+        kin_df = pd.DataFrame({
+            "session_id": ["session_001"] * n_samples,
+            "trial_id": [0] * n_samples,
+            "time_ms": np.arange(n_samples, dtype=np.float64) * 4.0,  # 0, 4, 8, ...
+            "x_pos": np.zeros(n_samples),
+            "y_pos": np.zeros(n_samples),
+            "heading": np.zeros(n_samples),
+            "velocity": np.zeros(n_samples),
+            "acceleration": np.zeros(n_samples),
+            "visual_angle": np.zeros(n_samples),
+            "wind_state": np.zeros(n_samples, dtype=int),
+            "l_v_ratio": np.zeros(n_samples),
+        })
+        kin_df.to_csv(kin_path, index=False)
 
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            if deviation > median_gap:
-                warnings.warn(
-                    f"parsed looming_onset_ms ({parsed_onset:.3f}) deviates "
-                    f"from trial start ({time_vals[0]:.3f}) by "
-                    f"{deviation:.3f} ms (> 1 median gap {median_gap:.3f} ms)",
-                    stacklevel=1,
-                )
-            assert len(w) == 1
-            assert "looming_onset_ms" in str(w[0].message)
-            assert "100.000" in str(w[0].message)
+        with pytest.warns(UserWarning, match="deviates from trial start"):
+            adapt_cercus_to_nsmor(raw_dir=str(tmp_path))
 
-    def test_fallback_when_missing(self):
-        """When looming_onset_ms is None, fall back to 0.0."""
-        info = {
-            'type': 'baseline_visual',
-            'looming_onset_ms': None,
-        }
-        parsed_onset = info.get('looming_onset_ms')
-        if parsed_onset is not None and parsed_onset >= 0:
-            onset_val = float(parsed_onset)
-        else:
-            onset_val = 0.0
-        assert onset_val == 0.0
+    def test_fallback_when_missing(self, tmp_path: Path):
+        """When looming_onset_ms is None, stimulus_onset falls back to 0.0."""
+        session_dir = tmp_path / "session_001"
+        session_dir.mkdir()
+        evt_path = session_dir / "session_001_events.csv"
+        kin_path = session_dir / "session_001_kinematics.csv"
+
+        # Events without Looming phase transition
+        evt_df = pd.DataFrame([
+            {
+                "session_id": "session_001",
+                "trial_id": 0,
+                "time_ms": 0.0,
+                "event_type": "trial_start",
+                "event_value": json.dumps({
+                    "type": "baseline_visual",
+                    "lv_ratio_ms": 40.0,
+                    "wind_dir": "none",
+                }),
+            }
+        ])
+        evt_df.to_csv(evt_path, index=False)
+
+        # 1. parse_trial_events contract: looming_onset_ms is None
+        trial_info = parse_trial_events(evt_path)
+        assert trial_info[0]["looming_onset_ms"] is None
+
+        # 2. adapt_cercus_to_nsmor fallback contract: stimulus_onset at 0.0
+        n_samples = 20
+        kin_df = pd.DataFrame({
+            "session_id": ["session_001"] * n_samples,
+            "trial_id": [0] * n_samples,
+            "time_ms": np.arange(n_samples, dtype=np.float64) * 4.0,
+            "x_pos": np.zeros(n_samples),
+            "y_pos": np.zeros(n_samples),
+            "heading": np.zeros(n_samples),
+            "velocity": np.zeros(n_samples),
+            "acceleration": np.zeros(n_samples),
+            "visual_angle": np.zeros(n_samples),
+            "wind_state": np.zeros(n_samples, dtype=int),
+            "l_v_ratio": np.zeros(n_samples),
+        })
+        kin_df.to_csv(kin_path, index=False)
+
+        adapt_cercus_to_nsmor(raw_dir=str(tmp_path))
+
+        rewritten_events = pd.read_csv(evt_path)
+        stim_onset_events = rewritten_events[rewritten_events["event_type"] == "stimulus_onset"]
+        assert len(stim_onset_events) == 1
+        assert stim_onset_events.iloc[0]["time_ms"] == pytest.approx(0.0)
 
 
 # ═══════════════════════════════════════════════════════════════
