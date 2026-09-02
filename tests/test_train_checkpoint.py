@@ -472,3 +472,182 @@ def test_provenance_with_normalization(tmp_path: Path) -> None:
         f"target_std mismatch: {ckpt['target_std']} vs {expected_std}"
     )
     assert ckpt["target_clip_cm_s"] == 100.0
+
+
+# ═════════════════════════════════════════════════════════════
+# Test 7: Gradient-isolation invariant across two-phase training
+# ═════════════════════════════════════════════════════════════
+
+def test_gradient_isolation_phase1_and_phase2() -> None:
+    """ADR-0005 gradient isolation invariant across two-phase training.
+
+    Phase 1: frontend is trainable, backend is frozen -> all backend
+    parameters have None grad after forward+backward.
+    Phase 2: frontend is frozen, backend is trainable -> all frontend
+    parameters have None grad after forward+backward.
+    """
+    from nsmor.model_nsmor_core import NSMoRCore
+    from nsmor.loss import FrontendLoss, BioDecisionLoss
+
+    device = torch.device("cpu")
+    model = NSMoRCore(
+        sensory_dim=_SENSORY, mcmc_dim=_MCMC, hidden_dim=_HIDDEN,
+    ).to(device)
+
+    B, T = 2, 10
+    x = torch.randn(B, T, _SENSORY + _MCMC, device=device)
+    y = torch.randn(B, T, device=device)
+    lengths = torch.tensor([T, T], dtype=torch.long, device=device)
+
+    # ── Phase 1: Train frontend only, freeze backend ──
+    for p in model.backend.parameters():
+        p.requires_grad = False
+    for p in model.frontend.parameters():
+        p.requires_grad = True
+
+    model.zero_grad(set_to_none=True)
+    frontend_criterion = FrontendLoss()
+    y_pred, internals = model(x, lengths, return_internals=True)
+    loss1 = frontend_criterion(y_pred=y_pred, y_true=y, lengths=lengths)
+    loss1.backward()
+
+    # Backend parameters must have None grad
+    backend_grads_p1 = [p.grad for p in model.backend.parameters()]
+    assert all(g is None for g in backend_grads_p1), (
+        "Phase 1: Found non-None gradient on frozen backend parameter"
+    )
+    # Frontend parameters must have received gradients
+    frontend_grads_p1 = [p.grad for p in model.frontend.parameters() if p.grad is not None]
+    assert len(frontend_grads_p1) > 0, (
+        "Phase 1: Expected non-empty gradients on trainable frontend parameters"
+    )
+
+    # ── Phase 2: Train backend only, freeze frontend ──
+    model.zero_grad(set_to_none=True)
+    for p in model.frontend.parameters():
+        p.requires_grad = False
+    for p in model.backend.parameters():
+        p.requires_grad = True
+
+    backend_criterion = BioDecisionLoss()
+    y_pred, internals = model(x, lengths, return_internals=True)
+    g_gru = internals["routing_gates"][:, :, 1:2]
+    lif_spikes = internals["lif_spikes"]
+    loss2 = backend_criterion(
+        y_pred=y_pred,
+        y_true=y,
+        lengths=lengths,
+        g_gru=g_gru,
+        lambda_reg=0.01,
+        lif_spikes=lif_spikes,
+        lambda_energy=0.0,
+        lambda_sparse=0.0,
+        lambda_jerk=0.0,
+        annealing_factor=1.0,
+    )
+    loss2.backward()
+
+    # Frontend parameters must have None grad
+    frontend_grads_p2 = [p.grad for p in model.frontend.parameters()]
+    assert all(g is None for g in frontend_grads_p2), (
+        "Phase 2: Found non-None gradient on frozen frontend parameter"
+    )
+    # Backend parameters must have received gradients
+    backend_grads_p2 = [p.grad for p in model.backend.parameters() if p.grad is not None]
+    assert len(backend_grads_p2) > 0, (
+        "Phase 2: Expected non-empty gradients on trainable backend parameters"
+    )
+
+
+# ═════════════════════════════════════════════════════════════
+# Test 8: Warmup factor restart behavior
+# ═════════════════════════════════════════════════════════════
+
+def test_warmup_factor_restart() -> None:
+    """Warmup factor starts near 0.0 at epoch 0 and reaches 1.0 at boundary.
+
+    Guarantees:
+    - compute_warmup_factor(0, W) < 0.1 for W >= 5 (smooth S-curve restart)
+    - compute_warmup_factor(W, W) == 1.0 (post-warmup returns full scale)
+    - compute_warmup_factor(0, 0) == 1.0 (warmup disabled returns 1.0)
+    """
+    from scripts.train import compute_warmup_factor, compute_lr_warmup_scale
+
+    # Check warmup factor at epoch 0 for various warmup epochs W >= 5
+    for W in [5, 10, 20, 50]:
+        val = compute_warmup_factor(0, W)
+        assert val < 0.1, (
+            f"compute_warmup_factor(0, {W}) = {val} >= 0.1; expected smooth start near 0.0"
+        )
+
+    # Post-warmup reaches 1.0
+    for W in [2, 5, 10, 20]:
+        assert compute_warmup_factor(W, W) == 1.0
+        assert compute_warmup_factor(W + 5, W) == 1.0
+
+    # Warmup disabled (W=0) is always 1.0
+    assert compute_warmup_factor(0, 0) == 1.0
+
+    # Also test LR warmup scale restart at epoch 0
+    for W in [20, 50]:
+        assert compute_lr_warmup_scale(0, W) < 0.1
+
+
+# ═════════════════════════════════════════════════════════════
+# Test 9: sweep_escape_sensitivity Cartesian row validation
+# ═════════════════════════════════════════════════════════════
+
+def test_sweep_escape_sensitivity() -> None:
+    """sweep_escape_sensitivity returns Cartesian product of bands x min_runs
+    with all required keys and valid numeric fields."""
+    from scripts.train import sweep_escape_sensitivity
+
+    rng = np.random.RandomState(42)
+    t1 = np.array([0.0, 15.0, 25.0, 0.0, 5.0], dtype=np.float32)
+    t2 = np.array([30.0, 35.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    p1 = t1 + rng.normal(0, 0.5, size=t1.shape).astype(np.float32)
+    p2 = t2 + rng.normal(0, 0.5, size=t2.shape).astype(np.float32)
+
+    bands = [10.0, 20.0]
+    min_runs = [1, 2, 3]
+
+    rows = sweep_escape_sensitivity(
+        all_true=[t1, t2],
+        all_pred=[p1, p2],
+        bands_cm_s=bands,
+        min_runs=min_runs,
+    )
+
+    expected_row_count = len(bands) * len(min_runs)
+    assert len(rows) == expected_row_count, (
+        f"Expected {expected_row_count} rows, got {len(rows)}"
+    )
+
+    expected_keys = {
+        "band_cm_s",
+        "min_run",
+        "n_escape_frames",
+        "n_escape_events",
+        "escape_rmse",
+        "resting_rmse",
+        "escape_ratio",
+    }
+
+    seen_pairs = set()
+    for row in rows:
+        assert set(row.keys()) == expected_keys, (
+            f"Row keys mismatch: {set(row.keys()) ^ expected_keys}"
+        )
+        assert isinstance(row["band_cm_s"], (int, float))
+        assert isinstance(row["min_run"], (int, np.integer))
+        assert isinstance(row["n_escape_frames"], (int, np.integer))
+        assert isinstance(row["n_escape_events"], (int, np.integer))
+        assert isinstance(row["escape_ratio"], float)
+        assert 0.0 <= row["escape_ratio"] <= 1.0
+
+        pair = (row["band_cm_s"], row["min_run"])
+        assert pair not in seen_pairs, f"Duplicate (band, min_run) pair: {pair}"
+        seen_pairs.add(pair)
+
+    assert seen_pairs == {(b, r) for b in bands for r in min_runs}
+
