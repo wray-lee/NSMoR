@@ -921,30 +921,50 @@ def prepare_dataset(
     logger.info("Label distribution: %s", label_counts)
 
     # ── Round-3 (Reviewer A MAJ-3B): threshold sensitivity sweep ──
-    # Re-label the full trial set with the velocity thresholds scaled
-    # by ±25% and report how the class composition moves.  If the
-    # primary labels are an artefact of one arbitrary threshold pair,
-    # this shows up as large composition swings; stable compositions
-    # support the criterion's robustness.  Persisted in the dataset
-    # for the analysis report.
+    # Re-label the full pre-filter trial set with the velocity thresholds
+    # scaled by ±25%, retaining the default composition as the reference.
+    # Each record is self-describing: scale, actual thresholds, class
+    # schema (including zero counts), denominator, and funnel metadata.
     import dataclasses as _dataclasses
-    labeling_threshold_sensitivity: Dict[str, Dict[str, int]] = {}
-    _primary_counts = dict(label_counts)
-    for scale in (0.75, 1.25):
+    label_names = [label.name for label in Label]
+    labeling_threshold_sensitivity: Dict[str, Dict[str, Any]] = {}
+    for scale in (0.75, 1.0, 1.25):
         cfg_alt = _dataclasses.replace(
             DEFAULT_THRESHOLD,
-            escape_velocity_threshold=DEFAULT_THRESHOLD.escape_velocity_threshold * scale,
-            prewalk_velocity_threshold=DEFAULT_THRESHOLD.prewalk_velocity_threshold * scale,
+            escape_velocity_threshold=(
+                DEFAULT_THRESHOLD.escape_velocity_threshold * scale
+            ),
+            prewalk_velocity_threshold=(
+                DEFAULT_THRESHOLD.prewalk_velocity_threshold * scale
+            ),
             pre_active_velocity_threshold=(
                 DEFAULT_THRESHOLD.pre_active_velocity_threshold * scale
             ),
         )
-        labeled_alt = assign_ground_truth_labels(trials, config=cfg_alt)
-        counts_alt: Dict[str, int] = {}
+        labeled_alt = assign_ground_truth_labels(
+            trials, config=cfg_alt, return_funnel=True,
+        )
+        counts_alt = {name: 0 for name in label_names}
         for info in labeled_alt:
-            name = info["label"].name
-            counts_alt[name] = counts_alt.get(name, 0) + 1
-        labeling_threshold_sensitivity[f"thresholds_x{scale:.2f}"] = counts_alt
+            counts_alt[info["label"].name] += 1
+        labeling_threshold_sensitivity[f"thresholds_x{scale:.2f}"] = {
+            "scale": scale,
+            "n_trials": len(labeled_alt),
+            "class_schema": list(label_names),
+            "counts": counts_alt,
+            "thresholds": {
+                "escape_velocity_threshold": float(
+                    cfg_alt.escape_velocity_threshold
+                ),
+                "prewalk_velocity_threshold": float(
+                    cfg_alt.prewalk_velocity_threshold
+                ),
+                "pre_active_velocity_threshold": float(
+                    cfg_alt.pre_active_velocity_threshold
+                ),
+            },
+            "labeling_funnel": labeling_funnel_summary(labeled_alt),
+        }
         logger.info(
             "Label sensitivity (thresholds x%.2f): %s", scale, counts_alt,
         )
@@ -1324,6 +1344,22 @@ def prepare_dataset(
             f"Y_seqs[{i}] shape {y.shape} != ({T_i},)"
         )
 
+    # Retention is a separate audit from the labeling elimination funnel.
+    # ``labeling_funnel`` stays exactly ``labeling_funnel_summary(...)``.
+    funnel_retention = {
+        "n_prefilter_labeled_trials": len(labeled_trials),
+        "n_retained_sequences": len(sequences),
+        "n_dropped_before_snapshot": len(labeled_trials) - len(labeled_kept),
+        "n_dropped_during_sequence_extraction": skipped_count,
+    }
+    assert funnel_retention["n_retained_sequences"] == len(X_seqs)
+    assert (
+        funnel_retention["n_prefilter_labeled_trials"]
+        - funnel_retention["n_dropped_before_snapshot"]
+        - funnel_retention["n_dropped_during_sequence_extraction"]
+        == funnel_retention["n_retained_sequences"]
+    ), f"Inconsistent labeling funnel denominators: {funnel_retention}"
+
     logger.info(
         "Dataset summary: %d sequences, total_frames=%d, "
         "avg_length=%.1f, max_length=%d",
@@ -1368,6 +1404,10 @@ def prepare_dataset(
         # Round-3 (Reviewer A MAJ-3B): label-composition sensitivity to
         # a ±25% scaling of the velocity thresholds.
         "labeling_threshold_sensitivity": labeling_threshold_sensitivity,
+        # Exact ``labeling_funnel_summary(labeled_trials)``; do not mutate.
+        "labeling_funnel": funnel,
+        # Post-label snapshot/sequence filtering denominators.
+        "labeling_funnel_retention": funnel_retention,
         # Round-3 (BLK-3B conservative resolution): prior columns whose
         # behavioural class is empty in this dataset — recorded so
         # downstream consumers can exclude them from interpretation.

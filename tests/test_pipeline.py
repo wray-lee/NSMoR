@@ -8,6 +8,7 @@ all tensor shapes and invariants.
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import tempfile
 from pathlib import Path
@@ -35,7 +36,10 @@ from nsmor.pipeline.io import (
     load_kinematics_csv,
 )
 from nsmor.pipeline.kinematics import demirror_prediction, mirror_to_right
-from nsmor.pipeline.labeling import assign_ground_truth_labels
+from nsmor.pipeline.labeling import (
+    assign_ground_truth_labels,
+    labeling_funnel_summary,
+)
 from nsmor.data_extractor import (
     PURE_WIND_PREPEND_FRAMES,
     build_sequence_dataset,
@@ -861,6 +865,197 @@ class TestNSMoRModel:
 
 # Need nn import for the end-to-end test
 import torch.nn as nn
+
+
+# ═══════════════════════════════════════════════════════════════
+# Labeling Funnel Persistence & Threshold Sensitivity (T4)
+# ═══════════════════════════════════════════════════════════════
+
+
+def _make_label_audit_csvs(
+    raw_dir: Path,
+    *,
+    n_sessions: int = 5,
+    frames_per_trial: int = 400,
+    dt_ms: float = 10.0,
+) -> None:
+    """Write deterministic trials with one near the escape threshold."""
+    onset_ms = 2000.0
+    stim_idx = int(onset_ms / dt_ms)
+    time_ms = np.arange(frames_per_trial, dtype=np.float64) * dt_ms
+    profiles = (
+        (0.1, 5.5),   # ESCAPE by default, NO_RESPONSE at 1.25x.
+        (0.1, 15.0),  # ESCAPE at every audited threshold.
+        (1.5, 15.0),  # PREWALK at every audited threshold.
+        (0.8, 0.1),   # PRE_ACTIVE at every audited threshold.
+        (0.1, 0.1),   # NO_RESPONSE at every audited threshold.
+    )
+
+    for session_idx in range(n_sessions):
+        session_id = f"audit_session_{session_idx}"
+        session_dir = raw_dir / session_id
+        session_dir.mkdir(parents=True)
+        kin_rows: list[dict[str, object]] = []
+        event_rows: list[dict[str, object]] = []
+
+        for trial_id, (baseline_velocity, response_velocity) in enumerate(
+            profiles,
+        ):
+            velocity = np.full(
+                frames_per_trial, baseline_velocity, dtype=np.float64,
+            )
+            velocity[stim_idx:] = 0.1
+            velocity[stim_idx + 5:stim_idx + 45] = response_velocity
+            acceleration = np.gradient(velocity, dt_ms / 1000.0)
+            visual_angle = np.zeros(frames_per_trial, dtype=np.float64)
+            visual_angle[stim_idx:] = np.linspace(
+                5.0, 60.0, frames_per_trial - stim_idx,
+            )
+
+            for frame_idx in range(frames_per_trial):
+                kin_rows.append({
+                    "session_id": session_id,
+                    "trial_id": trial_id,
+                    "time_ms": float(time_ms[frame_idx]),
+                    "x_pos": float(frame_idx * 0.01),
+                    "y_pos": float(frame_idx * 0.005),
+                    "heading": 0.0,
+                    "velocity": float(velocity[frame_idx]),
+                    "acceleration": float(acceleration[frame_idx]),
+                    "visual_angle": float(visual_angle[frame_idx]),
+                    "wind_state": float(frame_idx >= stim_idx),
+                    "l_v_ratio": float(visual_angle[frame_idx] * 0.1),
+                })
+            event_rows.extend((
+                {
+                    "session_id": session_id,
+                    "trial_id": trial_id,
+                    "time_ms": 0.0,
+                    "event_type": "trial_start",
+                    "event_value": 1,
+                },
+                {
+                    "session_id": session_id,
+                    "trial_id": trial_id,
+                    "time_ms": onset_ms,
+                    "event_type": "stimulus_onset",
+                    "event_value": 1,
+                },
+            ))
+
+        pd.DataFrame(kin_rows).to_csv(
+            session_dir / "kinematics.csv", index=False,
+        )
+        pd.DataFrame(event_rows).to_csv(
+            session_dir / "events.csv", index=False,
+        )
+
+
+def _extract_label_audit_trials(raw_dir: Path) -> list[dict]:
+    """Load fixture CSVs independently of ``prepare_dataset`` persistence."""
+    kin_paths: list[Path] = []
+    evt_paths: list[Path] = []
+    for session_dir in sorted(raw_dir.iterdir()):
+        if session_dir.is_dir():
+            kin_paths.append(session_dir / "kinematics.csv")
+            evt_paths.append(session_dir / "events.csv")
+    session_data = load_and_concat_sessions(kin_paths, evt_paths)
+    trials: list[dict] = []
+    for (session_id, trial_id), _ in session_data["kinematics"].groupby(
+        ["session_id", "trial_id"],
+    ):
+        trials.append(extract_trial_data(session_data, session_id, trial_id))
+    return trials
+
+
+def _expected_scaled_thresholds(scale: float) -> dict[str, float]:
+    """Independently expected velocity thresholds at a sensitivity scale."""
+    return {
+        "escape_velocity_threshold": (
+            DEFAULT_THRESHOLD.escape_velocity_threshold * scale
+        ),
+        "prewalk_velocity_threshold": (
+            DEFAULT_THRESHOLD.prewalk_velocity_threshold * scale
+        ),
+        "pre_active_velocity_threshold": (
+            DEFAULT_THRESHOLD.pre_active_velocity_threshold * scale
+        ),
+    }
+
+
+def _expected_sensitivity_record(
+    trials: list[dict],
+    scale: float,
+) -> dict[str, object]:
+    """Independently expected self-describing sensitivity record."""
+    class_schema = [label.name for label in Label]
+    cfg = dataclasses.replace(
+        DEFAULT_THRESHOLD,
+        escape_velocity_threshold=(
+            DEFAULT_THRESHOLD.escape_velocity_threshold * scale
+        ),
+        prewalk_velocity_threshold=(
+            DEFAULT_THRESHOLD.prewalk_velocity_threshold * scale
+        ),
+        pre_active_velocity_threshold=(
+            DEFAULT_THRESHOLD.pre_active_velocity_threshold * scale
+        ),
+    )
+    labeled = assign_ground_truth_labels(
+        trials, config=cfg, return_funnel=True,
+    )
+    counts = {name: 0 for name in class_schema}
+    for info in labeled:
+        counts[info["label"].name] += 1
+    return {
+        "scale": scale,
+        "n_trials": len(labeled),
+        "class_schema": class_schema,
+        "counts": counts,
+        "thresholds": _expected_scaled_thresholds(scale),
+        "labeling_funnel": labeling_funnel_summary(labeled),
+    }
+
+
+def test_label_audit_metadata_round_trips_through_artifact(
+    tmp_path: Path,
+) -> None:
+    """Persist exact funnel summary and self-describing sensitivity records."""
+    from scripts.prepare_data import prepare_dataset
+
+    raw_dir = tmp_path / "raw"
+    _make_label_audit_csvs(raw_dir)
+    independent_trials = _extract_label_audit_trials(raw_dir)
+    expected_funnel = labeling_funnel_summary(
+        assign_ground_truth_labels(
+            independent_trials, return_funnel=True,
+        )
+    )
+    expected_retention = {
+        "n_prefilter_labeled_trials": len(independent_trials),
+        "n_retained_sequences": len(independent_trials),
+        "n_dropped_before_snapshot": 0,
+        "n_dropped_during_sequence_extraction": 0,
+    }
+    expected_sensitivity = {
+        f"thresholds_x{scale:.2f}": _expected_sensitivity_record(
+            independent_trials, scale,
+        )
+        for scale in (0.75, 1.0, 1.25)
+    }
+
+    output = tmp_path / "dataset.pt"
+    prepare_dataset(raw_dir=raw_dir, output_path=output, random_seed=42)
+    dataset = torch.load(output, weights_only=False)
+
+    assert dataset["labeling_funnel"] == expected_funnel
+    assert dataset["labeling_funnel_retention"] == expected_retention
+    assert "n_retained_sequences" not in dataset["labeling_funnel"]
+    assert dataset["labeling_threshold_sensitivity"] == expected_sensitivity
+    assert (
+        expected_sensitivity["thresholds_x1.25"]["counts"]
+        != expected_sensitivity["thresholds_x1.00"]["counts"]
+    )
 
 
 # ═══════════════════════════════════════════════════════════════
