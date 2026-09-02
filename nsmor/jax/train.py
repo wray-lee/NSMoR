@@ -277,17 +277,22 @@ def train_jax(
         micro_bs = bs
         effective_accum = grad_accum_steps
 
+    # MAJOR-3 fix: Extract anchor_frames from dataset for anchor-aligned cropping
+    anchor_frames = raw_data.get("anchor_frames", None)
+
     train_dataset = JAXDataset(
         X_seqs, Y_seqs, mcmc_priors, indices=train_idx, max_seq_len=max_len,
         target_mean=target_mean, target_std=target_std,
         normalize_targets=config.training.normalize_targets,
         target_clip_cm_s=config.training.target_clip_cm_s,
+        anchor_frames=anchor_frames,
     )
     val_dataset = JAXDataset(
         X_seqs, Y_seqs, mcmc_priors, indices=val_idx, max_seq_len=max_len,
         target_mean=target_mean, target_std=target_std,
         normalize_targets=config.training.normalize_targets,
         target_clip_cm_s=config.training.target_clip_cm_s,
+        anchor_frames=anchor_frames,
     )
 
     train_loader = JAXDataLoader(train_dataset, batch_size=micro_bs, shuffle=True, seed=config.training.random_seed)
@@ -313,6 +318,7 @@ def train_jax(
         lif_tbptt_steps=config.model.lif_tbptt_steps,
         gru_neuromod_gain=config.model.gru_neuromod_gain,
         dropout_rate=config.model.dropout,
+        sensory_noise_std=getattr(config.model, "sensory_noise_std", 0.0),
     )
 
     rng = jax.random.PRNGKey(config.training.random_seed)

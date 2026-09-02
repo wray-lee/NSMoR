@@ -17,13 +17,16 @@ Full bidirectional weight compatibility with PyTorch NSMoRCore is provided.
 from __future__ import annotations
 
 import math
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple, Union
 
 import flax.linen as nn
 import jax
 import jax.lax as lax
 import jax.numpy as jnp
 import numpy as np
+
+if TYPE_CHECKING:
+    import torch
 
 
 # ===============================================================
@@ -85,9 +88,16 @@ class MoRRouterJAX(nn.Module):
     """MoR causal inference gate: Linear(H + M, 2) -> Softmax."""
     @nn.compact
     def __call__(self, e_sensory: jnp.ndarray, mcmc_prior: jnp.ndarray) -> jnp.ndarray:
+        assert e_sensory.shape[:-1] == mcmc_prior.shape[:-1], (
+            f"Batch/time dims must match: {e_sensory.shape[:-1]} vs {mcmc_prior.shape[:-1]}"
+        )
         comb = jnp.concatenate([e_sensory, mcmc_prior], axis=-1)
         logits = nn.Dense(2, name="gate")(comb)
-        return jax.nn.softmax(logits, axis=-1)
+        gates = jax.nn.softmax(logits, axis=-1)
+        assert gates.shape == (*e_sensory.shape[:-1], 2), (
+            f"Router output shape {gates.shape} != expected {(*e_sensory.shape[:-1], 2)}"
+        )
+        return gates
 
 
 class DirectionHeadJAX(nn.Module):
@@ -97,12 +107,18 @@ class DirectionHeadJAX(nn.Module):
 
     @nn.compact
     def __call__(self, h: jnp.ndarray, deterministic: bool = True) -> jnp.ndarray:
+        assert h.ndim >= 2, f"DirectionHeadJAX input must be >= 2-D, got {h.ndim}-D"
+        leading_shape = h.shape[:-1]
         h_norm = nn.LayerNorm(name="ln")(h)
         h_act = nn.relu(h_norm)
         if not deterministic and self.dropout_rate > 0.0:
             h_act = nn.Dropout(self.dropout_rate, deterministic=False)(h_act)
         y = nn.Dense(1, name="dense")(h_act)
-        return jnp.squeeze(y, axis=-1)
+        y = jnp.squeeze(y, axis=-1)
+        assert y.shape == leading_shape, (
+            f"DirectionHead output shape {y.shape} != expected {leading_shape}"
+        )
+        return y
 
 
 # ===============================================================

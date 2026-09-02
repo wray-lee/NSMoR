@@ -227,7 +227,13 @@ class TestJAXPipeline:
         )
 
         # MSE should match closely (exact same formula)
-        assert abs(float(jax_met["mse"]) - float(jax_met["mse"])) < 1e-4
+        # Compute PyTorch MSE separately for proper cross-validation
+        pt_mask = (torch.arange(T)[None, :] < torch.from_numpy(np_lengths.astype(np.int64))[:, None]).float()
+        pt_sq_err = (torch.from_numpy(np_y_pred) - torch.from_numpy(np_y_true)) ** 2 * pt_mask
+        pt_mse = float(pt_sq_err.sum() / pt_mask.sum().clamp(min=1.0))
+        assert abs(float(jax_met["mse"]) - pt_mse) < 1e-4, (
+            f"MSE mismatch: JAX {float(jax_met['mse']):.6f} vs PyTorch {pt_mse:.6f}"
+        )
         # Total loss tolerance (implementation details may differ slightly)
         assert abs(float(jax_loss) - float(pt_loss.item())) < 0.05, (
             f"JAX loss {float(jax_loss):.6f} vs PyTorch loss {float(pt_loss.item()):.6f}"
