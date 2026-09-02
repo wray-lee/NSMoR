@@ -73,6 +73,35 @@ Output: loss       scalar      — joint loss value
 
 ---
 
+### `NSMoRDataset` (nsmor_dataloader.py)
+
+**Item Contract (unchanged):**
+
+```
+__len__()        -> int                     — number of sequences
+__getitem__(i)   -> (X_seq, Y_seq)          — Tensors; see feature layout above
+.sequences       -> list[(X_seq, Y_seq, label)]
+```
+
+**Split Provenance (added 2026-09-02 under user override):**
+
+```
+__init__(..., source_indices: Sequence[int] | None = None)
+.source_indices  -> list[int]   — row index each sequence occupied in the
+                                  UNSPLIT dataset artifact; aligned 1:1 with
+                                  .sequences.  Defaults to range(n) when the
+                                  caller did no subsetting.
+```
+
+`source_indices` is a read-only sidecar. The `.sequences` tuple layout,
+`__getitem__`, and `_fill_priors` are deliberately untouched, so no training
+behaviour depends on it. Its purpose is auditability: a caller that hands
+this dataset a train/val subset records which original rows went where, so
+the split can be verified without reverse-engineering it from tensor
+contents. A length mismatch raises `ValueError`.
+
+---
+
 ## Sub-modules
 
 | Module           | Class       | I/O                                |

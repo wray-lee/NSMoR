@@ -641,12 +641,14 @@ def build_dataloaders(
         mcmc_priors=train_priors,
         feature_config=feature_config,
         max_seq_len=max_seq_len,
+        source_indices=train_indices,
     )
     val_dataset = NSMoRDataset(
         sequences=val_sequences,
         mcmc_priors=val_priors,
         feature_config=feature_config,
         max_seq_len=max_seq_len,
+        source_indices=val_indices,
     )
 
     # ── Create dataloaders (via factory) ──────────────────────
