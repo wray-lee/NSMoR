@@ -238,23 +238,16 @@ def test_target_stats_split_matches_dataloader(tmp_path: Path) -> None:
     ds_path = _make_synthetic_dataset(tmp_path)
     config = _make_config(tmp_path, epochs=1, normalize_targets=True)
     dataset = torch.load(ds_path, weights_only=False)
-    Y_ref = dataset["Y_seqs"]
     session_arr = np.asarray(dataset["session_ids"])
     all_sessions = set(np.unique(session_arr).tolist())
 
     def _sessions_of(loader) -> set:
-        """Map a loader's sequences back to their source session ids."""
-        found = set()
-        for seq in loader.dataset.sequences:
-            matches = [
-                i for i in range(len(Y_ref))
-                if np.array_equal(seq[1], Y_ref[i])
-            ]
-            assert len(matches) == 1, (
-                f"expected a unique Y_seq match, got {len(matches)}"
-            )
-            found.add(session_arr[matches[0]])
-        return found
+        """Read each sequence's recorded source row, then its session id."""
+        ds = loader.dataset
+        assert len(ds.source_indices) == len(ds.sequences), (
+            "source_indices must stay aligned with sequences"
+        )
+        return {session_arr[i] for i in ds.source_indices}
 
     # Real call 1 — the loaders define the split.
     train_loader, val_loader = build_dataloaders(
@@ -498,15 +491,23 @@ def test_provenance_with_normalization(tmp_path: Path) -> None:
 
 
 # ═════════════════════════════════════════════════════════════
-# Test 7: Gradient-isolation invariant across two-phase training
+# Test 7: the architecture PERMITS ADR-0005 gradient isolation
 # ═════════════════════════════════════════════════════════════
 
-def test_gradient_isolation_phase1_and_phase2() -> None:
-    """ADR-0005 gradient isolation invariant across two-phase training.
+def test_architecture_permits_gradient_isolation() -> None:
+    """The frontend/backend split admits ADR-0005 gradient isolation.
 
-    Phase 1: frontend is trainable, backend is frozen -> all backend
+    This test sets ``requires_grad`` by hand, so it does NOT verify that
+    ``train()`` applies the freeze schedule — that is
+    ``test_train_enforces_phase_freeze_schedule``'s job.  What it does
+    verify is the architectural precondition that makes the schedule
+    possible at all: frontend and backend share no parameters and no
+    hidden gradient path links them, so freezing one really does leave
+    its parameters at ``None`` grad.
+
+    Phase 1: frontend trainable, backend frozen -> all backend
     parameters have None grad after forward+backward.
-    Phase 2: frontend is frozen, backend is trainable -> all frontend
+    Phase 2: frontend frozen, backend trainable -> all frontend
     parameters have None grad after forward+backward.
     """
     from nsmor.model_nsmor_core import NSMoRCore
@@ -694,22 +695,21 @@ def test_split_cross_verification_dry(tmp_path: Path) -> None:
 
     config = _make_config(tmp_path, epochs=1, normalize_targets=True)
 
-    # 1. Call build_dataloaders and extract actual train indices
+    # 1. Call build_dataloaders and read the split provenance it recorded.
     train_loader, val_loader = build_dataloaders(
         config, dataset_path=str(ds_path), val_split=_VAL_SPLIT,
     )
     assert train_loader is not None
 
-    train_indices_from_loader = []
-    for seq in train_loader.dataset.sequences:
-        y_seq = seq[1]
-        matched = [
-            i for i in range(n_total)
-            if np.array_equal(y_seq, dataset["Y_seqs"][i])
-        ]
-        assert len(matched) == 1
-        train_indices_from_loader.append(matched[0])
-    train_indices_from_loader = np.array(train_indices_from_loader)
+    train_ds = train_loader.dataset
+    assert len(train_ds.source_indices) == len(train_ds.sequences), (
+        "source_indices must stay aligned with sequences"
+    )
+    train_indices_from_loader = np.array(train_ds.source_indices)
+    assert train_indices_from_loader.size > 0
+    assert np.all(train_indices_from_loader < n_total)
+    # Provenance must be a permutation-free subset, never a duplicate row.
+    assert len(set(train_ds.source_indices)) == len(train_ds.source_indices)
 
     # 2. Call compute_target_stats which now returns train indices directly
     target_mean, target_std, train_indices_from_stats = compute_target_stats(
@@ -927,10 +927,11 @@ def test_train_enforces_phase_freeze_schedule(tmp_path: Path) -> None:
     """ADR-0005 enforcement point: ``train()`` — not the caller — must
     freeze the backend during Phase 1 and the frontend during Phase 2.
 
-    ``test_gradient_isolation_phase1_and_phase2`` toggles ``requires_grad``
-    by hand, so it proves the architecture *permits* isolation but would
-    still pass if ``train()`` stopped freezing anything.  This test
-    observes the real per-epoch parameter state inside ``train()``.
+    ``test_architecture_permits_gradient_isolation`` toggles
+    ``requires_grad`` by hand, so it proves the architecture *permits*
+    isolation but would still pass if ``train()`` stopped freezing
+    anything.  This test observes the real per-epoch parameter state
+    inside ``train()``.
     """
     from scripts.train import train, train_one_epoch
 

@@ -32,7 +32,7 @@ lengths for each sample in the batch.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -66,6 +66,7 @@ class NSMoRDataset(Dataset):
         mcmc_priors: np.ndarray,
         feature_config: FeatureConfig = DEFAULT_FEATURE,
         max_seq_len: Optional[int] = None,
+        source_indices: Optional[Sequence[int]] = None,
     ) -> None:
         """
         Args:
@@ -74,10 +75,20 @@ class NSMoRDataset(Dataset):
             mcmc_priors: **Required** pre-computed probability vectors,
                 shape ``(n_trials, 4)``.  Each row must sum to 1.
             feature_config: Feature dimension constants.
+            source_indices: Optional provenance — the row index each
+                sequence occupied in the *unsplit* dataset artifact.
+                Callers that hand this dataset a train/val subset should
+                pass the subset's original indices so the split is
+                auditable without reverse-engineering it from tensor
+                contents.  Defaults to ``range(len(sequences))``, i.e.
+                identity, which is correct when no subsetting occurred.
+                Exposed as :attr:`source_indices`; it does not affect
+                ``__getitem__`` or any training behaviour.
 
         Raises:
             ValueError: If *mcmc_priors* is ``None`` or its shape does
-                not match the number of sequences.
+                not match the number of sequences, or if
+                *source_indices* is given with a mismatched length.
         """
         if mcmc_priors is None:
             raise ValueError(
@@ -93,6 +104,19 @@ class NSMoRDataset(Dataset):
         self.sequences = [
             (X.copy(), Y.copy(), lbl) for X, Y, lbl in sequences
         ]
+
+        # Split provenance.  Read-only sidecar: the tuple layout of
+        # ``self.sequences`` is deliberately unchanged so ``__getitem__``
+        # and ``_fill_priors`` keep their exact contracts.
+        if source_indices is None:
+            self.source_indices: List[int] = list(range(len(self.sequences)))
+        else:
+            self.source_indices = [int(i) for i in source_indices]
+            if len(self.source_indices) != len(self.sequences):
+                raise ValueError(
+                    f"source_indices length {len(self.source_indices)} does "
+                    f"not match sequence count {len(self.sequences)}."
+                )
 
         n = len(sequences)
         expected_shape = (n, feature_config.mcmc_dim)
