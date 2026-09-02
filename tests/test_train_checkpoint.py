@@ -719,10 +719,6 @@ def test_split_cross_verification_dry(tmp_path: Path) -> None:
     assert set(train_indices_from_loader) == set(captured_indices_from_stats)
 
 
-# Alias to match both 'split_cross_verify' and 'split_cross_verification' test filters
-test_split_cross_verify_dry = test_split_cross_verification_dry
-
-
 # ═════════════════════════════════════════════════════════════
 # Test 11: resume within phase 1
 # ═════════════════════════════════════════════════════════════
@@ -915,5 +911,82 @@ def test_resume_mid_phase2(tmp_path: Path) -> None:
     assert final_ckpt["epoch"] == 16  # 0-indexed, 17 total epochs
     assert final_ckpt["training_phase"] == 2
     assert len(final_ckpt["optimizer_state_dict"]["param_groups"]) == 2
+
+
+# ═════════════════════════════════════════════════════════════
+# Test 11: train() itself enforces the ADR-0005 freeze schedule
+# ═════════════════════════════════════════════════════════════
+
+def test_train_enforces_phase_freeze_schedule(tmp_path: Path) -> None:
+    """ADR-0005 enforcement point: ``train()`` — not the caller — must
+    freeze the backend during Phase 1 and the frontend during Phase 2.
+
+    ``test_gradient_isolation_phase1_and_phase2`` toggles ``requires_grad``
+    by hand, so it proves the architecture *permits* isolation but would
+    still pass if ``train()`` stopped freezing anything.  This test
+    observes the real per-epoch parameter state inside ``train()``.
+    """
+    from scripts.train import train, train_one_epoch
+
+    ds_path = _make_synthetic_dataset(tmp_path)
+    config = _make_config(tmp_path, epochs=4, warmup_epochs=0)
+
+    observed = []
+    orig_train_one_epoch = train_one_epoch
+
+    def _spy_train_one_epoch(*args, **kwargs):
+        mdl = kwargs["model"] if "model" in kwargs else args[0]
+        opt = kwargs["optimizer"] if "optimizer" in kwargs else args[3]
+        observed.append({
+            "frontend_trainable": [
+                p.requires_grad for p in mdl.frontend.parameters()
+            ],
+            "backend_trainable": [
+                p.requires_grad for p in mdl.backend.parameters()
+            ],
+            "n_groups": len(opt.param_groups),
+        })
+        return orig_train_one_epoch(*args, **kwargs)
+
+    with mock.patch(
+        "scripts.train.train_one_epoch", side_effect=_spy_train_one_epoch,
+    ):
+        train(
+            config, lambda_reg=0.01, phase1_epochs=2,
+            dataset_path=str(ds_path),
+        )
+
+    assert len(observed) == 4, (
+        f"expected 4 trained epochs, observed {len(observed)}"
+    )
+
+    # Epochs 0-1 → Phase 1: backend frozen, frontend trainable, 1 group.
+    for epoch_idx in (0, 1):
+        state = observed[epoch_idx]
+        assert state["backend_trainable"], "backend has no parameters"
+        assert not any(state["backend_trainable"]), (
+            f"epoch {epoch_idx}: Phase 1 must freeze every backend parameter"
+        )
+        assert all(state["frontend_trainable"]), (
+            f"epoch {epoch_idx}: Phase 1 must train every frontend parameter"
+        )
+        assert state["n_groups"] == 1, (
+            f"epoch {epoch_idx}: Phase 1 optimizer must have 1 param group"
+        )
+
+    # Epochs 2-3 → Phase 2: frontend frozen, backend trainable, 2 groups.
+    for epoch_idx in (2, 3):
+        state = observed[epoch_idx]
+        assert state["frontend_trainable"], "frontend has no parameters"
+        assert not any(state["frontend_trainable"]), (
+            f"epoch {epoch_idx}: Phase 2 must freeze every frontend parameter"
+        )
+        assert all(state["backend_trainable"]), (
+            f"epoch {epoch_idx}: Phase 2 must train every backend parameter"
+        )
+        assert state["n_groups"] == 2, (
+            f"epoch {epoch_idx}: Phase 2 optimizer must have 2 param groups"
+        )
+
 
 
