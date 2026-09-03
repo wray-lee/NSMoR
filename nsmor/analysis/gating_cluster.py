@@ -943,6 +943,8 @@ def extract_and_cluster_gates(
     labels: Optional[np.ndarray] = None,
     config: Optional[ClusterGatingConfig] = None,
     device: Optional[torch.device] = None,
+    is_pure_wind: Optional[np.ndarray] = None,
+    stimulus_conditions: Optional[np.ndarray] = None,
 ) -> Dict[str, Any]:
     """
     End-to-end pipeline: extract gates, compute fingerprints, cluster.
@@ -953,6 +955,8 @@ def extract_and_cluster_gates(
         labels: Optional ground truth labels.
         config: Optional ClusterGatingConfig.
         device: Optional device.
+        is_pure_wind: Optional per-trial boolean array (Ticket #17).
+        stimulus_conditions: Optional per-trial condition strings (Ticket #17).
 
     Returns:
         Dict with extraction results, fingerprints, clustering, and evaluation.
@@ -963,6 +967,14 @@ def extract_and_cluster_gates(
 
     # Extract gating sequences
     sequences = adapter.extract_gating_sequences(dataloader, labels)
+
+    # Ticket #17: Attach stimulus condition metadata to sequences
+    if is_pure_wind is not None:
+        for i, seq in enumerate(sequences):
+            seq["is_pure_wind"] = bool(is_pure_wind[i])
+    if stimulus_conditions is not None:
+        for i, seq in enumerate(sequences):
+            seq["stimulus_condition"] = str(stimulus_conditions[i])
 
     # Compute fingerprints
     fingerprints = adapter.compute_fingerprints(sequences)

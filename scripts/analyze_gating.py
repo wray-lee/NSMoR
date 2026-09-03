@@ -105,8 +105,14 @@ def load_model_and_dataset(
     dataset_path: Path,
     batch_size: int = 32,
     max_seq_len: Optional[int] = 1000,
-) -> Tuple[torch.nn.Module, torch.utils.data.DataLoader, np.ndarray]:
-    """Load model and dataset for gating extraction."""
+) -> Tuple[torch.nn.Module, torch.utils.data.DataLoader, np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
+    """
+    Load model and dataset for gating extraction.
+
+    Returns:
+        (model, dataloader, labels, is_pure_wind, stimulus_conditions)
+        where is_pure_wind and stimulus_conditions are None if not in dataset.
+    """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info("Device: %s", device)
 
@@ -129,8 +135,17 @@ def load_model_and_dataset(
     mcmc_priors = dataset["mcmc_priors"]
     labels = dataset["labels"]
 
+    # Ticket #17: Load stimulus condition metadata if available
+    is_pure_wind = dataset.get("is_pure_wind")
+    stimulus_conditions = dataset.get("stimulus_conditions")
+
     n_total = len(X_seqs)
     logger.info("Loaded %d sequences.", n_total)
+    if is_pure_wind is not None:
+        logger.info(
+            "Stimulus condition metadata: %d wind_only, %d other",
+            int(np.sum(is_pure_wind)), int(np.sum(~is_pure_wind)),
+        )
 
     sequences = [
         (X_seqs[i], Y_seqs[i], int(labels[i]))
@@ -144,6 +159,7 @@ def load_model_and_dataset(
         mcmc_priors=mcmc_priors,
         feature_config=feature_config,
         max_seq_len=max_seq_len,
+        is_pure_wind=is_pure_wind,  # Ticket #17
     )
 
     dataloader = create_optimized_dataloader(
@@ -153,7 +169,7 @@ def load_model_and_dataset(
         num_workers=-1,  # Auto-scale based on dataset size
     )
 
-    return model, dataloader, labels
+    return model, dataloader, labels, is_pure_wind, stimulus_conditions
 
 
 # =========================================================================
@@ -306,6 +322,9 @@ def build_summary_json(
     ari_3way_k3 = evaluation.get("k3_vs_3way", {}).get("ari", np.nan)
     nmi_3way_k3 = evaluation.get("k3_vs_3way", {}).get("nmi", np.nan)
 
+    # Ticket #17: Per-condition gate statistics (if metadata available)
+    condition_stats = _compute_condition_gate_stats(sequences)
+
     # Config hash
     config_dict = {
         "n_clusters": config.n_clusters,
@@ -340,7 +359,84 @@ def build_summary_json(
         "fingerprint_dim": config.fingerprint_dim,
     }
 
+    # Ticket #17: Add condition-specific routing stats if available
+    if condition_stats is not None:
+        summary["condition_specific_routing"] = condition_stats
+
     return summary
+
+
+def _compute_condition_gate_stats(
+    sequences: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """
+    Compute per-condition gate statistics (Ticket #17).
+
+    Args:
+        sequences: List of sequence dicts from extract_and_cluster_gates.
+            Each dict must have 'gate_seq' (T, 2) with [:, 0]=g_lif, [:, 1]=g_gru.
+            Optional: 'is_pure_wind' (bool) or 'stimulus_condition' (str).
+
+    Returns:
+        Dict with condition-specific stats if metadata available, else None.
+    """
+    # Check if any sequence has condition metadata
+    has_wind_flag = any("is_pure_wind" in s for s in sequences)
+    has_condition = any("stimulus_condition" in s for s in sequences)
+
+    if not (has_wind_flag or has_condition):
+        return None  # No metadata, skip
+
+    # Extract gate sequences and conditions
+    wind_g_lif_trials = []
+    visual_g_lif_trials = []
+
+    for seq in sequences:
+        gate_seq = seq["gate_seq"]  # (T, 2)
+        g_lif_seq = gate_seq[:, 0]  # (T,)
+        g_gru_seq = gate_seq[:, 1]  # (T,)
+
+        # Determine condition
+        is_wind = False
+        if "is_pure_wind" in seq:
+            is_wind = bool(seq["is_pure_wind"])
+        elif "stimulus_condition" in seq:
+            is_wind = seq["stimulus_condition"] == "wind_only"
+
+        # Per-trial mean (already computed in sequence, but recalculate for clarity)
+        trial_mean_g_lif = float(np.mean(g_lif_seq))
+
+        if is_wind:
+            wind_g_lif_trials.append(trial_mean_g_lif)
+        else:
+            visual_g_lif_trials.append(trial_mean_g_lif)
+
+    # Compute statistics
+    if len(wind_g_lif_trials) == 0 or len(visual_g_lif_trials) == 0:
+        return None  # Need both groups for comparison
+
+    mean_g_lif_wind = float(np.mean(wind_g_lif_trials))
+    mean_g_lif_visual = float(np.mean(visual_g_lif_trials))
+    std_g_lif_wind = float(np.std(wind_g_lif_trials))
+    std_g_lif_visual = float(np.std(visual_g_lif_trials))
+    separation = mean_g_lif_wind - mean_g_lif_visual
+
+    # Cohen's d effect size
+    pooled_std = np.sqrt(
+        (std_g_lif_wind**2 + std_g_lif_visual**2) / 2
+    )
+    cohens_d = separation / pooled_std if pooled_std > 0 else 0.0
+
+    return {
+        "mean_g_lif_wind": mean_g_lif_wind,
+        "mean_g_lif_visual": mean_g_lif_visual,
+        "std_g_lif_wind": std_g_lif_wind,
+        "std_g_lif_visual": std_g_lif_visual,
+        "separation": separation,
+        "cohens_d": float(cohens_d),
+        "n_wind_trials": len(wind_g_lif_trials),
+        "n_visual_trials": len(visual_g_lif_trials),
+    }
 
 
 def build_statistics_csv(
@@ -407,7 +503,7 @@ def run_analysis(
     cluster_config = exp_config.cluster_gating
 
     # Load model and dataset
-    model, dataloader, labels = load_model_and_dataset(
+    model, dataloader, labels, is_pure_wind, stimulus_conditions = load_model_and_dataset(
         checkpoint_path, dataset_path, batch_size=batch_size, max_seq_len=max_seq_len,
     )
 
@@ -417,6 +513,8 @@ def run_analysis(
         dataloader=dataloader,
         labels=labels,
         config=cluster_config,
+        is_pure_wind=is_pure_wind,  # Ticket #17
+        stimulus_conditions=stimulus_conditions,  # Ticket #17
     )
 
     umap_emb = result.get("umap_embedding")
