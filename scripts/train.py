@@ -324,6 +324,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Override output directory.",
     )
     parser.add_argument(
+        "--checkpoint_interval",
+        type=int,
+        default=None,
+        help="Override periodic checkpoint interval (epochs).",
+    )
+    parser.add_argument(
         "--sweep_escape_band",
         type=str,
         default=None,
@@ -386,6 +392,8 @@ def build_config(argv: Optional[Sequence[str]] = None) -> Tuple[ExperimentConfig
         config.checkpoint.resume_from = args.resume
     if args.output_dir is not None:
         config.checkpoint.output_dir = args.output_dir
+    if getattr(args, "checkpoint_interval", None) is not None:
+        config.training.checkpoint_interval = args.checkpoint_interval
 
     # Sweep bands: parse the comma list into a module-level holder consumed
     # by train() (kept out of ExperimentConfig — it is a reporting option,
@@ -2390,6 +2398,7 @@ def train(
     return {
         "best_val_loss": best_val_loss,
         "final_train_loss": history["train_loss"][-1] if history["train_loss"] else float("inf"),
+        "lambda_reg": lambda_reg,
         "metrics": metrics,
         "eval_provenance": eval_provenance,
     }
