@@ -3,9 +3,22 @@
 Corresponds to :mod:`nsmor.analysis.gating_cluster` (PyTorch version).
 
 Acceleration strategy:
-  - Model inference via :class:`nsmor.jax.model.NSMoRModel` under ``jax.jit``.
-  - Trial-level fingerprint extraction uses ``jax.jit``-compiled kernels.
+  - Model inference via :class:`nsmor.jax.model.NSMoRModel` under ``jax.jit``
+    -- this is where the real speedup lives.
   - KMeans / UMAP remain sklearn (not bottleneck; no native JAX impl).
+
+Known performance tradeoff (fingerprint path):
+  ``compute_fingerprints`` calls :func:`fingerprint_jax` once per trial at
+  the trial's exact length.  An earlier ``jax.vmap`` implementation over
+  zero-padded arrays was ~8x faster but silently corrupted 14 of the 16
+  features on variable-length trials (padding diluted means, zeroed minima,
+  shifted argmax).  Correctness won: the per-trial path matches the PyTorch
+  reference to < 1e-7 on heterogeneous lengths, at the cost of being ~8x
+  SLOWER than the pure-NumPy PyTorch path on CPU (per-call JAX dispatch and
+  array conversion dominate for these small reductions).  Prefer
+  :mod:`nsmor.analysis.gating_cluster` when only fingerprints are needed.
+  A future optimization could bucket same-length trials for vmap and fall
+  back to per-trial for the ragged remainder.
 
 All public functions match the PyTorch API; outputs are numerically
 compatible (same 16-dim fingerprint, same clustering contract).
