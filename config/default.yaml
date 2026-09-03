@@ -122,6 +122,7 @@ training:
 loss:
   reduction: mean           # MSE reduction: 'mean' or 'sum'
   target_rate: 0.05         # target mean firing rate for sparsity L1
+  lambda_reg: 0.2           # router anti-collapse; NOT warmup-scaled
   lambda_energy: 0.001        # ATP metabolic cost (0 disables)
   lambda_sparse: 0.005        # population sparsity L1 (0 disables)
   lambda_jerk: 0.005         # temporal coherence / jerk penalty (0 disables)

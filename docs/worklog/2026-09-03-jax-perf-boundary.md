@@ -36,9 +36,9 @@
 
 | 场景 | 用 JAX？ | 理由 |
 |---|---|---|
-| 长序列递归（`lax.scan`） | ✅ | 融合数千步，收益巨大 |
-| 大 batch 模型 forward | ✅ | 计算密集，dispatch 可忽略 |
-| 高阶导（jacobian/hessian） | ✅ | `jacfwd`/`jacrev` 比 PyTorch 高效 |
+| 长序列递归（`lax.scan`） | 训练 ✅ / 分析 ❌ | 训练 2x 真加速；分析 forward 的 LIF Heaviside 在 fp32 下会翻 spike，latency 偏 20%（见 [hotspots](2026-09-03-jax-analyze-hotspots.md)） |
+| 大 batch 模型 forward | 同上 | 快不等于可复现 kinematics |
+| 高阶导（jacobian/hessian） | ✅ | `jacfwd` 比 PyTorch 高效；**不要** fused JAX eig |
 | 同形状样本并行（vmap） | ✅ | 前提：无变长归约 |
 | 小张量归约（16 维统计量） | ❌ | dispatch 开销 >> 计算量,NumPy 更快 |
 | 逐样本 Python 循环调用 | ❌ | 每次都付 dispatch 成本 |

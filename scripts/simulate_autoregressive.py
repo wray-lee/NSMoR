@@ -47,6 +47,7 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(_SCRIPT_DIR)
 sys.path.insert(0, _PROJECT_ROOT)
 
+from nsmor.data_extractor import _compute_pure_wind_prepend_frames  # noqa: E402
 from nsmor.model_nsmor_core import NSMoRCore  # noqa: E402
 from nsmor.model_utils import load_model_from_checkpoint as _shared_load_model  # noqa: E402
 
@@ -250,9 +251,9 @@ def generate_stimulus_paradigm(
             if wind_onset_ms <= time_ms[i] < wind_offset_ms:
                 wind[i] = 1.0
 
-    # ── Pure-wind prepend (570 frames = 5.7s structural alignment) ──
+    # ── Pure-wind prepend (5.7s structural alignment) ──
     if paradigm.has_wind and not paradigm.has_visual:
-        prepend_frames = 570
+        prepend_frames = _compute_pure_wind_prepend_frames(dt_ms)
         v_vis = np.concatenate([np.zeros(prepend_frames), v_vis])
         wind = np.concatenate([np.zeros(prepend_frames), wind])
         time_ms = np.concatenate([

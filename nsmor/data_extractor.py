@@ -23,7 +23,7 @@ sequences already include the 2-second baseline plus stimulus period.
 
 from __future__ import annotations
 
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -35,7 +35,15 @@ from nsmor.config import (
 )
 from nsmor.pipeline.kinematics import mirror_to_right
 
-# Pure-wind prepended baseline: 5.7 s × 100 Hz = 570 frames
+
+def _compute_pure_wind_prepend_frames(dt_ms: float) -> int:
+    """Compute pure-wind prepend frames for 5.7s baseline at given sampling rate."""
+    if dt_ms <= 0:
+        raise ValueError(f"dt_ms must be positive, got {dt_ms}")
+    return int(round(5700.0 / dt_ms))
+
+
+# Pure-wind prepended baseline: 5.7 s × 100 Hz = 570 frames (default / backward compat)
 PURE_WIND_PREPEND_FRAMES: int = 570
 
 
@@ -231,6 +239,7 @@ def extract_mcmc_snapshot(
 def extract_trial_sequence(
     trial_data: Dict[str, np.ndarray],
     feature_config: FeatureConfig = DEFAULT_FEATURE,
+    dt_ms: Optional[float] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Build a Trial-Start anchored continuous sequence.
@@ -240,7 +249,8 @@ def extract_trial_sequence(
 
     **Pure-Wind baseline alignment:**
     If the trial has no looming visual stimulus (``visual_angle`` is
-    all zeros), a 5.7-second zero-matrix (570 frames at 100 Hz) is
+    all zeros), a 5.7-second zero-matrix (570 frames at 100 Hz, or
+    dynamically computed via :func:`_compute_pure_wind_prepend_frames`) is
     prepended to the physical features and target vector so that the
     temporal structure matches looming trials.
 
@@ -260,6 +270,8 @@ def extract_trial_sequence(
     Args:
         trial_data: From :func:`pipeline.io.extract_trial_data`.
         feature_config: Feature dimension config.
+        dt_ms: Frame interval in milliseconds. If None, inferred from
+            ``trial_data["time_ms"]`` median diff or falls back to 10.0.
 
     Returns:
         ``(X_seq, Y_seq)`` where
@@ -289,13 +301,22 @@ def extract_trial_sequence(
     # If no looming stimulus was presented, prepend 5.7 s of zeros
     # so that the temporal structure matches looming trials.
     if _is_pure_wind(visual_angle):
+        if dt_ms is None:
+            if n_frames > 1:
+                dt_ms_eff = float(np.median(np.diff(time_ms)))
+            else:
+                dt_ms_eff = 10.0
+        else:
+            dt_ms_eff = dt_ms
+
+        prepend_frames = _compute_pure_wind_prepend_frames(dt_ms_eff)
         prepend_zeros = np.zeros(
-            (PURE_WIND_PREPEND_FRAMES, feature_config.per_frame_physical_dim),
+            (prepend_frames, feature_config.per_frame_physical_dim),
             dtype=np.float64,
         )
         physical = np.concatenate([prepend_zeros, physical], axis=0)
 
-        target_zeros = np.zeros(PURE_WIND_PREPEND_FRAMES, dtype=np.float64)
+        target_zeros = np.zeros(prepend_frames, dtype=np.float64)
         Y_seq = np.concatenate([target_zeros, velocity.copy()], axis=0)
     else:
         Y_seq = velocity.copy()
@@ -428,6 +449,7 @@ def build_sequence_dataset(
     labeled_trials: List[Dict],
     feature_config: FeatureConfig = DEFAULT_FEATURE,
     unify_wind_sides: bool = False,
+    dt_ms: Optional[float] = None,
 ) -> List[Tuple[np.ndarray, np.ndarray, int]]:
     """
     Build Trial-Start anchored sequences for all valid trials.
@@ -453,6 +475,7 @@ def build_sequence_dataset(
             for naive t-tests. Train/test splits must apply the same
             ``unify_wind_sides`` flag on both sides to avoid leakage; log
             the flag in experiment metadata.
+        dt_ms: Frame interval in milliseconds.
 
     Returns:
         List of ``(X_seq, Y_seq, label)`` tuples.
@@ -470,6 +493,7 @@ def build_sequence_dataset(
             X_seq, Y_seq = extract_trial_sequence(
                 trial_data,
                 feature_config=feature_config,
+                dt_ms=dt_ms,
             )
             sequences.append((X_seq, Y_seq, int(info["label"])))
         except ValueError:

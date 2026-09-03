@@ -333,7 +333,8 @@ run_py "Phase E" scripts/analyze_jacobian.py \
     --checkpoint "${BEST_MODEL}" \
     --dataset "${DATASET}" \
     --output "${OUTPUT_DIR}/jacobian_spectrum.png" \
-    --dt_ms "${DT_MS}"
+    --dt_ms "${DT_MS}" \
+    --backend jax
 require_outputs "Phase E" \
     "${OUTPUT_DIR}/jacobian_spectrum.png" \
     "${OUTPUT_DIR}/jacobian_spectrum.json"

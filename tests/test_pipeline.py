@@ -43,6 +43,7 @@ from nsmor.pipeline.labeling import (
 )
 from nsmor.data_extractor import (
     PURE_WIND_PREPEND_FRAMES,
+    _compute_pure_wind_prepend_frames,
     build_sequence_dataset,
     build_snapshot_dataset,
     extract_mcmc_snapshot,
@@ -633,6 +634,28 @@ class TestSequenceExtraction:
 
         # Original region should have non-zero wind after stimulus
         assert np.any(X_seq[PURE_WIND_PREPEND_FRAMES:, 1] != 0.0)
+
+    def test_pure_wind_baseline_prepend_dynamic_dt(self, tmp_path: Path) -> None:
+        """Pure Wind trials dynamically scale prepend frames to dt_ms."""
+        # 1. Direct function calculation
+        assert _compute_pure_wind_prepend_frames(10.0) == 570
+        assert _compute_pure_wind_prepend_frames(4.0) == 1425
+        with pytest.raises(ValueError, match="positive"):
+            _compute_pure_wind_prepend_frames(-1.0)
+
+        # 2. Sequence extraction with explicit dt_ms
+        kin_path, evt_path = _make_pure_wind_csvs(tmp_path, frames_per_trial=600, dt_ms=4.0)
+        data = load_and_concat_sessions([kin_path], [evt_path])
+        trial = extract_trial_data(data, "wind_session", 0)
+
+        X_seq, Y_seq = extract_trial_sequence(trial, dt_ms=4.0)
+        expected_prepend = 1425
+        expected_len = expected_prepend + 600
+        assert X_seq.shape == (expected_len, 8)
+        assert Y_seq.shape == (expected_len,)
+        assert np.all(X_seq[:expected_prepend, :] == 0.0)
+        assert np.all(Y_seq[:expected_prepend] == 0.0)
+        assert np.any(X_seq[expected_prepend:, 1] != 0.0)
 
 
 class TestMirrorToRight:

@@ -288,8 +288,19 @@ class LossConfig:
     """MSE reduction mode: 'mean' or 'sum'."""
     target_rate: float = 0.05
     """Target mean firing rate for population sparsity L1 loss."""
-    lambda_reg: float = 0.01
-    """Router regularization weight (NOT warmup-scaled)."""
+    lambda_reg: float = 0.2
+    """Router regularization weight.
+
+    NOT warmup-scaled: ``lambda_reg`` is passed at full strength from
+    epoch 0.  Only ``lambda_energy``, ``lambda_sparse``, and
+    ``lambda_jerk`` are ramped by the cosine warmup schedule.  This
+    ensures the MoR router receives anti-collapse pressure before the
+    GRU pathway monopolises the hidden state during the bio-loss
+    warmup window.
+
+    Diagnostic band: 0.1--0.3 prevents gate collapse (g_lif ~ 0.13
+    everywhere) while keeping the MSE-dominated loss well-conditioned.
+    """
     lambda_energy: float = 0.0
     """ATP metabolic cost weight (Attwell & Laughlin 2001). 0 disables."""
     lambda_sparse: float = 0.0
@@ -299,7 +310,12 @@ class LossConfig:
     jerk_threshold: float = 0.1
     """Threshold for sudden-change jerk mask (unused when mask=None)."""
     warmup_epochs: int = 0
-    """Linear warmup epoch count for lambda_energy, lambda_sparse, lambda_jerk."""
+    """Cosine warmup epoch count for ``lambda_energy``, ``lambda_sparse``,
+    and ``lambda_jerk``.  These three bio-loss terms are ramped from 0
+    to their configured value over this window.
+
+    ``lambda_reg`` is explicitly EXCLUDED from warmup scaling so the MoR
+    router receives anti-collapse pressure from epoch 0."""
 
 
 # ═══════════════════════════════════════════════════════════════

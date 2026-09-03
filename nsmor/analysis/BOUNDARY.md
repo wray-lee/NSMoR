@@ -19,6 +19,18 @@ Provide tools for analyzing the internal dynamics of the NSMoR GRU pathway:
 
 ## Current Tools
 
+### `FixedPointAdapterJAX` / `create_jacobian_adapter` (dynamics_jax.py)
+
+Default GRU Jacobian kernel for `scripts/analyze_jacobian.py --backend jax`.
+Eigenvalues stay on `torch.linalg.eigvals` (fused JAX eig is slower).
+
+### `JAXEvalWrapper` (jax_eval.py)
+
+Opt-in duck-typed Flax apply. **Not** the analysis default: LIF spike
+decisions disagree under fp32 drift and shift latency ~20% on the real
+checkpoint. Use `--backend torch` (the script default) for publication
+kinematics. Autoregressive `states=` is unsupported.
+
 ### `FixedPointAdapter` (dynamics.py)
 
 **State Extraction:**

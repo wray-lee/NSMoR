@@ -19,7 +19,7 @@ Programmatic::
 
     from scripts.train import train, build_config
     cfg = build_config(["--config", "config/default.yaml"])
-    results = train(cfg, lambda_reg=0.01)
+    results = train(cfg)  # lambda_reg falls through to cfg.loss.lambda_reg
 """
 
 from __future__ import annotations
@@ -222,8 +222,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--lambda_reg",
         type=float,
-        default=0.01,
-        help="Router regularization weight for BioJointLoss.",
+        default=None,
+        help="Router regularization weight for BioJointLoss. "
+             "Overrides config.loss.lambda_reg when set.",
     )
     parser.add_argument(
         "--lambda_energy",
@@ -395,7 +396,12 @@ def build_config(argv: Optional[Sequence[str]] = None) -> Tuple[ExperimentConfig
         if args.sweep_escape_band else None
     )
 
-    return config, args.lambda_reg, args.phase1_epochs
+    # Resolve lambda_reg: CLI override > YAML config > dataclass default.
+    # The CLI default is None (sentinel), so an unset flag falls through
+    # to config.loss.lambda_reg (which the YAML or dataclass populates).
+    lambda_reg = args.lambda_reg if args.lambda_reg is not None else config.loss.lambda_reg
+
+    return config, lambda_reg, args.phase1_epochs
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -984,8 +990,11 @@ def compute_warmup_factor(epoch: int, warmup_epochs: int) -> float:
     S-curve), preventing the gradient shock that can destabilize
     Adam's moment estimates.
 
-    Note: ``lambda_reg`` is NOW also scaled by this factor (CF8 fix),
-    along with ``lambda_energy``, ``lambda_sparse``, and ``lambda_jerk``.
+    Note: ``lambda_reg`` is NOT scaled by this factor.  Only
+    ``lambda_energy``, ``lambda_sparse``, and ``lambda_jerk`` are
+    warmup-ramped via the ``annealing_factor`` parameter.  The router
+    needs anti-collapse pressure from epoch 0 to prevent GRU
+    monopolisation during the warmup window.
 
     Args:
         epoch: Current epoch number (0-indexed).
@@ -1653,7 +1662,7 @@ def plot_loss_curve(
 
 def train(
     config: ExperimentConfig,
-    lambda_reg: float = 0.01,
+    lambda_reg: Optional[float] = None,
     phase1_epochs: Optional[int] = None,
     dataset_path: Optional[str] = None,
     use_lazy_loading: bool = False,
@@ -1680,7 +1689,10 @@ def train(
 
     Args:
         config: Parsed experiment configuration.
-        lambda_reg: Router regularization weight.
+        lambda_reg: Router regularization weight.  ``None``
+            (default) falls through to ``config.loss.lambda_reg``,
+            matching the ``--lambda_reg`` CLI sentinel.  Pass
+            ``0.0`` to disable router regularization outright.
         phase1_epochs: Number of Phase 1 epochs.  ``None`` =
             single-phase mode (backward compatible).  ``0`` =
             skip Phase 1 entirely (start with Phase 2).
@@ -1698,6 +1710,12 @@ def train(
     # ── Reproducibility ───────────────────────────────────────
     torch.manual_seed(config.training.random_seed)
     np.random.seed(config.training.random_seed)
+
+    # Same sentinel contract as the CLI: only an explicit value overrides
+    # the config, so `train(cfg)` cannot silently regress to a stale
+    # constant while YAML says 0.2.  0.0 stays a valid opt-out.
+    if lambda_reg is None:
+        lambda_reg = config.loss.lambda_reg
 
     resolved_dataset_path = dataset_path or _DATASET_PATH
     logger.info("Dataset: %s", resolved_dataset_path)
@@ -2039,11 +2057,12 @@ def train(
             criterion = backend_criterion
             current_phase = 2
 
-        # ── Warmup factor for bio-loss terms AND lambda_reg ──
-        # CF8 fix: lambda_reg is now also scaled by warmup_factor.
-        # During early epochs, the LIF pathway needs to stabilize
-        # (via sharpened surrogate gradient and TBPTT) before the
-        # router regularization pressure for LIF routing ramps up.
+        # ── Warmup factor for bio-loss terms (energy/sparse/jerk ONLY) ──
+        # lambda_reg is NOT warmup-scaled: the router needs anti-collapse
+        # pressure from epoch 0; ramping it with warmup_factor allows the
+        # GRU to monopolise the hidden state before the gate can learn
+        # (root cause of g_lif ~ 0.13 collapse).  Only lambda_energy,
+        # lambda_sparse, and lambda_jerk are cosine-ramped.
         #
         # Two-phase fix: In Hybrid Funnel mode, Phase 2 starts at
         # global epoch = phase1_epochs.  We must use the *local*
@@ -2091,7 +2110,7 @@ def train(
             criterion=criterion,
             optimizer=optimizer,
             device=device,
-            lambda_reg=lambda_reg * warmup_factor,
+            lambda_reg=lambda_reg,
             lambda_energy=config.loss.lambda_energy,
             lambda_sparse=config.loss.lambda_sparse,
             lambda_jerk=config.loss.lambda_jerk,

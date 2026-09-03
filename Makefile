@@ -8,7 +8,8 @@
 #   make test       — run full test suite
 #   make data       — run ETL pipeline
 #   make train      — run training engine
-#   make analyze    — run all 5 analysis scripts
+#   make analyze    — hybrid analysis (JAX Jacobian; rest PyTorch)
+#   make analyze-torch — previous all-PyTorch analysis aggregate
 #   make pipeline   — execute full end-to-end pipeline
 #   make clean      — remove caches and build artefacts
 # ═══════════════════════════════════════════════════════════════
@@ -38,7 +39,7 @@ DT_MS ?= $(shell $(PYTHON) -c 'import yaml; cfg = yaml.safe_load(open("$(CONFIG)
 # every target below works from a bare clone, installed or not.
 export PYTHONPATH := $(CURDIR)$(if $(PYTHONPATH),:$(PYTHONPATH),)
 
-.PHONY: install test data train analyze pipeline clean help
+.PHONY: install test data train analyze analyze-torch jacobian-torch pipeline clean help
 
 # ── Default target ───────────────────────────────────────────
 help: ## Show available targets
@@ -78,8 +79,16 @@ posttrain:
 train: ## Run training engine (train.py)
 	$(PYTHON) scripts/train.py --config $(CONFIG) --dataset $(DATA) --epochs $(EPOCHS) --phase1_epochs $(PRE_EPOCHS) --output_dir $(RUN_DIR)
 
-# ── Analysis (all 6 analysis scripts) ──────────────────────────
-analyze: dynamics lesion jacobian integration psychophysics cluster ## Run all analysis scripts
+# ── Analysis ───────────────────────────────────────────────────
+# Default `analyze` is hybrid: GRU Jacobian uses JAX jacfwd (~20x on this
+# GPU, max |ΔJ| ~1e-4).  Full-seq JAX forward is ~2.5x faster but LIF
+# Heaviside crossings disagree on ~0.5% of spikes and shift latency ~20%
+# on the real checkpoint — so dynamics / lesion / integration /
+# psychophysics / cluster stay PyTorch.  `analyze-torch` is the previous
+# all-torch aggregate (jacobian --backend torch).
+analyze: dynamics lesion jacobian integration psychophysics cluster ## Hybrid analysis (JAX Jacobian; rest PyTorch)
+
+analyze-torch: dynamics lesion jacobian-torch integration psychophysics cluster ## All-PyTorch analysis (pre-JAX default)
 
 dynamics: $(BEST) ## Run dynamics & manifold analysis
 	$(PYTHON) scripts/analyze_dynamics.py --checkpoint $(BEST) --dataset $(DATA) --output $(OUTPUT)/mechanism_analysis.png
@@ -87,8 +96,11 @@ dynamics: $(BEST) ## Run dynamics & manifold analysis
 lesion: $(BEST) ## Run in-silico lesion analysis
 	$(PYTHON) scripts/simulate_lesion.py --checkpoint $(BEST) --dataset $(DATA) --output $(OUTPUT)/ablation_kinematics.png --stats_output $(OUTPUT)/lesion_statistics.csv --dt_ms $(DT_MS)
 
-jacobian: $(BEST) ## Run Jacobian eigenvalue spectrum
-	$(PYTHON) scripts/analyze_jacobian.py --checkpoint $(BEST) --dataset $(DATA) --output $(OUTPUT)/jacobian_spectrum.png --dt_ms $(DT_MS)
+jacobian: $(BEST) ## Run Jacobian eigenvalue spectrum (JAX jacfwd)
+	$(PYTHON) scripts/analyze_jacobian.py --checkpoint $(BEST) --dataset $(DATA) --output $(OUTPUT)/jacobian_spectrum.png --dt_ms $(DT_MS) --backend jax
+
+jacobian-torch: $(BEST) ## Jacobian spectrum with PyTorch autograd
+	$(PYTHON) scripts/analyze_jacobian.py --checkpoint $(BEST) --dataset $(DATA) --output $(OUTPUT)/jacobian_spectrum.png --dt_ms $(DT_MS) --backend torch
 
 integration: $(BEST) ## Run multisensory integration window
 	$(PYTHON) scripts/analyze_integration.py --checkpoint $(BEST) --dataset $(DATA) --output $(OUTPUT)/integration_window.png --summary $(OUTPUT)/integration_summary.json --dt_ms $(DT_MS)

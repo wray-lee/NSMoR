@@ -64,6 +64,7 @@ from nsmor.data_extractor import (
     extract_trial_sequence,
     extract_mcmc_snapshot,
     PURE_WIND_PREPEND_FRAMES,
+    _compute_pure_wind_prepend_frames,
 )
 from nsmor.mcmc_module import MCMCPriorGenerator, train_mcmc, train_mcmc_cross_fitted
 from nsmor.pipeline.io import EVENT_COLUMNS, KINEMATICS_COLUMNS
@@ -289,14 +290,15 @@ def reconstruct_trial_visual_features(
     if is_pure_wind:
         # Pure wind: absolute flat zeros for entire sequence
         n_original = len(time_ms)
-        n_total = n_original + PURE_WIND_PREPEND_FRAMES
+        prepend_frames = _compute_pure_wind_prepend_frames(dt_ms)
+        n_total = n_original + prepend_frames
 
         visual_angle_full = np.zeros(n_total, dtype=np.float64)
         l_v_full = np.zeros(n_total, dtype=np.float64)
 
         logger.debug(
             "Pure-wind trial: %d prepended + %d original = %d total frames.",
-            PURE_WIND_PREPEND_FRAMES, n_original, n_total,
+            prepend_frames, n_original, n_total,
         )
     else:
         # ── Looming trial: reconstruct from physics ──
@@ -1294,6 +1296,7 @@ def prepare_dataset(
             X_seq, Y_seq = extract_trial_sequence(
                 trial_data,
                 feature_config=feature_config,
+                dt_ms=dt_ms,
             )
 
             # 4. 处理视觉特征：优先使用原始数据，否则重构

@@ -61,6 +61,7 @@ import matplotlib.ticker as ticker
 import numpy as np
 import torch
 
+from nsmor.analysis.analyze_jacobian_jax import create_jacobian_adapter
 from nsmor.analysis.dynamics import FixedPointAdapter
 from nsmor.nsmor_dataloader import NSMoRDataset
 from nsmor.dataloader_factory import create_optimized_dataloader
@@ -915,6 +916,10 @@ def compute_eigenvalues_at_epochs(
 
             # Compute Jacobians for this batch
             J_batch = adapter.compute_jacobian_batch(h_batch, x_batch)  # (B, H, H)
+            if not isinstance(J_batch, torch.Tensor):
+                J_batch = torch.from_numpy(np.asarray(J_batch)).to(
+                    device=h_batch.device, dtype=torch.float32,
+                )
 
             # ── Shape assertion ───────────────────────────────
             assert J_batch.shape == (h_batch.shape[0], H, H), (
@@ -923,7 +928,8 @@ def compute_eigenvalues_at_epochs(
             )
 
             # ── Extract eigenvalues ───────────────────────────
-            # torch.linalg.eigvals returns complex eigenvalues
+            # Stay on torch.linalg.eigvals: fused JAX jac+eig is slower
+            # than jacfwd + PyTorch eig on this GPU (measured 2026-09-03).
             eigvals = torch.linalg.eigvals(J_batch)  # (B, H) complex
 
             # Shape assertion
@@ -1043,6 +1049,10 @@ def compute_eigenvalues_at_epochs(
                 np.nonzero(keep_mask)[0]).to(device)]
             x_rep = x_frozen.unsqueeze(0).expand(h_keep.shape[0], -1)
             J_frozen = adapter.compute_jacobian_batch(h_keep, x_rep)
+            if not isinstance(J_frozen, torch.Tensor):
+                J_frozen = torch.from_numpy(np.asarray(J_frozen)).to(
+                    device=h_keep.device, dtype=torch.float32,
+                )
             eig_frozen = torch.linalg.eigvals(J_frozen)
             mags_frozen = eig_frozen.abs().flatten()
             frozen_input_stats[epoch_name] = {
@@ -1449,6 +1459,7 @@ def run_jacobian_analysis(
     dt_ms: float = 10.0,
     max_states_per_epoch: int = 100,
     full_system: bool = False,
+    backend: str = "jax",
 ) -> None:
     """
     Run the full Jacobian eigenvalue spectrum analysis.
@@ -1463,6 +1474,10 @@ def run_jacobian_analysis(
         batch_size: Batch size for data loading.
         dt_ms: Frame interval in milliseconds.
         max_states_per_epoch: Maximum states to process per epoch.
+        backend: ``"jax"`` uses the measured-faster GRU Jacobian kernel
+            (falls back to PyTorch if JAX is missing). ``"torch"``
+            forces autograd. Eigenvalues stay on PyTorch either way —
+            the fused JAX eig path is slower on this hardware.
     """
     logger.info("=" * 60)
     logger.info("NSMoR Jacobian Eigenvalue Spectrum Analysis (Phase 8)")
@@ -1483,8 +1498,13 @@ def run_jacobian_analysis(
     # ── Task 1: Dynamic stimulus onset detection ──────────────
     onset_frames = detect_stimulus_onset_frames(X_seqs, dt_ms=dt_ms)
 
-    # ── Initialize FixedPointAdapter ──────────────────────────
-    adapter = FixedPointAdapter(model, device=device)
+    # ── Initialize adapter (JAX Jacobian only if requested) ──
+    adapter = create_jacobian_adapter(model, device=device, backend=backend)
+    logger.info(
+        "Jacobian backend: requested=%s resolved=%s",
+        backend,
+        type(adapter).__name__,
+    )
 
     # ── Extract GRU states at epochs (slow-point search) ──────
     epoch_data_full = extract_gru_states_at_epochs(
@@ -1691,6 +1711,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Compute full system Jacobian (LIF + GRU + Router) instead "
              "of GRU-only.  CF5 fix: captures the complete MoR dynamics.",
     )
+    parser.add_argument(
+        "--backend",
+        type=str,
+        choices=("jax", "torch"),
+        default="jax",
+        help="GRU Jacobian kernel. jax is ~20x faster on this GPU for "
+             "N=32–100, H=64 (falls back to torch if JAX is missing). "
+             "Eigenvalues always use torch.linalg.eigvals.",
+    )
     return parser
 
 
@@ -1716,6 +1745,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         dt_ms=args.dt_ms,
         max_states_per_epoch=args.max_states,
         full_system=args.full_system,
+        backend=args.backend,
     )
 
 

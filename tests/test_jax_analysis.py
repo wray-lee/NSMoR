@@ -358,3 +358,64 @@ class TestUQJAX:
         for name, (adj_p, sig) in result.items():
             assert 0.0 <= adj_p <= 1.0
             assert isinstance(sig, bool)
+
+
+@pytest.mark.skipif(not JAX_AVAILABLE, reason="JAX is not installed")
+class TestJAXEvalWrapper:
+    """Duck-typed Flax apply behind the PyTorch analysis call signature."""
+
+    def test_y_and_gates_match_torch_on_short_sequences(self) -> None:
+        import os
+
+        os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+        os.environ.setdefault("JAX_PLATFORMS", "cpu")
+
+        import torch
+        from nsmor.analysis.jax_eval import wrap_eval_model
+        from nsmor.model_nsmor_core import NSMoRCore
+
+        torch.manual_seed(0)
+        device = torch.device("cpu")
+        pt = NSMoRCore(hidden_dim=16, dt_ms=4.0).to(device).eval()
+        jx = wrap_eval_model(pt, backend="jax", device=device)
+        x = torch.randn(2, 20, 8)
+        lengths = torch.tensor([20, 12], dtype=torch.int64)
+        with torch.no_grad():
+            y_pt, i_pt = pt(x, lengths, return_internals=True)
+        y_jx, i_jx = jx(x, lengths, return_internals=True)
+        mask = torch.arange(20).unsqueeze(0) < lengths.unsqueeze(1)
+        assert y_jx.shape == y_pt.shape
+        np.testing.assert_allclose(
+            y_pt[mask].numpy(), y_jx[mask].numpy(), atol=5e-4, rtol=1e-3,
+        )
+        np.testing.assert_allclose(
+            i_pt["routing_gates"][mask].numpy(),
+            i_jx["routing_gates"][mask].numpy(),
+            atol=5e-4,
+            rtol=1e-3,
+        )
+
+    def test_states_carry_is_refused(self) -> None:
+        import os
+
+        os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+        os.environ.setdefault("JAX_PLATFORMS", "cpu")
+
+        import torch
+        from nsmor.analysis.jax_eval import wrap_eval_model
+        from nsmor.model_nsmor_core import NSMoRCore
+
+        pt = NSMoRCore(hidden_dim=8, dt_ms=4.0).eval()
+        jx = wrap_eval_model(pt, backend="jax", device=torch.device("cpu"))
+        x = torch.randn(1, 1, 8)
+        lengths = torch.ones(1, dtype=torch.int64)
+        with pytest.raises(TypeError, match="states="):
+            jx(x, lengths, states={})
+
+    def test_torch_backend_returns_the_pytorch_model(self) -> None:
+        import torch
+        from nsmor.analysis.jax_eval import wrap_eval_model
+        from nsmor.model_nsmor_core import NSMoRCore
+
+        pt = NSMoRCore(hidden_dim=8, dt_ms=4.0)
+        assert wrap_eval_model(pt, backend="torch") is pt

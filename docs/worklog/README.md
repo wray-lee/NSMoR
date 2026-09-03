@@ -22,6 +22,7 @@
 ## 索引
 
 - [2026-09-03 — vmap 零填充静默污染变长序列归约](2026-09-03-jax-vmap-padding-trap.md) — 14/16 特征算错，等长测试假通过
+- [2026-09-03 — 分析路径哪些能默认 JAX](2026-09-03-jax-analyze-hotspots.md) — Jacobian 20x 可切；forward 2.5x 但 latency 偏 20%
 - [2026-09-03 — JAX 加速的真实边界](2026-09-03-jax-perf-boundary.md) — 小规模归约比 NumPy 慢 8x
 - [2026-09-03 — JAX/PyTorch 数值对齐清单](2026-09-03-jax-torch-parity-checklist.md) — clamp 阈值、mask 门控、状态导出语义
 - [2026-09-03 — 训练流水线：ETL 切换与 FP16 NaN](2026-09-03-training-etl-fp32.md) — 5x 加速 + 混合精度不可用

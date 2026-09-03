@@ -173,6 +173,24 @@ def test_runner_covers_every_pipeline_stage(planned_stages) -> None:
     assert not missing, f"run_pipeline.sh never runs: {sorted(missing)}"
 
 
+def test_runner_pins_jacobian_backend_jax(planned_stages) -> None:
+    """Default hybrid analyze: GRU Jacobian is JAX; other stages stay torch."""
+    jacobian = next(
+        tokens for tokens in planned_stages
+        if tokens[0].replace("\\", "/") == "scripts/analyze_jacobian.py"
+    )
+    assert "--backend" in jacobian
+    assert jacobian[jacobian.index("--backend") + 1] == "jax"
+    for tokens in planned_stages:
+        script = tokens[0].replace("\\", "/")
+        if script == "scripts/analyze_jacobian.py":
+            continue
+        assert "--backend" not in tokens, (
+            f"{script} must stay on the PyTorch default; JAX full-seq "
+            "forward shifts LIF-timed latency"
+        )
+
+
 PINNED_FLAGS = ("--dataset", "--dt_ms", "--config", "--raw_dir")
 
 

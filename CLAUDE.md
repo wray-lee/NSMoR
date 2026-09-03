@@ -4,6 +4,7 @@
 - **Harness Specification**: Read `AGENTS.md` and `HARNESS.md` for full details on multi-agent execution rules, double-blind peer review protocols, and state machine loops.
 - **Git Author / Committer**: MUST be `wray-lee <i@wray7.top>` (verified GitHub primary email).
 - **Git Constraint**: Never commit under unverified emails or secondary aliases. Always verify `git config user.email` returns `i@wray7.top` before creating commits.
+- **⚠️ Email Redaction Hazard**: Claude Code 环境会将邮箱地址脱敏为 `[EMAIL_REDACTED]`。若 `git config user.email` 被环境或 agent 意外写入字面量 `[EMAIL_REDACTED]`，后续所有 commit 将无法关联 GitHub 账户（无头像、不计入 contribution）。**每次 session 开始时必须验证**：`git config user.email` 输出的是真实邮箱 `i@wray7.top` 而非 `[EMAIL_REDACTED]`。如不正确，立即执行 `git config user.email 'i@wray7.top'`。
 - **WSL Execution Environment**: All python/pytest/bash operations run in WSL Zsh with `t` conda activate alias.
 
 ---
@@ -84,6 +85,18 @@ Release Commit <── Pass Gate ── Tester (nsmor_tester) <── Fix Propos
     ```
 3. Respect the I/O contracts defined in `BOUNDARY.md` files.
 4. Add shape assertions to all new functions.
+
+---
+
+## Agent skills
+
+### Issue tracker
+
+Issues live as GitHub issues on wray-lee/BioMoR. See `docs/agents/issue-tracker.md`.
+
+### Domain docs
+
+Single-context repo: one `CONTEXT.md` + `docs/adr/` at root. See `docs/agents/domain.md`.
 
 ---
 

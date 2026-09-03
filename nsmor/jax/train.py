@@ -349,7 +349,9 @@ def train_jax(
     # MAJOR-2 fix: Read lambda_reg from config instead of hardcoding.
     # Previously lambda_reg was set to config.loss.lambda_energy (wrong field)
     # and then overridden by a hardcoded 0.01.
-    lambda_reg_val = getattr(config.loss, "lambda_reg", 0.01)
+    # lambda_reg is NOT warmup-scaled in either the JAX or PyTorch trainers;
+    # only energy/sparse/jerk are ramped.
+    lambda_reg_val = getattr(config.loss, "lambda_reg", 0.2)
     lambda_energy_val = getattr(config.loss, "lambda_energy", 0.001)
     lambda_sparse_val = getattr(config.loss, "lambda_sparse", 0.005)
     lambda_jerk_val = getattr(config.loss, "lambda_jerk", 0.005)

@@ -65,7 +65,9 @@ class NSMoRDataset(Dataset):
         sequences: List[Tuple[np.ndarray, np.ndarray, int]],
         mcmc_priors: np.ndarray,
         feature_config: FeatureConfig = DEFAULT_FEATURE,
-        max_seq_len: Optional[int] = None,
+        max_seq_len: Optional[int] = 2400,
+        pre_anchor_frames: int = 1200,
+        anchor_frames: Optional[Sequence[int]] = None,
         source_indices: Optional[Sequence[int]] = None,
     ) -> None:
         """
@@ -75,6 +77,15 @@ class NSMoRDataset(Dataset):
             mcmc_priors: **Required** pre-computed probability vectors,
                 shape ``(n_trials, 4)``.  Each row must sum to 1.
             feature_config: Feature dimension constants.
+            max_seq_len: Maximum sequence length for cropping. If ``None``,
+                no cropping is applied (full sequences). Default 2400 covers
+                anchor + 2s response at 250 Hz.
+            pre_anchor_frames: Number of frames before anchor to include
+                in anchor-aligned crop (baseline window). Default 1200
+                provides ~5s baseline at 250 Hz.
+            anchor_frames: Optional frame index of stimulus anchor per trial.
+                If provided, enables anchor-aligned cropping. If ``None``,
+                falls back to legacy random crop (deprecated).
             source_indices: Optional provenance — the row index each
                 sequence occupied in the *unsplit* dataset artifact.
                 Callers that hand this dataset a train/val subset should
@@ -99,6 +110,8 @@ class NSMoRDataset(Dataset):
 
         self.feature_config = feature_config
         self.max_seq_len = max_seq_len
+        self.pre_anchor_frames = pre_anchor_frames
+        self.anchor_frames = anchor_frames
         # Deep-copy each (X_seq, Y_seq, label) tuple so that _fill_priors
         # writes into private arrays and never corrupts the caller's data.
         self.sequences = [
@@ -174,8 +187,8 @@ class NSMoRDataset(Dataset):
         """
         Return ``(X_seq, Y_seq)`` for trial *idx*.
 
-        If the sequence exceeds ``max_seq_len``, a random contiguous
-        crop of length ``max_seq_len`` is extracted (data augmentation).
+        Applies anchor-aligned cropping if ``anchor_frames`` was provided;
+        otherwise falls back to legacy random crop (deprecated).
 
         Shape assertions are enforced on every access.
 
@@ -185,11 +198,25 @@ class NSMoRDataset(Dataset):
         """
         X_seq, Y_seq, _label = self.sequences[idx]
 
-        # ── Crop long sequences (random window for augmentation) ──
+        # ── Crop long sequences ──
         if self.max_seq_len is not None and X_seq.shape[0] > self.max_seq_len:
-            start = np.random.randint(0, X_seq.shape[0] - self.max_seq_len + 1)
-            X_seq = X_seq[start : start + self.max_seq_len]
-            Y_seq = Y_seq[start : start + self.max_seq_len]
+            if self.anchor_frames is not None:
+                # Anchor-aligned crop (preserves stimulus + response)
+                anchor_frame = self.anchor_frames[idx]
+                start = max(0, anchor_frame - self.pre_anchor_frames)
+                end = min(X_seq.shape[0], start + self.max_seq_len)
+
+                # Adjust start if end clamped (keeps window size consistent)
+                if end - start < self.max_seq_len:
+                    start = max(0, end - self.max_seq_len)
+
+                X_seq = X_seq[start:end]
+                Y_seq = Y_seq[start:end]
+            else:
+                # Legacy random crop (deprecated — low stimulus capture rate)
+                start = np.random.randint(0, X_seq.shape[0] - self.max_seq_len + 1)
+                X_seq = X_seq[start : start + self.max_seq_len]
+                Y_seq = Y_seq[start : start + self.max_seq_len]
 
         X_tensor = torch.as_tensor(X_seq, dtype=torch.float32)
         Y_tensor = torch.as_tensor(Y_seq, dtype=torch.float32)
