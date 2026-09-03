@@ -419,7 +419,7 @@ def test_makefile_pipeline_dry_run_forwards_all_required_variables() -> None:
         "scripts/analyze_integration.py",
         "scripts/simulate_autoregressive.py",
     ):
-        assert _arg_value(stages[script], "--dt_ms") == "10.00"
+        assert _arg_value(stages[script], "--dt_ms") == "4.0"
 
 
 # ── Loader entry points must honour the raw_dir they are given ───────
