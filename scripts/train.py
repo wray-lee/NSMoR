@@ -645,6 +645,15 @@ def build_dataloaders(
     labels = dataset["labels"]
     lengths = dataset["lengths"]
 
+    # Ticket #16: Extract stimulus condition metadata for routing aux loss
+    is_pure_wind = dataset.get("is_pure_wind")
+    stimulus_conditions = dataset.get("stimulus_conditions")
+    if is_pure_wind is not None:
+        logger.info(
+            "Loaded stimulus condition metadata: %d wind_only, %d other",
+            int(np.sum(is_pure_wind)), int(np.sum(~is_pure_wind)),
+        )
+
     n_total = len(X_seqs)
     logger.info(
         "Loaded %d sequences, total_frames=%d",
@@ -723,6 +732,13 @@ def build_dataloaders(
     train_priors = mcmc_priors[train_indices]
     val_priors = mcmc_priors[val_indices]
 
+    # Ticket #16: Split stimulus condition metadata
+    train_is_pure_wind = None
+    val_is_pure_wind = None
+    if is_pure_wind is not None:
+        train_is_pure_wind = is_pure_wind[train_indices]
+        val_is_pure_wind = is_pure_wind[val_indices]
+
     # ── Shape assertions ──
     assert len(train_sequences) == n_train, (
         f"Train sequences: {len(train_sequences)} != {n_train}"
@@ -748,6 +764,7 @@ def build_dataloaders(
         feature_config=feature_config,
         max_seq_len=max_seq_len,
         source_indices=train_indices,
+        is_pure_wind=train_is_pure_wind,
     )
     val_dataset = NSMoRDataset(
         sequences=val_sequences,
@@ -755,6 +772,7 @@ def build_dataloaders(
         feature_config=feature_config,
         max_seq_len=max_seq_len,
         source_indices=val_indices,
+        is_pure_wind=val_is_pure_wind,
     )
 
     # ── Create dataloaders (via factory) ──────────────────────
@@ -1086,8 +1104,15 @@ def train_one_epoch(
 
     pbar = tqdm(loader, desc=f"Epoch {epoch + 1}", leave=False, dynamic_ncols=True)
     for batch_idx, batch in enumerate(pbar):
-        # Unpack batch — expect (X, Y, lengths) from collate_variable_length
-        x_batch, y_batch, lengths = batch
+        # Ticket #16: Unpack batch — (X, Y, lengths) legacy 3-tuple, or
+        # (X, Y, lengths, wind_only_mask) 4-tuple when metadata present.
+        if len(batch) == 4:
+            x_batch, y_batch, lengths, wind_only_mask = batch
+            wind_only_mask = wind_only_mask.to(device).contiguous()
+        else:
+            x_batch, y_batch, lengths = batch
+            wind_only_mask = None
+
         x_batch = x_batch.to(device).contiguous()
         y_batch = y_batch.to(device).contiguous()
         lengths = lengths.to(device).contiguous()
@@ -1109,9 +1134,10 @@ def train_one_epoch(
         with _ctx:
             y_pred, internals = model(x_batch, lengths, return_internals=True)
 
-            # ── Extract g_gru from routing gates ──
-            # routing_gates: (B, T, 2) — index 1 is g_gru
+            # ── Extract routing gates for bio-loss ──
+            # routing_gates: (B, T, 2) — index 0 is g_lif, index 1 is g_gru
             g_gru = internals["routing_gates"][:, :, 1:2]           # (B, T, 1)
+            g_lif = internals["routing_gates"][:, :, 0:1]           # (B, T, 1), Ticket #16
             lif_spikes = internals["lif_spikes"]                    # (B, T, H)
 
             # ── Compute loss ──
@@ -1135,6 +1161,10 @@ def train_one_epoch(
                     lambda_sparse=lambda_sparse,
                     lambda_jerk=lambda_jerk,
                     annealing_factor=annealing_factor,
+                    # Ticket #16: Auxiliary routing loss
+                    g_lif=g_lif,
+                    lambda_routing_aux=config.loss.lambda_routing_aux,
+                    wind_only_mask=wind_only_mask,
                 )
 
         # ── Membrane health monitoring (CF9: per-epoch averages) ──
@@ -1352,7 +1382,14 @@ def validate(
 
     pbar = tqdm(loader, desc="Validation", leave=False, dynamic_ncols=True)
     for batch in pbar:
-        x_batch, y_batch, lengths = batch
+        # Ticket #16: Unpack batch with optional metadata
+        if len(batch) == 4:
+            x_batch, y_batch, lengths, wind_only_mask = batch
+            wind_only_mask = wind_only_mask.to(device).contiguous()
+        else:
+            x_batch, y_batch, lengths = batch
+            wind_only_mask = None
+
         x_batch = x_batch.to(device).contiguous()
         y_batch = y_batch.to(device).contiguous()
         lengths = lengths.to(device).contiguous()
@@ -1375,6 +1412,7 @@ def validate(
         else:
             # Phase 2 / single-phase: full bio loss
             g_gru = internals["routing_gates"][:, :, 1:2]
+            g_lif = internals["routing_gates"][:, :, 0:1]  # Ticket #16
             lif_spikes = internals["lif_spikes"]
             loss = criterion(
                 y_pred=y_pred,
@@ -1386,6 +1424,10 @@ def validate(
                 lambda_energy=lambda_energy,
                 lambda_sparse=lambda_sparse,
                 lambda_jerk=lambda_jerk,
+                # Ticket #16: Auxiliary routing loss
+                g_lif=g_lif,
+                lambda_routing_aux=config.loss.lambda_routing_aux,
+                wind_only_mask=wind_only_mask,
             )
 
         total_loss += loss.item()
@@ -2122,6 +2164,7 @@ def train(
             lambda_energy=config.loss.lambda_energy,
             lambda_sparse=config.loss.lambda_sparse,
             lambda_jerk=config.loss.lambda_jerk,
+            lambda_routing_aux=config.loss.lambda_routing_aux,  # Ticket #16
             annealing_factor=warmup_factor,
             grad_clip_norm=config.training.grad_clip_norm,
             log_interval=config.training.log_interval,
@@ -2133,6 +2176,7 @@ def train(
             target_mean=target_mean,
             target_std=target_std,
             target_clip_cm_s=config.training.target_clip_cm_s,
+            wind_only_mask_full=train_is_pure_wind,  # Ticket #16
         )
         # Advance the cosine.  When lr_warmup_epochs==0 (default), the step is
         # unconditional exactly as in the original pipeline, preserving the

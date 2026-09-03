@@ -157,6 +157,10 @@ def create_optimized_dataloader(
     reject is normalized away before construction.  Keyword-only
     arguments prevent positional-argument drift at call sites.
 
+    Ticket #16: Automatically selects ``collate_with_metadata`` when
+    the dataset has ``is_pure_wind`` metadata, enabling the auxiliary
+    routing loss.
+
     Args:
         dataset: A sized dataset yielding ``(X_seq, Y_seq)`` tuples —
             typically an
@@ -177,7 +181,9 @@ def create_optimized_dataloader(
 
     Returns:
         A ``DataLoader`` yielding ``(X_batch, Y_batch, lengths)``
-        tuples via :func:`~nsmor.nsmor_dataloader.collate_variable_length`.
+        tuples via :func:`~nsmor.nsmor_dataloader.collate_variable_length`,
+        or ``(X_batch, Y_batch, lengths, wind_only_mask)`` when metadata
+        is present.
 
     Raises:
         ValueError: If *batch_size* is below 1.
@@ -192,12 +198,23 @@ def create_optimized_dataloader(
 
     nw: int = compute_num_workers(dataset, num_workers)
 
+    # Ticket #16: Select collate function based on metadata availability.
+    # If dataset.is_pure_wind exists, use collate_with_metadata; otherwise
+    # fall back to legacy collate_variable_length.
+    from functools import partial
+    from nsmor.nsmor_dataloader import collate_with_metadata
+
+    if hasattr(dataset, "is_pure_wind") and dataset.is_pure_wind is not None:
+        collate_fn = partial(collate_with_metadata, is_pure_wind=dataset.is_pure_wind)
+    else:
+        collate_fn = collate_variable_length
+
     loader_kwargs: Dict[str, Any] = {
         "dataset": dataset,
         "batch_size": batch_size,
         "shuffle": shuffle,
         # Module-level collate — spawn-safe (see module docstring).
-        "collate_fn": collate_variable_length,
+        "collate_fn": collate_fn,
         # Page-locked memory is meaningless without CUDA H2D transfer.
         "pin_memory": pin_memory and torch.cuda.is_available(),
         "num_workers": nw,

@@ -31,8 +31,9 @@ lengths for each sample in the batch.
 
 from __future__ import annotations
 
+from functools import partial
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -69,6 +70,7 @@ class NSMoRDataset(Dataset):
         pre_anchor_frames: int = 1200,
         anchor_frames: Optional[Sequence[int]] = None,
         source_indices: Optional[Sequence[int]] = None,
+        is_pure_wind: Optional[np.ndarray] = None,
     ) -> None:
         """
         Args:
@@ -95,6 +97,11 @@ class NSMoRDataset(Dataset):
                 identity, which is correct when no subsetting occurred.
                 Exposed as :attr:`source_indices`; it does not affect
                 ``__getitem__`` or any training behaviour.
+            is_pure_wind: Optional per-trial boolean array indicating
+                pure-wind trials (``True``) vs visual-present trials
+                (``False``). Shape ``(n_trials,)``. If provided, enables
+                the auxiliary routing loss (Ticket #16). Defaults to
+                ``None`` (no condition metadata).
 
         Raises:
             ValueError: If *mcmc_priors* is ``None`` or its shape does
@@ -130,6 +137,17 @@ class NSMoRDataset(Dataset):
                     f"source_indices length {len(self.source_indices)} does "
                     f"not match sequence count {len(self.sequences)}."
                 )
+
+        # Ticket #16: Stimulus condition metadata for routing aux loss.
+        # Store as instance variable; accessed by custom collate function.
+        self.is_pure_wind: Optional[np.ndarray] = None
+        if is_pure_wind is not None:
+            if len(is_pure_wind) != len(self.sequences):
+                raise ValueError(
+                    f"is_pure_wind length {len(is_pure_wind)} does not match "
+                    f"sequence count {len(self.sequences)}."
+                )
+            self.is_pure_wind = np.asarray(is_pure_wind, dtype=bool)
 
         n = len(sequences)
         expected_shape = (n, feature_config.mcmc_dim)
@@ -183,9 +201,11 @@ class NSMoRDataset(Dataset):
     def __len__(self) -> int:
         return len(self.sequences)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def __getitem__(
+        self, idx: int
+    ) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[int, torch.Tensor, torch.Tensor]]:
         """
-        Return ``(X_seq, Y_seq)`` for trial *idx*.
+        Return ``(X_seq, Y_seq)`` or ``(idx, X_seq, Y_seq)`` for trial *idx*.
 
         Applies anchor-aligned cropping if ``anchor_frames`` was provided;
         otherwise falls back to legacy random crop (deprecated).
@@ -193,6 +213,13 @@ class NSMoRDataset(Dataset):
         Shape assertions are enforced on every access.
 
         Returns:
+            If ``is_pure_wind`` is ``None`` (legacy mode):
+                ``(X_seq, Y_seq)`` — 2-tuple.
+
+            If ``is_pure_wind`` is present (Ticket #16):
+                ``(idx, X_seq, Y_seq)`` — 3-tuple, where ``idx`` is used
+                by ``collate_with_metadata`` to attach condition metadata.
+
             X_seq: ``(seq_len, 8)``
             Y_seq: ``(seq_len,)``
         """
@@ -242,6 +269,12 @@ class NSMoRDataset(Dataset):
             f"min={prob_sums.min():.6f}  max={prob_sums.max():.6f}"
         )
 
+        # ── Return format based on metadata availability ──
+        # Ticket #16: If is_pure_wind is present, return (idx, X, Y) for
+        # collate_with_metadata to attach condition mask. Otherwise return
+        # (X, Y) for backward compatibility.
+        if self.is_pure_wind is not None:
+            return idx, X_tensor, Y_tensor
         return X_tensor, Y_tensor
 
 
@@ -277,6 +310,62 @@ def collate_variable_length(
         X_batch[i, :sl, :] = X_seq
         Y_batch[i, :sl] = Y_seq
         lengths[i] = sl
+
+    return X_batch, Y_batch, lengths
+
+
+def collate_with_metadata(
+    batch: List[Tuple[int, torch.Tensor, torch.Tensor]],
+    is_pure_wind: Optional[np.ndarray] = None,
+) -> Union[
+    Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+]:
+    """
+    Pad variable-length sequences and attach stimulus condition metadata.
+
+    Ticket #16: Extended collate function that returns ``wind_only_mask``
+    when ``is_pure_wind`` metadata is available.
+
+    Args:
+        batch: List of ``(idx, X_seq, Y_seq)`` tuples from dataset.
+        is_pure_wind: Optional boolean array indicating pure-wind trials.
+            If ``None``, falls back to legacy 3-tuple return.
+
+    Returns:
+        If ``is_pure_wind`` is ``None``:
+            ``(X_batch, Y_batch, lengths)`` — legacy 3-tuple.
+
+        Otherwise:
+            ``(X_batch, Y_batch, lengths, wind_only_mask)`` where
+            ``wind_only_mask`` is a boolean tensor of shape ``(batch_size,)``.
+    """
+    # Unpack (idx, X_seq, Y_seq) and build index list
+    indices = [item[0] for item in batch]
+    X_Y_batch = [(item[1], item[2]) for item in batch]
+
+    # Standard padding
+    max_len = max(x.shape[0] for x, _y in X_Y_batch)
+    feat_dim = X_Y_batch[0][0].shape[1]
+    bs = len(X_Y_batch)
+
+    X_batch = torch.zeros(bs, max_len, feat_dim)
+    Y_batch = torch.zeros(bs, max_len)
+    lengths = torch.empty(bs, dtype=torch.int64)
+
+    for i, (X_seq, Y_seq) in enumerate(X_Y_batch):
+        sl = X_seq.shape[0]
+        X_batch[i, :sl, :] = X_seq
+        Y_batch[i, :sl] = Y_seq
+        lengths[i] = sl
+
+    # Attach metadata if available
+    if is_pure_wind is not None:
+        wind_only_mask = torch.tensor(
+            [is_pure_wind[idx] for idx in indices],
+            dtype=torch.bool,
+        )
+        return X_batch, Y_batch, lengths, wind_only_mask
 
     return X_batch, Y_batch, lengths
 
