@@ -425,6 +425,7 @@ def train_jax(
 
     epoch_times = []
     history = []
+    epochs_no_improve = 0
 
     for ep in range(1, epochs + 1):
         t0 = time.time()
@@ -480,6 +481,7 @@ def train_jax(
         is_best = val_loss < state.best_val_loss
         if is_best:
             state = state.replace(best_val_loss=val_loss)
+            epochs_no_improve = 0
             # MINOR-3 fix: Atomic write via .tmp + os.replace
             best_pth = out_path / "best_model.pth"
             best_tmp = out_path / "best_model.pth.tmp"
@@ -508,6 +510,18 @@ def train_jax(
                 "target_std": target_std,
             }, ep_tmp)
             os.replace(ep_tmp, ep_pth)
+
+        if not is_best:
+            epochs_no_improve += 1
+
+        # ── Early stopping ───────────────────────────────────
+        es_patience = getattr(config.training, "early_stopping_patience", 0)
+        if es_patience > 0 and epochs_no_improve >= es_patience:
+            logger.info(
+                "Early stopping: val_loss did not improve for %d epochs "
+                "(best=%.4f)", es_patience, state.best_val_loss,
+            )
+            break
 
     avg_ep_time = np.mean(epoch_times[1:]) if len(epoch_times) > 1 else epoch_times[0]
     logger.info("=" * 60)

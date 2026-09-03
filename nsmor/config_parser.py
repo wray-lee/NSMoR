@@ -111,6 +111,7 @@ class TrainingConfig:
     grad_clip_norm: float = 1.0
     log_interval: int = 10
     checkpoint_interval: int = 10
+    early_stopping_patience: int = 0  # 0 = disabled
     random_seed: int = 42
     max_seq_len: Optional[int] = 1000  # crop sequences longer than this (cuDNN compat)
 

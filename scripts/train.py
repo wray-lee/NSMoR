@@ -111,8 +111,16 @@ def _atomic_save_checkpoint(**kwargs) -> Path:
 
     # fsync the written bytes so the OS page-cache is flushed before the
     # atomic rename — protects against power-loss on non-journaled FS.
-    with open(tmp, "rb") as fh:
-        os.fsync(fh.fileno())
+    # Must sync the directory entry after the file is closed.
+    try:
+        fd = os.open(tmp, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        # Windows may not support fsync on all filesystem types — skip it
+        pass
     os.replace(tmp, target)
     return target
 
@@ -170,6 +178,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Processed dataset to train on (default: "
              "data/processed/nsmor_dataset.pt).  The pipeline passes the "
              "dataset produced by the ETL stage of the same run.",
+    )
+    parser.add_argument(
+        "--lazy_loading",
+        action="store_true",
+        help="Use ELT mode with lazy loading (requires metadata file from prepare_metadata.py). "
+             "Dramatically reduces memory usage for large datasets.",
     )
 
     # ── Training overrides ────────────────────────────────────
@@ -493,18 +507,20 @@ def build_dataloaders(
     config: ExperimentConfig,
     dataset_path: str = "data/processed/nsmor_dataset.pt",
     val_split: float = 0.2,
+    use_lazy_loading: bool = False,
 ) -> Tuple[Optional[torch.utils.data.DataLoader], Optional[torch.utils.data.DataLoader]]:
     """
     Build train and validation dataloaders from the prepared dataset.
 
-    Loads the preprocessed dataset from ``nsmor_dataset.pt`` (produced
-    by ``scripts/prepare_data.py``), performs a deterministic train/val
-    split, and returns two DataLoader instances.
+    Supports two modes:
+    - ETL mode (default): Load pre-processed dataset from ``nsmor_dataset.pt``
+    - ELT mode (lazy): Load metadata and read trials on-demand from CSVs
 
     Args:
         config: Parsed experiment configuration.
-        dataset_path: Path to the preprocessed dataset file.
+        dataset_path: Path to dataset/metadata file.
         val_split: Fraction of data to use for validation (0-1).
+        use_lazy_loading: If True, use ELT mode with lazy loading.
 
     Returns:
         ``(train_loader, val_loader)`` — either may be ``None`` if
@@ -513,18 +529,94 @@ def build_dataloaders(
     Raises:
         FileNotFoundError: If the dataset file does not exist.
     """
-    from nsmor.nsmor_dataloader import NSMoRDataset
-
     dataset_file = Path(dataset_path)
     if not dataset_file.exists():
         logger.warning(
             "Dataset file not found: %s.  "
-            "Run 'python scripts/prepare_data.py' first.",
+            "Run 'python scripts/prepare_%s.py' first.",
             dataset_file,
+            "metadata" if use_lazy_loading else "data",
         )
         return None, None
 
-    # ── Load preprocessed dataset ─────────────────────────────
+    # ── ELT Mode: Lazy Loading ────────────────────────────────
+    if use_lazy_loading:
+        from nsmor.lazy_dataloader import NSMoRLazyDataset
+
+        logger.info("Loading metadata from %s (lazy mode)", dataset_file)
+
+        # Create full dataset
+        full_dataset = NSMoRLazyDataset(
+            metadata_path=str(dataset_file),
+            max_seq_len=config.training.max_seq_len,
+            dt_ms=config.model.dt_ms,
+        )
+
+        # Session-grouped split
+        session_ids = [full_dataset.get_session_id(i) for i in range(len(full_dataset))]
+        unique_sessions = list(set(session_ids))
+
+        rng = np.random.RandomState(config.training.random_seed)
+        rng.shuffle(unique_sessions)
+
+        n_val_sessions = max(1, int(len(unique_sessions) * val_split))
+        val_sessions = set(unique_sessions[:n_val_sessions])
+
+        train_indices = [i for i in range(len(full_dataset))
+                        if session_ids[i] not in val_sessions]
+        val_indices = [i for i in range(len(full_dataset))
+                      if session_ids[i] in val_sessions]
+
+        logger.info(
+            "Session-grouped split: %d train (%d sessions), %d val (%d sessions)",
+            len(train_indices),
+            len(unique_sessions) - n_val_sessions,
+            len(val_indices),
+            n_val_sessions,
+        )
+
+        # Create subset datasets
+        from torch.utils.data import Subset
+        train_dataset = Subset(full_dataset, train_indices)
+        val_dataset = Subset(full_dataset, val_indices)
+
+        # Create dataloaders with collate function
+        def collate_fn(batch):
+            X_seqs, Y_seqs, lengths = zip(*batch)
+            return (
+                torch.nn.utils.rnn.pad_sequence(X_seqs, batch_first=True),
+                torch.nn.utils.rnn.pad_sequence(Y_seqs, batch_first=True),
+                torch.tensor(lengths),
+            )
+
+        train_loader = torch.utils.data.DataLoader(
+            train_dataset,
+            batch_size=config.training.batch_size,
+            shuffle=True,
+            collate_fn=collate_fn,
+            num_workers=0,  # CSV loading not thread-safe
+        )
+
+        val_loader = torch.utils.data.DataLoader(
+            val_dataset,
+            batch_size=config.training.batch_size,
+            shuffle=False,
+            collate_fn=collate_fn,
+            num_workers=0,
+        )
+
+        logger.info(
+            "DataLoaders created: train=%d batches, val=%d batches (batch_size=%d)",
+            len(train_loader),
+            len(val_loader),
+            config.training.batch_size,
+        )
+
+        return train_loader, val_loader
+
+    # ── ETL Mode: Pre-loaded Dataset ──────────────────────────
+    from nsmor.nsmor_dataloader import NSMoRDataset
+
     logger.info("Loading dataset from %s", dataset_file)
     dataset = torch.load(dataset_file, weights_only=False)
 
@@ -1564,6 +1656,7 @@ def train(
     lambda_reg: float = 0.01,
     phase1_epochs: Optional[int] = None,
     dataset_path: Optional[str] = None,
+    use_lazy_loading: bool = False,
 ) -> Dict[str, float]:
     """
     Full training pipeline.
@@ -1685,7 +1778,7 @@ def train(
         current_phase = 0  # single-phase mode
 
     # ── Mixed Precision (AMP) ─────────────────────────────────
-    use_amp = device.type == "cuda"
+    use_amp = False  # Disabled: FP16 causes frequent NaN with new dataset
     scaler = torch.amp.GradScaler(enabled=use_amp)
     amp_ctx = lambda: torch.amp.autocast(device_type="cuda", enabled=use_amp)
     if use_amp:
@@ -1704,7 +1797,10 @@ def train(
     if not two_phase:
         pass  # criterion already set above
     train_loader, val_loader = build_dataloaders(
-        config, dataset_path=resolved_dataset_path, val_split=_VAL_SPLIT,
+        config,
+        dataset_path=resolved_dataset_path,
+        val_split=_VAL_SPLIT,
+        use_lazy_loading=use_lazy_loading,
     )
 
     if train_loader is None:
@@ -1884,6 +1980,12 @@ def train(
     logger.info("=" * 60)
 
     history = {"train_loss": [], "val_loss": []}
+
+    # ── Early stopping ───────────────────────────────────────
+    early_stopping_patience = getattr(
+        config.training, "early_stopping_patience", 0
+    )
+    epochs_without_improvement = 0
 
     # ── Bio-loss warmup schedule ─────────────────────────────
     warmup_epochs = config.loss.warmup_epochs
@@ -2111,6 +2213,7 @@ def train(
         # which must not silently overwrite a good checkpoint.
         if math.isfinite(val_loss) and val_loss < best_val_loss:
             best_val_loss = val_loss
+            epochs_without_improvement = 0
             best_path = output_dir / "best_model.pth"
             _atomic_save_checkpoint(
                 model=model,
@@ -2129,6 +2232,22 @@ def train(
                 dataset_path=str(resolved_dataset_path),
             )
             logger.info("Saved best model (val_loss=%.6f): %s", val_loss, best_path)
+        elif math.isfinite(val_loss):
+            epochs_without_improvement += 1
+
+        # ── Early stopping check ─────────────────────────────
+        if (
+            early_stopping_patience > 0
+            and epochs_without_improvement >= early_stopping_patience
+        ):
+            logger.info(
+                "Early stopping triggered: val_loss did not improve for %d epochs "
+                "(best=%.6f at epoch %d)",
+                early_stopping_patience,
+                best_val_loss,
+                epoch - epochs_without_improvement,
+            )
+            break
 
     # ── Final checkpoint ──────────────────────────────────────
     final_path = output_dir / "final_model.pth"
@@ -2271,9 +2390,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         argv: Argument list (defaults to ``sys.argv[1:]``).
     """
     config, lambda_reg, phase1_epochs = build_config(argv)
-    # build_config keeps its 3-tuple contract (imported by tests); the
-    # dataset path is read from the same argv without changing it.
-    dataset_path = build_arg_parser().parse_args(argv).dataset
+    args = build_arg_parser().parse_args(argv)
+    dataset_path = args.dataset
+    lazy_loading = args.lazy_loading
     logger.info("Config loaded: %s", config.checkpoint.output_dir)
 
     output_dir = Path(config.checkpoint.output_dir)
@@ -2282,6 +2401,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         lambda_reg=lambda_reg,
         phase1_epochs=phase1_epochs,
         dataset_path=dataset_path,
+        use_lazy_loading=lazy_loading,
     )
     train_log_path = output_dir / "train.log"
     with open(train_log_path, "w") as f:

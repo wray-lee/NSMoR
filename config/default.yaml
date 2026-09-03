@@ -21,9 +21,10 @@ model:
   # in PHYSICAL ms and converted internally via alpha = exp(-dt/tau).
   # Reviewer Round-1 BLOCKER-1: changing the acquisition rate can no
   # longer silently rescale the biophysics.
-  dt_ms: 10.0             # frame interval (100 Hz imaging)
+  # CORRECTED: Real acquisition is 250 Hz (4.006 ms median dt), not 100 Hz.
+  dt_ms: 4.0              # frame interval (250 Hz imaging)
 
-  lif_alpha: 0.9          # LIF leak factor (higher = slower decay)
+  lif_alpha: 0.9587       # LIF leak factor: 0.9587 keeps physical membrane time constant tau_mem ~95ms invariant when dt_ms is 4.0 (converted from alpha=0.9 at dt=10.0ms: exp(-4.0/94.91))
   lif_threshold: 0.5      # LIF spike threshold
   lif_beta: 2.0           # LIF input scaling
 
@@ -78,12 +79,16 @@ training:
   learning_rate: 0.0005
   weight_decay: 0.0001
   num_epochs: 150
-  batch_size: 64
+  batch_size: 128  # GPU优化：从64增加到128
   grad_clip_norm: 1.0
   log_interval: 10
   checkpoint_interval: 10
+  early_stopping_patience: 20  # Stop if val_loss doesn't improve for N epochs (0=disabled)
   random_seed: 42
-  max_seq_len: 1000        # crop sequences longer than this (cuDNN compatibility)
+  # CORRECTED: max_seq_len raised from 1000 to 2400 to cover anchor at
+  # ~1716 frames + 500-frame (2s) response window at 250 Hz. The old
+  # value of 1000 caused 100% stimulus loss (anchor always outside crop).
+  max_seq_len: 2400        # anchor-aligned crop window (covers stimulus + response)
 
   # CF: LR warmup (linear) — prevents cold-start overshoot of the shared
   #     AdamW on the LIF surrogate-gradient + GRU composite loss surface.
