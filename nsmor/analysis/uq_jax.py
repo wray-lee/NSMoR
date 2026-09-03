@@ -164,7 +164,9 @@ class MCDropoutAnalyzerJAX:
         )
 
         y_mean = jnp.mean(y_all, axis=0)  # (B, T)
-        y_std = jnp.std(y_all, axis=0)    # (B, T)
+        # MINOR-3: Use ddof=1 (Bessel correction) for epistemic uncertainty
+        # estimate — more appropriate for small n_samples (4-30).
+        y_std = jnp.std(y_all, axis=0, ddof=1)    # (B, T)
 
         result: Dict[str, np.ndarray] = {
             "y_mean": np.asarray(y_mean),
@@ -174,7 +176,7 @@ class MCDropoutAnalyzerJAX:
 
         if return_internals:
             gates_mean = jnp.mean(gates_all, axis=0)  # (B, T, 2)
-            gates_std = jnp.std(gates_all, axis=0)    # (B, T, 2)
+            gates_std = jnp.std(gates_all, axis=0, ddof=1)    # (B, T, 2)
             result["gates_mean"] = np.asarray(gates_mean)
             result["gates_std"] = np.asarray(gates_std)
 

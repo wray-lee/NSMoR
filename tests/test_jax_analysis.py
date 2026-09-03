@@ -85,6 +85,18 @@ class TestGatingClusterJAX:
         assert fp.shape == (16,)
         assert np.allclose(fp, 0.0)
 
+    def test_fingerprint_t1_no_nan(self):
+        """MAJOR-1: T=1 gate sequence does not produce NaN (ddof=1 guard)."""
+        from nsmor.analysis.gating_cluster_jax import fingerprint_jax
+        from nsmor.analysis.gating_cluster import ClusterGatingConfig
+
+        config = ClusterGatingConfig()
+        gates = np.array([[0.6, 0.4]], dtype=np.float32)  # T=1
+        fp = fingerprint_jax(gates, config)
+        assert fp.shape == (16,)
+        # T=1 < 2 is caught by the guard in fingerprint_jax, returns zeros
+        assert np.allclose(fp, 0.0)
+
     def test_adapter_extract_and_fingerprint(self, jax_model_and_params):
         """GatingClusterAdapterJAX produces correct shapes from model output."""
         from nsmor.analysis.gating_cluster_jax import GatingClusterAdapterJAX
@@ -143,7 +155,12 @@ class TestGatingClusterJAX:
         assert result["labels_k3"].shape == (B,)
 
     def test_fingerprint_parity_with_pytorch(self):
-        """JAX and PyTorch fingerprints are numerically close."""
+        """JAX and PyTorch fingerprints are numerically identical.
+
+        MAJOR-2 fix: tests multiple variable-length trials to cover
+        the padding-removed path.
+        MAJOR-3 fix: tolerance tightened to atol=1e-4, rtol=1e-4.
+        """
         from nsmor.analysis.gating_cluster_jax import fingerprint_jax
         from nsmor.analysis.gating_cluster import (
             ClusterGatingConfig,
@@ -152,25 +169,78 @@ class TestGatingClusterJAX:
         import torch
 
         config = ClusterGatingConfig()
-        np.random.seed(99)
-        T = 80
-        g_lif = np.clip(0.4 + 0.3 * np.sin(np.linspace(0, 4 * np.pi, T)) + 0.05 * np.random.randn(T), 0, 1)
-        g_gru = np.clip(1.0 - g_lif + 0.05 * np.random.randn(T), 0, 1)
-        gates = np.stack([g_lif, g_gru], axis=1).astype(np.float32)
+        rng = np.random.RandomState(99)
 
-        # JAX
-        fp_jax = fingerprint_jax(gates, config)
+        # Test with multiple lengths to cover variable-length path
+        test_lengths = [30, 50, 80, 120]
 
-        # PyTorch adapter
-        pt_adapter = GatingClusterAdapter(torch.nn.Module(), config=config)
-        seq = {"trial_id": 0, "gates": gates, "true_4way": 0, "true_3way_merged": 0}
-        fp_pt = pt_adapter.compute_fingerprints([seq])[0]
+        for T in test_lengths:
+            g_lif = np.clip(
+                0.4 + 0.3 * np.sin(np.linspace(0, 4 * np.pi, T))
+                + 0.05 * rng.randn(T),
+                0, 1,
+            ).astype(np.float32)
+            g_gru = np.clip(
+                1.0 - g_lif + 0.05 * rng.randn(T),
+                0, 1,
+            ).astype(np.float32)
+            gates = np.stack([g_lif, g_gru], axis=1)
 
-        # Tolerances: mean/max/min/dominant_frac should be very close;
-        # std may differ slightly (JAX ddof=1 vs NumPy ddof=1)
-        assert fp_jax.shape == fp_pt.shape == (16,)
-        np.testing.assert_allclose(fp_jax, fp_pt, atol=0.05, rtol=0.05,
-                                    err_msg="JAX vs PyTorch fingerprint mismatch")
+            # JAX
+            fp_jax = fingerprint_jax(gates, config)
+
+            # PyTorch adapter
+            pt_adapter = GatingClusterAdapter(torch.nn.Module(), config=config)
+            seq = {
+                "trial_id": 0, "gates": gates,
+                "true_4way": 0, "true_3way_merged": 0,
+            }
+            fp_pt = pt_adapter.compute_fingerprints([seq])[0]
+
+            assert fp_jax.shape == fp_pt.shape == (16,)
+            np.testing.assert_allclose(
+                fp_jax, fp_pt, atol=1e-4, rtol=1e-4,
+                err_msg=(
+                    f"JAX vs PyTorch fingerprint mismatch at T={T}. "
+                    f"Max diff: {np.max(np.abs(fp_jax - fp_pt)):.6e}"
+                ),
+            )
+
+    def test_adapter_compute_fingerprints_variable_length(self, jax_model_and_params):
+        """BLOCKER-1 regression: adapter fingerprints match per-trial fingerprints.
+
+        Verifies that compute_fingerprints (batch path) produces the same
+        result as calling fingerprint_jax per trial -- confirming no
+        padding contamination.
+        """
+        from nsmor.analysis.gating_cluster_jax import (
+            GatingClusterAdapterJAX,
+            fingerprint_jax,
+        )
+        from nsmor.analysis.gating_cluster import ClusterGatingConfig
+
+        model, params = jax_model_and_params
+        config = ClusterGatingConfig()
+        adapter = GatingClusterAdapterJAX(model, params, config=config)
+
+        B, T = 4, 25
+        rng = jax.random.PRNGKey(77)
+        X = jax.random.normal(rng, (B, T, 8))
+        # Deliberately variable lengths
+        lengths = jnp.array([25, 10, 18, 5], dtype=jnp.int32)
+
+        sequences = adapter.extract_gating_sequences([X], [lengths])
+        batch_fps = adapter.compute_fingerprints(sequences)
+
+        for i, seq in enumerate(sequences):
+            single_fp = fingerprint_jax(seq["gates"], config)
+            np.testing.assert_allclose(
+                batch_fps[i], single_fp, atol=1e-6,
+                err_msg=(
+                    f"Batch vs single fingerprint mismatch at trial {i} "
+                    f"(length={seq['length']})"
+                ),
+            )
 
 
 # ===============================================================
