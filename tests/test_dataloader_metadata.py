@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from nsmor.config import DEFAULT_FEATURE
+from nsmor.dataloader_factory import create_optimized_dataloader
 from nsmor.nsmor_dataloader import NSMoRDataset, collate_with_metadata
 
 
@@ -107,6 +108,67 @@ def test_collate_with_metadata_without_metadata_returns_3tuple():
     assert X_batch.shape == (2, 120, 8)
     assert Y_batch.shape == (2, 120)
     assert lengths.shape == (2,)
+
+
+def test_factory_metadata_batch_has_wind_mask():
+    """Factory emits a 4-tuple when the dataset carries condition metadata."""
+    n_seqs = 4
+    seqs = [
+        (
+            np.random.randn(10 + i, 8).astype(np.float32),
+            np.random.randn(10 + i).astype(np.float32),
+            0,
+        )
+        for i in range(n_seqs)
+    ]
+    priors = np.random.rand(n_seqs, 4).astype(np.float32)
+    priors /= priors.sum(axis=1, keepdims=True)
+    is_pure_wind = np.array([True, False, True, False], dtype=bool)
+    dataset = NSMoRDataset(
+        sequences=seqs,
+        mcmc_priors=priors,
+        feature_config=DEFAULT_FEATURE,
+        is_pure_wind=is_pure_wind,
+    )
+
+    loader = create_optimized_dataloader(
+        dataset,
+        batch_size=n_seqs,
+        shuffle=False,
+        num_workers=0,
+    )
+    batch = next(iter(loader))
+
+    assert len(batch) == 4
+    assert torch.equal(batch[3], torch.tensor(is_pure_wind))
+
+
+def test_factory_legacy_batch_stays_three_tuple():
+    """Factory preserves the legacy three-tuple without condition metadata."""
+    n_seqs = 2
+    seqs = [
+        (
+            np.random.randn(10 + i, 8).astype(np.float32),
+            np.random.randn(10 + i).astype(np.float32),
+            0,
+        )
+        for i in range(n_seqs)
+    ]
+    priors = np.random.rand(n_seqs, 4).astype(np.float32)
+    priors /= priors.sum(axis=1, keepdims=True)
+    dataset = NSMoRDataset(
+        sequences=seqs,
+        mcmc_priors=priors,
+        feature_config=DEFAULT_FEATURE,
+    )
+
+    loader = create_optimized_dataloader(
+        dataset,
+        batch_size=n_seqs,
+        shuffle=False,
+        num_workers=0,
+    )
+    assert len(next(iter(loader))) == 3
 
 
 def test_is_pure_wind_length_mismatch_raises():

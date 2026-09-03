@@ -1060,6 +1060,7 @@ def train_one_epoch(
     target_mean: float = 0.0,
     target_std: float = 1.0,
     target_clip_cm_s: float = 0.0,
+    lambda_routing_aux: float = 0.0,
 ) -> float:
     """
     Run one training epoch.
@@ -1161,9 +1162,9 @@ def train_one_epoch(
                     lambda_sparse=lambda_sparse,
                     lambda_jerk=lambda_jerk,
                     annealing_factor=annealing_factor,
-                    # Ticket #16: Auxiliary routing loss
-                    g_lif=g_lif,
-                    lambda_routing_aux=config.loss.lambda_routing_aux,
+                    # Ticket #16: auxiliary routing loss is enabled only
+                    # when collate_with_metadata supplies the condition mask.
+                    lambda_routing_aux=lambda_routing_aux,
                     wind_only_mask=wind_only_mask,
                 )
 
@@ -1350,6 +1351,7 @@ def validate(
     target_mean: float = 0.0,
     target_std: float = 1.0,
     target_clip_cm_s: float = 0.0,
+    lambda_routing_aux: float = 0.0,
 ) -> float:
     """
     Run validation (no gradient computation).
@@ -1424,9 +1426,9 @@ def validate(
                 lambda_energy=lambda_energy,
                 lambda_sparse=lambda_sparse,
                 lambda_jerk=lambda_jerk,
-                # Ticket #16: Auxiliary routing loss
-                g_lif=g_lif,
-                lambda_routing_aux=config.loss.lambda_routing_aux,
+                # Ticket #16: condition metadata is optional for legacy
+                # datasets; no metadata means the routing auxiliary term is 0.
+                lambda_routing_aux=lambda_routing_aux,
                 wind_only_mask=wind_only_mask,
             )
 
@@ -2164,7 +2166,6 @@ def train(
             lambda_energy=config.loss.lambda_energy,
             lambda_sparse=config.loss.lambda_sparse,
             lambda_jerk=config.loss.lambda_jerk,
-            lambda_routing_aux=config.loss.lambda_routing_aux,  # Ticket #16
             annealing_factor=warmup_factor,
             grad_clip_norm=config.training.grad_clip_norm,
             log_interval=config.training.log_interval,
@@ -2176,7 +2177,7 @@ def train(
             target_mean=target_mean,
             target_std=target_std,
             target_clip_cm_s=config.training.target_clip_cm_s,
-            wind_only_mask_full=train_is_pure_wind,  # Ticket #16
+            lambda_routing_aux=config.loss.lambda_routing_aux,
         )
         # Advance the cosine.  When lr_warmup_epochs==0 (default), the step is
         # unconditional exactly as in the original pipeline, preserving the
@@ -2215,6 +2216,7 @@ def train(
                 target_mean=target_mean,
                 target_std=target_std,
                 target_clip_cm_s=config.training.target_clip_cm_s,
+                lambda_routing_aux=config.loss.lambda_routing_aux,
             )
             history["val_loss"].append(val_loss)
 
