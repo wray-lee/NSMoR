@@ -162,7 +162,7 @@ class GatingClusterAdapter:
         trial_idx = 0
 
         for batch_idx, batch in enumerate(dataloader):
-            X_batch, _Y_batch, lengths = batch
+            X_batch, _Y_batch, lengths = batch[:3]
             X_batch = X_batch.to(self.device)
             lengths = lengths.to(self.device)
 
@@ -197,9 +197,12 @@ class GatingClusterAdapter:
                 # Map 4-way to 3-way (EVAL ONLY mapping)
                 true_3way_merged = self._map_4way_to_3way(true_4way)
 
+                gate_mean = float(np.mean(gates_i[:, 0])) if gates_i.shape[0] > 0 else 0.0
+
                 sequences.append({
                     "trial_id": trial_idx,
                     "gates": gates_i,
+                    "gate_mean": gate_mean,
                     "length": length_i,
                     "true_4way": true_4way,
                     "true_3way_merged": true_3way_merged,

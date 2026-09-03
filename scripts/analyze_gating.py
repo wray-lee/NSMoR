@@ -33,8 +33,14 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+# Prevent thread contention in scikit-learn / OpenMP / MKL on high-core CPUs
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 
 import matplotlib
 import matplotlib.pyplot as plt
@@ -138,6 +144,18 @@ def load_model_and_dataset(
     # Ticket #17: Load stimulus condition metadata if available
     is_pure_wind = dataset.get("is_pure_wind")
     stimulus_conditions = dataset.get("stimulus_conditions")
+    if is_pure_wind is None:
+        lengths = dataset.get("lengths")
+        if lengths is not None:
+            is_pure_wind = np.array(
+                [bool(np.all(np.abs(x[:int(l), 0]) < 1e-6)) for x, l in zip(X_seqs, lengths)],
+                dtype=bool,
+            )
+        else:
+            is_pure_wind = np.array(
+                [bool(np.all(np.abs(x[:, 0]) < 1e-6)) for x in X_seqs],
+                dtype=bool,
+            )
 
     n_total = len(X_seqs)
     logger.info("Loaded %d sequences.", n_total)
@@ -195,7 +213,7 @@ def plot_umap(
         ax.scatter(
             embedding[mask, 0],
             embedding[mask, 1],
-            c=color,
+            color=color,
             label=f"{name} (n={mask.sum()})",
             alpha=0.7,
             s=30,
@@ -392,9 +410,13 @@ def _compute_condition_gate_stats(
     visual_g_lif_trials = []
 
     for seq in sequences:
-        gate_seq = seq["gate_seq"]  # (T, 2)
+        gate_seq = seq.get("gates")
+        if gate_seq is None:
+            gate_seq = seq.get("gate_seq")
+        if gate_seq is None:
+            continue
+
         g_lif_seq = gate_seq[:, 0]  # (T,)
-        g_gru_seq = gate_seq[:, 1]  # (T,)
 
         # Determine condition
         is_wind = False
@@ -419,20 +441,20 @@ def _compute_condition_gate_stats(
     mean_g_lif_visual = float(np.mean(visual_g_lif_trials))
     std_g_lif_wind = float(np.std(wind_g_lif_trials))
     std_g_lif_visual = float(np.std(visual_g_lif_trials))
-    separation = mean_g_lif_wind - mean_g_lif_visual
+    separation = abs(mean_g_lif_wind - mean_g_lif_visual)
 
     # Cohen's d effect size
     pooled_std = np.sqrt(
         (std_g_lif_wind**2 + std_g_lif_visual**2) / 2
     )
-    cohens_d = separation / pooled_std if pooled_std > 0 else 0.0
+    cohens_d = (mean_g_lif_wind - mean_g_lif_visual) / pooled_std if pooled_std > 0 else 0.0
 
     return {
         "mean_g_lif_wind": mean_g_lif_wind,
         "mean_g_lif_visual": mean_g_lif_visual,
         "std_g_lif_wind": std_g_lif_wind,
         "std_g_lif_visual": std_g_lif_visual,
-        "separation": separation,
+        "separation": float(separation),
         "cohens_d": float(cohens_d),
         "n_wind_trials": len(wind_g_lif_trials),
         "n_visual_trials": len(visual_g_lif_trials),
@@ -588,38 +610,22 @@ def run_analysis(
     logger.info("=" * 60)
 
     # -- Per-Condition Gate Statistics (Ticket #17) --
-    sequences = result["sequences"]
-    if sequences and "is_pure_wind" in sequences[0]:
-        is_pure_wind_arr = np.array([s["is_pure_wind"] for s in sequences], dtype=bool)
-        gate_means = np.array([s["gate_mean"] for s in sequences])
-
-        wind_mask = is_pure_wind_arr
-        n_wind = wind_mask.sum()
-        n_visual = (~wind_mask).sum()
-
-        if n_wind > 0 and n_visual > 0:
-            g_wind = gate_means[wind_mask]
-            g_visual = gate_means[~wind_mask]
-
-            mean_wind = g_wind.mean()
-            std_wind = g_wind.std()
-            mean_visual = g_visual.mean()
-            std_visual = g_visual.std()
-            separation = abs(mean_wind - mean_visual)
-
-            logger.info("=" * 60)
-            logger.info("Per-Condition Gate Statistics (Validation Set):")
-            logger.info(f"  Pure-wind trials (N={n_wind}):  mean g_lif = {mean_wind:.3f} ± {std_wind:.3f}")
-            logger.info(f"  Visual-present (N={n_visual}):  mean g_lif = {mean_visual:.3f} ± {std_visual:.3f}")
-            logger.info(f"  Separation: |Δ| = {separation:.3f}")
-            logger.info("=" * 60)
-        elif n_wind == 0:
-            logger.warning("No pure-wind trials in dataset; per-condition stats skipped.")
-        elif n_visual == 0:
-            logger.warning("No visual-present trials in dataset; per-condition stats skipped.")
+    cond_stats = _compute_condition_gate_stats(result["sequences"])
+    if cond_stats is not None:
+        logger.info("=" * 60)
+        logger.info("Per-Condition Gate Statistics (Validation Set):")
+        logger.info(
+            f"  Pure-wind trials (N={cond_stats['n_wind_trials']}):  "
+            f"mean g_lif = {cond_stats['mean_g_lif_wind']:.3f} ± {cond_stats['std_g_lif_wind']:.3f}"
+        )
+        logger.info(
+            f"  Visual-present (N={cond_stats['n_visual_trials']}):    "
+            f"mean g_lif = {cond_stats['mean_g_lif_visual']:.3f} ± {cond_stats['std_g_lif_visual']:.3f}"
+        )
+        logger.info(f"  Separation: |Δ| = {cond_stats['separation']:.3f}")
+        logger.info("=" * 60)
     else:
-        logger.info("Stimulus condition metadata (is_pure_wind) not available; per-condition gate stats skipped.")
-        logger.info("Regenerate dataset with prepare_data.py to enable modality differentiation analysis.")
+        logger.info("Stimulus condition metadata (is_pure_wind) not available or insufficient groups; per-condition gate stats skipped.")
 
 
 # =========================================================================
