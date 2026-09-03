@@ -587,6 +587,40 @@ def run_analysis(
     logger.info("Gating cluster analysis complete!")
     logger.info("=" * 60)
 
+    # -- Per-Condition Gate Statistics (Ticket #17) --
+    sequences = result["sequences"]
+    if sequences and "is_pure_wind" in sequences[0]:
+        is_pure_wind_arr = np.array([s["is_pure_wind"] for s in sequences], dtype=bool)
+        gate_means = np.array([s["gate_mean"] for s in sequences])
+
+        wind_mask = is_pure_wind_arr
+        n_wind = wind_mask.sum()
+        n_visual = (~wind_mask).sum()
+
+        if n_wind > 0 and n_visual > 0:
+            g_wind = gate_means[wind_mask]
+            g_visual = gate_means[~wind_mask]
+
+            mean_wind = g_wind.mean()
+            std_wind = g_wind.std()
+            mean_visual = g_visual.mean()
+            std_visual = g_visual.std()
+            separation = abs(mean_wind - mean_visual)
+
+            logger.info("=" * 60)
+            logger.info("Per-Condition Gate Statistics (Validation Set):")
+            logger.info(f"  Pure-wind trials (N={n_wind}):  mean g_lif = {mean_wind:.3f} ± {std_wind:.3f}")
+            logger.info(f"  Visual-present (N={n_visual}):  mean g_lif = {mean_visual:.3f} ± {std_visual:.3f}")
+            logger.info(f"  Separation: |Δ| = {separation:.3f}")
+            logger.info("=" * 60)
+        elif n_wind == 0:
+            logger.warning("No pure-wind trials in dataset; per-condition stats skipped.")
+        elif n_visual == 0:
+            logger.warning("No visual-present trials in dataset; per-condition stats skipped.")
+    else:
+        logger.info("Stimulus condition metadata (is_pure_wind) not available; per-condition gate stats skipped.")
+        logger.info("Regenerate dataset with prepare_data.py to enable modality differentiation analysis.")
+
 
 # =========================================================================
 # 5. CLI Entry Point

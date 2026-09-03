@@ -241,6 +241,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
              "rate (Olshausen & Field 1996). 0 disables.",
     )
     parser.add_argument(
+        "--lambda_routing_aux",
+        type=float,
+        default=None,
+        help="Auxiliary routing differentiation weight. "
+             "Overrides config.loss.lambda_routing_aux when set.",
+    )
+    parser.add_argument(
         "--target_rate",
         type=float,
         default=0.05,
@@ -394,6 +401,8 @@ def build_config(argv: Optional[Sequence[str]] = None) -> Tuple[ExperimentConfig
         config.checkpoint.output_dir = args.output_dir
     if getattr(args, "checkpoint_interval", None) is not None:
         config.training.checkpoint_interval = args.checkpoint_interval
+    if getattr(args, "lambda_routing_aux", None) is not None:
+        config.loss.lambda_routing_aux = args.lambda_routing_aux
 
     # Sweep bands: parse the comma list into a module-level holder consumed
     # by train() (kept out of ExperimentConfig — it is a reporting option,
@@ -1061,6 +1070,7 @@ def train_one_epoch(
     target_std: float = 1.0,
     target_clip_cm_s: float = 0.0,
     lambda_routing_aux: float = 0.0,
+    wind_only_mask_full: Optional[np.ndarray] = None,
     routing_aux_margin: float = 0.024,
 ) -> float:
     """
@@ -1354,6 +1364,7 @@ def validate(
     target_std: float = 1.0,
     target_clip_cm_s: float = 0.0,
     lambda_routing_aux: float = 0.0,
+    wind_only_mask_full: Optional[np.ndarray] = None,
     routing_aux_margin: float = 0.024,
 ) -> float:
     """
@@ -1377,6 +1388,9 @@ def validate(
             enabled.  Default ``(0.0, 1.0)`` is the identity.
         target_clip_cm_s: Robust clip magnitude (cm/s) applied to the
             validation target to mirror training.  ``0.0`` disables.
+        lambda_routing_aux: Auxiliary routing loss weight for modality differentiation.
+        wind_only_mask_full: Optional full-split boolean array for pure-wind trials.
+        routing_aux_margin: Hinge margin for routing auxiliary loss.
 
     Returns:
         Average validation loss.
@@ -1386,14 +1400,22 @@ def validate(
     n_batches = 0
 
     pbar = tqdm(loader, desc="Validation", leave=False, dynamic_ncols=True)
-    for batch in pbar:
-        # Ticket #16: Unpack batch with optional metadata
+    for batch_idx, batch in enumerate(pbar):
+        # Ticket #16: Unpack batch — (X, Y, lengths) legacy 3-tuple, or
+        # (X, Y, lengths, wind_only_mask) 4-tuple when metadata present.
         if len(batch) == 4:
             x_batch, y_batch, lengths, wind_only_mask = batch
             wind_only_mask = wind_only_mask.to(device).contiguous()
         else:
             x_batch, y_batch, lengths = batch
-            wind_only_mask = None
+            # Extract wind_only_mask from full array by batch offset
+            batch_size = x_batch.shape[0]
+            batch_start = batch_idx * batch_size
+            batch_end = batch_start + batch_size
+            if wind_only_mask_full is not None and batch_end <= len(wind_only_mask_full):
+                wind_only_mask = torch.from_numpy(wind_only_mask_full[batch_start:batch_end]).to(device)
+            else:
+                wind_only_mask = None
 
         x_batch = x_batch.to(device).contiguous()
         y_batch = y_batch.to(device).contiguous()
@@ -1783,6 +1805,7 @@ def train(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info("Device: %s", device)
     logger.info("lambda_reg: %.4f", lambda_reg)
+    logger.info("lambda_routing_aux=%.4f", config.loss.lambda_routing_aux)
     if config.training.max_seq_len is not None:
         logger.info("max_seq_len: %d (sequences will be cropped)", config.training.max_seq_len)
 
@@ -1885,6 +1908,14 @@ def train(
             "Training DataLoader is None.  "
             "Wire build_dataloaders() to the real data pipeline."
         )
+
+    # Ticket #16: stimulus condition metadata for routing auxiliary loss
+    train_is_pure_wind = getattr(getattr(train_loader, "dataset", None), "is_pure_wind", None)
+    val_is_pure_wind = (
+        getattr(getattr(val_loader, "dataset", None), "is_pure_wind", None)
+        if val_loader is not None
+        else None
+    )
 
     # ── Target normalization statistics (train split only) ──
     # When config.training.normalize_targets is enabled, the velocity
@@ -2130,6 +2161,14 @@ def train(
         # and the untrained backend gets hit with full penalties.
         warmup_epoch = (epoch - phase1_epochs) if (two_phase and current_phase == 2) else epoch
         warmup_factor = compute_warmup_factor(warmup_epoch, warmup_epochs)
+        if config.loss.lambda_routing_aux > 0.0:
+            logger.info(
+                "Epoch %d/%d  lambda_routing_aux=%.4f  effective=%.4f",
+                epoch + 1,
+                config.training.num_epochs,
+                config.loss.lambda_routing_aux,
+                config.loss.lambda_routing_aux * warmup_factor,
+            )
 
         # ── LR warmup (linear ramp of the shared AdamW LR) ────
         # Applied *before* the epoch so every optimiser step this epoch
@@ -2185,6 +2224,7 @@ def train(
             target_std=target_std,
             target_clip_cm_s=config.training.target_clip_cm_s,
             lambda_routing_aux=config.loss.lambda_routing_aux,
+            wind_only_mask_full=train_is_pure_wind,
             routing_aux_margin=config.loss.routing_aux_margin,
         )
         # Advance the cosine.  When lr_warmup_epochs==0 (default), the step is
@@ -2225,6 +2265,7 @@ def train(
                 target_std=target_std,
                 target_clip_cm_s=config.training.target_clip_cm_s,
                 lambda_routing_aux=config.loss.lambda_routing_aux,
+                wind_only_mask_full=val_is_pure_wind,
                 routing_aux_margin=config.loss.routing_aux_margin,
             )
             history["val_loss"].append(val_loss)
@@ -2456,6 +2497,7 @@ def train(
         "lambda_reg": lambda_reg,
         "metrics": metrics,
         "eval_provenance": eval_provenance,
+        "history": history,
     }
 
 
