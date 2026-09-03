@@ -641,6 +641,38 @@ def pair_csv_files(
 # 4b.  OOF → serve prior shift audit
 # ═══════════════════════════════════════════════════════════════
 
+def classify_stimulus_condition(trial_data: Dict[str, np.ndarray]) -> str:
+    """Name the stimulus condition from the physical channels.
+
+    Condition is read off ``visual_angle`` / ``wind_state`` rather than
+    any label or metadata field, so it stays correct for corpora that
+    never recorded a condition column.
+
+    The MoR Router's routing hypothesis is stated per *modality*, not per
+    behavioural outcome: wind transients should engage the LIF Pathway
+    while looming expansion should engage the GRU Pathway.  Reading the
+    condition here keeps that split in one place for both the drop audit
+    and the per-trial flags consumed downstream.
+
+    Args:
+        trial_data: Per-trial channel dict with ``visual_angle`` and
+            ``wind_state`` arrays.
+
+    Returns:
+        One of ``"multisensory"``, ``"visual_only"``, ``"wind_only"``,
+        ``"no_stimulus"``.
+    """
+    has_visual = bool(np.any(np.abs(trial_data["visual_angle"]) > 0.0))
+    has_wind = bool(np.any(np.abs(trial_data["wind_state"]) > 0.0))
+    if has_visual and has_wind:
+        return "multisensory"
+    if has_visual:
+        return "visual_only"
+    if has_wind:
+        return "wind_only"
+    return "no_stimulus"
+
+
 def _audit_snapshot_drops(
     labeled_trials: List[Dict[str, Any]],
     kept_indices: Sequence[int],
@@ -675,17 +707,7 @@ def _audit_snapshot_drops(
         name = info["label"].name
         by_class[name] = by_class.get(name, 0) + 1
 
-        trial_data = info["trial_data"]
-        has_visual = bool(np.any(np.abs(trial_data["visual_angle"]) > 0.0))
-        has_wind = bool(np.any(np.abs(trial_data["wind_state"]) > 0.0))
-        if has_visual and has_wind:
-            condition = "multisensory"
-        elif has_visual:
-            condition = "visual_only"
-        elif has_wind:
-            condition = "wind_only"
-        else:
-            condition = "no_stimulus"
+        condition = classify_stimulus_condition(info["trial_data"])
         by_condition[condition] = by_condition.get(condition, 0) + 1
 
     return {
@@ -1256,6 +1278,11 @@ def prepare_dataset(
     valid_snaps = []  # 仅收集快照输入，不在循环内推理
     seq_session_ids: List[str] = []  # Round-3 CRITICAL-3b: session id per kept trial
     kept_seq_indices: List[int] = []  # Track which trials succeed (Flaw 2 fix)
+    # Stimulus modality per kept trial.  The MoR Router's routing
+    # hypothesis is per modality, so the condition has to travel with the
+    # sequence rather than be re-derived from the 8-D features later (the
+    # pure-wind zero-prepend makes that ambiguous downstream).
+    seq_conditions: List[str] = []
 
     # Iterate over labeled_kept ONLY: trials dropped during snapshot
     # extraction have no out-of-fold prior row, so including them here
@@ -1350,6 +1377,7 @@ def prepare_dataset(
             valid_snaps.append(snap)
             seq_session_ids.append(str(info["session_id"]))
             kept_seq_indices.append(trial_idx)  # Track successful trial index
+            seq_conditions.append(classify_stimulus_condition(trial_data))
 
             logger.debug(
                 "Trial %s/%d: θ(t) range [%.2f°, %.2f°], "
@@ -1415,6 +1443,20 @@ def prepare_dataset(
     assert len(snapshot_groups_aligned) == len(X_seqs), (
         f"session_ids count {len(snapshot_groups_aligned)} != "
         f"sequence count {len(X_seqs)}"
+    )
+    stimulus_conditions = np.array(seq_conditions, dtype=object)
+    # ``wind_only`` is the modality with no looming at all; multisensory
+    # trials carry both channels and must NOT count as pure wind, or the
+    # routing signal would be trained against a mixed population.
+    is_pure_wind = np.array(
+        [c == "wind_only" for c in seq_conditions], dtype=bool
+    )
+    assert len(stimulus_conditions) == len(X_seqs), (
+        f"stimulus_conditions count {len(stimulus_conditions)} != "
+        f"sequence count {len(X_seqs)}"
+    )
+    assert is_pure_wind.shape == (len(X_seqs),), (
+        f"is_pure_wind shape {is_pure_wind.shape} != ({len(X_seqs)},)"
     )
 
     # ── Shape assertions ──
@@ -1502,6 +1544,14 @@ def prepare_dataset(
         # tractable mitigation (full nested CV is documented as a
         # limitation in the analysis report).
         "session_ids": snapshot_groups_aligned,
+        # Per-trial stimulus modality, read off the physical channels at
+        # ETL time.  ``is_pure_wind`` is the boolean the routing-aux loss
+        # partitions on; ``stimulus_conditions`` keeps the full 4-way
+        # naming for analysis.  Additive keys — loaders that predate them
+        # ignore them, and consumers must treat a missing key as "unknown"
+        # rather than assume False.
+        "stimulus_conditions": stimulus_conditions,
+        "is_pure_wind": is_pure_wind,
         # Round-3 (Reviewer A MAJ-3B): label-composition sensitivity to
         # a ±25% scaling of the velocity thresholds.
         "labeling_threshold_sensitivity": labeling_threshold_sensitivity,
