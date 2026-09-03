@@ -744,3 +744,4 @@ Every push and pull request to `main` triggers the GitHub Actions pipeline:
 `checkout` → `make install` (Python 3.10) → `make test`.
 The pipeline enforces deterministic verification of all PyTorch shape assertions
 and padding masks before merge.
+
