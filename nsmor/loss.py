@@ -143,6 +143,8 @@ class BioDecisionLoss(nn.Module):
         lambda_sparse: float = 0.0,
         lambda_jerk: float = 0.0,
         annealing_factor: float = 1.0,
+        lambda_routing_aux: float = 0.0,
+        wind_only_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Compute bio-decision loss (MSE + physics penalties).
@@ -159,6 +161,8 @@ class BioDecisionLoss(nn.Module):
             lambda_sparse: Population sparsity L1 weight.
             lambda_jerk: Temporal coherence weight.
             annealing_factor: Scaling factor for bio-loss lambdas.
+            lambda_routing_aux: Auxiliary routing loss weight for modality differentiation.
+            wind_only_mask: ``(B,)`` — boolean, True for pure-wind trials.
 
         Returns:
             Scalar loss tensor.
@@ -231,7 +235,74 @@ class BioDecisionLoss(nn.Module):
             jerk_count = length_mask.sum().clamp(min=1.0)
             total_loss = total_loss + lambda_jerk_eff * (jerk_sq.sum() / jerk_count)
 
+        # ── Auxiliary routing loss (modality differentiation) ──
+        lambda_routing_aux_eff = lambda_routing_aux * annealing_factor
+        if lambda_routing_aux_eff > 0.0 and wind_only_mask is not None:
+            g_lif = 1.0 - g_gru.squeeze(-1)  # (B, T)
+            aux_loss = compute_routing_aux_loss(
+                g_lif, lengths, wind_only_mask, margin=0.2
+            )
+            total_loss = total_loss + lambda_routing_aux_eff * aux_loss
+
         return total_loss
+
+
+def compute_routing_aux_loss(
+    g_lif: torch.Tensor,
+    lengths: torch.Tensor,
+    wind_only_mask: torch.Tensor,
+    margin: float = 0.2,
+) -> torch.Tensor:
+    """
+    Auxiliary routing loss: penalize gate overlap between pure-wind and visual-present trials.
+
+    Encourages trial-level gate differentiation by pushing pure-wind trials
+    toward high `g_lif` (fast LIF pathway) and visual-present trials toward
+    low `g_lif` (smooth GRU pathway).
+
+    Args:
+        g_lif: ``(B, T, 1)`` or ``(B, T)`` — LIF routing gate over time.
+        lengths: ``(B,)`` — valid timesteps per trial.
+        wind_only_mask: ``(B,)`` — boolean mask, True for pure-wind trials.
+        margin: Minimum desired separation between group means. Default 0.2.
+
+    Returns:
+        Scalar loss: ``max(0, margin - (mean(g_wind) - mean(g_visual)))``.
+        Zero when either group is empty, or separation exceeds margin.
+    """
+    if g_lif.dim() == 3:
+        g_lif = g_lif.squeeze(-1)  # (B, T)
+    assert g_lif.dim() == 2, f"g_lif must be (B, T) or (B, T, 1), got {g_lif.shape}"
+    assert lengths.dim() == 1
+    assert wind_only_mask.dim() == 1
+    assert g_lif.shape[0] == lengths.shape[0] == wind_only_mask.shape[0]
+
+    B, T = g_lif.shape
+    device = g_lif.device
+
+    # Per-trial mean gate (masked by valid lengths)
+    arange_t = torch.arange(T, device=device).unsqueeze(0)  # (1, T)
+    mask = (arange_t < lengths.unsqueeze(1)).float()  # (B, T)
+    masked_gates = g_lif * mask  # (B, T)
+    valid_counts = mask.sum(dim=1).clamp(min=1.0)  # (B,)
+    g_lif_per_trial = masked_gates.sum(dim=1) / valid_counts  # (B,)
+
+    # Partition by modality
+    wind_mask_f = wind_only_mask.float()
+    n_wind = wind_mask_f.sum()
+    n_visual = (1.0 - wind_mask_f).sum()
+
+    # If either group is empty, no penalty
+    if n_wind < 1.0 or n_visual < 1.0:
+        return torch.zeros((), device=device)
+
+    g_wind_mean = (g_lif_per_trial * wind_mask_f).sum() / n_wind
+    g_visual_mean = (g_lif_per_trial * (1.0 - wind_mask_f)).sum() / n_visual
+
+    # Hinge loss: penalize if separation < margin
+    separation = g_wind_mean - g_visual_mean
+    loss = torch.clamp(margin - separation, min=0.0)
+    return loss
 
 
 class BioJointLoss(nn.Module):
@@ -277,6 +348,8 @@ class BioJointLoss(nn.Module):
         lambda_sparse: float = 0.0,
         lambda_jerk: float = 0.0,
         annealing_factor: float = 1.0,
+        lambda_routing_aux: float = 0.0,
+        wind_only_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Compute the bio-constrained joint loss.
@@ -296,6 +369,8 @@ class BioJointLoss(nn.Module):
             lambda_sparse: Population sparsity L1 weight.
             lambda_jerk: Temporal coherence weight.
             annealing_factor: Scaling factor for bio-loss lambdas.
+            lambda_routing_aux: Auxiliary routing loss weight for modality differentiation.
+            wind_only_mask: ``(B,)`` — boolean, True for pure-wind trials.
 
         Returns:
             Scalar loss tensor.
@@ -312,6 +387,8 @@ class BioJointLoss(nn.Module):
             lambda_sparse=lambda_sparse,
             lambda_jerk=lambda_jerk,
             annealing_factor=annealing_factor,
+            lambda_routing_aux=lambda_routing_aux,
+            wind_only_mask=wind_only_mask,
         )
 
 

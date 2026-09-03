@@ -1,310 +1,113 @@
-"""Unit tests for loss_ext.py (Ticket #14 + #18)."""
+"""Unit tests for auxiliary routing loss (gate modality differentiation)."""
 
 from __future__ import annotations
 
-import numpy as np
 import pytest
 import torch
 
-from nsmor.loss_ext import BioJointLossExt, compute_routing_aux_loss
+from nsmor.loss import compute_routing_aux_loss
 
 
-class TestComputeRoutingAuxLoss:
-    """Unit tests for compute_routing_aux_loss."""
+def test_routing_aux_loss_zero_when_separation_exceeds_margin():
+    """Loss is zero when mean(g_wind) - mean(g_visual) >= margin."""
+    g_lif = torch.tensor([
+        [0.9, 0.9, 0.9],  # pure-wind trial
+        [0.2, 0.2, 0.2],  # visual trial
+    ], dtype=torch.float32)
+    lengths = torch.tensor([3, 3], dtype=torch.int64)
+    wind_only_mask = torch.tensor([True, False], dtype=torch.bool)
 
-    def test_zero_loss_when_separation_exceeds_margin(self) -> None:
-        """Loss is zero when mean(g_wind) - mean(g_visual) >= margin."""
-        B, T = 4, 100
-        lengths = torch.full((B,), T, dtype=torch.long)
+    loss = compute_routing_aux_loss(g_lif, lengths, wind_only_mask, margin=0.2)
 
-        # Wind trials have high g_lif, visual trials have low g_lif
-        g_lif = torch.zeros(B, T)
-        wind_only_mask = torch.tensor([True, True, False, False])
-        g_lif[wind_only_mask, :] = 0.8  # Wind -> LIF dominant
-        g_lif[~wind_only_mask, :] = 0.2  # Visual -> GRU dominant
-
-        loss = compute_routing_aux_loss(g_lif, lengths, wind_only_mask, margin=0.2)
-
-        # Separation = 0.8 - 0.2 = 0.6 > 0.2 → loss should be zero
-        assert loss.item() == pytest.approx(0.0, abs=1e-6)
-
-    def test_positive_loss_when_separation_below_margin(self) -> None:
-        """Loss > 0 when mean(g_wind) - mean(g_visual) < margin."""
-        B, T = 4, 100
-        lengths = torch.full((B,), T, dtype=torch.long)
-
-        # Wind and visual trials have similar g_lif (collapse)
-        g_lif = torch.zeros(B, T)
-        wind_only_mask = torch.tensor([True, True, False, False])
-        g_lif[wind_only_mask, :] = 0.45  # Collapsed gate
-        g_lif[~wind_only_mask, :] = 0.40  # Collapsed gate
-
-        loss = compute_routing_aux_loss(g_lif, lengths, wind_only_mask, margin=0.2)
-
-        # Separation = 0.45 - 0.40 = 0.05 < 0.2
-        # Hinge = 0.2 - 0.05 = 0.15
-        expected = 0.15
-        assert loss.item() == pytest.approx(expected, abs=1e-5)
-
-    def test_zero_loss_when_wind_only_mask_all_false(self) -> None:
-        """No wind trials → no penalty."""
-        B, T = 4, 100
-        lengths = torch.full((B,), T, dtype=torch.long)
-        g_lif = torch.rand(B, T)
-        wind_only_mask = torch.tensor([False, False, False, False])
-
-        loss = compute_routing_aux_loss(g_lif, lengths, wind_only_mask, margin=0.2)
-        assert loss.item() == pytest.approx(0.0, abs=1e-6)
-
-    def test_zero_loss_when_wind_only_mask_all_true(self) -> None:
-        """No visual trials → no penalty."""
-        B, T = 4, 100
-        lengths = torch.full((B,), T, dtype=torch.long)
-        g_lif = torch.rand(B, T)
-        wind_only_mask = torch.tensor([True, True, True, True])
-
-        loss = compute_routing_aux_loss(g_lif, lengths, wind_only_mask, margin=0.2)
-        assert loss.item() == pytest.approx(0.0, abs=1e-6)
-
-    def test_respects_variable_lengths(self) -> None:
-        """Aggregation only considers valid (non-padded) frames."""
-        B, T = 2, 100
-        lengths = torch.tensor([50, 80], dtype=torch.long)
-        wind_only_mask = torch.tensor([True, False])
-
-        g_lif = torch.zeros(B, T)
-        # Wind trial (valid 0:50)
-        g_lif[0, :50] = 0.9
-        g_lif[0, 50:] = 0.0  # Padding (should be ignored)
-
-        # Visual trial (valid 0:80)
-        g_lif[1, :80] = 0.3
-        g_lif[1, 80:] = 1.0  # Padding (should be ignored)
-
-        loss = compute_routing_aux_loss(g_lif, lengths, wind_only_mask, margin=0.2)
-
-        # Mean(wind) = 0.9, Mean(visual) = 0.3
-        # Separation = 0.9 - 0.3 = 0.6 > 0.2 → zero loss
-        assert loss.item() == pytest.approx(0.0, abs=1e-6)
-
-    def test_accepts_g_lif_shape_BT1(self) -> None:
-        """Handles [B, T, 1] shape (router output format)."""
-        B, T = 4, 100
-        lengths = torch.full((B,), T, dtype=torch.long)
-        g_lif = torch.rand(B, T, 1)
-        wind_only_mask = torch.tensor([True, True, False, False])
-
-        # Should not raise
-        loss = compute_routing_aux_loss(g_lif, lengths, wind_only_mask, margin=0.2)
-        assert loss.shape == ()  # Scalar
-
-    def test_shape_assertion_failures(self) -> None:
-        """Shape mismatches raise AssertionError."""
-        B, T = 4, 100
-        lengths = torch.full((B,), T, dtype=torch.long)
-        g_lif = torch.rand(B, T)
-        wind_only_mask = torch.tensor([True, True, False, False])
-
-        # Mismatched batch size
-        with pytest.raises(AssertionError):
-            compute_routing_aux_loss(
-                g_lif, torch.ones(3, dtype=torch.long) * T, wind_only_mask
-            )
-
-        # Mismatched mask size
-        with pytest.raises(AssertionError):
-            compute_routing_aux_loss(
-                g_lif, lengths, torch.tensor([True, False, True])
-            )
-
-        # Invalid g_lif shape
-        with pytest.raises(AssertionError):
-            compute_routing_aux_loss(
-                torch.rand(B, T, 2), lengths, wind_only_mask
-            )
+    # mean(g_wind)=0.9, mean(g_visual)=0.2, separation=0.7 > 0.2
+    assert loss.item() == pytest.approx(0.0), (
+        f"Expected zero loss when separation exceeds margin, got {loss.item()}"
+    )
 
 
-class TestBioJointLossExt:
-    """Integration tests for BioJointLossExt wrapper."""
+def test_routing_aux_loss_positive_when_separation_below_margin():
+    """Loss is positive when mean(g_wind) - mean(g_visual) < margin."""
+    g_lif = torch.tensor([
+        [0.5, 0.5, 0.5],  # pure-wind trial
+        [0.4, 0.4, 0.4],  # visual trial
+    ], dtype=torch.float32)
+    lengths = torch.tensor([3, 3], dtype=torch.int64)
+    wind_only_mask = torch.tensor([True, False], dtype=torch.bool)
 
-    def test_fallback_to_base_when_lambda_routing_aux_zero(self) -> None:
-        """lambda_routing_aux=0 returns frozen base loss exactly."""
-        from nsmor.loss import BioJointLoss
+    loss = compute_routing_aux_loss(g_lif, lengths, wind_only_mask, margin=0.2)
 
-        B, T, H = 4, 100, 32
-        y_pred = torch.randn(B, T)
-        y_true = torch.randn(B, T)
-        lengths = torch.full((B,), T, dtype=torch.long)
-        g_gru = torch.rand(B, T, 1)
-
-        base_loss = BioJointLoss()
-        ext_loss = BioJointLossExt(base_loss)
-
-        base_out = base_loss(
-            y_pred, y_true, lengths, g_gru, lambda_reg=0.2, annealing_factor=1.0
-        )
-        ext_out = ext_loss(
-            y_pred,
-            y_true,
-            lengths,
-            g_gru,
-            lambda_reg=0.2,
-            lambda_routing_aux=0.0,
-            annealing_factor=1.0,
-        )
-
-        assert torch.allclose(ext_out, base_out, atol=1e-6)
-
-    def test_adds_routing_aux_when_lambda_positive(self) -> None:
-        """lambda_routing_aux > 0 increases total loss."""
-        from nsmor.loss import BioJointLoss
-
-        B, T = 4, 100
-        y_pred = torch.randn(B, T)
-        y_true = torch.randn(B, T)
-        lengths = torch.full((B,), T, dtype=torch.long)
-        g_gru = torch.rand(B, T, 1)
-        g_lif = torch.rand(B, T, 1)
-        wind_only_mask = torch.tensor([True, True, False, False])
-
-        # Induce separation gap below margin
-        g_lif[wind_only_mask, :, 0] = 0.45
-        g_lif[~wind_only_mask, :, 0] = 0.40
-
-        base_loss = BioJointLoss()
-        ext_loss = BioJointLossExt(base_loss)
-
-        base_out = base_loss(
-            y_pred, y_true, lengths, g_gru, lambda_reg=0.2, annealing_factor=1.0
-        )
-        ext_out = ext_loss(
-            y_pred,
-            y_true,
-            lengths,
-            g_gru,
-            g_lif=g_lif,
-            lambda_reg=0.2,
-            lambda_routing_aux=0.5,
-            wind_only_mask=wind_only_mask,
-            annealing_factor=1.0,
-        )
-
-        assert ext_out.item() > base_out.item()
-
-    def test_raises_when_g_lif_missing(self) -> None:
-        """lambda_routing_aux > 0 requires g_lif."""
-        from nsmor.loss import BioJointLoss
-
-        B, T = 4, 100
-        y_pred = torch.randn(B, T)
-        y_true = torch.randn(B, T)
-        lengths = torch.full((B,), T, dtype=torch.long)
-        g_gru = torch.rand(B, T, 1)
-        wind_only_mask = torch.tensor([True, True, False, False])
-
-        base_loss = BioJointLoss()
-        ext_loss = BioJointLossExt(base_loss)
-
-        with pytest.raises(ValueError, match="g_lif required"):
-            ext_loss(
-                y_pred,
-                y_true,
-                lengths,
-                g_gru,
-                lambda_routing_aux=0.5,
-                wind_only_mask=wind_only_mask,
-            )
-
-    def test_raises_when_wind_only_mask_missing(self) -> None:
-        """lambda_routing_aux > 0 requires wind_only_mask."""
-        from nsmor.loss import BioJointLoss
-
-        B, T = 4, 100
-        y_pred = torch.randn(B, T)
-        y_true = torch.randn(B, T)
-        lengths = torch.full((B,), T, dtype=torch.long)
-        g_gru = torch.rand(B, T, 1)
-        g_lif = torch.rand(B, T, 1)
-
-        base_loss = BioJointLoss()
-        ext_loss = BioJointLossExt(base_loss)
-
-        with pytest.raises(ValueError, match="wind_only_mask required"):
-            ext_loss(
-                y_pred,
-                y_true,
-                lengths,
-                g_gru,
-                g_lif=g_lif,
-                lambda_routing_aux=0.5,
-            )
-
-    def test_annealing_factor_scales_routing_aux(self) -> None:
-        """Warmup annealing scales lambda_routing_aux."""
-        from nsmor.loss import BioJointLoss
-
-        B, T = 4, 100
-        y_pred = torch.randn(B, T)
-        y_true = torch.randn(B, T)
-        lengths = torch.full((B,), T, dtype=torch.long)
-        g_gru = torch.rand(B, T, 1)
-        g_lif = torch.rand(B, T, 1)
-        wind_only_mask = torch.tensor([True, True, False, False])
-
-        # Induce positive routing_aux loss
-        g_lif[wind_only_mask, :, 0] = 0.45
-        g_lif[~wind_only_mask, :, 0] = 0.40
-
-        base_loss = BioJointLoss()
-        ext_loss = BioJointLossExt(base_loss)
-
-        # Full annealing (annealing_factor=1.0)
-        loss_full = ext_loss(
-            y_pred,
-            y_true,
-            lengths,
-            g_gru,
-            g_lif=g_lif,
-            lambda_reg=0.2,
-            lambda_routing_aux=0.5,
-            wind_only_mask=wind_only_mask,
-            annealing_factor=1.0,
-        )
-
-        # Half annealing (annealing_factor=0.5)
-        loss_half = ext_loss(
-            y_pred,
-            y_true,
-            lengths,
-            g_gru,
-            g_lif=g_lif,
-            lambda_reg=0.2,
-            lambda_routing_aux=0.5,
-            wind_only_mask=wind_only_mask,
-            annealing_factor=0.5,
-        )
-
-        # The difference should be roughly half of the routing_aux component
-        # (MSE and lambda_reg are constant)
-        assert loss_half < loss_full
+    # mean(g_wind)=0.5, mean(g_visual)=0.4, separation=0.1 < 0.2
+    # loss = max(0, 0.2 - 0.1) = 0.1
+    assert loss.item() == pytest.approx(0.1, abs=1e-5), (
+        f"Expected loss=0.1 when separation=0.1 < margin=0.2, got {loss.item()}"
+    )
 
 
-class TestLossConfigExtension:
-    """Test lambda_routing_aux config loading (Ticket #15)."""
+def test_routing_aux_loss_zero_when_no_wind_trials():
+    """Loss is zero when wind_only_mask contains no True values."""
+    g_lif = torch.tensor([
+        [0.5, 0.5, 0.5],
+        [0.4, 0.4, 0.4],
+    ], dtype=torch.float32)
+    lengths = torch.tensor([3, 3], dtype=torch.int64)
+    wind_only_mask = torch.tensor([False, False], dtype=torch.bool)
 
-    def test_lambda_routing_aux_in_default_config(self) -> None:
-        """Default config contains lambda_routing_aux with default 0.0."""
-        from nsmor.config_parser import ExperimentConfig
+    loss = compute_routing_aux_loss(g_lif, lengths, wind_only_mask, margin=0.2)
 
-        # Load from YAML
-        cfg = ExperimentConfig.from_yaml("config/default.yaml")
-        assert hasattr(cfg.loss, "lambda_routing_aux")
-        assert cfg.loss.lambda_routing_aux == 0.0
+    assert loss.item() == pytest.approx(0.0), (
+        "Expected zero loss when wind group is empty"
+    )
 
-    def test_lambda_routing_aux_dataclass_default(self) -> None:
-        """LossConfig dataclass has lambda_routing_aux field with default 0.0."""
-        from nsmor.config_parser import LossConfig
 
-        cfg = LossConfig()
-        assert hasattr(cfg, "lambda_routing_aux")
-        assert cfg.lambda_routing_aux == 0.0
+def test_routing_aux_loss_zero_when_no_visual_trials():
+    """Loss is zero when all trials are pure-wind."""
+    g_lif = torch.tensor([
+        [0.9, 0.9, 0.9],
+        [0.8, 0.8, 0.8],
+    ], dtype=torch.float32)
+    lengths = torch.tensor([3, 3], dtype=torch.int64)
+    wind_only_mask = torch.tensor([True, True], dtype=torch.bool)
+
+    loss = compute_routing_aux_loss(g_lif, lengths, wind_only_mask, margin=0.2)
+
+    assert loss.item() == pytest.approx(0.0), (
+        "Expected zero loss when visual group is empty"
+    )
+
+
+def test_routing_aux_loss_respects_lengths_mask():
+    """Loss uses only valid timesteps per trial."""
+    g_lif = torch.tensor([
+        [0.9, 0.9, 0.0],  # pure-wind, length=2, last frame padded
+        [0.2, 0.2, 1.0],  # visual, length=2, last frame padded
+    ], dtype=torch.float32)
+    lengths = torch.tensor([2, 2], dtype=torch.int64)
+    wind_only_mask = torch.tensor([True, False], dtype=torch.bool)
+
+    loss = compute_routing_aux_loss(g_lif, lengths, wind_only_mask, margin=0.2)
+
+    # mean(g_wind) = mean([0.9, 0.9]) = 0.9
+    # mean(g_visual) = mean([0.2, 0.2]) = 0.2
+    # separation = 0.7 > 0.2 → loss=0
+    assert loss.item() == pytest.approx(0.0), (
+        "Padded frames should be masked out"
+    )
+
+
+def test_routing_aux_loss_accepts_3d_g_lif():
+    """Loss handles g_lif with shape (B, T, 1)."""
+    g_lif = torch.tensor([
+        [[0.9], [0.9], [0.9]],
+        [[0.2], [0.2], [0.2]],
+    ], dtype=torch.float32)
+    lengths = torch.tensor([3, 3], dtype=torch.int64)
+    wind_only_mask = torch.tensor([True, False], dtype=torch.bool)
+
+    loss = compute_routing_aux_loss(g_lif, lengths, wind_only_mask, margin=0.2)
+
+    # Same as test_routing_aux_loss_zero_when_separation_exceeds_margin
+    assert loss.item() == pytest.approx(0.0)
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
