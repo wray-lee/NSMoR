@@ -216,3 +216,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking change in v2.1**: Datasets generated with v2.0 semantics cannot be loaded by v2.1+ code due to version guard enforcement.
 - **Performance**: Two-phase training with v2.1 semantics achieves R² ≈ 0.37 (honest generalization) vs. R² ≈ 0.47 (inflated by session leakage in pre-v2.1 pipeline).
 - **PREWALK label**: Small sample size (n=11) may limit statistical power for this category in some analyses.
+
