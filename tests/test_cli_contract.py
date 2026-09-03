@@ -393,7 +393,7 @@ def test_makefile_pipeline_dry_run_forwards_all_required_variables() -> None:
         BATCH_SIZE="37",
         LR="0.0123",
         SEED="99",
-        DT_MS="10.00",
+        DT_MS="4.0",
     )
     assert result.returncode == 0, (
         f"DRY_RUN=1 make pipeline failed:\n{result.stdout}\n{result.stderr}"
@@ -408,7 +408,7 @@ def test_makefile_pipeline_dry_run_forwards_all_required_variables() -> None:
 
     etl = stages["scripts/prepare_data.py"]
     assert _arg_value(etl, "--seed") == "99"
-    assert _arg_value(etl, "--dt_ms") == "10.00"
+    assert _arg_value(etl, "--dt_ms") == "4.0"
 
     psych = stages["scripts/simulate_psychophysics.py"]
     assert _arg_value(psych, "--seed") == "99"
