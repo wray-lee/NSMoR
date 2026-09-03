@@ -307,6 +307,17 @@ class LossConfig:
     """Population sparsity L1 weight (Olshausen & Field 1996). 0 disables."""
     lambda_jerk: float = 0.0
     """Temporal coherence (jerk penalty) weight (Gabbiani et al. 1999). 0 disables."""
+    lambda_routing_aux: float = 0.0
+    """Auxiliary routing differentiation weight (Ticket #15).
+
+    Penalizes gate overlap between stimulus conditions (pure-wind vs
+    visual-present trials). Encourages the router to learn condition-
+    specific routing: high g_lif for wind transients, high g_gru for
+    smooth looming. Hinge loss with margin=0.2.
+
+    Warmup-scaled like ``lambda_energy/sparse/jerk``, ramping from 0
+    over the first ``warmup_epochs``. Default 0.0 (disabled).
+    """
     jerk_threshold: float = 0.1
     """Threshold for sudden-change jerk mask (unused when mask=None)."""
     warmup_epochs: int = 0

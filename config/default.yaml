@@ -126,6 +126,7 @@ loss:
   lambda_energy: 0.001        # ATP metabolic cost (0 disables)
   lambda_sparse: 0.005        # population sparsity L1 (0 disables)
   lambda_jerk: 0.005         # temporal coherence / jerk penalty (0 disables)
+  lambda_routing_aux: 0.0    # auxiliary routing separation (Ticket #15; 0 disables; warmup-scaled)
   jerk_threshold: 0.1       # sudden-change jerk mask threshold
   warmup_epochs: 20          # CF9: extended warmup for new biophysical mechanisms
 

@@ -287,3 +287,24 @@ class TestBioJointLossExt:
         # The difference should be roughly half of the routing_aux component
         # (MSE and lambda_reg are constant)
         assert loss_half < loss_full
+
+
+class TestLossConfigExtension:
+    """Test lambda_routing_aux config loading (Ticket #15)."""
+
+    def test_lambda_routing_aux_in_default_config(self) -> None:
+        """Default config contains lambda_routing_aux with default 0.0."""
+        from nsmor.config_parser import ExperimentConfig
+
+        # Load from YAML
+        cfg = ExperimentConfig.from_yaml("config/default.yaml")
+        assert hasattr(cfg.loss, "lambda_routing_aux")
+        assert cfg.loss.lambda_routing_aux == 0.0
+
+    def test_lambda_routing_aux_dataclass_default(self) -> None:
+        """LossConfig dataclass has lambda_routing_aux field with default 0.0."""
+        from nsmor.config_parser import LossConfig
+
+        cfg = LossConfig()
+        assert hasattr(cfg, "lambda_routing_aux")
+        assert cfg.lambda_routing_aux == 0.0
