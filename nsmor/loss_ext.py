@@ -15,7 +15,7 @@ def compute_routing_aux_loss(
     g_lif: torch.Tensor,
     lengths: torch.Tensor,
     wind_only_mask: torch.Tensor,
-    margin: float = 0.2,
+    margin: float = 0.024,
 ) -> torch.Tensor:
     """Auxiliary routing loss: penalize gate overlap between conditions.
 
@@ -29,7 +29,7 @@ def compute_routing_aux_loss(
         wind_only_mask: Boolean mask where True indicates pure-wind trials,
             shape [B]. Derived from `is_pure_wind` dataset key.
         margin: Desired minimum separation (mean(g_lif_wind) -
-            mean(g_lif_visual) >= margin). Typical: 0.2.
+            mean(g_lif_visual) >= margin). Default 0.024 (1.0× pooled std).
 
     Returns:
         Scalar tensor. Zero when separation >= margin, positive hinge
@@ -111,6 +111,7 @@ class BioJointLossExt(nn.Module):
         lambda_routing_aux: float = 0.0,
         wind_only_mask: Optional[torch.Tensor] = None,
         annealing_factor: float = 1.0,
+        routing_aux_margin: float = 0.024,
     ) -> torch.Tensor:
         """Compute joint loss with optional auxiliary routing term.
 
@@ -154,7 +155,7 @@ class BioJointLossExt(nn.Module):
                     "wind_only_mask required when lambda_routing_aux > 0"
                 )
             routing_aux = compute_routing_aux_loss(
-                g_lif, lengths, wind_only_mask, margin=0.2
+                g_lif, lengths, wind_only_mask, margin=routing_aux_margin
             )
             return base + lambda_routing_aux * annealing_factor * routing_aux
 

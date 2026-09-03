@@ -145,6 +145,7 @@ class BioDecisionLoss(nn.Module):
         annealing_factor: float = 1.0,
         lambda_routing_aux: float = 0.0,
         wind_only_mask: Optional[torch.Tensor] = None,
+        routing_aux_margin: float = 0.024,
     ) -> torch.Tensor:
         """
         Compute bio-decision loss (MSE + physics penalties).
@@ -163,6 +164,11 @@ class BioDecisionLoss(nn.Module):
             annealing_factor: Scaling factor for bio-loss lambdas.
             lambda_routing_aux: Auxiliary routing loss weight for modality differentiation.
             wind_only_mask: ``(B,)`` — boolean, True for pure-wind trials.
+            routing_aux_margin: Hinge margin on trial-mean ``g_lif``
+                separation. Default 0.024 is 1.0× pooled std of the
+                backup-corpus calibration (whole-trial mean, not peri
+                top-k). The previous 0.2 exceeded the observed 5–95
+                frame-level range.
 
         Returns:
             Scalar loss tensor.
@@ -240,7 +246,7 @@ class BioDecisionLoss(nn.Module):
         if lambda_routing_aux_eff > 0.0 and wind_only_mask is not None:
             g_lif = 1.0 - g_gru.squeeze(-1)  # (B, T)
             aux_loss = compute_routing_aux_loss(
-                g_lif, lengths, wind_only_mask, margin=0.2
+                g_lif, lengths, wind_only_mask, margin=routing_aux_margin
             )
             total_loss = total_loss + lambda_routing_aux_eff * aux_loss
 
@@ -251,20 +257,25 @@ def compute_routing_aux_loss(
     g_lif: torch.Tensor,
     lengths: torch.Tensor,
     wind_only_mask: torch.Tensor,
-    margin: float = 0.2,
+    margin: float = 0.024,
 ) -> torch.Tensor:
     """
     Auxiliary routing loss: penalize gate overlap between pure-wind and visual-present trials.
 
     Encourages trial-level gate differentiation by pushing pure-wind trials
     toward high `g_lif` (fast LIF pathway) and visual-present trials toward
-    low `g_lif` (smooth GRU pathway).
+    low `g_lif` (smooth GRU pathway). Aggregation is the whole-trial
+    masked mean: peri-stimulus top-k saturates both groups (~0.514) and
+    carries no condition signal.
 
     Args:
         g_lif: ``(B, T, 1)`` or ``(B, T)`` — LIF routing gate over time.
         lengths: ``(B,)`` — valid timesteps per trial.
         wind_only_mask: ``(B,)`` — boolean mask, True for pure-wind trials.
-        margin: Minimum desired separation between group means. Default 0.2.
+        margin: Minimum desired separation between group means.
+            Default 0.024 = 1.0× pooled std on
+            ``nsmor_dataset_full_backup.pt`` (wind 0.485±0.032 vs
+            visual 0.439±0.012, Cohen's d=1.87).
 
     Returns:
         Scalar loss: ``max(0, margin - (mean(g_wind) - mean(g_visual)))``.
@@ -350,6 +361,7 @@ class BioJointLoss(nn.Module):
         annealing_factor: float = 1.0,
         lambda_routing_aux: float = 0.0,
         wind_only_mask: Optional[torch.Tensor] = None,
+        routing_aux_margin: float = 0.024,
     ) -> torch.Tensor:
         """
         Compute the bio-constrained joint loss.
@@ -371,6 +383,7 @@ class BioJointLoss(nn.Module):
             annealing_factor: Scaling factor for bio-loss lambdas.
             lambda_routing_aux: Auxiliary routing loss weight for modality differentiation.
             wind_only_mask: ``(B,)`` — boolean, True for pure-wind trials.
+            routing_aux_margin: Hinge margin for the routing-aux term.
 
         Returns:
             Scalar loss tensor.
@@ -389,6 +402,7 @@ class BioJointLoss(nn.Module):
             annealing_factor=annealing_factor,
             lambda_routing_aux=lambda_routing_aux,
             wind_only_mask=wind_only_mask,
+            routing_aux_margin=routing_aux_margin,
         )
 
 

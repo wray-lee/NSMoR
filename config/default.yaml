@@ -127,6 +127,7 @@ loss:
   lambda_sparse: 0.005        # population sparsity L1 (0 disables)
   lambda_jerk: 0.005         # temporal coherence / jerk penalty (0 disables)
   lambda_routing_aux: 0.0    # auxiliary routing separation (Ticket #15; 0 disables; warmup-scaled)
+  routing_aux_margin: 0.024  # hinge on trial-mean g_lif (1.0× pooled std; backup corpus)
   jerk_threshold: 0.1       # sudden-change jerk mask threshold
   warmup_epochs: 20          # CF9: extended warmup for new biophysical mechanisms
 

@@ -109,5 +109,23 @@ def test_routing_aux_loss_accepts_3d_g_lif():
     assert loss.item() == pytest.approx(0.0)
 
 
+def test_routing_aux_default_margin_is_calibrated() -> None:
+    """Default hinge is 0.024 (1.0× pooled std), not the old 0.2."""
+    g_lif = torch.tensor(
+        [
+            [0.50, 0.50, 0.50],
+            [0.49, 0.49, 0.49],
+        ],
+        dtype=torch.float32,
+    )
+    lengths = torch.tensor([3, 3], dtype=torch.int64)
+    wind_only_mask = torch.tensor([True, False], dtype=torch.bool)
+
+    loss = compute_routing_aux_loss(g_lif, lengths, wind_only_mask)
+
+    # separation = 0.01; default margin = 0.024 → hinge = 0.014
+    assert loss.item() == pytest.approx(0.014, abs=1e-5)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

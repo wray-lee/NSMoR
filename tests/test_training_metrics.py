@@ -65,6 +65,18 @@ def _tiny_loader(y_values: np.ndarray) -> torch.utils.data.DataLoader:
     return torch.utils.data.DataLoader(ds, batch_size=1)
 
 
+def _tiny_metadata_loader(y_values: np.ndarray) -> torch.utils.data.DataLoader:
+    """Return a four-item batch like ``collate_with_metadata``."""
+    y_arr = np.asarray(y_values, dtype=np.float32)
+    L = y_arr.size
+    y = torch.as_tensor(y_arr).view(1, L)
+    x = y.unsqueeze(-1).clone()
+    lengths = torch.full((1,), L, dtype=torch.long)
+    is_pure_wind = torch.tensor([True], dtype=torch.bool)
+    ds = torch.utils.data.TensorDataset(x, y, lengths, is_pure_wind)
+    return torch.utils.data.DataLoader(ds, batch_size=1)
+
+
 @pytest.fixture(scope="module")
 def compute_metrics():
     return _load_train_module().compute_metrics
@@ -81,6 +93,19 @@ def test_compute_metrics_returns_nine_key_dict(compute_metrics):
     expect = {"mse", "rmse", "mae", "r2", "escape_band_cm_s",
               "n_escape_frames", "escape_rmse", "resting_rmse", "escape_ratio"}
     assert set(m.keys()) == expect, f"missing/extra keys: {set(m.keys()) ^ expect}"
+
+
+def test_compute_metrics_accepts_metadata_batch(compute_metrics):
+    """Best-model scoring must accept the metadata DataLoader contract."""
+    y = np.array([0.0, 0.0, 20.0, 30.0])
+    m = compute_metrics(
+        _FakeModel(scale=1.0), _tiny_metadata_loader(y), torch.device("cpu"),
+        target_mean=0.0, target_std=1.0, target_clip_cm_s=0.0,
+        escape_band_cm_s=10.0,
+    )
+
+    assert m["mse"] == pytest.approx(0.0)
+    assert m["n_escape_frames"] == 2.0
 
 
 def test_escape_classified_on_unclipped_y_true(compute_metrics):

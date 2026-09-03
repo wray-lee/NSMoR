@@ -1061,6 +1061,7 @@ def train_one_epoch(
     target_std: float = 1.0,
     target_clip_cm_s: float = 0.0,
     lambda_routing_aux: float = 0.0,
+    routing_aux_margin: float = 0.024,
 ) -> float:
     """
     Run one training epoch.
@@ -1166,6 +1167,7 @@ def train_one_epoch(
                     # when collate_with_metadata supplies the condition mask.
                     lambda_routing_aux=lambda_routing_aux,
                     wind_only_mask=wind_only_mask,
+                    routing_aux_margin=routing_aux_margin,
                 )
 
         # ── Membrane health monitoring (CF9: per-epoch averages) ──
@@ -1352,6 +1354,7 @@ def validate(
     target_std: float = 1.0,
     target_clip_cm_s: float = 0.0,
     lambda_routing_aux: float = 0.0,
+    routing_aux_margin: float = 0.024,
 ) -> float:
     """
     Run validation (no gradient computation).
@@ -1430,6 +1433,7 @@ def validate(
                 # datasets; no metadata means the routing auxiliary term is 0.
                 lambda_routing_aux=lambda_routing_aux,
                 wind_only_mask=wind_only_mask,
+                routing_aux_margin=routing_aux_margin,
             )
 
         total_loss += loss.item()
@@ -1529,7 +1533,10 @@ def compute_metrics(
     all_true: List[np.ndarray] = []
 
     for batch in loader:
-        x_batch, y_batch, lengths = batch
+        if len(batch) == 4:
+            x_batch, y_batch, lengths, _ = batch
+        else:
+            x_batch, y_batch, lengths = batch
         x_batch = x_batch.to(device).contiguous()
         y_batch = y_batch.to(device).contiguous()
         lengths = lengths.to(device).contiguous()
@@ -2178,6 +2185,7 @@ def train(
             target_std=target_std,
             target_clip_cm_s=config.training.target_clip_cm_s,
             lambda_routing_aux=config.loss.lambda_routing_aux,
+            routing_aux_margin=config.loss.routing_aux_margin,
         )
         # Advance the cosine.  When lr_warmup_epochs==0 (default), the step is
         # unconditional exactly as in the original pipeline, preserving the
@@ -2217,6 +2225,7 @@ def train(
                 target_std=target_std,
                 target_clip_cm_s=config.training.target_clip_cm_s,
                 lambda_routing_aux=config.loss.lambda_routing_aux,
+                routing_aux_margin=config.loss.routing_aux_margin,
             )
             history["val_loss"].append(val_loss)
 

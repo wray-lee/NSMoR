@@ -638,3 +638,94 @@ class TestCrossPathConsistency:
             rtol=0.05,
             atol=0.01,
         )
+
+
+# ═══════════════════════════════════════════════════════════════
+# G. Raw-schema hard fail + unknown-type wind preservation
+# ═══════════════════════════════════════════════════════════════
+
+class TestRawSchemaGuard:
+    """Unadapted cercus CSVs must not silently drop the wind channel."""
+
+    def test_raw_sensor_schema_points_at_pre_load_adapt(self, tmp_path: Path):
+        """sys_time/stim_state CSVs fail with an actionable error."""
+        path = tmp_path / "kinematics.csv"
+        pd.DataFrame({
+            "sys_time": [0.0, 0.004],
+            "ard_time": [1, 2],
+            "dx": [0.0, 0.0],
+            "dy": [0.0, 0.0],
+            "dz": [0.0, 0.0],
+            "stim_state": [0, 1],
+            "global_trial_id": [0, 0],
+        }).to_csv(path, index=False)
+
+        with pytest.raises(ValueError, match="pre_load_adapt"):
+            load_kinematics_csv(path)
+
+    def test_unknown_trial_type_keeps_physical_wind(self, tmp_path: Path):
+        """Missing trial_start metadata must not zero stim_state-derived wind."""
+        session_dir = tmp_path / "session_001"
+        session_dir.mkdir()
+        kin_path = session_dir / "session_001_kinematics.csv"
+        evt_path = session_dir / "session_001_events.csv"
+
+        n = 8
+        pd.DataFrame({
+            "sys_time": np.arange(n, dtype=np.float64) * 0.004,
+            "ard_time": np.arange(n),
+            "dx": np.zeros(n),
+            "dy": np.zeros(n),
+            "dz": np.zeros(n),
+            "stim_state": [0, 0, 0, 1, 1, 1, 1, 1],
+            "global_trial_id": [0] * n,
+        }).to_csv(kin_path, index=False)
+        pd.DataFrame({
+            "event_name": ["iti_start"],
+            "timestamp": [0.0],
+            "session_num": [1],
+            "trial_in_session": [0],
+            "global_trial_id": [0],
+            "details": [""],
+        }).to_csv(evt_path, index=False)
+
+        adapt_cercus_to_nsmor(raw_dir=str(tmp_path))
+
+        rewritten = pd.read_csv(kin_path)
+        assert "wind_state" in rewritten.columns
+        assert int(rewritten["wind_state"].sum()) == 5
+
+    def test_known_visual_only_still_zeros_wind(self, tmp_path: Path):
+        """baseline_visual remains allowed to clear the wind channel."""
+        session_dir = tmp_path / "session_001"
+        session_dir.mkdir()
+        kin_path = session_dir / "session_001_kinematics.csv"
+        evt_path = session_dir / "session_001_events.csv"
+
+        n = 8
+        pd.DataFrame({
+            "sys_time": np.arange(n, dtype=np.float64) * 0.004,
+            "ard_time": np.arange(n),
+            "dx": np.zeros(n),
+            "dy": np.zeros(n),
+            "dz": np.zeros(n),
+            "stim_state": [0, 0, 0, 1, 1, 1, 1, 1],
+            "global_trial_id": [0] * n,
+        }).to_csv(kin_path, index=False)
+        pd.DataFrame({
+            "event_name": ["trial_start"],
+            "timestamp": [0.0],
+            "session_num": [1],
+            "trial_in_session": [0],
+            "global_trial_id": [0],
+            "details": [json.dumps({
+                "type": "baseline_visual",
+                "lv_ratio_ms": 40.0,
+                "wind_dir": "none",
+            })],
+        }).to_csv(evt_path, index=False)
+
+        adapt_cercus_to_nsmor(raw_dir=str(tmp_path))
+
+        rewritten = pd.read_csv(kin_path)
+        assert int(rewritten["wind_state"].sum()) == 0

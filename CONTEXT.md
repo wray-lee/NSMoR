@@ -111,8 +111,16 @@ _Avoid_: non-responder, inactive
 ### Training
 
 **BioJointLoss**:
-Composite loss function combining masked MSE, router regularization (penalizing GRU gate collapse), ATP metabolic energy cost, population sparsity L1 penalty, and temporal coherence (jerk) penalty.
+Composite loss function combining masked MSE, router regularization (penalizing GRU Pathway collapse), ATP metabolic energy cost, population sparsity L1 penalty, temporal coherence (jerk) penalty, and optional Routing Auxiliary Loss.
 _Avoid_: loss, joint loss, bio loss
+
+**Routing Auxiliary Loss**:
+Hinge on trial-mean LIF Pathway gate separation between Pure-Wind Trial and visual-present trials: ``max(0, margin − (mean(g_wind) − mean(g_visual)))``. Aggregation is the whole-trial masked mean; the default margin is 0.024 (1.0× pooled std on the backup corpus). Peri-stimulus top-k saturates both groups and is not used.
+_Avoid_: peri-stimulus top-k loss, routing contrastive loss, gate overlap loss
+
+**Stimulus Condition**:
+Four-way physical-channel label stored on the dataset artifact: ``multisensory``, ``visual_only``, ``wind_only``, ``no_stimulus``. Read off ``visual_angle`` and ``wind_state``, never behavioural labels or session names. ``is_pure_wind`` is True iff the condition is ``wind_only``.
+_Avoid_: experimental type, trial type, baseline_wind
 
 **Hybrid Funnel Training**:
 Two-phase training strategy where Phase 1 trains FrontendEncoder with plain MSE loss and Phase 2 trains BioDecisionCore with physics/ATP/sparsity penalties.

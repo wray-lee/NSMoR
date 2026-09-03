@@ -149,6 +149,15 @@ def load_kinematics_csv(
     df = pd.read_csv(path)
     missing = set(KINEMATICS_COLUMNS) - set(df.columns)
     if missing:
+        raw_markers = {"sys_time", "stim_state"}
+        if raw_markers <= set(df.columns):
+            raise ValueError(
+                f"{path} is still in the raw sensor schema "
+                f"(sys_time/stim_state), missing {sorted(missing)}. "
+                "Run scripts/pre_load_adapt.py on a staging copy first so "
+                "stim_state becomes wind_state; skipping that step collapses "
+                "wind-only trials to no_stimulus."
+            )
         raise ValueError(f"Missing columns in {path}: {missing}")
     df = df[KINEMATICS_COLUMNS].copy()
     df["wind_state"] = pd.to_numeric(df["wind_state"], errors="coerce").fillna(0).eq(1).astype(np.int64)

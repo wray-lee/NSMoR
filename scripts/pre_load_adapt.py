@@ -208,24 +208,20 @@ def adapt_cercus_to_nsmor(raw_dir="data/raw"):
             # velocity increment by the ACTUAL per-sample interval.  Using
             # a bare .diff() (units cm/s per frame) would underestimate
             # acceleration by a factor equal to the sampling rate.
-            def _acceleration_cm_s2(grp: pd.DataFrame) -> pd.Series:
-                v = grp["velocity"].values
-                t = grp["abs_time"].values  # ms
-                dv = np.concatenate([[0.0], np.diff(v)])           # cm/s
-                dt_ms_arr = np.concatenate([[0.0], np.diff(t)])    # ms
-                # Guard: zero/negative gaps get floored to the minimum
-                # positive gap in this trial (documented, not silent).
+            acc_out = np.zeros(len(df_k), dtype=np.float64)
+            for _, grp in df_k.groupby("trial_id", sort=False):
+                idx = grp.index
+                v = grp["velocity"].to_numpy()
+                t = grp["abs_time"].to_numpy()  # ms
+                dv = np.concatenate([[0.0], np.diff(v)])
+                dt_ms_arr = np.concatenate([[0.0], np.diff(t)])
                 pos_gaps = dt_ms_arr[dt_ms_arr > 0]
                 floor_ms = float(np.min(pos_gaps)) if pos_gaps.size > 0 else 1.0
                 dt_safe = np.where(dt_ms_arr > 0, dt_ms_arr, floor_ms)
-                acc = dv / (dt_safe / 1000.0)  # cm/s²
-                acc[0] = 0.0  # first frame: no prior sample
-                return pd.Series(acc, index=grp.index)
-
-            df_k["acceleration"] = (
-                df_k.groupby("trial_id", group_keys=False)
-                .apply(_acceleration_cm_s2)
-            )
+                acc = dv / (dt_safe / 1000.0)
+                acc[0] = 0.0
+                acc_out[idx] = acc
+            df_k["acceleration"] = acc_out
 
             df_k["visual_angle"] = 0.0
             df_k["l_v_ratio"] = 0.0
@@ -252,6 +248,9 @@ def adapt_cercus_to_nsmor(raw_dir="data/raw"):
 
             has_visual = trial_type in ('baseline_visual', 'looming_wind')
             has_wind = trial_type in ('baseline_wind', 'looming_wind')
+            known_type = trial_type in (
+                'baseline_visual', 'baseline_wind', 'looming_wind',
+            )
 
             # Boolean mask for this trial (faster than groupby + loc)
             trial_mask = tid_series == tid
@@ -267,8 +266,13 @@ def adapt_cercus_to_nsmor(raw_dir="data/raw"):
                 df_k.loc[trial_mask, "visual_angle"] = 0.0
                 df_k.loc[trial_mask, "l_v_ratio"] = 0.0
 
-            if not has_wind:
+            # Only a known visual-only type may zero the physical wind
+            # channel. Unknown / unparsed types keep stim_state-derived
+            # wind_state — otherwise wind-only trials become no_stimulus.
+            if known_type and not has_wind:
                 df_k.loc[trial_mask, "wind_state"] = 0
+            elif not known_type:
+                has_wind = bool((df_k.loc[trial_mask, "wind_state"] == 1).any())
 
             # Detect stimulus onset for events
             if has_wind:

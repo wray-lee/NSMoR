@@ -72,6 +72,16 @@ def test_build_config_dataclass_default() -> None:
     )
 
 
+def test_build_config_reads_routing_aux_margin_from_yaml() -> None:
+    """Calibrated hinge (0.024) is a first-class LossConfig field."""
+    from scripts.train import build_config
+
+    config, _, _ = build_config(
+        ["--config", str(REPO_ROOT / "config" / "default.yaml")]
+    )
+    assert config.loss.routing_aux_margin == pytest.approx(0.024)
+
+
 # ═════════════════════════════════════════════════════════════
 # Test 4: compute_warmup_factor ramps energy-like terms
 # ═════════════════════════════════════════════════════════════

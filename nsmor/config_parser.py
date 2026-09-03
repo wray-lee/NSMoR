@@ -313,10 +313,20 @@ class LossConfig:
     Penalizes gate overlap between stimulus conditions (pure-wind vs
     visual-present trials). Encourages the router to learn condition-
     specific routing: high g_lif for wind transients, high g_gru for
-    smooth looming. Hinge loss with margin=0.2.
+    smooth looming. Hinge loss with ``routing_aux_margin``.
 
     Warmup-scaled like ``lambda_energy/sparse/jerk``, ramping from 0
     over the first ``warmup_epochs``. Default 0.0 (disabled).
+    """
+    routing_aux_margin: float = 0.024
+    """Hinge margin on trial-mean ``g_lif`` (wind − visual).
+
+    Calibrated on ``nsmor_dataset_full_backup.pt`` (48/48 sampled
+    trials, whole-trial masked mean): pooled std ≈ 0.024, observed
+    separation ≈ 0.046, Cohen's d ≈ 1.87. Default is 1.0× pooled std.
+    The previous hardcoded 0.2 exceeded the 5–95 frame-level range
+    (~0.185) and could never saturate. Peri-stimulus top-k saturates
+    both groups and is not used.
     """
     jerk_threshold: float = 0.1
     """Threshold for sudden-change jerk mask (unused when mask=None)."""

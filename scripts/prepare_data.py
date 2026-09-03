@@ -1458,6 +1458,21 @@ def prepare_dataset(
     assert is_pure_wind.shape == (len(X_seqs),), (
         f"is_pure_wind shape {is_pure_wind.shape} != ({len(X_seqs)},)"
     )
+    condition_counts = {
+        str(name): int(count)
+        for name, count in zip(
+            *np.unique(stimulus_conditions, return_counts=True)
+        )
+    }
+    logger.info("Stimulus-condition coverage: %s", condition_counts)
+    if int(is_pure_wind.sum()) == 0:
+        logger.warning(
+            "No wind_only trials survived ETL (%s). Routing-aux will "
+            "be identically zero. Typical cause: raw CSVs still carry "
+            "stim_state instead of wind_state — run "
+            "scripts/pre_load_adapt.py on a staging copy first.",
+            condition_counts,
+        )
 
     # ── Shape assertions ──
     assert len(X_seqs) == len(Y_seqs) == len(labels) == len(lengths), (
