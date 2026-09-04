@@ -10,14 +10,12 @@ information leakage.
 
 | Corpus | Status | Provenance | Trials / Animals | Notes |
 |---|---|---|---|---|
-| `nsmor_dataset_full_backup.pt` | Regenerated | `oof_4fold_animal_grouped_cv` | 396 trials / 11 animals | Baseline 1-condition corpus |
-| `nsmor_subset_routing_calibration.pt` | Regenerated | `oof_4fold_animal_grouped_cv` | Derived from full_backup | Routing calibration subset |
-| `nsmor_dataset_3cond_v2.pt` | Regenerated | `oof_5fold_animal_grouped_cv` | 1332 trials / 37 animals | 3-condition corpus (`data/raw_3cond_adapted/`) |
-| `nsmor_subset_small.pt` | Pending | `MISSING` (None) | 288 trials | Derived from pre-fix session-grouped corpus; symlinked by `nsmor_dataset.pt` |
-| `backup_before_animal_grouped/nsmor_dataset_3cond_v2.pt` | Preserved | `MISSING` (session-grouped) | 1440 trials / 40 animals | Safety net backup from `staging_3cond_1440` |
+| `nsmor_dataset_full_backup.pt` | ✅ Regenerated | `oof_4fold_animal_grouped_cv` | 396 trials / 11 animals | Baseline 1-condition corpus |
+| `nsmor_subset_routing_calibration.pt` | ✅ Regenerated | `oof_4fold_animal_grouped_cv` | Derived from full_backup | Routing calibration subset |
+| `nsmor_dataset_3cond_v2.pt` | ✅ Regenerated | `oof_5fold_animal_grouped_cv` | 1332 trials / 37 animals | 3-condition corpus with dt_ms=4.0 + anchor_frames |
+| `nsmor_subset_small.pt` | ✅ Regenerated | `oof_5fold_animal_grouped_cv` | 288 trials / 8 animals | Derived from new 3cond_v2; symlinked by `nsmor_dataset.pt` |
 
-Overall progress: 3 of 4 primary corpora are regenerated with animal-grouped priors.
-Only `nsmor_subset_small.pt` remains pending regeneration.
+Overall progress: **100% complete (4/4 primary corpora regenerated with animal-grouped priors)**.
 
 ## Critical Distinction: 3cond_v2 vs Backup
 
