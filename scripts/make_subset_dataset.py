@@ -31,7 +31,6 @@ from __future__ import annotations
 import argparse
 import collections
 import logging
-import re
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
 
@@ -39,15 +38,20 @@ import numpy as np
 import torch
 
 from nsmor.pipeline.conditions import derive_stimulus_metadata
+from nsmor.pipeline.grouping import animal_of
 
 logger = logging.getLogger(__name__)
 
-# Re-exported: this module was the original home, and tests plus other
-# scripts import the name from here.
-__all__ = ["derive_stimulus_metadata", "subset_dataset", "main"]
-
-# ``..._session_1`` / ``..._session_12`` -> animal-recording prefix.
-_SESSION_SUFFIX = re.compile(r"_session_\d+$")
+# Re-exported: this module was the original home of both names, and tests
+# plus other scripts import them from here.  ``animal_of`` now lives in
+# the installed package so scripts/train.py can share the one definition
+# — the split that consumes it could not import it from here.
+__all__ = [
+    "animal_of",
+    "derive_stimulus_metadata",
+    "subset_dataset",
+    "main",
+]
 
 # Keys carrying one entry per trial; sliced by the sampled index set.
 _PER_TRIAL_KEYS: Tuple[str, ...] = (
@@ -60,11 +64,6 @@ _PER_TRIAL_KEYS: Tuple[str, ...] = (
     "stimulus_conditions",
     "is_pure_wind",
 )
-
-
-def animal_of(session_id: str) -> str:
-    """Strip the ``_session_N`` block suffix to get the animal key."""
-    return _SESSION_SUFFIX.sub("", str(session_id))
 
 
 def group_by_animal(session_ids: Sequence[str]) -> Dict[str, List[int]]:

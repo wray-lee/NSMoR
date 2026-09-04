@@ -16,6 +16,8 @@ from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import torch
 
+from nsmor.pipeline.grouping import grouped_train_val_split
+
 try:
     import jax
     import jax.numpy as jnp
@@ -69,33 +71,23 @@ def session_grouped_train_val_split(
     val_split: float = 0.2,
     random_seed: int = 42,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Perform deterministic session-grouped train/val split.
+    """Deterministic **animal**-grouped train/val split.
 
-    Matches the exact logic in scripts/train.py:
-    Trials belonging to the same recording session are kept entirely within
-    either the training set or the validation set to prevent baseline leakage.
-    """
-    rng = np.random.RandomState(random_seed)
-    if session_ids is not None and len(session_ids) == n_total:
-        session_arr = np.asarray(session_ids)
-        unique_sessions = np.unique(session_arr)
-        rng.shuffle(unique_sessions)
-        n_val_sessions = max(1, int(len(unique_sessions) * val_split))
-        val_sessions = set(unique_sessions[:n_val_sessions].tolist())
-        is_val = np.array([s in val_sessions for s in session_arr])
-        val_indices = np.nonzero(is_val)[0]
-        train_indices = np.nonzero(~is_val)[0]
-    else:
-        # Fallback to sample-level split
-        logger.warning("Dataset lacks valid session_ids; falling back to sample shuffle")
-        indices = np.arange(n_total)
-        rng.shuffle(indices)
-        n_val = max(1, int(n_total * val_split))
-        train_indices = indices[n_val:]
-        val_indices = indices[:n_val]
+    Thin delegation to :func:`nsmor.pipeline.grouping.grouped_train_val_split`
+    so the JAX and PyTorch pipelines cannot drift apart.  This was a
+    fourth hand-written copy of the split; grouping by session is
+    insufficient because ``_session_N`` blocks belong to one animal, and
+    its fallback branch also disagreed with ``scripts/train.py`` about
+    which end of the shuffled index array became validation.
 
-    return train_indices, val_indices
+    The name is kept for backward compatibility with existing callers.
+    """
+    return grouped_train_val_split(
+        session_ids,
+        n_total,
+        val_split=val_split,
+        random_seed=random_seed,
+    )
 
 
 def compute_target_stats(

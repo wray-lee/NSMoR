@@ -54,6 +54,7 @@ from nsmor.dataloader_factory import create_dataloaders_from_config
 from nsmor.loss import BioJointLoss, BioDecisionLoss, FrontendLoss
 from nsmor.model_nsmor_core import NSMoRCore
 from nsmor.pipeline.conditions import derive_stimulus_metadata
+from nsmor.pipeline.grouping import grouped_train_val_split
 
 
 # ── Deployment provenance keys ────────────────────────────────
@@ -684,28 +685,23 @@ def build_dataloaders(
             dt_ms=config.model.dt_ms,
         )
 
-        # Session-grouped split
-        session_ids = [full_dataset.get_session_id(i) for i in range(len(full_dataset))]
-        unique_sessions = list(set(session_ids))
-
-        rng = np.random.RandomState(config.training.random_seed)
-        rng.shuffle(unique_sessions)
-
-        n_val_sessions = max(1, int(len(unique_sessions) * val_split))
-        val_sessions = set(unique_sessions[:n_val_sessions])
-
-        train_indices = [i for i in range(len(full_dataset))
-                        if session_ids[i] not in val_sessions]
-        val_indices = [i for i in range(len(full_dataset))
-                      if session_ids[i] in val_sessions]
-
-        logger.info(
-            "Session-grouped split: %d train (%d sessions), %d val (%d sessions)",
-            len(train_indices),
-            len(unique_sessions) - n_val_sessions,
-            len(val_indices),
-            n_val_sessions,
+        # Animal-grouped split, via the same helper the eager path uses.
+        # The previous implementation derived unique keys from
+        # ``list(set(...))``, whose iteration order varies with
+        # PYTHONHASHSEED — so the lazy split was not reproducible across
+        # processes even at a fixed seed, and could not match the eager
+        # path or compute_target_stats.
+        session_ids = [
+            full_dataset.get_session_id(i) for i in range(len(full_dataset))
+        ]
+        train_indices, val_indices = grouped_train_val_split(
+            session_ids,
+            len(full_dataset),
+            val_split=val_split,
+            random_seed=config.training.random_seed,
         )
+        train_indices = train_indices.tolist()
+        val_indices = val_indices.tolist()
 
         # Create subset datasets
         from torch.utils.data import Subset
@@ -782,48 +778,22 @@ def build_dataloaders(
     )
 
     # ── Deterministic train/val split ─────────────────────────
-    # Round-3 fix (Reviewer B CRITICAL-3b): the split is SESSION-GROUPED.
-    # A sample-level shuffle lets one recording session straddle train
-    # and validation — trials of the same session share the animal's
-    # baseline locomotor statistics and gain state, so val metrics were
-    # mildly inflated by session-level information.  Whole sessions are
-    # now assigned to one side.  (Full nested CV — outer NSMoR split,
-    # inner cross-fitting restricted to the outer-training sessions —
-    # remains a documented limitation; grouped splitting removes the
-    # dominant first-order channel at negligible cost.)
-    rng = np.random.RandomState(config.training.random_seed)
-    session_ids = dataset.get("session_ids")
-    if session_ids is not None and len(session_ids) == n_total:
-        session_arr = np.asarray(session_ids)
-        unique_sessions = np.unique(session_arr)
-        rng.shuffle(unique_sessions)
-        n_val_sessions = max(1, int(len(unique_sessions) * val_split))
-        val_sessions = set(unique_sessions[:n_val_sessions].tolist())
-        is_val = np.array([s in val_sessions for s in session_arr])
-        val_indices = np.nonzero(is_val)[0]
-        train_indices = np.nonzero(~is_val)[0]
-        logger.info(
-            "Session-grouped split: %d train (%d sessions), "
-            "%d val (%d sessions)",
-            len(train_indices),
-            len(set(session_arr[train_indices].tolist())),
-            len(val_indices), n_val_sessions,
-        )
-    else:
-        # Fallback: sample-level shuffle (datasets without session ids;
-        # synthetic data only).  Warn loudly — this split is leak-prone.
-        logger.warning(
-            "Dataset lacks per-sequence 'session_ids'; falling back to "
-            "sample-level train/val split.  Session-level information "
-            "may inflate validation metrics.  Re-run prepare_data to "
-            "regenerate the dataset with session ids."
-        )
-        indices = np.arange(n_total)
-        rng.shuffle(indices)
-        n_val = max(1, int(n_total * val_split))
-        n_train = n_total - n_val
-        train_indices = indices[:n_train]
-        val_indices = indices[n_train:]
+    # The split is ANIMAL-GROUPED, not session-grouped.  Grouping by
+    # session is not enough: ``_session_N`` splits ONE recording of one
+    # animal into blocks, so a session-grouped split let an animal's
+    # _session_1 sit in train while its _session_2 sat in validation.
+    # Trials of one animal share that animal's baseline locomotor
+    # statistics, gain state, and body mass, so those val trials were
+    # not held out in any meaningful sense.  (Full nested CV — outer
+    # NSMoR split, inner cross-fitting restricted to outer-training
+    # animals — remains a documented limitation; grouping by animal
+    # removes the dominant first-order channel at negligible cost.)
+    train_indices, val_indices = grouped_train_val_split(
+        dataset.get("session_ids"),
+        n_total,
+        val_split=val_split,
+        random_seed=config.training.random_seed,
+    )
     n_train = len(train_indices)
     n_val = len(val_indices)
 
@@ -968,29 +938,19 @@ def compute_target_stats(
     Y_seqs = dataset["Y_seqs"]
     n_total = len(Y_seqs)
 
-    # ── Session-grouped split (must mirror build_dataloaders exactly) ──
-    # Round-4 fix: the previous implementation used a SAMPLE-level
-    # shuffle while build_dataloaders splits by SESSION.  That meant
-    # normalization statistics were fit on data that included validation
-    # sessions — a subtle data-leakage channel.  We now replicate the
-    # exact same session-grouped logic so the two code paths produce
-    # byte-identical train_indices from the same seed.
-    rng = np.random.RandomState(config.training.random_seed)
-    session_ids = dataset.get("session_ids")
-    if session_ids is not None and len(session_ids) == n_total:
-        session_arr = np.asarray(session_ids)
-        unique_sessions = np.unique(session_arr)
-        rng.shuffle(unique_sessions)
-        n_val_sessions = max(1, int(len(unique_sessions) * val_split))
-        val_sessions = set(unique_sessions[:n_val_sessions].tolist())
-        is_val = np.array([s in val_sessions for s in session_arr])
-        train_indices = np.nonzero(~is_val)[0].astype(np.int64)
-    else:
-        indices = np.arange(n_total, dtype=np.int64)
-        rng.shuffle(indices)
-        n_val = max(1, int(n_total * val_split))
-        n_train = n_total - n_val
-        train_indices = indices[:n_train]
+    # ── Grouped split (must mirror build_dataloaders exactly) ─────────
+    # Normalization statistics must be fit on the training split only, so
+    # this calls the SAME helper build_dataloaders calls.  Two hand-copied
+    # implementations previously drifted apart (sample-level here vs
+    # session-level there), fitting the statistics on data that included
+    # validation trials — a leakage channel that no test could catch while
+    # both copies existed.  One shared function, one split.
+    train_indices, _val_indices = grouped_train_val_split(
+        dataset.get("session_ids"),
+        n_total,
+        val_split=val_split,
+        random_seed=config.training.random_seed,
+    )
 
     train_y = np.concatenate([Y_seqs[i] for i in train_indices]).astype(np.float64)
 

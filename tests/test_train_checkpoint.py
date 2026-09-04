@@ -4,7 +4,7 @@ Covers:
 - Atomic-write semantics (no partial file left on interrupted save).
 - A completed run always yields a loadable best checkpoint.
 - Non-finite val loss is surfaced rather than silently swallowed.
-- Target-stats split matches the dataloader split (session-disjoint).
+- Target-stats split matches the dataloader split (animal-disjoint).
 - Deployment provenance fields in all checkpoint types.
 
 All tests use tiny synthetic data to run in <10s on CPU.
@@ -26,6 +26,7 @@ import pytest
 import torch
 
 from nsmor.config import PIPELINE_SEMANTICS_VERSION, FeatureConfig
+from nsmor.pipeline.grouping import animal_of as _animal_of
 
 # ── Fixtures ────────────────────────────────────────────────────────
 
@@ -35,7 +36,7 @@ _MCMC = 4
 _N_TRAIN = 8
 _N_VAL = 2
 _SEQ_LEN = 50
-_N_SESSIONS = 5  # at least 2 for val
+_N_SESSIONS = 5  # animals in the fixture; at least 2 so val is non-empty
 
 
 def _make_synthetic_dataset(tmp_path: Path) -> Path:
@@ -56,8 +57,25 @@ def _make_synthetic_dataset(tmp_path: Path) -> Path:
     _raw_logits = rng.randn(n_total, _MCMC).astype(np.float32)
     _exp = np.exp(_raw_logits - _raw_logits.max(axis=1, keepdims=True))
     mcmc_priors = (_exp / _exp.sum(axis=1, keepdims=True)).astype(np.float32)
-    # Assign sessions round-robin so we have at least 2 unique sessions.
-    session_ids = [f"sess_{i % _N_SESSIONS}" for i in range(n_total)]
+    # Session ids mirror the real corpus shape:
+    # ``<mass>cricket_001_<date>_<time>_session_<N>``.  The ``_session_N``
+    # suffix splits ONE recording of ONE animal into blocks, so each
+    # animal here owns two sessions.  This matters: with flat ids like
+    # ``sess_0`` an animal is indistinguishable from a session, and a
+    # session-grouped split passes an animal-disjointness assertion
+    # vacuously.  Real ids make the distinction observable.
+    session_ids = [
+        f"0.{500 + (i % _N_SESSIONS)}cricket_001_20260101_00000"
+        f"{i % _N_SESSIONS}_session_{1 + (i // _N_SESSIONS)}"
+        for i in range(n_total)
+    ]
+    assert len(set(session_ids)) == n_total, (
+        "fixture must give every trial a distinct session id"
+    )
+    assert len({_animal_of(s) for s in session_ids}) == _N_SESSIONS, (
+        f"fixture must yield {_N_SESSIONS} animals across "
+        f"{n_total} sessions, so animal != session"
+    )
 
     dataset = {
         "X_seqs": X_seqs,
@@ -226,12 +244,17 @@ def test_nonfinite_val_loss_handled(tmp_path: Path) -> None:
 
 def test_target_stats_split_matches_dataloader(tmp_path: Path) -> None:
     """``build_dataloaders`` and ``compute_target_stats`` must agree on the
-    session-grouped split at SESSION granularity (no data leakage).
+    grouped split at ANIMAL granularity (no data leakage).
 
     Both real functions are called and nothing is replicated locally.  The
     previous version of this test compared two identically-seeded local
     copies of the split logic to each other, so it could not fail no matter
     what the production functions did.
+
+    Granularity is animal, not session: ``_session_N`` blocks belong to one
+    animal, so a session-disjoint split still lets an animal straddle the
+    two sides and share its baseline locomotor statistics with validation.
+    Asserting at session granularity passes under that bug.
     """
     from scripts.train import (
         build_dataloaders,
@@ -243,6 +266,7 @@ def test_target_stats_split_matches_dataloader(tmp_path: Path) -> None:
     config = _make_config(tmp_path, epochs=1, normalize_targets=True)
     dataset = torch.load(ds_path, weights_only=False)
     session_arr = np.asarray(dataset["session_ids"])
+    animal_arr = np.array([_animal_of(s) for s in session_arr], dtype=object)
     all_sessions = set(np.unique(session_arr).tolist())
 
     def _sessions_of(loader) -> set:
@@ -252,6 +276,10 @@ def test_target_stats_split_matches_dataloader(tmp_path: Path) -> None:
             "source_indices must stay aligned with sequences"
         )
         return {session_arr[i] for i in ds.source_indices}
+
+    def _animals_of(loader) -> set:
+        ds = loader.dataset
+        return {animal_arr[i] for i in ds.source_indices}
 
     # Real call 1 — the loaders define the split.
     train_loader, val_loader = build_dataloaders(
@@ -275,6 +303,22 @@ def test_target_stats_split_matches_dataloader(tmp_path: Path) -> None:
     assert not (train_sessions_build & val_sessions_build), (
         "build_dataloaders leaked sessions across the split: "
         f"{sorted(train_sessions_build & val_sessions_build)}"
+    )
+    # ...and, strictly stronger, not one ANIMAL on both sides.  This is the
+    # assertion that fails under a session-grouped split.
+    train_animals_build = _animals_of(train_loader)
+    val_animals_build = _animals_of(val_loader)
+    assert not (train_animals_build & val_animals_build), (
+        "build_dataloaders leaked ANIMALS across the split (its "
+        "_session_N blocks landed on opposite sides): "
+        f"{sorted(train_animals_build & val_animals_build)}"
+    )
+    # compute_target_stats must be animal-disjoint from val too, or the
+    # normalization statistics carry validation animals' locomotor scale.
+    train_animals_stats = set(animal_arr[train_indices_stats].tolist())
+    assert not (train_animals_stats & val_animals_build), (
+        "compute_target_stats fit statistics on validation animals: "
+        f"{sorted(train_animals_stats & val_animals_build)}"
     )
     # The two independent code paths must agree, session for session.
     assert train_sessions_build == train_sessions_stats, (
