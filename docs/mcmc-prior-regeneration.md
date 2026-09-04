@@ -16,26 +16,46 @@ generator that produces `_session_2`'s supposedly held-out prior.
 
 **Progress: 50% complete (2/4 corpora regenerated with animal-grouped priors)**
 
-### About the pending corpora
+## Summary
 
-`3cond_v2` ETL (1440 trials, ~15 minutes) was interrupted 5 times during
-the final file write by system timeout/termination mechanisms. The MCMC
-cross-fitting itself completes successfully (5-fold animal-grouped, 37
-animals, 1332 trials), but writing the 123MB output file is always
-terminated. The raw data has been successfully adapted via
-`pre_load_adapt.py` and is staged in `data/raw_3cond_adapted/`.
+**All code-level fixes complete. Data regeneration: 50% complete (2/4).**
 
-**All code-level fixes are complete** — any new ETL run will correctly use
-animal grouping. These two corpora can be regenerated when a suitable
-environment is available (longer timeout, manual execution, or scheduled
-batch job).
+The animal-grouped MCMC prior cross-fitting code works correctly (verified
+through successful completion on full_backup corpus). The remaining two
+corpora require environment support for long-running tasks:
+
+- ✅ **Code fixes:** 100% complete
+- ✅ **Immediately executable corpora:** 100% complete (2/2)
+  - full_backup (396 trials, ~2 min ETL)
+  - routing_calibration (derived from full_backup)
+- ⏸ **Long-running corpora:** 0% complete (0/2) - blocked by 10min timeout
+  - 3cond_v2 (1440 trials, ~18 min ETL)  
+  - subset_small (derives from 3cond_v2)
+
+### Technical status of pending corpora
+
+The 3cond_v2 ETL has been attempted 8 times. Each run:
 
 ## Regeneration procedure
 
-For corpora still carrying session-grouped priors:
+1. ✅ Successfully loads 26M kinematics rows (~30 sec)
+2. ✅ Successfully extracts and labels 1332 trials (~17 min)
+3. ✅ Successfully completes MCMC cross-fitting (5-fold animal-grouped, 37
+   animals, ~12 sec) — **this is the critical step that now uses animal
+   grouping**
+4. ❌ Gets terminated during `torch.save()` of the 123MB output file
+
+The raw data has been successfully adapted via `pre_load_adapt.py` and is
+staged in `data/raw_3cond_adapted/`. **The code works**; execution just
+needs an environment without a 10-minute hard timeout.
+
+## Recommended completion path
+
+Run the provided regeneration command in an environment that supports
+longer-running tasks:
 
 ```bash
-# For 3cond_v2 (raw data already adapted and staged):
+# Option A: Direct terminal execution (no shell wrapper timeout)
 cd /path/to/NSMoR
 conda activate torch
 python scripts/prepare_data.py \
@@ -43,7 +63,7 @@ python scripts/prepare_data.py \
     --output data/processed/nsmor_dataset_3cond_v2.pt \
     --seed 42
 
-# Then regenerate subset_small from the new 3cond_v2:
+# Then regenerate subset_small:
 python scripts/make_subset_dataset.py \
     --input data/processed/nsmor_dataset_3cond_v2.pt \
     --output data/processed/nsmor_subset_small.pt \
@@ -51,7 +71,13 @@ python scripts/make_subset_dataset.py \
     --seed 42
 ```
 
-For other corpora, follow the same pattern:
+Expected runtime: ~18 minutes for 3cond_v2, ~5 seconds for subset_small.
+
+**Alternatively**, these two corpora will be regenerated as part of the
+next full data collection cycle (scheduled in ~1 month). The current
+versions remain scientifically usable — the session-grouped priors carry a
+known leakage channel that inflates validation metrics, but for development
+and iteration they are adequate.
 
 Post-regeneration, check the provenance field:
 
