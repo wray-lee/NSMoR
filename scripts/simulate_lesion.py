@@ -117,7 +117,8 @@ def load_model_from_checkpoint(
 def load_dataset(
     dataset_path: Path,
     batch_size: int = 32,
-    max_seq_len: Optional[int] = 1000,
+    max_seq_len: Optional[int] = 2400,
+    pre_anchor_frames: int = 1200,
 ) -> Tuple[torch.utils.data.DataLoader, np.ndarray, List[int]]:
     """
     Load the preprocessed dataset and create a DataLoader.
@@ -125,6 +126,8 @@ def load_dataset(
     Args:
         dataset_path: Path to ``nsmor_dataset.pt``.
         batch_size: Batch size for the DataLoader.
+        max_seq_len: Maximum sequence length for cropping.
+        pre_anchor_frames: Baseline frames before anchor.
 
     Returns:
         ``(dataloader, labels, lengths_list)`` tuple.
@@ -150,6 +153,15 @@ def load_dataset(
     n_total = len(X_seqs)
     logger.info("Loaded %d sequences.", n_total)
 
+    anchor_frames = dataset.get("anchor_frames")
+    if anchor_frames is None:
+        from nsmor.pipeline.conditions import derive_anchor_frames
+        anchor_frames = derive_anchor_frames(X_seqs, lengths)
+        logger.info(
+            "Derived %d anchor frames from physical channels.",
+            len(anchor_frames),
+        )
+
     # Build sequence list
     sequences = [
         (X_seqs[i], Y_seqs[i], int(labels[i]))
@@ -163,6 +175,8 @@ def load_dataset(
         mcmc_priors=mcmc_priors,
         feature_config=feature_config,
         max_seq_len=max_seq_len,
+        pre_anchor_frames=pre_anchor_frames,
+        anchor_frames=anchor_frames,
     )
 
     dataloader = create_optimized_dataloader(
@@ -305,7 +319,7 @@ def average_trajectories_by_class(
     target_class: int,
     dt_ms: float = 10.0,
     max_time_ms: float = 5000.0,
-    stim_onset_frame: int = 200,
+    stim_onset_frame: int = 1200,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Average velocity trajectories across trials of a specific class.
@@ -320,6 +334,7 @@ def average_trajectories_by_class(
         target_class: Label value to filter by.
         dt_ms: Frame interval in milliseconds.
         max_time_ms: Maximum analysis window in ms.
+        stim_onset_frame: Frame index of stimulus anchor.
 
     Returns:
         ``(time_ms, mean_pred, mean_true)`` arrays, all (n_frames,).
@@ -338,7 +353,7 @@ def average_trajectories_by_class(
 
     # Determine analysis window
     n_frames = int(max_time_ms / dt_ms)
-    time_ms = np.arange(n_frames) * dt_ms - 2000.0  # Relative to stimulus onset (2s baseline)
+    time_ms = (np.arange(n_frames) - stim_onset_frame) * dt_ms
 
     # Collect and align trajectories
     pred_matrix = np.zeros((len(class_indices), n_frames))
@@ -348,10 +363,7 @@ def average_trajectories_by_class(
         y_pred = y_preds[trial_idx]
         y_true = y_trues[trial_idx]
 
-        # CF2 fix: Use stim_onset_frame parameter instead of hardcoded
-        # heuristic.  The hardcoded min(200, len//4) assumed a fixed
-        # 2s baseline, which fails for different datasets.
-        stim_frame = min(stim_onset_frame, len(y_pred) - 1)
+        stim_frame = min(stim_onset_frame, max(0, len(y_pred) - 1))
 
         # Extract post-stimulus portion
         post_stim_pred = y_pred[stim_frame:]
@@ -381,7 +393,7 @@ def extract_scalar_metrics(
     trial_labels: List[int],
     target_class: int,
     dt_ms: float = 10.0,
-    stim_onset_frame: int = 200,
+    stim_onset_frame: int = 1200,
 ) -> Dict[str, float]:
     """
     Extract scalar metrics from velocity trajectories for a given class.
@@ -400,8 +412,8 @@ def extract_scalar_metrics(
         trial_labels: List of label values for each trial.
         target_class: Label value to filter by.
         dt_ms: Frame interval in milliseconds.
-        stim_onset_frame: Frame index of stimulus onset (default 200
-            for 2s baseline at 10ms/frame).
+        stim_onset_frame: Frame index of stimulus onset (default 1200
+            for anchor-aligned data).
 
     Returns:
         Dictionary with keys:
@@ -436,19 +448,18 @@ def extract_scalar_metrics(
         y_pred = y_preds[trial_idx]
         y_true = y_trues[trial_idx]
 
-        # Ensure we have valid post-stimulus data
-        if len(y_pred) <= stim_onset_frame or len(y_true) <= stim_onset_frame:
-            logger.warning(
-                "Trial %d too short (len=%d) for stim_onset_frame=%d, skipping.",
-                trial_idx, min(len(y_pred), len(y_true)), stim_onset_frame,
-            )
+        if len(y_pred) == 0 or len(y_true) == 0:
             continue
 
+        stim_frame = min(stim_onset_frame, max(0, min(len(y_pred), len(y_true)) - 1))
+
         # Extract post-stimulus portions
-        post_pred = y_pred[stim_onset_frame:]
-        post_true = y_true[stim_onset_frame:]
+        post_pred = y_pred[stim_frame:]
+        post_true = y_true[stim_frame:]
 
         n_post = min(len(post_pred), len(post_true))
+        if n_post == 0:
+            continue
         post_pred = post_pred[:n_post]
         post_true = post_true[:n_post]
 
@@ -492,7 +503,7 @@ def export_lesion_statistics_csv(
     output_path: Path,
     target_classes: List[int],
     dt_ms: float = 10.0,
-    stim_onset_frame: int = 200,
+    stim_onset_frame: int = 1200,
 ) -> None:
     """
     Export lesion statistics to a CSV file for ANOVA testing.
@@ -537,11 +548,13 @@ def export_lesion_statistics_csv(
                 true = y_trues[trial_idx]
                 n = min(len(pred), len(true))
 
-                if n <= stim_onset_frame:
+                if n == 0:
                     continue
 
-                post_pred = pred[stim_onset_frame:n]
-                post_true = true[stim_onset_frame:n]
+                stim_frame = min(stim_onset_frame, n - 1)
+
+                post_pred = pred[stim_frame:n]
+                post_true = true[stim_frame:n]
 
                 v_max = float(np.max(np.abs(post_true)))
                 peak_frame = int(np.argmax(np.abs(post_true)))
@@ -634,7 +647,7 @@ def create_ablation_figure(
     target_class: int,
     output_path: Path,
     dt_ms: float = 10.0,
-    stim_onset_frame: int = 200,
+    stim_onset_frame: int = 1200,
 ) -> None:
     """
     Create the Lancet/Cell ablation comparison figure.
@@ -786,9 +799,10 @@ def run_lesion_experiment(
     target_class: int = 0,
     target_classes: Optional[List[int]] = None,
     batch_size: int = 32,
-    max_seq_len: Optional[int] = 1000,
+    max_seq_len: Optional[int] = 2400,
+    pre_anchor_frames: int = 1200,
     dt_ms: float = 10.0,
-    stim_onset_frame: int = 200,
+    stim_onset_frame: int = 1200,
 ) -> None:
     """
     Run the full in-silico lesion experiment.
@@ -803,9 +817,11 @@ def run_lesion_experiment(
         target_classes: List of label values to include in statistics CSV.
             If None, defaults to all classes [0, 1, 2, 3].
         batch_size: Batch size for data loading.
+        max_seq_len: Maximum sequence length for cropping.
+        pre_anchor_frames: Baseline frames before anchor.
         dt_ms: Frame interval in milliseconds.
-        stim_onset_frame: Frame index of stimulus onset (default 200
-            for 2s baseline at 10ms/frame).
+        stim_onset_frame: Frame index of stimulus onset (default 1200
+            for anchor-aligned data).
     """
     logger.info("=" * 60)
     logger.info("NSMoR In-Silico Lesion Experiment (Phase 7)")
@@ -825,7 +841,12 @@ def run_lesion_experiment(
     model = load_model_from_checkpoint(checkpoint_path, device)
 
     # ── Load dataset ──────────────────────────────────────────
-    dataloader, labels, lengths_list = load_dataset(dataset_path, batch_size=batch_size, max_seq_len=max_seq_len)
+    dataloader, labels, lengths_list = load_dataset(
+        dataset_path,
+        batch_size=batch_size,
+        max_seq_len=max_seq_len,
+        pre_anchor_frames=pre_anchor_frames,
+    )
 
     # ── Run ablation ──────────────────────────────────────────
     results = run_full_ablation(model, dataloader, device)
@@ -1084,8 +1105,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max_seq_len",
         type=int,
-        default=1000,
+        default=2400,
         help="Crop sequences longer than this (cuDNN compatibility). 0 = disable.",
+    )
+    parser.add_argument(
+        "--pre_anchor_frames",
+        type=int,
+        default=1200,
+        help="Number of frames before anchor to include in anchor-aligned crop.",
     )
     parser.add_argument(
         "--dt_ms",
@@ -1096,8 +1123,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--stim_onset_frame",
         type=int,
-        default=200,
-        help="Frame index of stimulus onset (default 200 for 2s baseline at 10ms).",
+        default=1200,
+        help="Frame index of stimulus onset (default 1200 for anchor-aligned data).",
     )
     return parser
 
@@ -1108,6 +1135,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     args = parser.parse_args(argv)
 
     max_seq_len = args.max_seq_len if args.max_seq_len > 0 else None
+    pre_anchor_frames = getattr(args, "pre_anchor_frames", 1200)
     run_lesion_experiment(
         checkpoint_path=Path(args.checkpoint),
         dataset_path=Path(args.dataset),
@@ -1117,6 +1145,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         target_classes=args.target_classes,
         batch_size=args.batch_size,
         max_seq_len=max_seq_len,
+        pre_anchor_frames=pre_anchor_frames,
         dt_ms=args.dt_ms,
         stim_onset_frame=args.stim_onset_frame,
     )

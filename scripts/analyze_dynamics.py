@@ -124,7 +124,8 @@ def load_model_from_checkpoint(
 def load_dataset(
     dataset_path: Path,
     batch_size: int = 32,
-    max_seq_len: Optional[int] = 1000,
+    max_seq_len: Optional[int] = 2400,
+    pre_anchor_frames: int = 1200,
 ) -> Tuple[torch.utils.data.DataLoader, np.ndarray]:
     """
     Load the preprocessed dataset and create a DataLoader.
@@ -149,6 +150,16 @@ def load_dataset(
     n_total = len(X_seqs)
     logger.info("Loaded %d sequences.", n_total)
 
+    anchor_frames = dataset.get("anchor_frames")
+    if anchor_frames is None:
+        from nsmor.pipeline.conditions import derive_anchor_frames
+        lengths = dataset.get("lengths")
+        anchor_frames = derive_anchor_frames(X_seqs, lengths)
+        logger.info(
+            "Derived %d anchor frames from physical channels.",
+            len(anchor_frames),
+        )
+
     sequences = [
         (X_seqs[i], Y_seqs[i], int(labels[i]))
         for i in range(n_total)
@@ -160,6 +171,8 @@ def load_dataset(
         mcmc_priors=mcmc_priors,
         feature_config=feature_config,
         max_seq_len=max_seq_len,
+        pre_anchor_frames=pre_anchor_frames,
+        anchor_frames=anchor_frames,
     )
 
     dataloader = create_optimized_dataloader(
@@ -1078,7 +1091,8 @@ def run_analysis(
     dataset_path: Path,
     output_path: Path,
     batch_size: int = 32,
-    max_seq_len: Optional[int] = 1000,
+    max_seq_len: Optional[int] = 2400,
+    pre_anchor_frames: int = 1200,
     layout: str = "2x2",
 ) -> None:
     """
@@ -1090,6 +1104,7 @@ def run_analysis(
         output_path: Path to save the figure.
         batch_size: Batch size for data loading.
         max_seq_len: Maximum sequence length (cuDNN compat). None = no limit.
+        pre_anchor_frames: Baseline frames before stimulus anchor.
         layout: Panel layout ("2x2" or "1x2").
     """
     logger.info("=" * 60)
@@ -1104,7 +1119,12 @@ def run_analysis(
     model = load_model_from_checkpoint(checkpoint_path, device)
 
     # Load dataset
-    dataloader, labels = load_dataset(dataset_path, batch_size=batch_size, max_seq_len=max_seq_len)
+    dataloader, labels = load_dataset(
+        dataset_path,
+        batch_size=batch_size,
+        max_seq_len=max_seq_len,
+        pre_anchor_frames=pre_anchor_frames,
+    )
 
     # Single-pass extraction of all dynamics
     bundle = extract_full_dynamics(model, dataloader, labels, device)
@@ -1169,8 +1189,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max_seq_len",
         type=int,
-        default=1000,
+        default=2400,
         help="Crop sequences longer than this (cuDNN compatibility). 0 = disable.",
+    )
+    parser.add_argument(
+        "--pre_anchor_frames",
+        type=int,
+        default=1200,
+        help="Number of frames before anchor to include in anchor-aligned crop.",
     )
     parser.add_argument(
         "--layout",
@@ -1188,12 +1214,14 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     args = parser.parse_args(argv)
 
     max_seq_len = args.max_seq_len if args.max_seq_len > 0 else None
+    pre_anchor_frames = getattr(args, "pre_anchor_frames", 1200)
     run_analysis(
         checkpoint_path=Path(args.checkpoint),
         dataset_path=Path(args.dataset),
         output_path=Path(args.output),
         batch_size=args.batch_size,
         max_seq_len=max_seq_len,
+        pre_anchor_frames=pre_anchor_frames,
         layout=args.layout,
     )
 

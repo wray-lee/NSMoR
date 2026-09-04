@@ -94,7 +94,8 @@ def load_checkpoint(ckpt_path: str, device: torch.device):
 
 def load_validation_data(
     device: torch.device,
-    max_seq_len: int = 1000,
+    max_seq_len: Optional[int] = 2400,
+    pre_anchor_frames: int = 1200,
     dataset_path: Optional[str] = None,
     val_split: float = 0.2,
     random_seed: int = 42,
@@ -109,6 +110,10 @@ def load_validation_data(
 
     Uses animal-grouped train/val split (nsmor.pipeline.grouping.grouped_train_val_split)
     matching train.py to eliminate animal leakage across splits.
+
+    Returns validation tensors with metadata attributes:
+        - X_val.val_indices: original dataset indices
+        - X_val.stim_onset_frame: anchor-aligned stimulus frame
     """
     if dataset_path is None:
         dataset_path = os.path.join(
@@ -137,6 +142,17 @@ def load_validation_data(
         random_seed=random_seed,
     )
 
+    anchor_frames = data.get("anchor_frames")
+    if anchor_frames is None:
+        from nsmor.pipeline.conditions import derive_anchor_frames
+        anchor_frames = derive_anchor_frames(X_seqs, lengths)
+        logger.info(
+            "Derived %d anchor frames from physical channels.",
+            len(anchor_frames),
+        )
+
+    val_anchor_frames = [anchor_frames[i] for i in val_indices]
+
     # Use DataLoader with collate_variable_length for proper padding
     from nsmor.nsmor_dataloader import NSMoRDataset
     from nsmor.dataloader_factory import create_optimized_dataloader
@@ -155,6 +171,8 @@ def load_validation_data(
         ),
         feature_config=feature_config,
         max_seq_len=max_seq_len,
+        pre_anchor_frames=pre_anchor_frames,
+        anchor_frames=val_anchor_frames,
     )
 
     # Create a single batch with all validation data
@@ -171,6 +189,10 @@ def load_validation_data(
     Y_val = Y_val.to(device).contiguous()
     lengths_val = lengths_val.to(device).contiguous()
 
+    X_val.stim_onset_frame = pre_anchor_frames
+    X_val.pre_anchor_frames = pre_anchor_frames
+    X_val.val_indices = val_indices
+
     logger.info("Validation data loaded: %d trials", X_val.shape[0])
     return X_val, Y_val, lengths_val
 
@@ -179,7 +201,7 @@ def load_validation_data(
 # Condition Filtering & Noise Injection
 # ===================================================================
 
-STIM_ONSET_FRAME = 200
+STIM_ONSET_FRAME = 1200
 NOISE_LEVELS = [0.0, 5.0, 15.0, 30.0]  # σ in degrees
 
 
@@ -196,10 +218,15 @@ def find_multisensory_ttc0(
     X_seqs: torch.Tensor,
     lengths: torch.Tensor,
     raw_dir: str = "data/raw",
+    val_indices: Optional[Sequence[int]] = None,
+    stim_onset_frame: Optional[int] = None,
+    dt_ms: float = 10.0,
 ) -> torch.Tensor:
     """Return boolean mask for trials matching multisensory_ttc_0ms condition.
 
-    Uses events files to determine trial type and target_ttc_ms.
+    Uses events files to determine trial type and target_ttc_ms, aligned with
+    the validation indices from animal-grouped split. Falls back to kinematics
+    analysis of physical channels if raw events files are missing or empty.
     """
     import json
     from pathlib import Path
@@ -207,9 +234,14 @@ def find_multisensory_ttc0(
     B, T, _ = X_seqs.shape
     mask = torch.zeros(B, dtype=torch.bool, device=X_seqs.device)
 
+    if val_indices is None:
+        val_indices = getattr(X_seqs, "val_indices", None)
+    if stim_onset_frame is None:
+        stim_onset_frame = getattr(X_seqs, "stim_onset_frame", STIM_ONSET_FRAME)
+
     # Load trial info from events files
     trial_info = []
-    events_files = sorted(Path(raw_dir).rglob("*_events.csv"))
+    events_files = sorted(Path(raw_dir).rglob("*_events.csv")) if os.path.exists(raw_dir) else []
     for evt_path in events_files:
         df = pd.read_csv(evt_path)
         for _, row in df.iterrows():
@@ -225,19 +257,49 @@ def find_multisensory_ttc0(
                     'target_ttc_ms': details.get('target_ttc_ms'),
                 })
 
-    # Use validation split (last 20%)
-    n_total = len(trial_info)
-    n_val = min(B, int(n_total * 0.2))
-    split = n_total - n_val
-    val_info = trial_info[split:split + B]
+    # Align with val_indices from grouped_train_val_split
+    if trial_info and val_indices is not None and len(val_indices) == B:
+        for i, idx in enumerate(val_indices):
+            if idx < len(trial_info):
+                info = trial_info[idx]
+                if info.get('type') in ('looming_wind', 'multisensory') and info.get('target_ttc_ms') is not None:
+                    if abs(info['target_ttc_ms']) < 50:
+                        mask[i] = True
+    elif trial_info and val_indices is None:
+        n_total = len(trial_info)
+        n_val = min(B, int(n_total * 0.2))
+        split = n_total - n_val
+        val_info = trial_info[split:split + B]
+        for i, info in enumerate(val_info):
+            if i >= B:
+                break
+            if info.get('type') in ('looming_wind', 'multisensory') and info.get('target_ttc_ms') is not None:
+                if abs(info['target_ttc_ms']) < 50:
+                    mask[i] = True
 
-    # Mark trials with target_ttc_ms ≈ 0
-    for i, info in enumerate(val_info):
-        if i >= B:
-            break
-        if info['type'] == 'looming_wind' and info['target_ttc_ms'] is not None:
-            if abs(info['target_ttc_ms']) < 50:
-                mask[i] = True
+    # Kinematics-based fallback from physical channels (TTC ~ 0ms)
+    if mask.sum() == 0:
+        logger.info("Aligning multisensory ttc0 from physical channels.")
+        for i in range(B):
+            L = int(lengths[i].item())
+            vis = X_seqs[i, :L, VISUAL_ANGLE_IDX].abs()
+            wind = X_seqs[i, :L, 1]
+            has_vis = bool((vis > 1e-4).any().item())
+            has_wind = bool((wind > 0.5).any().item())
+            if has_vis and has_wind:
+                wind_indices = (wind > 0.5).nonzero(as_tuple=False)
+                wind_onset = int(wind_indices[0].item()) if wind_indices.numel() > 0 else 0
+                ref_frame = stim_onset_frame if (stim_onset_frame is not None and stim_onset_frame < L) else int(torch.argmax(vis).item())
+                if abs(wind_onset - ref_frame) * dt_ms < 50.0:
+                    mask[i] = True
+
+    # Strict condition semantics: no TTC=0 found → raise error
+    if mask.sum() == 0:
+        raise ValueError(
+            "No multisensory TTC=0ms trials found in validation set. "
+            "This analysis requires exact TTC=0 trials for Bayesian reliability inference. "
+            "Check raw events files and animal-grouped validation split."
+        )
 
     return mask
 
@@ -317,28 +379,48 @@ def extract_gate_trajectory(internals: dict, lengths: torch.Tensor) -> np.ndarra
 
 
 def extract_latency_to_peak(
-    Y_pred: torch.Tensor, lengths: torch.Tensor, dt_ms: float = 10.0
+    Y_pred: torch.Tensor,
+    lengths: torch.Tensor,
+    dt_ms: float = 10.0,
+    stim_onset_frame: Optional[int] = None,
+    search_window_frames: int = 1000,
+    pre_stim_window_frames: int = 500,
 ) -> list[float]:
     """
     Per-trial latency to peak velocity (ms) relative to stimulus onset.
 
-    Trials whose global peak falls at or before stimulus onset (i.e.
-    peak occurred during the baseline epoch) are reported as NaN and
-    must be excluded from inferential statistics — clamping them to 0
-    (previous behaviour) artificially compressed the variance of the
-    clean-condition sample and biased the psychometric curve upward.
+    Searches in physiologically relevant window around stimulus onset:
+    [onset - pre_stim_window : onset + search_window] to capture both
+    pre-collision escapes (biologically valid) and post-stimulus responses,
+    while avoiding spurious peaks from distant baseline drift.
+
+    Args:
+        search_window_frames: Post-stimulus search window (default 1000 = 4s at 250Hz).
+        pre_stim_window_frames: Pre-stimulus search window (default 500 = 2s at 250Hz).
     """
+    if stim_onset_frame is None:
+        stim_onset_frame = STIM_ONSET_FRAME
     latencies = []
     B, T = Y_pred.shape
     for i in range(B):
         L = int(lengths[i].item())
-        vel = Y_pred[i, :L]
-        peak_frame = torch.argmax(vel.abs()).item()
-        if peak_frame <= STIM_ONSET_FRAME:
-            # Pre-stimulus peak: no post-stimulus response measurable.
+        if L == 0:
             latencies.append(float("nan"))
             continue
-        latency_ms = (peak_frame - STIM_ONSET_FRAME) * dt_ms
+
+        # Search in window around stimulus: [onset - pre_window : onset + post_window]
+        search_start = max(0, stim_onset_frame - pre_stim_window_frames)
+        search_end = min(L, stim_onset_frame + search_window_frames)
+
+        if search_start >= L or search_end <= search_start:
+            latencies.append(float("nan"))
+            continue
+
+        vel_window = Y_pred[i, search_start:search_end]
+        peak_in_window = torch.argmax(vel_window.abs()).item()
+        peak_frame = search_start + peak_in_window
+
+        latency_ms = (peak_frame - stim_onset_frame) * dt_ms
         latencies.append(latency_ms)
     return latencies
 
@@ -349,6 +431,9 @@ def extract_peak_velocity(Y_pred: torch.Tensor, lengths: torch.Tensor) -> list[f
     B, T = Y_pred.shape
     for i in range(B):
         L = int(lengths[i].item())
+        if L == 0:
+            peaks.append(0.0)
+            continue
         vel = Y_pred[i, :L]
         peaks.append(vel.abs().max().item())
     return peaks
@@ -503,8 +588,14 @@ def main() -> None:
     parser.add_argument(
         "--max_seq_len",
         type=int,
-        default=1000,
+        default=2400,
         help="Crop sequences longer than this (cuDNN compatibility). 0 = disable.",
+    )
+    parser.add_argument(
+        "--pre_anchor_frames",
+        type=int,
+        default=1200,
+        help="Number of frames before anchor to include in anchor-aligned crop.",
     )
     parser.add_argument(
         "--seed",
@@ -512,6 +603,12 @@ def main() -> None:
         default=42,
         help="Seed for the visual-noise generator (paired design must be "
              "reproducible; recorded in the JSON summary).",
+    )
+    parser.add_argument(
+        "--dt_ms",
+        type=float,
+        default=4.0,
+        help="Frame interval in milliseconds (250 Hz = 4.0 ms).",
     )
     args = parser.parse_args()
 
@@ -522,12 +619,23 @@ def main() -> None:
     # --- Load model & data ---
     model = load_checkpoint(args.checkpoint, device)
     max_seq_len = args.max_seq_len if args.max_seq_len > 0 else None
+    pre_anchor_frames = getattr(args, "pre_anchor_frames", 1200)
     X_val, Y_val, lengths_val = load_validation_data(
-        device, max_seq_len=max_seq_len, dataset_path=args.dataset,
+        device,
+        max_seq_len=max_seq_len,
+        pre_anchor_frames=pre_anchor_frames,
+        dataset_path=args.dataset,
     )
 
     # --- Filter to multisensory_ttc_0ms ---
-    ttc0_mask = find_multisensory_ttc0(X_val, lengths_val, raw_dir=args.raw_dir)
+    ttc0_mask = find_multisensory_ttc0(
+        X_val,
+        lengths_val,
+        raw_dir=args.raw_dir,
+        val_indices=getattr(X_val, "val_indices", None),
+        stim_onset_frame=getattr(X_val, "stim_onset_frame", STIM_ONSET_FRAME),
+        dt_ms=args.dt_ms,
+    )
     n_ttc0 = ttc0_mask.sum().item()
     logger.info("multisensory_ttc_0ms trials found: %d / %d", n_ttc0, X_val.shape[0])
     if n_ttc0 == 0:
@@ -592,7 +700,10 @@ def main() -> None:
         )
 
         # Latency
-        latencies = extract_latency_to_peak(Y_pred, L_ttc0)
+        latencies = extract_latency_to_peak(
+            Y_pred, L_ttc0, dt_ms=args.dt_ms,
+            stim_onset_frame=getattr(X_val, "stim_onset_frame", STIM_ONSET_FRAME),
+        )
         latency_arrays[sigma] = np.asarray(latencies, dtype=np.float64)
         valid = latency_arrays[sigma][~np.isnan(latency_arrays[sigma])]
         mean_lat = float(np.mean(valid)) if valid.size else float("nan")

@@ -67,7 +67,7 @@ A 5-dimensional feature vector extracted 50 ms before a trial's anchor instant: 
 _Avoid_: feature vector, TTC snapshot
 
 **Cross-Fitted OOF Priors**:
-Out-of-fold MCMC prior probabilities generated via K-fold cross-fitting with session-grouped stratification, ensuring each trial's prior is produced by a model that never saw that trial's label or any trial from its recording session.
+Out-of-fold MCMC prior probabilities generated via K-fold cross-fitting with animal-grouped stratification, ensuring each trial's prior is produced by a model that never saw that trial's label or any trial from the same animal.
 _Avoid_: OOF, out-of-fold priors
 
 **Ensemble Priors**:
@@ -78,17 +78,21 @@ _Avoid_: served priors, deployment priors
 A provenance stamp embedded in every checkpoint and dataset artifact, enforcing that loaders reject artifacts produced under incompatible scientific semantics. Current version: 2.2.
 _Avoid_: version, stamp, tag
 
+**Physical Cadence (dt_ms)**:
+The hardware sampling interval in milliseconds (nominal 250 Hz, dt_ms = 4.0 ms, ~4.006 ms median), superseding legacy 100 Hz (10.0 ms) assumptions. All biophysical time constants are specified in physical milliseconds and converted internally via exp(-dt_ms / tau_ms).
+_Avoid_: frame rate, step size
+
 **Trial-Start Anchor**:
 The temporal reference point for all continuous sequences, defined as the moment of the 2-second absolute static baseline onset. Sequences are extracted from this anchor forward.
 _Avoid_: baseline onset, sequence origin
 
 **Pure-Wind Trial**:
-An experimental trial with no visual looming stimulus, receiving 570 frames of zero-padding prepended to align temporally with looming trials.
+An experimental trial with no visual looming stimulus, receiving 1425 frames (5.7s at 250 Hz / 4ms cadence) of zero-padding prepended to align temporally with looming trials.
 _Avoid_: wind-only trial
 
-**Session-Grouped Split**:
-Train/val partition that assigns entire recording sessions to one side, preventing within-session information leakage from shared animal baseline and gain state.
-_Avoid_: session split, grouped split
+**Animal-Grouped Split**:
+Train/val partition that assigns entire animals to one side (stripping session suffixes), preventing information leakage from shared animal baseline and gain state.
+_Avoid_: animal split, session split, grouped split
 
 ### Behavioral Classification
 

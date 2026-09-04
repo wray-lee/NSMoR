@@ -112,7 +112,8 @@ def load_model_and_dataset(
     checkpoint_path: Path,
     dataset_path: Path,
     batch_size: int = 32,
-    max_seq_len: Optional[int] = 1000,
+    max_seq_len: Optional[int] = 2400,
+    pre_anchor_frames: int = 1200,
 ) -> Tuple[torch.nn.Module, torch.utils.data.DataLoader, np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
     """
     Load model and dataset for gating extraction.
@@ -176,6 +177,16 @@ def load_model_and_dataset(
                 "computed against an empty group."
             )
 
+    anchor_frames = dataset.get("anchor_frames")
+    if anchor_frames is None:
+        from nsmor.pipeline.conditions import derive_anchor_frames
+        lengths = dataset.get("lengths")
+        anchor_frames = derive_anchor_frames(X_seqs, lengths)
+        logger.info(
+            "Derived %d anchor frames from physical channels.",
+            len(anchor_frames),
+        )
+
     sequences = [
         (X_seqs[i], Y_seqs[i], int(labels[i]))
         for i in range(n_total)
@@ -188,6 +199,8 @@ def load_model_and_dataset(
         mcmc_priors=mcmc_priors,
         feature_config=feature_config,
         max_seq_len=max_seq_len,
+        pre_anchor_frames=pre_anchor_frames,
+        anchor_frames=anchor_frames,
         is_pure_wind=is_pure_wind,  # Ticket #17
     )
 
@@ -517,7 +530,8 @@ def run_analysis(
     dataset_path: Path,
     output_dir: Path,
     batch_size: int = 32,
-    max_seq_len: Optional[int] = 1000,
+    max_seq_len: Optional[int] = 2400,
+    pre_anchor_frames: int = 1200,
     config_path: Optional[Path] = None,
 ) -> None:
     """Run the full gating cluster analysis pipeline."""
@@ -537,7 +551,11 @@ def run_analysis(
 
     # Load model and dataset
     model, dataloader, labels, is_pure_wind, stimulus_conditions = load_model_and_dataset(
-        checkpoint_path, dataset_path, batch_size=batch_size, max_seq_len=max_seq_len,
+        checkpoint_path,
+        dataset_path,
+        batch_size=batch_size,
+        max_seq_len=max_seq_len,
+        pre_anchor_frames=pre_anchor_frames,
     )
 
     # Extract and cluster
@@ -683,8 +701,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max_seq_len",
         type=int,
-        default=1000,
+        default=2400,
         help="Crop sequences longer than this (cuDNN compatibility). 0 = disable.",
+    )
+    parser.add_argument(
+        "--pre_anchor_frames",
+        type=int,
+        default=1200,
+        help="Number of frames before anchor to include in anchor-aligned crop.",
     )
     return parser
 
@@ -695,12 +719,14 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     args = parser.parse_args(argv)
 
     max_seq_len = args.max_seq_len if args.max_seq_len > 0 else None
+    pre_anchor_frames = getattr(args, "pre_anchor_frames", 1200)
     run_analysis(
         checkpoint_path=Path(args.checkpoint),
         dataset_path=Path(args.dataset),
         output_dir=Path(args.output_dir),
         batch_size=args.batch_size,
         max_seq_len=max_seq_len,
+        pre_anchor_frames=pre_anchor_frames,
         config_path=Path(args.config) if args.config else None,
     )
 

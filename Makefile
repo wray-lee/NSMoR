@@ -106,7 +106,7 @@ integration: $(BEST) ## Run multisensory integration window
 	$(PYTHON) scripts/analyze_integration.py --checkpoint $(BEST) --dataset $(DATA) --output $(OUTPUT)/integration_window.png --summary $(OUTPUT)/integration_summary.json --dt_ms $(DT_MS)
 
 psychophysics: $(BEST) ## Run Bayesian reliability analysis
-	$(PYTHON) scripts/simulate_psychophysics.py --checkpoint $(BEST) --dataset $(DATA) --raw_dir $(RAW) --output_dir $(OUTPUT) --seed $(SEED)
+	$(PYTHON) scripts/simulate_psychophysics.py --checkpoint $(BEST) --dataset $(DATA) --raw_dir $(RAW) --output_dir $(OUTPUT) --dt_ms $(DT_MS) --seed $(SEED)
 
 cluster: $(BEST) ## Run unsupervised gating strategy clustering
 	$(PYTHON) scripts/analyze_gating.py --checkpoint $(BEST) --dataset $(DATA) --config $(CONFIG) --output_dir $(OUTPUT)

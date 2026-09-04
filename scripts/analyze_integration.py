@@ -129,7 +129,8 @@ def load_model_from_checkpoint(
 def load_dataset(
     dataset_path: Path,
     batch_size: int = 32,
-    max_seq_len: Optional[int] = 1000,
+    max_seq_len: Optional[int] = 2400,
+    pre_anchor_frames: int = 1200,
 ) -> Tuple[torch.utils.data.DataLoader, np.ndarray, List[int], np.ndarray, List[Dict]]:
     """
     Load the preprocessed dataset and create a DataLoader.
@@ -137,6 +138,8 @@ def load_dataset(
     Args:
         dataset_path: Path to ``nsmor_dataset.pt``.
         batch_size: Batch size for the DataLoader.
+        max_seq_len: Maximum sequence length for cropping.
+        pre_anchor_frames: Number of baseline frames before anchor to retain.
 
     Returns:
         ``(dataloader, labels, lengths_list, X_seqs, trial_info_list)`` tuple.
@@ -164,6 +167,15 @@ def load_dataset(
     n_total = len(X_seqs)
     logger.info("Loaded %d sequences.", n_total)
 
+    anchor_frames = dataset.get("anchor_frames")
+    if anchor_frames is None:
+        from nsmor.pipeline.conditions import derive_anchor_frames
+        anchor_frames = derive_anchor_frames(X_seqs, lengths)
+        logger.info(
+            "Derived %d anchor frames from physical channels.",
+            len(anchor_frames),
+        )
+
     # Build sequence list
     sequences = [
         (X_seqs[i], Y_seqs[i], int(labels[i]))
@@ -177,6 +189,8 @@ def load_dataset(
         mcmc_priors=mcmc_priors,
         feature_config=feature_config,
         max_seq_len=max_seq_len,
+        pre_anchor_frames=pre_anchor_frames,
+        anchor_frames=anchor_frames,
     )
 
     dataloader = create_optimized_dataloader(
@@ -240,7 +254,7 @@ def _load_trial_info_from_events(raw_dir: Path) -> List[Dict]:
 
 def detect_wind_onset_frame(
     x_seq: np.ndarray,
-    stim_onset_frame: int = 200,
+    stim_onset_frame: int = 1200,
     wind_threshold: float = 0.5,
 ) -> Optional[int]:
     """
@@ -249,19 +263,12 @@ def detect_wind_onset_frame(
     Args:
         x_seq: Single trial feature array, shape ``(T_i, 8)``.
             Index 1 is the wind state feature ``wind(t)``.
-        stim_onset_frame: Frame index of visual stimulus onset.
+        stim_onset_frame: Frame index of visual stimulus onset / anchor.
         wind_threshold: Threshold to detect wind activation.
 
     Returns:
         Frame index of wind onset relative to sequence start,
         or ``None`` if no wind detected.
-
-    Note:
-        - For pure-wind trials (visual_angle ≡ 0), the sequence has
-          570 frames prepended. Wind onset is detected in the original
-          portion (after prepend).
-        - The 0° visual baseline assumption means visual stimulus starts
-          from frame ``stim_onset_frame`` and increases monotonically.
     """
     assert x_seq.ndim == 2 and x_seq.shape[1] == 8, (
         f"x_seq must be (T, 8), got {x_seq.shape}"
@@ -269,27 +276,17 @@ def detect_wind_onset_frame(
 
     # Wind feature is at index 1
     wind_feature = x_seq[:, 1]
-
-    # Look for first frame after stim_onset where wind > threshold
-    post_stim_wind = wind_feature[stim_onset_frame:]
-
-    if len(post_stim_wind) == 0:
-        return None
-
-    # Find first active wind frame
-    active_frames = np.where(post_stim_wind > wind_threshold)[0]
+    active_frames = np.where(wind_feature > wind_threshold)[0]
 
     if len(active_frames) == 0:
         return None  # No wind detected
 
-    # Return absolute frame index
-    wind_onset_frame = stim_onset_frame + int(active_frames[0])
-    return wind_onset_frame
+    return int(active_frames[0])
 
 
 def classify_wind_condition(
     x_seq: np.ndarray,
-    stim_onset_frame: int = 200,
+    stim_onset_frame: int = 1200,
     dt_ms: float = 10.0,
     wind_threshold: float = 0.5,
 ) -> Tuple[str, Optional[float]]:
@@ -298,7 +295,7 @@ def classify_wind_condition(
 
     Args:
         x_seq: Single trial feature array, shape ``(T_i, 8)``.
-        stim_onset_frame: Frame index of visual stimulus onset.
+        stim_onset_frame: Frame index of visual stimulus onset / anchor.
         dt_ms: Frame interval in milliseconds.
         wind_threshold: Threshold for wind detection.
 
@@ -309,19 +306,14 @@ def classify_wind_condition(
           Negative = wind before TTC, Positive = wind after TTC.
           ``None`` for visual-only or wind-only conditions.
     """
-    # ── Check for visual stimulus ─────────────────────────────
-    # Visual angle (index 0) should be non-zero post-stimulus for looming
     visual_feature = x_seq[:, 0]
-    post_stim_visual = visual_feature[stim_onset_frame:]
-    has_visual = bool(np.any(np.abs(post_stim_visual) > 1e-6))
+    has_visual = bool(np.any(np.abs(visual_feature) > 1e-4))
 
-    # ── Check for wind stimulus ───────────────────────────────
     wind_onset_frame = detect_wind_onset_frame(
         x_seq, stim_onset_frame, wind_threshold
     )
     has_wind = wind_onset_frame is not None
 
-    # ── Classify condition ────────────────────────────────────
     if has_visual and not has_wind:
         return "visual_only", None
 
@@ -329,12 +321,8 @@ def classify_wind_condition(
         return "wind_only", None
 
     if has_visual and has_wind:
-        # Compute wind onset time relative to stimulus onset
-        # ΔT = (wind_onset_frame - stim_onset_frame) * dt_ms
         delta_t_ms = float((wind_onset_frame - stim_onset_frame) * dt_ms)
 
-        # Classify into specific multisensory conditions
-        # Use tolerance bins for known experimental conditions
         if abs(delta_t_ms - (-373.0)) < 50.0:
             return "multisensory_ttc_-373ms", delta_t_ms
         elif abs(delta_t_ms - (-119.0)) < 50.0:
@@ -346,14 +334,13 @@ def classify_wind_condition(
         else:
             return "multisensory_other", delta_t_ms
 
-    # Fallback: no stimulus detected
     return "visual_only", None
 
 
 def group_trials_by_condition(
     X_seqs: np.ndarray,
     trial_info_list: List[Dict],
-    stim_onset_frame: int = 200,
+    stim_onset_frame: int = 1200,
     dt_ms: float = 10.0,
 ) -> Dict[str, List[int]]:
     """
@@ -427,22 +414,30 @@ def extract_predicted_metrics(
     y_preds: List[np.ndarray],
     trial_indices: List[int],
     dt_ms: float = 10.0,
-    stim_onset_frame: int = 200,
+    stim_onset_frame: int = 1200,
+    search_window_frames: int = 1000,
+    pre_stim_window_frames: int = 500,
 ) -> Dict[str, List[float]]:
     """
     Extract scalar metrics from predicted velocities for a set of trials.
 
     Computes per-trial:
-        - **Peak Velocity (V_max):** Maximum absolute predicted velocity
-          in the post-stimulus window.
+        - **Peak Velocity (V_max):** Maximum absolute predicted velocity.
         - **Latency to Peak (T_max):** Time (ms) relative to stimulus
-          onset when V_max is reached.
+          onset / anchor when V_max is reached.
+
+    Searches in physiologically relevant window around stimulus onset:
+    [onset - pre_stim_window : onset + search_window] to capture both
+    pre-collision escapes (biologically valid) and post-stimulus responses,
+    while avoiding spurious peaks from distant baseline drift.
 
     Args:
         y_preds: List of predicted velocity arrays, each (T_i,).
         trial_indices: Indices of trials to analyze.
         dt_ms: Frame interval in milliseconds.
-        stim_onset_frame: Frame index of stimulus onset.
+        stim_onset_frame: Frame index of stimulus anchor.
+        search_window_frames: Post-stimulus search window (default 1000 = 4s at 250Hz).
+        pre_stim_window_frames: Pre-stimulus search window (default 500 = 2s at 250Hz).
 
     Returns:
         Dictionary with keys:
@@ -455,27 +450,23 @@ def extract_predicted_metrics(
     for trial_idx in trial_indices:
         y_pred = y_preds[trial_idx]
 
-        # Ensure valid post-stimulus data
-        if len(y_pred) <= stim_onset_frame:
-            logger.debug(
-                "Trial %d too short (len=%d) for stim_onset_frame=%d, skipping.",
-                trial_idx, len(y_pred), stim_onset_frame,
-            )
+        if len(y_pred) == 0:
             continue
 
-        # Extract post-stimulus predicted velocity
-        post_pred = y_pred[stim_onset_frame:]
+        # Search in window around stimulus: [onset - pre_window : onset + post_window]
+        search_start = max(0, stim_onset_frame - pre_stim_window_frames)
+        search_end = min(len(y_pred), stim_onset_frame + search_window_frames)
 
-        if len(post_pred) == 0:
+        if search_start >= len(y_pred) or search_end <= search_start:
+            # No valid search window
             continue
 
-        # Peak Velocity: maximum absolute predicted velocity
-        abs_velocity = np.abs(post_pred)
-        v_max = float(np.max(abs_velocity))
+        abs_velocity_window = np.abs(y_pred[search_start:search_end])
+        v_max = float(np.max(abs_velocity_window))
+        peak_in_window = int(np.argmax(abs_velocity_window))
+        peak_frame = search_start + peak_in_window
 
-        # Latency to Peak: time of V_max relative to stimulus
-        peak_frame = int(np.argmax(abs_velocity))
-        t_max = float(peak_frame * dt_ms)
+        t_max = float((peak_frame - stim_onset_frame) * dt_ms)
 
         peak_velocities.append(v_max)
         latencies.append(t_max)
@@ -929,9 +920,10 @@ def run_integration_analysis(
     output_path: Path,
     summary_path: Optional[Path] = None,
     batch_size: int = 32,
-    max_seq_len: Optional[int] = 1000,
+    max_seq_len: Optional[int] = 2400,
+    pre_anchor_frames: int = 1200,
     dt_ms: float = 10.0,
-    stim_onset_frame: int = 200,
+    stim_onset_frame: int = 1200,
 ) -> None:
     """
     Run the full multisensory integration window analysis.
@@ -943,8 +935,10 @@ def run_integration_analysis(
         summary_path: Path to save the JSON summary. If None,
             defaults to ``results/integration_summary.json``.
         batch_size: Batch size for data loading.
+        max_seq_len: Maximum sequence length for cropping.
+        pre_anchor_frames: Baseline frames before anchor.
         dt_ms: Frame interval in milliseconds.
-        stim_onset_frame: Frame index of stimulus onset.
+        stim_onset_frame: Frame index of stimulus onset / anchor.
     """
     logger.info("=" * 60)
     logger.info("NSMoR Multisensory Integration Window Analysis (Phase 9)")
@@ -963,7 +957,10 @@ def run_integration_analysis(
 
     # ── Load dataset ──────────────────────────────────────────
     dataloader, labels, lengths_list, X_seqs, trial_info_list = load_dataset(
-        dataset_path, batch_size=batch_size, max_seq_len=max_seq_len,
+        dataset_path,
+        batch_size=batch_size,
+        max_seq_len=max_seq_len,
+        pre_anchor_frames=pre_anchor_frames,
     )
 
     # ── Run model inference ───────────────────────────────────
@@ -1094,8 +1091,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max_seq_len",
         type=int,
-        default=1000,
+        default=2400,
         help="Crop sequences longer than this (cuDNN compatibility). 0 = disable.",
+    )
+    parser.add_argument(
+        "--pre_anchor_frames",
+        type=int,
+        default=1200,
+        help="Number of frames before anchor to include in anchor-aligned crop.",
     )
     parser.add_argument(
         "--dt_ms",
@@ -1106,8 +1109,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--stim_onset_frame",
         type=int,
-        default=200,
-        help="Frame index of stimulus onset (default 200 for 2s baseline at 10ms).",
+        default=1200,
+        help="Frame index of stimulus onset / anchor (default 1200).",
     )
     return parser
 
@@ -1118,6 +1121,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     args = parser.parse_args(argv)
 
     max_seq_len = args.max_seq_len if args.max_seq_len > 0 else None
+    pre_anchor_frames = getattr(args, "pre_anchor_frames", 1200)
     run_integration_analysis(
         checkpoint_path=Path(args.checkpoint),
         dataset_path=Path(args.dataset),
@@ -1125,6 +1129,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         summary_path=Path(args.summary),
         batch_size=args.batch_size,
         max_seq_len=max_seq_len,
+        pre_anchor_frames=pre_anchor_frames,
         dt_ms=args.dt_ms,
         stim_onset_frame=args.stim_onset_frame,
     )

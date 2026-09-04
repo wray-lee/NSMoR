@@ -7,7 +7,7 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Dict, List, Optional, Sequence
 import numpy as np
 import torch
 from tqdm import tqdm
@@ -16,6 +16,69 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from nsmor.lazy_dataloader import NSMoRLazyDataset
+
+
+def populate_etl_provenance_and_conditions(
+    output: Dict[str, Any],
+    metadata: Dict[str, Any],
+    X_seqs: Optional[List[np.ndarray]] = None,
+    lengths: Optional[Sequence[int]] = None,
+) -> Dict[str, Any]:
+    """Populate provenance and condition metadata into output ETL dictionary.
+
+    Adds "mcmc_prior_provenance", "anchor_frames", "stimulus_conditions",
+    and "is_pure_wind", copying from input metadata where available.
+
+    Args:
+        output: ETL dataset dictionary to enrich in-place.
+        metadata: Source metadata dictionary.
+        X_seqs: Optional extracted physical sequences for fallback derivation.
+        lengths: Optional sequence lengths.
+
+    Returns:
+        The enriched output dictionary.
+    """
+    # ── MCMC prior provenance ─────────────────────────────────────
+    if "mcmc_prior_provenance" in metadata:
+        output["mcmc_prior_provenance"] = metadata["mcmc_prior_provenance"]
+
+    # ── Anchor frames ─────────────────────────────────────────────
+    if "anchor_frames" in metadata:
+        output["anchor_frames"] = metadata["anchor_frames"]
+    elif "trial_specs" in metadata and all("anchor_frame" in s for s in metadata["trial_specs"]):
+        output["anchor_frames"] = [int(s["anchor_frame"]) for s in metadata["trial_specs"]]
+    elif X_seqs is not None and lengths is not None:
+        try:
+            from nsmor.pipeline.conditions import derive_anchor_frames
+            output["anchor_frames"] = derive_anchor_frames(X_seqs, lengths)
+        except Exception:
+            pass
+
+    # ── Stimulus conditions ───────────────────────────────────────
+    if "stimulus_conditions" in metadata:
+        output["stimulus_conditions"] = metadata["stimulus_conditions"]
+    elif "trial_specs" in metadata and all("stimulus_condition" in s for s in metadata["trial_specs"]):
+        output["stimulus_conditions"] = [s["stimulus_condition"] for s in metadata["trial_specs"]]
+    elif X_seqs is not None and lengths is not None:
+        try:
+            from nsmor.pipeline.conditions import derive_stimulus_metadata
+            conditions_derived, pure_wind_derived = derive_stimulus_metadata(X_seqs, lengths)
+            output["stimulus_conditions"] = conditions_derived
+            if "is_pure_wind" not in output:
+                output["is_pure_wind"] = pure_wind_derived
+        except Exception:
+            pass
+
+    # ── is_pure_wind ──────────────────────────────────────────────
+    if "is_pure_wind" in metadata:
+        is_pw = metadata["is_pure_wind"]
+        output["is_pure_wind"] = is_pw if isinstance(is_pw, np.ndarray) else np.array(is_pw, dtype=bool)
+    elif "trial_specs" in metadata and all("is_pure_wind" in s for s in metadata["trial_specs"]):
+        output["is_pure_wind"] = np.array([s["is_pure_wind"] for s in metadata["trial_specs"]], dtype=bool)
+    elif "stimulus_conditions" in output and "is_pure_wind" not in output:
+        output["is_pure_wind"] = np.array([c == "wind_only" for c in output["stimulus_conditions"]], dtype=bool)
+
+    return output
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -95,10 +158,15 @@ def main(argv: Sequence[str] | None = None) -> None:
         lengths.append(length)
 
     # Build output dict matching old format
+    priors_np = (
+        mcmc_priors.numpy()
+        if isinstance(mcmc_priors, torch.Tensor)
+        else np.asarray(mcmc_priors)
+    )
     output = {
         "X_seqs": X_seqs,
         "Y_seqs": Y_seqs,
-        "mcmc_priors": mcmc_priors.numpy(),
+        "mcmc_priors": priors_np,
         "labels": labels,
         "lengths": np.array(lengths, dtype=np.int64),  # Convert to numpy array
         "session_ids": metadata.get("session_ids", []),
@@ -107,6 +175,10 @@ def main(argv: Sequence[str] | None = None) -> None:
             "pipeline_semantics_version", "unknown"
         ),
     }
+
+    populate_etl_provenance_and_conditions(
+        output, metadata, X_seqs=X_seqs, lengths=lengths
+    )
 
     print(f"Saving to {output_path}...")
     torch.save(output, output_path)

@@ -303,7 +303,8 @@ def load_model_from_checkpoint(
 def load_dataset(
     dataset_path: Path,
     batch_size: int = 32,
-    max_seq_len: Optional[int] = 1000,
+    max_seq_len: Optional[int] = 2400,
+    pre_anchor_frames: int = 1200,
 ) -> Tuple[torch.utils.data.DataLoader, np.ndarray, List[int], List[np.ndarray]]:
     """
     Load the preprocessed dataset and create a DataLoader.
@@ -314,6 +315,8 @@ def load_dataset(
     Args:
         dataset_path: Path to ``nsmor_dataset.pt``.
         batch_size: Batch size for the DataLoader.
+        max_seq_len: Maximum sequence length for cropping.
+        pre_anchor_frames: Baseline frames before anchor.
 
     Returns:
         ``(dataloader, labels, lengths_list, X_seqs)`` tuple.
@@ -339,6 +342,15 @@ def load_dataset(
     n_total = len(X_seqs)
     logger.info("Loaded %d sequences.", n_total)
 
+    anchor_frames = dataset.get("anchor_frames")
+    if anchor_frames is None:
+        from nsmor.pipeline.conditions import derive_anchor_frames
+        anchor_frames = derive_anchor_frames(X_seqs, lengths)
+        logger.info(
+            "Derived %d anchor frames from physical channels.",
+            len(anchor_frames),
+        )
+
     # Build sequence list
     sequences = [
         (X_seqs[i], Y_seqs[i], int(labels[i]))
@@ -352,6 +364,8 @@ def load_dataset(
         mcmc_priors=mcmc_priors,
         feature_config=feature_config,
         max_seq_len=max_seq_len,
+        pre_anchor_frames=pre_anchor_frames,
+        anchor_frames=anchor_frames,
     )
 
     dataloader = create_optimized_dataloader(
@@ -1455,7 +1469,8 @@ def run_jacobian_analysis(
     output_path: Path,
     target_class: int = Label.PREWALK.value,
     batch_size: int = 32,
-    max_seq_len: Optional[int] = 1000,
+    max_seq_len: Optional[int] = 2400,
+    pre_anchor_frames: int = 1200,
     dt_ms: float = 10.0,
     max_states_per_epoch: int = 100,
     full_system: bool = False,
@@ -1472,6 +1487,8 @@ def run_jacobian_analysis(
             sustained locomotion — required by the "Sustained epoch"
             line-attractor hypothesis).
         batch_size: Batch size for data loading.
+        max_seq_len: Maximum sequence length for cropping.
+        pre_anchor_frames: Baseline frames before anchor.
         dt_ms: Frame interval in milliseconds.
         max_states_per_epoch: Maximum states to process per epoch.
         backend: ``"jax"`` uses the measured-faster GRU Jacobian kernel
@@ -1492,7 +1509,10 @@ def run_jacobian_analysis(
 
     # ── Load dataset (returns raw X_seqs for onset detection) ─
     dataloader, labels, lengths_list, X_seqs = load_dataset(
-        dataset_path, batch_size=batch_size, max_seq_len=max_seq_len,
+        dataset_path,
+        batch_size=batch_size,
+        max_seq_len=max_seq_len,
+        pre_anchor_frames=pre_anchor_frames,
     )
 
     # ── Task 1: Dynamic stimulus onset detection ──────────────
@@ -1689,8 +1709,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max_seq_len",
         type=int,
-        default=1000,
+        default=2400,
         help="Crop sequences longer than this (cuDNN compatibility). 0 = disable.",
+    )
+    parser.add_argument(
+        "--pre_anchor_frames",
+        type=int,
+        default=1200,
+        help="Number of frames before anchor to include in anchor-aligned crop.",
     )
     parser.add_argument(
         "--dt_ms",
@@ -1735,6 +1761,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         output_path = Path(args.output)
 
     max_seq_len = args.max_seq_len if args.max_seq_len > 0 else None
+    pre_anchor_frames = getattr(args, "pre_anchor_frames", 1200)
     run_jacobian_analysis(
         checkpoint_path=Path(args.checkpoint),
         dataset_path=Path(args.dataset),
@@ -1742,6 +1769,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         target_class=args.target_class,
         batch_size=args.batch_size,
         max_seq_len=max_seq_len,
+        pre_anchor_frames=pre_anchor_frames,
         dt_ms=args.dt_ms,
         max_states_per_epoch=args.max_states,
         full_system=args.full_system,

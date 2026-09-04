@@ -104,7 +104,7 @@ assign_ground_truth_labels()      →  ESCAPE / PREWALK / PRE_ACTIVE / NO_RESPON
 extract_mcmc_snapshot()           →  5-D vector at TTC − 50 ms
 extract_trial_sequence()          →  (X_seq, Y_seq) anchored at Trial Start
     ↓
-train_mcmc()                      →  Session-grouped 5-fold OOF priors (no leakage)
+train_mcmc()                      →  Animal-grouped 5-fold OOF priors (no leakage)
     ↓
 create_dataloader()               →  DataLoader yielding (X_batch, Y_batch)
     X: (batch, seq_len, 8)
@@ -118,7 +118,7 @@ The dataset carries two provenance keys embedded at generation time:
 | Key | Value | Purpose |
 |-----|-------|---------|
 | `pipeline_semantics_version` | `"2.1"` | Labels use escape-first branch ordering (PREWALK recovery) |
-| `mcmc_prior_provenance` | `"oof_5fold_session_grouped_cv"` | Session-grouped OOF priors (no session-level leakage) |
+| `mcmc_prior_provenance` | `"oof_5fold_animal_grouped_cv"` | Animal-grouped OOF priors (no animal-level leakage) |
 
 The version guard in `model_utils.validate_dataset_provenance()` refuses to load
 datasets generated under older semantics, preventing silent regression.
@@ -148,7 +148,7 @@ labeled = assign_ground_truth_labels(trials)
 snapshots, labels = build_snapshot_dataset(labeled)
 sequences = build_sequence_dataset(labeled)
 
-# 4. Train MCMC (session-grouped 5-fold OOF — no leakage)
+# 4. Train MCMC (animal-grouped 5-fold OOF — no leakage)
 model = train_mcmc(snapshots, labels)
 
 # 5. Create DataLoader
@@ -270,7 +270,7 @@ See [CHANGELOG.md](CHANGELOG.md) for detailed release notes.
 
 ### Version 2.1 Highlights (Current)
 
-- **Pipeline semantics v2.1**: Fixed PREWALK label collapse via escape-first branch ordering; session-grouped 5-fold CV eliminates data leakage
+- **Pipeline semantics v2.1**: Fixed PREWALK label collapse via escape-first branch ordering; animal-grouped 5-fold CV eliminates data leakage
 - **DataLoader factory**: Intelligent worker auto-scaling (datasets <200 sequences use single-process, larger datasets scale to 4 workers)
 - **Jacobian GMM+BIC calibration**: Replaces ad-hoc thresholds with principled Gaussian Mixture Model + Bayesian Information Criterion selection
 - **Two-phase Hybrid Funnel training**: Gradient-isolated frontend (Phase 1: MSE) → backend (Phase 2: bio-physical losses)
@@ -278,7 +278,7 @@ See [CHANGELOG.md](CHANGELOG.md) for detailed release notes.
 - **Biophysical completeness**: Added `lif_rel_refract_ms`, `sensory_noise_std`, `lif_lateral_inhibition` with sampling-rate-invariant conversion
 - **Statistical rigor**: Fixed nonparametric psychophysics analysis (Wilcoxon + Hodges-Lehmann), Holm-Bonferroni FWER correction, Wilson score CIs
 
-**Performance**: Training with v2.1 semantics achieves **R² ≈ 0.37** (honest generalization without session leakage), compared to R² ≈ 0.47 in the pre-v2.1 inflated pipeline.
+**Performance**: Training with v2.1 semantics achieves **R² ≈ 0.37** (honest generalization without animal leakage), compared to R² ≈ 0.47 in the pre-v2.1 inflated pipeline.
 
 ---
 

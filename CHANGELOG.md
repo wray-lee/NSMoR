@@ -11,6 +11,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+#### Pipeline Semantics v2.2 & Physical Alignment (Current)
+- **Animal-grouped cross-validation (`oof_5fold_animal_grouped_cv`)**
+  - MCMC prior generation partitions folds strictly by animal identity (stripping `_session_N` suffixes from session IDs)
+  - Eliminates cross-session animal leakage present in historical session-grouped partitioning
+  - Provenance guard enforces `mcmc_prior_provenance="oof_5fold_animal_grouped_cv"`, rejecting un-grouped or session-grouped artifacts
+- **Physical Sampling Cadence Alignment (250 Hz / 4.0 ms)**
+  - Fully aligned `dt_ms=4.0` across default YAML configuration, `ModelConfig`, ETL CLI, and all data extraction functions
+  - Pure-wind prepend zero-padding aligned to 1425 frames (5.7 s @ 250 Hz / 4.0 ms), resolving historical 3.41 s (851-frame) offset caused by legacy 100 Hz / 10.0 ms default (570 frames)
+- **Downstream Anchor-Aligned Geometry Contract**
+  - Standardized analysis loaders (`scripts/analyze_*.py`, `scripts/simulate_*.py`) to `max_seq_len=2400` and `pre_anchor_frames=1200`
+  - Guarantees stimulus capture in 100% of sampled batches (supersedes historical random crop stimulus loss)
+
 #### Phase 2: DataLoader Factory Integration
 - **DataLoader Factory Module** (`nsmor/dataloader_factory.py`)
   - Intelligent worker auto-scaling: datasets <200 sequences use single-process mode, larger datasets auto-scale up to 4 workers
@@ -22,9 +34,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 #### Phase 3: Data Preparation Parallelization
 - **Parallel MCMC training** (`scripts/prepare_data.py`)
   - Concurrent 5-fold model training with `ThreadPoolExecutor` (max_workers=5)
-  - Session-grouped fold assignments ensure zero session-level leakage
+  - Grouped fold assignments ensure zero leakage (historical: session-grouped; current: animal-grouped)
   - Out-of-fold (OOF) prior aggregation with deterministic ordering
-  - Per-fold provenance logging with session IDs and class distributions
+  - Per-fold provenance logging with entity IDs and class distributions
   - Train-vs-serve distribution consistency diagnostics (KS statistic, variance ratio)
 
 #### Phase 1: Configuration System Extension
@@ -38,10 +50,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `training.persistent_workers`: Worker persistence control
 
 #### Round-3: Scientific Rigor Enhancements
-- **Pipeline semantics v2.1** with escape-first branch ordering
+- **Pipeline semantics v2.1 (Historical Baseline)** with escape-first branch ordering
   - Fixed PREWALK label collapse via responder-priority decision tree
-  - Session-grouped 5-fold cross-validation with zero session-level leakage
-  - Dataset provenance stamping: `pipeline_semantics_version="2.1"` and `mcmc_prior_provenance="oof_5fold_session_grouped_cv"`
+  - Session-grouped 5-fold cross-validation (historical; superseded by animal-grouped in v2.2)
+  - Dataset provenance stamping: `pipeline_semantics_version="2.1"` and `mcmc_prior_provenance="oof_5fold_session_grouped_cv"` (historical; v2.2 requires `"oof_5fold_animal_grouped_cv"`)
   - Version guard in `model_utils.validate_dataset_provenance()` prevents loading datasets with mismatched semantics
 
 - **Jacobian analysis GMM+BIC calibration** (`scripts/analyze_jacobian.py`)

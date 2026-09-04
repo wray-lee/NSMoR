@@ -112,8 +112,8 @@ def main() -> None:
     parser.add_argument(
         "--dt_ms",
         type=float,
-        default=10.0,
-        help="Frame interval in milliseconds (for reference only in ELT mode).",
+        default=4.0,
+        help="Frame interval in milliseconds (nominal 250 Hz = 4.0 ms, for reference only in ELT mode).",
     )
     args = parser.parse_args()
 
@@ -316,6 +316,7 @@ def main() -> None:
     metadata = {
         "trial_specs": trial_specs,
         "mcmc_priors": torch.from_numpy(mcmc_priors).float(),
+        "mcmc_prior_provenance": f"oof_{n_folds}fold_animal_grouped_cv",
         "pipeline_semantics_version": PIPELINE_SEMANTICS_VERSION,
         "n_trials": len(trial_specs),
         "label_encoder": {
@@ -326,6 +327,7 @@ def main() -> None:
         "snapshot_anchor_rules": snapshot_anchor_rules,
         "n_sessions": n_sessions,
         "session_ids": [spec["session_id"] for spec in trial_specs],
+        "anchor_frames": [spec["anchor_frame"] for spec in trial_specs],
         "stimulus_conditions": [spec["stimulus_condition"] for spec in trial_specs],
         "is_pure_wind": np.array(
             [spec["is_pure_wind"] for spec in trial_specs], dtype=bool

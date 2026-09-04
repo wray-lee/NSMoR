@@ -18,7 +18,7 @@ Processing Steps
    continuous trajectories and mathematically reconstruct visual looming
    parameters (θ(t) and l/v) using:
        θ(t) = 2 × arctan(l/v / (TTC - t))
-   Pure-wind trials receive 5.7s (570 frames) prepended zero-padding.
+   Pure-wind trials receive 5.7s (1425 frames at 4.0ms) prepended zero-padding.
 
 Output
 ------
@@ -34,7 +34,7 @@ Usage
 CLI::
 
     python scripts/prepare_data.py --raw_dir data/raw --output data/processed/nsmor_dataset.pt
-    python scripts/prepare_data.py --raw_dir data/raw --output data/processed/nsmor_dataset.pt --dt_ms 10.0
+    python scripts/prepare_data.py --raw_dir data/raw --output data/processed/nsmor_dataset.pt --dt_ms 4.0
 """
 
 from __future__ import annotations
@@ -183,7 +183,7 @@ def reconstruct_visual_looming(
     l_v_ratio: float,
     ttc_ms: float,
     stimulus_onset_ms: float,
-    dt_ms: float = 10.0,
+    dt_ms: float = 4.0,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Mathematically reconstruct continuous visual looming parameters.
@@ -202,7 +202,7 @@ def reconstruct_visual_looming(
         l_v_ratio: The l/v ratio extracted from events (constant per trial).
         ttc_ms: Absolute time-to-collision in ms.
         stimulus_onset_ms: Absolute stimulus onset time in ms.
-        dt_ms: Frame interval in milliseconds (default 10ms = 100Hz).
+        dt_ms: Frame interval in milliseconds (default 4.0ms = 250Hz).
 
     Returns:
         ``(visual_angle, l_v_array)`` where:
@@ -264,13 +264,13 @@ def reconstruct_trial_visual_features(
     trial_data: Dict[str, np.ndarray],
     stimulus_onset_ms: float,
     l_v_ratio: float,
-    dt_ms: float = 10.0,
+    dt_ms: float = 4.0,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Reconstruct visual features for a single trial with pure-wind handling.
 
     For pure-wind trials (no looming stimulus), returns arrays filled
-    with absolute flat zeros (including the 570-frame prepended region).
+    with absolute flat zeros (including the 1425-frame prepended region at 4.0ms).
 
     Args:
         trial_data: Trial data dictionary from extract_trial_data.
@@ -483,7 +483,7 @@ def apply_hardware_time_correction(
     kinematics_df: pd.DataFrame,
     events_df: pd.DataFrame,
     hw_triggers: Dict[Tuple[str, int], float],
-    dt_ms: float = 10.0,
+    dt_ms: float = 4.0,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Apply hardware time correction to kinematics and events DataFrames.
@@ -552,7 +552,7 @@ def apply_hardware_time_correction(
         # Correct: speed = sqrt(dx/dt² + dy/dt²).
         #
         # Use the REAL per-sample interval from time_ms (median ~4 ms,
-        # not the configured dt_ms=10 ms) to avoid a systematic scaling
+        # not the configured dt_ms=4.0 ms) to avoid a systematic scaling
         # error.  np.gradient(..., t_s) handles irregular spacing.
         time_ms_arr = group["time_ms"].values
         t_s = time_ms_arr / 1000.0  # seconds
@@ -898,7 +898,7 @@ def audit_prior_train_serve_shift(
 def prepare_dataset(
     raw_dir: Path,
     output_path: Path,
-    dt_ms: float = 10.0,
+    dt_ms: float = 4.0,
     time_config: TimeWindowConfig = DEFAULT_TIME_WINDOW,
     feature_config: FeatureConfig = DEFAULT_FEATURE,
     random_seed: int = 42,
@@ -909,7 +909,7 @@ def prepare_dataset(
     Args:
         raw_dir: Root directory containing raw session data.
         output_path: Path to save the processed dataset.
-        dt_ms: Frame interval in milliseconds.
+        dt_ms: Frame interval in milliseconds (default 4.0ms = 250Hz).
         time_config: Time window configuration.
         feature_config: Feature dimension configuration.
         random_seed: Random seed for MCMC training.

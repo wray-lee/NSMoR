@@ -204,14 +204,14 @@ def compute_visual_angle(
 
 def generate_stimulus_paradigm(
     paradigm: StimulusParadigm,
-    dt_ms: float = 10.0,
+    dt_ms: float = 4.0,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Synthesize the physical stimulus time-series for a paradigm.
 
     Args:
         paradigm: The stimulus paradigm specification.
-        dt_ms: Frame interval in milliseconds (default 10ms = 100Hz).
+        dt_ms: Frame interval in milliseconds (default 4.0ms = 250Hz).
 
     Returns:
         ``(time_ms, v_vis, wind)`` where:
@@ -338,6 +338,7 @@ class TrialResult:
     gate_gru: np.ndarray        # (T,) GRU routing gate
     target_ttc_ms: float
     lv_ratio: float
+    dt_ms: float = 4.0
 
 
 def run_autoregressive_trial(
@@ -345,7 +346,7 @@ def run_autoregressive_trial(
     paradigm: StimulusParadigm,
     mcmc_prior: np.ndarray,
     device: torch.device,
-    dt_ms: float = 10.0,
+    dt_ms: float = 4.0,
     current_fatigue: float = 0.0,
     max_fatigue_penalty: float = 0.0,
 ) -> TrialResult:
@@ -475,6 +476,7 @@ def run_autoregressive_trial(
         gate_gru=gates_gru,
         target_ttc_ms=paradigm.target_ttc_ms,
         lv_ratio=paradigm.lv_ratio,
+        dt_ms=dt_ms,
     )
 
 
@@ -574,6 +576,7 @@ def export_kinematics_csv(
     trials: List[TrialResult],
     output_path: Path,
     session_num: int = 0,
+    dt_ms: Optional[float] = None,
 ) -> None:
     """
     Export per-frame kinematics in ``cercus``-compatible format.
@@ -584,6 +587,8 @@ def export_kinematics_csv(
         trials: List of TrialResult objects.
         output_path: Path to write kinematics.csv.
         session_num: Session number for this virtual session.
+        dt_ms: Frame interval in milliseconds. If None, derived from
+            trial.dt_ms or trial.time_ms step (fallback 4.0).
     """
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -592,13 +597,22 @@ def export_kinematics_csv(
     rows = []
     for trial_idx, trial in enumerate(trials):
         T = len(trial.time_ms)
+        effective_dt = (
+            dt_ms
+            if dt_ms is not None
+            else getattr(
+                trial,
+                "dt_ms",
+                (trial.time_ms[1] - trial.time_ms[0]) if T > 1 else 4.0,
+            )
+        )
         for t in range(T):
             # stim_state: 1 if either visual or wind is active
             stim_active = 1 if (trial.v_vis[t] > 0 or trial.wind[t] > 0) else 0
 
             rows.append({
                 "sys_time": f"{trial.time_ms[t]:.1f}",
-                "dx": f"{trial.velocity[t] * (10.0 / 1000.0):.6f}",  # displacement per frame
+                "dx": f"{trial.velocity[t] * (effective_dt / 1000.0):.6f}",  # displacement per frame
                 "dy": "0.0",
                 "dz": "0.0",
                 "stim_state": str(stim_active),
@@ -620,8 +634,17 @@ def export_kinematics_csv(
 # 7.  Summary Statistics
 # ═══════════════════════════════════════════════════════════════
 
-def log_trial_summary(trials: List[TrialResult]) -> None:
-    """Log summary statistics for all trials."""
+def log_trial_summary(
+    trials: List[TrialResult],
+    dt_ms: Optional[float] = None,
+) -> None:
+    """Log summary statistics for all trials.
+
+    Args:
+        trials: List of TrialResult objects.
+        dt_ms: Frame interval in milliseconds. If None, derived from
+            trial.dt_ms or trial.time_ms step (fallback 4.0).
+    """
     logger.info("=" * 70)
     logger.info("Autoregressive Generation Summary")
     logger.info("=" * 70)
@@ -630,13 +653,22 @@ def log_trial_summary(trials: List[TrialResult]) -> None:
 
     for trial in trials:
         T = len(trial.time_ms)
-        stim_onset_frame = int(2000.0 / 10.0)  # 2s baseline at 10ms
+        effective_dt = (
+            dt_ms
+            if dt_ms is not None
+            else getattr(
+                trial,
+                "dt_ms",
+                (trial.time_ms[1] - trial.time_ms[0]) if T > 1 else 4.0,
+            )
+        )
+        stim_onset_frame = int(2000.0 / effective_dt)  # 2s baseline at effective_dt
 
         if stim_onset_frame < T:
             post_stim = trial.velocity[stim_onset_frame:]
             v_peak = float(np.max(np.abs(post_stim)))
             peak_frame = int(np.argmax(np.abs(post_stim)))
-            latency_ms = float(peak_frame * 10.0)
+            latency_ms = float(peak_frame * effective_dt)
         else:
             v_peak = 0.0
             latency_ms = 0.0
@@ -687,7 +719,7 @@ def main() -> None:
     parser.add_argument(
         "--dt_ms",
         type=float,
-        default=10.0,
+        default=4.0,
         help="Frame interval in milliseconds.",
     )
     parser.add_argument(
@@ -786,12 +818,12 @@ def main() -> None:
         trials.append(trial)
 
     # ── Summary ──────────────────────────────────────────────
-    log_trial_summary(trials)
+    log_trial_summary(trials, dt_ms=args.dt_ms)
 
     # ── Export CSVs ──────────────────────────────────────────
     output_dir = Path(args.output_dir)
     export_events_csv(trials, output_dir / "events.csv", args.session_num)
-    export_kinematics_csv(trials, output_dir / "kinematics.csv", args.session_num)
+    export_kinematics_csv(trials, output_dir / "kinematics.csv", args.session_num, dt_ms=args.dt_ms)
 
     logger.info("Done. Outputs in %s", output_dir)
 

@@ -364,6 +364,7 @@ run_py "Phase G" scripts/simulate_psychophysics.py \
     --dataset "${DATASET}" \
     --raw_dir "${RAW_DIR}" \
     --output_dir "${OUTPUT_DIR}" \
+    --dt_ms "${DT_MS}" \
     --seed "${SEED}"
 require_outputs "Phase G" \
     "${OUTPUT_DIR}/bayesian_reliability.png" \
