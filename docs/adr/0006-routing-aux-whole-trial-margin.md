@@ -37,3 +37,30 @@ without ``is_pure_wind`` True rows is a no-op. Regenerating 3cond without
 ``pre_load_adapt`` still drops wind-only; the loader now hard-fails on
 raw ``sys_time/stim_state`` schema instead of writing a silent
 no_stimulus corpus.
+
+That no-op is now reported at runtime rather than merely documented:
+``check_routing_aux_active`` in ``scripts/train.py`` logs the condition
+census at ERROR when the weight is set but a group is empty. It reports
+instead of raising, because User Story 12 requires a weight sweep to
+survive a corpus that lacks wind trials.
+
+### The baseline group is "not pure-wind", not "visual-present"
+
+``compute_routing_aux_loss`` receives a single boolean mask and forms the
+contrast group as its complement, so the baseline is every non-wind_only
+trial — including ``no_stimulus``. The calibration corpus has none
+(``nsmor_dataset_full_backup.pt``: 288 multisensory, 36 visual_only, 72
+wind_only), so 0.024 was measured where the complement happened to equal
+visual-present exactly.
+
+A corpus containing ``no_stimulus`` trials breaks that coincidence. Those
+trials have no stimulus transient at all, so their ``g_lif`` is
+unconstrained by the task and enters the baseline as noise, shifting both
+the mean and the pooled std the margin was derived from. The margin is
+therefore only valid for a ``no_stimulus``-free corpus.
+
+Consequence for the full corpus (expected to carry all four conditions):
+re-derive the margin before trusting it, and treat 0.024 as calibrated for
+a condition mix that no longer holds. Narrowing the baseline to
+visual-present would need a signal richer than one boolean mask, which
+means changing a frozen loss signature — deferred, not adopted.
