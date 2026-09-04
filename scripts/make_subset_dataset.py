@@ -38,7 +38,13 @@ from typing import Dict, List, Sequence, Tuple
 import numpy as np
 import torch
 
+from nsmor.pipeline.conditions import derive_stimulus_metadata
+
 logger = logging.getLogger(__name__)
+
+# Re-exported: this module was the original home, and tests plus other
+# scripts import the name from here.
+__all__ = ["derive_stimulus_metadata", "subset_dataset", "main"]
 
 # ``..._session_1`` / ``..._session_12`` -> animal-recording prefix.
 _SESSION_SUFFIX = re.compile(r"_session_\d+$")
@@ -54,55 +60,6 @@ _PER_TRIAL_KEYS: Tuple[str, ...] = (
     "stimulus_conditions",
     "is_pure_wind",
 )
-
-
-def derive_stimulus_metadata(
-    x_seqs: Sequence[np.ndarray],
-    lengths: Sequence[int],
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Derive auditable condition metadata from physical input channels.
-
-    This mirrors ``scripts.prepare_data.classify_stimulus_condition`` and
-    makes legacy processed artifacts usable by the routing-aux path without
-    guessing from behavioural labels or session names.
-
-    Args:
-        x_seqs: Per-trial feature arrays with visual angle at index 0 and
-            wind state at index 1.
-        lengths: Valid (unpadded) frame count for each trial.
-
-    Returns:
-        ``(stimulus_conditions, is_pure_wind)`` arrays aligned 1:1 with
-        ``x_seqs``.
-    """
-    if len(x_seqs) != len(lengths):
-        raise ValueError(
-            f"x_seqs/lengths mismatch: {len(x_seqs)} != {len(lengths)}"
-        )
-
-    conditions: List[str] = []
-    for index, (x_seq, length) in enumerate(zip(x_seqs, lengths)):
-        valid_length = int(length)
-        if valid_length < 1 or valid_length > len(x_seq):
-            raise ValueError(
-                f"trial {index}: invalid length {valid_length} for "
-                f"sequence length {len(x_seq)}"
-            )
-        physical = np.asarray(x_seq)[:valid_length, :2]
-        has_visual = bool(np.any(np.abs(physical[:, 0]) > 0.0))
-        has_wind = bool(np.any(np.abs(physical[:, 1]) > 0.0))
-        if has_visual and has_wind:
-            conditions.append("multisensory")
-        elif has_visual:
-            conditions.append("visual_only")
-        elif has_wind:
-            conditions.append("wind_only")
-        else:
-            conditions.append("no_stimulus")
-
-    stimulus_conditions = np.asarray(conditions, dtype=object)
-    is_pure_wind = stimulus_conditions == "wind_only"
-    return stimulus_conditions, is_pure_wind
 
 
 def animal_of(session_id: str) -> str:

@@ -59,7 +59,7 @@ from nsmor.dataloader_factory import create_optimized_dataloader
 from nsmor.model_utils import load_model_from_checkpoint as _shared_load_model
 from nsmor.model_utils import validate_dataset_provenance
 from nsmor.nsmor_dataloader import NSMoRDataset
-from scripts.make_subset_dataset import derive_stimulus_metadata
+from nsmor.pipeline.conditions import derive_stimulus_metadata
 
 # Use non-interactive backend for headless environments
 matplotlib.use("Agg")
