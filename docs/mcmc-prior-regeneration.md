@@ -35,31 +35,24 @@ directly compared as identical datasets:
    - New `3cond_v2`: Uncapped raw continuous recordings up to 121,918 frames
      (median 18,002 frames) in `float64` (1900.8 MB).
 
-## Pipeline & Scientific Caveats
+## Pipeline & Scientific Caveats (Historical Audit & Current Resolutions)
 
-Findings from recent audits that downstream analysis and training must account for:
+Findings from recent audits and their current resolution status:
 
-- **Uncapped sequence length & random crop hazard (Audit 3 & 5):**
-  `3cond_v2.pt` stores full continuous recordings without anchor-aligned cropping.
-  Passing `max_seq_len=2400` to `NSMoRDataset` without `anchor_frames` causes random
-  cropping that misses stimulus onset in 88%-95% of crops. Uncropped batch training
-  risks CUDA OOM (>40 GB for batch size 128). `float64` storage is redundant
-  because dataloaders immediately cast to `float32`.
-- **Sampling interval mismatch (Audit 1):**
-  Hardware acquisition median is 4.01 ms (nominal 250 Hz), but ETL ran with
-  `--dt_ms 10.0`. In pure-wind trials, `prepend_frames` was set to 570 frames
-  (2.28 s) instead of ~1425 frames (5.7 s), creating an 851-frame (3.41 s) onset
-  misalignment relative to multisensory trials. Discrete dynamical parameters
-  configured for 10 ms scale by 2.49x in real time.
-- **MCMC prior train-serve shift (Audit 5):**
-  The cross-fitted MCMC prior exhibits a distribution shift between out-of-fold
-  training and full-fit serving (mean total variation distance 0.2739, argmax
-  agreement 0.676). This shift is stored in `mcmc_prior_train_serve_consistency`
-  and must be reported alongside any evaluation utilizing the MCMC prior channel.
-- **Provenance validation (Audit 5):**
-  `validate_dataset_provenance` checks `pipeline_semantics_version` (2.2) but not
-  `mcmc_prior_provenance`. `nsmor_subset_small.pt` currently has `mcmc_prior_provenance: None`
-  and must be regenerated before use in leak-free evaluation.
+- **[RESOLVED] Sampling interval mismatch (Audit 1):**
+  *Historical issue*: Hardware acquisition median is 4.01 ms (nominal 250 Hz), but legacy ETL previously ran with `--dt_ms 10.0`. In pure-wind trials, `prepend_frames` was set to 570 frames (2.28 s) instead of 1425 frames (5.7 s), creating an 851-frame (3.41 s) onset misalignment relative to multisensory trials.
+  *Resolution*: Fixed across CLI defaults and ETL functions (`dt_ms=4.0`). All corpora regenerated with 1425 prepended frames and aligned 250 Hz physical cadence.
+
+- **[RESOLVED] Uncapped sequence length & random crop hazard (Audit 3 & 5):**
+  *Historical issue*: Passing `max_seq_len=2400` to `NSMoRDataset` without anchor indices caused random cropping that missed stimulus onset in 88%-95% of crops.
+  *Resolution*: Per-trial `anchor_frames` are now derived and persisted in the dataset artifacts; all training and downstream analysis scripts use anchor-aligned cropping (`max_seq_len=2400`, `pre_anchor_frames=1200`), guaranteeing 100% stimulus capture.
+
+- **[RESOLVED] Provenance validation (Audit 5):**
+  *Historical issue*: `validate_dataset_provenance` checked only `pipeline_semantics_version` (2.2), allowing un-grouped or missing prior provenance to pass silently.
+  *Resolution*: `validate_dataset_provenance()` strictly enforces `mcmc_prior_provenance="oof_5fold_animal_grouped_cv"`. All corpora including `nsmor_subset_small.pt` have been regenerated and verified.
+
+- **[ACTIVE TELEMETRY] MCMC prior train-serve shift (Audit 5):**
+  The cross-fitted MCMC prior exhibits a distribution shift between out-of-fold training and full-fit serving (mean total variation distance 0.2739, argmax agreement 0.676). This shift is stored in `mcmc_prior_train_serve_consistency` and logged to checkpoints and metrics to ensure complete scientific auditability.
 
 ## Verification
 

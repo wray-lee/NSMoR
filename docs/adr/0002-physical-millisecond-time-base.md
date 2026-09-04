@@ -11,4 +11,4 @@ Before this decision, time constants were in frame units -- a tau_w of 100 meant
 
 ## Consequences
 
-Every checkpoint must carry dt_ms. The Pipeline Semantics Version guard rejects artifacts without it, breaking all pre-v2.0 workflows. Config/default.yaml documents dt_ms=10.0 as the reference acquisition rate.
+Every checkpoint must carry dt_ms. The Pipeline Semantics Version guard rejects artifacts without it, breaking all pre-v2.0 workflows. Config/default.yaml documents dt_ms=4.0 (250 Hz acquisition, median ~4.006 ms) as the true reference acquisition rate, superseding the legacy reference value of 10.0 ms. Pure-wind trials receive 1425 frames (5.7 s) of prepended padding at 4.0 ms.
