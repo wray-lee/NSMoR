@@ -25,6 +25,7 @@ Programmatic::
 from __future__ import annotations
 
 import argparse
+import collections
 import json
 import logging
 import os
@@ -52,6 +53,7 @@ from nsmor.config_parser import ExperimentConfig
 from nsmor.dataloader_factory import create_dataloaders_from_config
 from nsmor.loss import BioJointLoss, BioDecisionLoss, FrontendLoss
 from nsmor.model_nsmor_core import NSMoRCore
+from nsmor.pipeline.conditions import derive_stimulus_metadata
 
 
 # ── Deployment provenance keys ────────────────────────────────
@@ -526,6 +528,113 @@ def build_loss(config: ExperimentConfig) -> BioJointLoss:
 # 3.  DataLoader Factory
 # ═══════════════════════════════════════════════════════════════
 
+def resolve_condition_metadata(
+    dataset: Dict[str, Any],
+    x_seqs: Sequence[np.ndarray],
+    lengths: Sequence[int],
+) -> Tuple[np.ndarray, np.ndarray, bool]:
+    """Return per-trial condition metadata, deriving it when absent.
+
+    ``pipeline_semantics_version`` 2.2 does not imply the condition stamp:
+    most processed corpora carry that version yet omit
+    ``stimulus_conditions``/``is_pure_wind``.  Deriving from the physical
+    channels keeps the routing auxiliary loss usable on those artifacts
+    instead of silently disabling it.
+
+    Derivation always runs, even when a stamp exists, so a stale stamp is
+    caught rather than trusted blindly.
+
+    Args:
+        dataset: Loaded corpus mapping.
+        x_seqs: Per-trial feature arrays (visual angle at index 0, wind
+            state at index 1).
+        lengths: Valid (unpadded) frame count per trial.
+
+    Returns:
+        ``(stimulus_conditions, is_pure_wind, derived)``; ``derived`` is
+        True when either field came from the channels, not the stamp.
+    """
+    stored_cond = dataset.get("stimulus_conditions")
+    stored_pw = dataset.get("is_pure_wind")
+    derived_cond, derived_pw = derive_stimulus_metadata(x_seqs, lengths)
+
+    if stored_cond is None and stored_pw is None:
+        return derived_cond, derived_pw, True
+
+    conditions = (
+        np.asarray(stored_cond, dtype=object)
+        if stored_cond is not None
+        else derived_cond
+    )
+    is_pure_wind = (
+        np.asarray(stored_pw, dtype=bool) if stored_pw is not None else derived_pw
+    )
+    if stored_pw is not None and not np.array_equal(is_pure_wind, derived_pw):
+        logger.warning(
+            "Stored is_pure_wind disagrees with the physical channels on "
+            "%d trial(s); trusting the stored stamp.",
+            int(np.sum(is_pure_wind != derived_pw)),
+        )
+    return conditions, is_pure_wind, stored_cond is None or stored_pw is None
+
+
+def check_routing_aux_active(
+    is_pure_wind: np.ndarray,
+    stimulus_conditions: np.ndarray,
+    lambda_routing_aux: float,
+    split_name: str,
+    corpus: str,
+) -> bool:
+    """Report whether the routing hinge can actually fire on this split.
+
+    ``compute_routing_aux_loss`` returns exactly ``0.0`` when either
+    condition group is empty, so a split without pure-wind trials makes
+    the auxiliary term vanish -- and a vanished term is indistinguishable
+    from a converged one in the training log.  That silence is the defect;
+    the graceful non-crash is deliberate (User Story 12), so this reports
+    rather than raises, at ERROR level because the configured term is
+    contributing nothing to a run the operator believes is using it.
+
+    Args:
+        is_pure_wind: Per-trial pure-wind flags for this split.
+        stimulus_conditions: Per-trial condition names, for the census.
+        lambda_routing_aux: Configured auxiliary weight; 0 disables.
+        split_name: ``"train"`` or ``"val"``, named in the message.
+        corpus: Dataset path, named in the message.
+
+    Returns:
+        True when the term is active (both groups present, weight > 0);
+        False when it is disabled or structurally inert.  Callers should
+        surface a False alongside the run's metrics so an inert term is
+        never mistaken for a trained one.
+    """
+    if lambda_routing_aux <= 0.0:
+        return False
+
+    flags = np.asarray(is_pure_wind, dtype=bool)
+    n_wind = int(np.sum(flags))
+    n_other = int(np.sum(~flags))
+    if n_wind > 0 and n_other > 0:
+        return True
+
+    census = dict(collections.Counter(np.asarray(stimulus_conditions).tolist()))
+    empty = "pure-wind" if n_wind == 0 else "non-pure-wind"
+    logger.error(
+        "ROUTING AUX INERT: lambda_routing_aux=%s is set but the %s split "
+        "of %s contains no %s trials (condition census: %s). The hinge "
+        "contrasts the two groups, so it returns exactly 0.0 for every "
+        "batch and the term contributes NOTHING to this run -- the loss "
+        "curve will look normal regardless. Use a corpus with both groups "
+        "present, or set lambda_routing_aux=0 to disable it deliberately.",
+        lambda_routing_aux,
+        split_name,
+        corpus,
+        empty,
+        census,
+    )
+    return False
+
+
 def build_dataloaders(
     config: ExperimentConfig,
     dataset_path: str = "data/processed/nsmor_dataset.pt",
@@ -654,14 +763,17 @@ def build_dataloaders(
     labels = dataset["labels"]
     lengths = dataset["lengths"]
 
-    # Ticket #16: Extract stimulus condition metadata for routing aux loss
-    is_pure_wind = dataset.get("is_pure_wind")
-    stimulus_conditions = dataset.get("stimulus_conditions")
-    if is_pure_wind is not None:
-        logger.info(
-            "Loaded stimulus condition metadata: %d wind_only, %d other",
-            int(np.sum(is_pure_wind)), int(np.sum(~is_pure_wind)),
-        )
+    # Ticket #16: stimulus condition metadata for the routing aux loss.
+    # Derived when the corpus lacks the stamp -- version 2.2 does not imply
+    # it -- so the term is never silently disabled by a missing key.
+    stimulus_conditions, is_pure_wind, derived = resolve_condition_metadata(
+        dataset, X_seqs, lengths
+    )
+    logger.info(
+        "Stimulus condition census (%s): %s",
+        "derived from physical channels" if derived else "from stored stamp",
+        dict(collections.Counter(np.asarray(stimulus_conditions).tolist())),
+    )
 
     n_total = len(X_seqs)
     logger.info(
@@ -742,11 +854,18 @@ def build_dataloaders(
     val_priors = mcmc_priors[val_indices]
 
     # Ticket #16: Split stimulus condition metadata
-    train_is_pure_wind = None
-    val_is_pure_wind = None
-    if is_pure_wind is not None:
-        train_is_pure_wind = is_pure_wind[train_indices]
-        val_is_pure_wind = is_pure_wind[val_indices]
+    train_is_pure_wind = is_pure_wind[train_indices]
+    val_is_pure_wind = is_pure_wind[val_indices]
+
+    # The hinge is evaluated per split, so a split that strands every wind
+    # trial on one side is as inert as a corpus with none at all.
+    check_routing_aux_active(
+        train_is_pure_wind,
+        np.asarray(stimulus_conditions)[train_indices],
+        config.loss.lambda_routing_aux,
+        "train",
+        str(dataset_file),
+    )
 
     # ── Shape assertions ──
     assert len(train_sequences) == n_train, (
