@@ -67,6 +67,7 @@ from nsmor.data_extractor import (
     _compute_pure_wind_prepend_frames,
 )
 from nsmor.mcmc_module import MCMCPriorGenerator, train_mcmc, train_mcmc_cross_fitted
+from nsmor.pipeline.grouping import animal_keys_of, resolve_group_folds
 from nsmor.pipeline.io import EVENT_COLUMNS, KINEMATICS_COLUMNS
 from nsmor.pipeline.labeling import (
     assign_ground_truth_labels,
@@ -1111,28 +1112,37 @@ def prepare_dataset(
     # 5-fold cross-fitting, every prior row is produced by a generator
     # that never saw that trial's label.
     #
-    # Reviewer Round-2 B-2 fix: fold membership is GROUPED BY SESSION.
-    # All trials from one recording session share the animal's baseline
-    # locomotor statistics and gain state; a sample-level shuffle lets
-    # the same session straddle train/test folds and leak session-level
-    # information into the "held-out" priors.  Session ids are aligned
+    # Fold membership is GROUPED BY ANIMAL.  Grouping by session is not
+    # enough: ``_session_N`` splits ONE recording of ONE animal into
+    # blocks, so a session-grouped fold let an animal's _session_1 train
+    # the generator that produced _session_2's "held-out" prior.  Trials
+    # of one animal share that animal's baseline locomotor statistics,
+    # gain state, and body mass, so the prior was not out-of-fold in any
+    # meaningful sense -- and these priors become input channels 4-7, so
+    # the leak enters the model as a feature.  Session ids are aligned
     # through kept_indices because build_snapshot_dataset may skip trials
     # whose snapshot cannot be extracted -- and only when this caller
     # explicitly opts in via on_unanchorable="skip" (a plain zip with
     # labeled_trials misaligns groups when any is dropped).
     labeled_kept = [labeled_trials[i] for i in kept_indices]
-    snapshot_groups = np.array(
-        [str(info["session_id"]) for info in labeled_kept], dtype=object,
+    snapshot_groups = animal_keys_of(
+        [info["session_id"] for info in labeled_kept]
     )
     assert len(snapshot_groups) == len(snapshots), (
-        f"Session-group count {len(snapshot_groups)} != "
+        f"Animal-group count {len(snapshot_groups)} != "
         f"snapshot count {len(snapshots)}"
     )
 
+    # Halving the group count can push a rare class (escape is ~3% of
+    # trials) below the fold count.  Adapt the folds; never weaken the
+    # grouping to keep a round number.
+    n_folds = resolve_group_folds(
+        np.asarray(snapshot_labels), snapshot_groups, max_folds=5,
+    )
     mcmc_priors, fold_models, fold_diagnostics = train_mcmc_cross_fitted(
         snapshots,
         snapshot_labels,
-        n_folds=5,
+        n_folds=n_folds,
         groups=snapshot_groups,
         verbose=True,
     )
@@ -1140,20 +1150,22 @@ def prepare_dataset(
     # guarantee balanced class composition across folds.  Persist the
     # per-fold (session count, class histogram) so fold imbalance is
     # auditable in the saved dataset instead of only logged.
+    # The diagnostic keys are named n_*_sessions in the frozen module; the
+    # groups passed in are now animals, so these are animal counts.
     for diag in fold_diagnostics:
         logger.info(
-            "[MCMC-CV] fold %d: train sessions=%d classes=%s | "
-            "oof sessions=%d classes=%s",
+            "[MCMC-CV] fold %d: train animals=%d classes=%s | "
+            "oof animals=%d classes=%s",
             diag["fold"], diag["n_train_sessions"],
             np.bincount(diag["train_classes"], minlength=4).tolist(),
             diag["n_oof_sessions"],
             np.bincount(diag["oof_classes"], minlength=4).tolist(),
         )
-    n_sessions = len(set(snapshot_groups))
+    n_animals = len(set(snapshot_groups.tolist()))
     logger.info(
-        "Generated out-of-fold MCMC priors (5-fold session-grouped "
-        "cross-fitting over %d sessions): %s",
-        n_sessions, mcmc_priors.shape,
+        "Generated out-of-fold MCMC priors (%d-fold animal-grouped "
+        "cross-fitting over %d animals): %s",
+        n_folds, n_animals, mcmc_priors.shape,
     )
     assert mcmc_priors.shape == (len(snapshots), feature_config.mcmc_dim), (
         f"mcmc_priors shape {mcmc_priors.shape} != "
@@ -1537,7 +1549,10 @@ def prepare_dataset(
         # to refit a generator on data whose labels they hold (that would
         # reintroduce the Round-1 leakage).  Protocol: predict with every
         # fold model, average the probability rows, renormalise.
-        "mcmc_prior_provenance": "oof_5fold_session_grouped_cv",
+        # Records the fold count ACTUALLY used, not a literal: the count
+        # adapts down when a rare class occupies too few animals, and a
+        # stale "5fold" claim in the artifact would misstate provenance.
+        "mcmc_prior_provenance": f"oof_{n_folds}fold_animal_grouped_cv",
         "mcmc_fold_models": fold_models,
         # Round-3 (Reviewer A MAJ-3C): per-fold composition records so
         # StratifiedGroupKFold imbalance is auditable post hoc.
@@ -1551,13 +1566,16 @@ def prepare_dataset(
         ),
         "labels": labels,
         "lengths": lengths,
-        # Round-3 (Reviewer B CRITICAL-3b): per-sequence session ids so
-        # downstream train/val splits can be SESSION-GROUPED.  A
-        # sample-level NSMoR split lets one session straddle train and
-        # validation, mildly inflating val metrics through shared
-        # session-level locomotor statistics — grouped splitting is the
-        # tractable mitigation (full nested CV is documented as a
-        # limitation in the analysis report).
+        # Per-sequence session ids, stored with the ``_session_N`` suffix
+        # INTACT.  Downstream splits group by ANIMAL, deriving the animal
+        # key by stripping that suffix
+        # (nsmor.pipeline.grouping.animal_of), so the finer granularity is
+        # kept here and coarsened at the point of use — the reverse would
+        # discard information no consumer can recover.  Grouping by
+        # session alone is insufficient: ``_session_N`` blocks belong to
+        # one animal, and trials of one animal share its baseline
+        # locomotor statistics, gain state, and body mass.  (Full nested CV
+        # remains a documented limitation in the analysis report.)
         "session_ids": snapshot_groups_aligned,
         # Per-trial stimulus modality, read off the physical channels at
         # ETL time.  ``is_pure_wind`` is the boolean the routing-aux loss

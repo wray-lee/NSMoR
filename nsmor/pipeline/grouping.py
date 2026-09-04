@@ -40,6 +40,7 @@ __all__ = [
     "animal_keys_of",
     "check_group_disjoint",
     "grouped_train_val_split",
+    "resolve_group_folds",
 ]
 
 # ``..._session_1`` / ``..._session_12`` -> animal-recording prefix.
@@ -95,6 +96,82 @@ def check_group_disjoint(
             f"Split leaks {len(both)} group(s) across train and val: "
             f"{sorted(both)[:5]}"
         )
+
+
+def resolve_group_folds(
+    labels: np.ndarray,
+    group_keys: np.ndarray,
+    max_folds: int = 5,
+) -> int:
+    """Largest fold count a grouped stratified split can actually satisfy.
+
+    Grouped cross-fitting needs every class to appear in at least
+    ``n_folds`` distinct groups, otherwise some fold's training side sees
+    no instance of that class and the corresponding out-of-fold prior
+    column degenerates toward zero.  ``mcmc_module`` enforces that as a
+    hard error, so the fold count must be chosen to fit the corpus rather
+    than fixed at a literal.
+
+    Coarsening from session groups to animal groups roughly halves the
+    group count, which is exactly the point -- but it can push a rare
+    class below ``max_folds``.  On the escape class (~3% of trials) this
+    is reachable on the small corpora, so the fold count adapts instead of
+    the grouping weakening.
+
+    This resolves the *necessary* condition only.  ``StratifiedGroupKFold``
+    assignment is heuristic, so ``mcmc_module``'s post-split per-fold
+    assertion remains the authority on sufficiency.
+
+    Args:
+        labels: ``(n_trials,)`` integer class labels.
+        group_keys: ``(n_trials,)`` per-trial group keys.
+        max_folds: Preferred fold count; never exceeded.
+
+    Returns:
+        Fold count in ``[2, max_folds]``.
+
+    Raises:
+        ValueError: If some class occupies fewer than 2 groups, which no
+            grouped stratified split can accommodate.
+    """
+    if len(labels) != len(group_keys):
+        raise ValueError(
+            f"labels length {len(labels)} != group_keys length "
+            f"{len(group_keys)}"
+        )
+    unique_groups = np.unique(group_keys)
+    coverage = {
+        int(cls): sum(
+            1
+            for g in unique_groups
+            if cls in set(labels[group_keys == g].tolist())
+        )
+        for cls in np.unique(labels)
+    }
+    min_coverage = min(coverage.values())
+    if min_coverage < 2:
+        scarce = [c for c, n in coverage.items() if n < 2]
+        raise ValueError(
+            f"Class(es) {scarce} occupy fewer than 2 groups "
+            f"(coverage={coverage}); no grouped stratified split can put "
+            f"the class on both sides of any fold.  Collect more animals "
+            f"carrying that class, or drop grouped cross-fitting."
+        )
+
+    n_folds = min(max_folds, min_coverage)
+    if n_folds < max_folds:
+        logger.warning(
+            "Reducing cross-fitting folds %d -> %d: the rarest class "
+            "occupies only %d groups (per-class group coverage %s). "
+            "Grouping is NOT weakened to compensate -- fewer folds means "
+            "each fold trains on less data, which is the honest cost of "
+            "a rare class concentrated in few animals.",
+            max_folds,
+            n_folds,
+            min_coverage,
+            coverage,
+        )
+    return n_folds
 
 
 def grouped_train_val_split(

@@ -23,6 +23,7 @@ from nsmor.pipeline.grouping import (
     animal_keys_of,
     check_group_disjoint,
     grouped_train_val_split,
+    resolve_group_folds,
 )
 
 
@@ -160,6 +161,77 @@ class TestGroupedTrainValSplit:
             grouped_train_val_split(sids, len(sids), 0.2, 42)
         assert "Animal-grouped split" in caplog.text
         assert "target" in caplog.text
+
+
+class TestResolveGroupFolds:
+    """Coarsening to animals can starve a rare class of groups.
+
+    The escape class is ~3% of the corpus and concentrated in few animals,
+    so the fold count must adapt.  What must NOT happen is the grouping
+    weakening back to sessions to keep a round fold number.
+    """
+
+    def test_returns_max_when_coverage_is_ample(self) -> None:
+        labels = np.array([0, 1] * 10)
+        keys = np.array([f"a{i}" for i in range(20)], dtype=object)
+        assert resolve_group_folds(labels, keys, max_folds=5) == 5
+
+    def test_caps_at_rarest_class_coverage(self) -> None:
+        # class 1 lives in exactly 3 groups -> at most 3 folds.
+        labels = np.array([0, 0, 0, 0, 0, 0, 1, 1, 1])
+        keys = np.array(
+            ["a", "b", "c", "d", "e", "f", "g", "h", "i"], dtype=object
+        )
+        keys[6:] = ["g", "h", "i"]
+        assert resolve_group_folds(labels, keys, max_folds=5) == 3
+
+    def test_never_exceeds_max_folds(self) -> None:
+        labels = np.array([0, 1] * 25)
+        keys = np.array([f"a{i}" for i in range(50)], dtype=object)
+        assert resolve_group_folds(labels, keys, max_folds=3) == 3
+
+    def test_warns_when_reducing(self, caplog) -> None:
+        labels = np.array([0, 0, 0, 0, 1, 1])
+        keys = np.array(["a", "b", "c", "d", "e", "f"], dtype=object)
+        with caplog.at_level("WARNING"):
+            n = resolve_group_folds(labels, keys, max_folds=5)
+        assert n == 2
+        assert "Reducing cross-fitting folds" in caplog.text
+        assert "NOT weakened" in caplog.text
+
+    def test_raises_when_a_class_owns_one_group(self) -> None:
+        # class 1 lives in a single animal: no fold can hold it on both
+        # sides, so this must fail loudly rather than degrade.
+        labels = np.array([0, 0, 0, 0, 1, 1])
+        keys = np.array(["a", "b", "c", "d", "e", "e"], dtype=object)
+        with pytest.raises(ValueError, match="fewer than 2 groups"):
+            resolve_group_folds(labels, keys, max_folds=5)
+
+    def test_rejects_length_mismatch(self) -> None:
+        with pytest.raises(ValueError, match="length"):
+            resolve_group_folds(
+                np.array([0, 1]), np.array(["a"], dtype=object), 5
+            )
+
+    def test_animal_coarsening_can_cost_folds(self) -> None:
+        """The whole reason this function exists, stated as a test.
+
+        One animal, two sessions, carrying the only instances of a rare
+        class: session-grouping sees 2 groups, animal-grouping sees 1.
+        """
+        sids = np.array(
+            [
+                "x_session_1", "x_session_2",  # rare class, one animal
+                "y_session_1", "z_session_1", "w_session_1",
+            ],
+            dtype=object,
+        )
+        labels = np.array([1, 1, 0, 0, 0])
+        # By session the rare class spans 2 groups -> a split is possible.
+        assert resolve_group_folds(labels, sids, max_folds=5) == 2
+        # By animal it spans 1 -> impossible, and it says so.
+        with pytest.raises(ValueError, match="fewer than 2 groups"):
+            resolve_group_folds(labels, animal_keys_of(sids), max_folds=5)
 
 
 class TestCheckGroupDisjoint:

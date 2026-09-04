@@ -1074,7 +1074,13 @@ def _make_label_audit_csvs(
     )
 
     for session_idx in range(n_sessions):
-        session_id = f"audit_session_{session_idx}"
+        # Distinct ANIMALS, one recording block each -- mirroring real ids
+        # (``<mass>cricket_001_<date>_<time>_session_<N>``).  The previous
+        # name ``audit_session_{i}`` looked like N sessions but was N
+        # blocks of ONE animal named "audit": animal grouping strips the
+        # ``_session_N`` suffix, so cross-fitting saw a single group and
+        # correctly refused to split.
+        session_id = f"0.50{session_idx}cricket_001_20260101_00000{session_idx}_session_1"
         session_dir = raw_dir / session_id
         session_dir.mkdir(parents=True)
         kin_rows: list[dict[str, object]] = []
@@ -1336,13 +1342,15 @@ def test_label_audit_retention_with_drops(tmp_path: Path) -> None:
         "event_value": [1, 1],
     })
 
-    # Combine with existing sessions' data (updating session_id)
-    existing_kin = pd.read_csv(raw_dir / "audit_session_0" / "kinematics.csv")
+    # Combine with existing sessions' data (updating session_id).  Must
+    # track the id scheme _make_label_audit_csvs writes.
+    first_session = "0.500cricket_001_20260101_000000_session_1"
+    existing_kin = pd.read_csv(raw_dir / first_session / "kinematics.csv")
     existing_kin["session_id"] = session_id
     combined_kin = pd.concat([existing_kin, short_trial_kin], ignore_index=True)
     combined_kin.to_csv(session_dir / "kinematics.csv", index=False)
 
-    existing_evt = pd.read_csv(raw_dir / "audit_session_0" / "events.csv")
+    existing_evt = pd.read_csv(raw_dir / first_session / "events.csv")
     existing_evt["session_id"] = session_id
     combined_evt = pd.concat([existing_evt, short_trial_evt], ignore_index=True)
     combined_evt.to_csv(session_dir / "events.csv", index=False)
