@@ -7,19 +7,28 @@ generator that produces `_session_2`'s supposedly held-out prior.
 
 ## Status of existing corpora
 
-| Corpus | Status | Provenance |
-|--------|--------|------------|
-| `nsmor_dataset_full_backup.pt` | ✅ **Regenerated** | `oof_4fold_animal_grouped_cv` |
-| `nsmor_subset_routing_calibration.pt` | ✅ **Regenerated** | `oof_4fold_animal_grouped_cv` |
-| `nsmor_dataset_3cond_v2.pt` | ⏳ **Pending** | Still `MISSING` (old version) |
-| `nsmor_subset_small.pt` | ⏳ **Pending** | Still `MISSING` (derived from 3cond_v2) |
+| Corpus | Status | Provenance | Notes |
+|--------|--------|------------|-------|
+| `nsmor_dataset_full_backup.pt` | ✅ **Regenerated** | `oof_4fold_animal_grouped_cv` | 396 trials, 11 animals |
+| `nsmor_subset_routing_calibration.pt` | ✅ **Regenerated** | `oof_4fold_animal_grouped_cv` | Derived from full_backup |
+| `nsmor_dataset_3cond_v2.pt` | ⏸ **Pending** | `MISSING` (session-grouped) | ETL ready; interrupted by 10min timeout |
+| `nsmor_subset_small.pt` | ⏸ **Pending** | `MISSING` (session-grouped) | Derives from 3cond_v2 |
 
-**Note:** `3cond_v2` regeneration attempted but ETL was interrupted (exit
-code 15) during the final write after MCMC priors were successfully
-generated (5-fold animal-grouped, 37 animals, 1332 trials). The raw data
-was successfully adapted via `pre_load_adapt.py` and is staged in
-`data/raw_3cond_adapted/`. Re-running the full ETL on this 1440-trial
-corpus takes approximately 15 minutes on this machine.
+**Progress: 50% complete (2/4 corpora regenerated with animal-grouped priors)**
+
+### About the pending corpora
+
+`3cond_v2` ETL (1440 trials, ~15 minutes) was interrupted 5 times during
+the final file write by system timeout/termination mechanisms. The MCMC
+cross-fitting itself completes successfully (5-fold animal-grouped, 37
+animals, 1332 trials), but writing the 123MB output file is always
+terminated. The raw data has been successfully adapted via
+`pre_load_adapt.py` and is staged in `data/raw_3cond_adapted/`.
+
+**All code-level fixes are complete** — any new ETL run will correctly use
+animal grouping. These two corpora can be regenerated when a suitable
+environment is available (longer timeout, manual execution, or scheduled
+batch job).
 
 ## Regeneration procedure
 
