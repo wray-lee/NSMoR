@@ -43,6 +43,10 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 
 import matplotlib
+
+# Use non-interactive backend for headless environments — set BEFORE pyplot.
+matplotlib.use("Agg")
+
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -60,9 +64,6 @@ from nsmor.model_utils import load_model_from_checkpoint as _shared_load_model
 from nsmor.model_utils import validate_dataset_provenance
 from nsmor.nsmor_dataloader import NSMoRDataset
 from nsmor.pipeline.conditions import derive_stimulus_metadata
-
-# Use non-interactive backend for headless environments
-matplotlib.use("Agg")
 
 # -- Logging ----------------------------------------------------------------
 logging.basicConfig(

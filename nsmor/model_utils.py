@@ -228,6 +228,11 @@ def validate_dataset_provenance(dataset: Dict[str, Any], path: Path) -> None:
     ``np.max``-based labels; every downstream analysis run on them is
     scientifically invalid, so loading must fail loudly.
 
+    Checks the version string only. The condition stamp (stimulus_conditions,
+    is_pure_wind) was added in v2.1 but is not gated here: its absence is
+    a valid state for corpora that predate the ETL change, and consumers
+    that need it must check explicitly and derive on the fly when missing.
+
     Args:
         dataset: The dict returned by ``torch.load`` on a dataset file.
         path: File path (for error text only).
