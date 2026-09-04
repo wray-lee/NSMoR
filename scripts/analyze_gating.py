@@ -59,6 +59,7 @@ from nsmor.dataloader_factory import create_optimized_dataloader
 from nsmor.model_utils import load_model_from_checkpoint as _shared_load_model
 from nsmor.model_utils import validate_dataset_provenance
 from nsmor.nsmor_dataloader import NSMoRDataset
+from scripts.make_subset_dataset import derive_stimulus_metadata
 
 # Use non-interactive backend for headless environments
 matplotlib.use("Agg")
@@ -145,17 +146,20 @@ def load_model_and_dataset(
     is_pure_wind = dataset.get("is_pure_wind")
     stimulus_conditions = dataset.get("stimulus_conditions")
     if is_pure_wind is None:
+        # Legacy artifacts predate the condition stamp. Derive it with the
+        # canonical classifier rather than a local approximation: pure-wind
+        # is "wind present AND visual absent", so a no_stimulus trial (both
+        # channels silent) must NOT land in the wind group.
         lengths = dataset.get("lengths")
-        if lengths is not None:
-            is_pure_wind = np.array(
-                [bool(np.all(np.abs(x[:int(l), 0]) < 1e-6)) for x, l in zip(X_seqs, lengths)],
-                dtype=bool,
-            )
-        else:
-            is_pure_wind = np.array(
-                [bool(np.all(np.abs(x[:, 0]) < 1e-6)) for x in X_seqs],
-                dtype=bool,
-            )
+        if lengths is None:
+            lengths = [len(x) for x in X_seqs]
+        stimulus_conditions, is_pure_wind = derive_stimulus_metadata(
+            X_seqs, lengths
+        )
+        logger.info(
+            "Dataset lacks is_pure_wind; derived from physical channels "
+            "(visual_angle/wind_state)."
+        )
 
     n_total = len(X_seqs)
     logger.info("Loaded %d sequences.", n_total)
@@ -164,6 +168,12 @@ def load_model_and_dataset(
             "Stimulus condition metadata: %d wind_only, %d other",
             int(np.sum(is_pure_wind)), int(np.sum(~is_pure_wind)),
         )
+        if not np.any(is_pure_wind):
+            logger.warning(
+                "No wind_only trials in this corpus -- per-condition gate "
+                "statistics will be reported as unavailable rather than "
+                "computed against an empty group."
+            )
 
     sequences = [
         (X_seqs[i], Y_seqs[i], int(labels[i]))
