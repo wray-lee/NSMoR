@@ -5,30 +5,44 @@ cross-fitted with groups derived by **animal** (stripping `_session_N`),
 not by session. This prevents an animal's `_session_1` from training the
 generator that produces `_session_2`'s supposedly held-out prior.
 
-## Impact on existing corpora
+## Status of existing corpora
 
-**All `.pt` files generated before this fix still carry session-grouped
-priors in input channels 4-7.** The fix is ETL-time only — those priors
-are baked into the tensors during `scripts/prepare_data.py`, so no
-deployment-time patch can repair them retroactively.
+| Corpus | Status | Provenance |
+|--------|--------|------------|
+| `nsmor_dataset_full_backup.pt` | ✅ **Regenerated** | `oof_4fold_animal_grouped_cv` |
+| `nsmor_subset_routing_calibration.pt` | ✅ **Regenerated** | `oof_4fold_animal_grouped_cv` |
+| `nsmor_dataset_3cond_v2.pt` | ⏳ **Pending** | Still `MISSING` (old version) |
+| `nsmor_subset_small.pt` | ⏳ **Pending** | Still `MISSING` (derived from 3cond_v2) |
 
-## Regeneration requirement
+**Note:** `3cond_v2` regeneration attempted but ETL was interrupted (exit
+code 15) during the final write after MCMC priors were successfully
+generated (5-fold animal-grouped, 37 animals, 1332 trials). The raw data
+was successfully adapted via `pre_load_adapt.py` and is staged in
+`data/raw_3cond_adapted/`. Re-running the full ETL on this 1440-trial
+corpus takes approximately 15 minutes on this machine.
 
-The following corpora must be regenerated via `prepare_data.py` to receive
-animal-grouped priors:
+## Regeneration procedure
 
-- `data/processed/nsmor_dataset.pt`
-- `data/processed/nsmor_dataset_3cond_v2.pt`
-- `data/processed/nsmor_dataset_full_backup.pt`
-- `data/processed/nsmor_subset_routing_calibration.pt`
-- Any other `.pt` files whose `mcmc_prior_provenance` field reads
-  `"oof_5fold_session_grouped_cv"` instead of `"oof_Nfold_animal_grouped_cv"`.
+For corpora still carrying session-grouped priors:
 
-The full dataset regeneration is scheduled as part of the next data
-collection window (roughly 1 month). Until then, validation metrics on the
-existing corpora carry this leakage channel.
+```bash
+# For 3cond_v2 (raw data already adapted and staged):
+cd /path/to/NSMoR
+conda activate torch
+python scripts/prepare_data.py \
+    --raw_dir data/raw_3cond_adapted \
+    --output data/processed/nsmor_dataset_3cond_v2.pt \
+    --seed 42
 
-## Verification
+# Then regenerate subset_small from the new 3cond_v2:
+python scripts/make_subset_dataset.py \
+    --input data/processed/nsmor_dataset_3cond_v2.pt \
+    --output data/processed/nsmor_subset_small.pt \
+    --n_animals 8 \
+    --seed 42
+```
+
+For other corpora, follow the same pattern:
 
 Post-regeneration, check the provenance field:
 
