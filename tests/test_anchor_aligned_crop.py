@@ -223,3 +223,48 @@ def test_metadata_contains_anchor_frame():
     assert 0 <= spec["anchor_frame"] < spec["n_frames"], (
         "anchor_frame must be within trial bounds"
     )
+
+
+def test_nsmor_dataset_anchor_aligned_cropping():
+    """NSMoRDataset must crop around anchor_frames when max_seq_len is set."""
+    from nsmor.nsmor_dataloader import NSMoRDataset
+
+    n_frames = 5000
+    anchor_frame = 1716
+    X = np.zeros((n_frames, 8), dtype=np.float32)
+    Y = np.zeros(n_frames, dtype=np.float32)
+    X[anchor_frame, 0] = 180.0
+    Y[anchor_frame] = 100.0
+
+    priors = np.full((1, 4), 0.25, dtype=np.float32)
+    sequences = [(X, Y, 0)]
+
+    ds = NSMoRDataset(
+        sequences=sequences,
+        mcmc_priors=priors,
+        max_seq_len=2400,
+        pre_anchor_frames=1200,
+        anchor_frames=[anchor_frame],
+    )
+
+    X_crop, Y_crop = ds[0]
+    assert len(X_crop) == 2400
+    assert len(Y_crop) == 2400
+    assert X_crop[1200, 0] == 180.0, "Visual spike missing in cropped NSMoRDataset"
+    assert Y_crop[1200] == 100.0, "Response spike missing in cropped NSMoRDataset"
+
+
+def test_derive_anchor_frames():
+    """derive_anchor_frames extracts correct anchors from physical channels."""
+    from nsmor.pipeline.conditions import derive_anchor_frames
+
+    seq_wind = np.zeros((1000, 8), dtype=np.float32)
+    seq_wind[350:450, 1] = 1.0  # wind onset at 350
+
+    seq_vis = np.zeros((1000, 8), dtype=np.float32)
+    seq_vis[200:600, 0] = np.linspace(10.0, 90.0, 400)  # peak at 599
+
+    seq_silent = np.zeros((1000, 8), dtype=np.float32)
+
+    anchors = derive_anchor_frames([seq_wind, seq_vis, seq_silent])
+    assert anchors == [350, 599, 0]

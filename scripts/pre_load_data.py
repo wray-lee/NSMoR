@@ -21,10 +21,10 @@ def organize_raw_data(raw_dir: str = "data/raw"):
 
             target_path = target_dir / csv_file.name
 
-            # 避免同目录移动报错
+            # Avoid same-directory move errors
             if csv_file.parent != target_dir:
                 shutil.move(str(csv_file), str(target_path))
-                print(f"归档: {csv_file.name} -> {session_folder_name}/")
+                print(f"Archived: {csv_file.name} -> {session_folder_name}/")
 
 def build_parser() -> argparse.ArgumentParser:
     """Build CLI argument parser."""

@@ -1608,6 +1608,18 @@ def prepare_dataset(
         "pipeline_semantics_version": PIPELINE_SEMANTICS_VERSION,
     }
 
+    # Derive anchor frames for anchor-aligned cropping (addresses
+    # stimulus-loss bug where random crops miss the stimulus in 88-95%
+    # of trials when sequences are uncapped).  Stored per-trial so
+    # NSMoRDataset can crop deterministically around the stimulus onset.
+    from nsmor.pipeline.conditions import derive_anchor_frames
+    anchor_frames_list = derive_anchor_frames(X_seqs, lengths)
+    dataset["anchor_frames"] = anchor_frames_list
+    logger.info(
+        "Derived %d anchor frames from physical channels.",
+        len(anchor_frames_list),
+    )
+
     torch.save(dataset, output_path)
     logger.info("Saved dataset to %s", output_path)
 
@@ -1643,8 +1655,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dt_ms",
         type=float,
-        default=10.0,
-        help="Frame interval in milliseconds.",
+        default=4.0,
+        help="Frame interval in milliseconds (hardware nominal 250 Hz = 4.0 ms).",
     )
     parser.add_argument(
         "--seed",

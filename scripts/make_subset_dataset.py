@@ -63,6 +63,7 @@ _PER_TRIAL_KEYS: Tuple[str, ...] = (
     "session_ids",
     "stimulus_conditions",
     "is_pure_wind",
+    "anchor_frames",
 )
 
 

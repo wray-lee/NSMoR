@@ -108,6 +108,8 @@ def _run_runner(**env_overrides: str) -> subprocess.CompletedProcess:
         env=env,
         capture_output=True,
         text=True,
+        encoding='utf-8',
+        errors='replace',
         timeout=300,
     )
 
@@ -297,6 +299,8 @@ def test_entry_script_is_executable(script: str) -> None:
         env=env,
         capture_output=True,
         text=True,
+        encoding='utf-8',
+        errors='replace',
         timeout=300,
     )
     assert result.returncode == 0, (
@@ -378,6 +382,8 @@ def _run_make_pipeline(**make_overrides: str) -> subprocess.CompletedProcess:
         env=env,
         capture_output=True,
         text=True,
+        encoding='utf-8',
+        errors='replace',
         timeout=300,
     )
 
@@ -493,6 +499,8 @@ def _run_entry_script(script: str, cwd: Path, *args: str) -> subprocess.Complete
         env=env,
         capture_output=True,
         text=True,
+        encoding='utf-8',
+        errors='replace',
         timeout=300,
     )
 

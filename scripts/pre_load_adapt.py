@@ -153,7 +153,7 @@ def adapt_cercus_to_nsmor(raw_dir="data/raw"):
         is_raw = "sys_time" in df_k.columns and "x_pos" not in df_k.columns
 
         if is_raw:
-            print(f"正在重构轨迹与相对时间轴: {kin_path.name}")
+            print(f"Reconstructing trajectories and relative time axis: {kin_path.name}")
             df_k["session_id"] = session_id
             df_k["trial_id"] = df_k["global_trial_id"]
 
@@ -234,7 +234,7 @@ def adapt_cercus_to_nsmor(raw_dir="data/raw"):
             df_k["wind_state"] = pd.to_numeric(df_k["wind_state"], errors="coerce").fillna(0).eq(1).astype(int)
 
         # ── 3. Reconstruct visual angle per trial (always run) ──
-        print(f"正在重构视觉角度: {kin_path.name}")
+        print(f"Reconstructing visual angle: {kin_path.name}")
 
         # Pre-build trial parameter mapping for vectorized assignment
         tid_series = df_k["trial_id"]
@@ -330,7 +330,7 @@ def adapt_cercus_to_nsmor(raw_dir="data/raw"):
 
             # 若还未映射结构
             if "event_type" not in df_e.columns:
-                print(f"正在格式化兜底事件流: {evt_path.name}")
+                print(f"Formatting fallback event stream: {evt_path.name}")
                 df_e["session_id"] = session_id
                 df_e["trial_id"] = df_e["global_trial_id"]
                 df_e["abs_time"] = df_e["timestamp"] * 1000.0
@@ -360,7 +360,7 @@ def adapt_cercus_to_nsmor(raw_dir="data/raw"):
                 df_e.to_csv(evt_path, index=False)
                 count_e += 1
 
-    print(f"绝对对齐完毕: 重构 {count_k} 份轨迹, 覆盖 {count_e} 份基准事件。")
+    print(f"Absolute alignment complete: reconstructed {count_k} trajectories, overwrote {count_e} baseline events.")
 
 def build_parser() -> argparse.ArgumentParser:
     """Build CLI argument parser."""

@@ -83,6 +83,7 @@ def _make_synthetic_dataset(tmp_path: Path) -> Path:
         "labels": labels,
         "lengths": lengths,
         "mcmc_priors": mcmc_priors,
+        "mcmc_prior_provenance": "oof_5fold_animal_grouped_cv",
         "session_ids": session_ids,
         "feature_config": FeatureConfig(),
         # Track the constant, never a literal: a semantics bump is a
@@ -536,6 +537,38 @@ def test_provenance_with_normalization(tmp_path: Path) -> None:
         f"target_std mismatch: {ckpt['target_std']} vs {expected_std}"
     )
     assert ckpt["target_clip_cm_s"] == 100.0
+
+
+def test_provenance_mcmc_prior_train_serve_consistency(
+    tmp_path: Path,
+) -> None:
+    """When mcmc_prior_train_serve_consistency is in dataset, it must
+    be recorded in checkpoint provenance and metrics.json."""
+    from scripts.train import train
+
+    ds_path = _make_synthetic_dataset(tmp_path)
+    data = torch.load(ds_path, weights_only=False)
+    dummy_consistency = {
+        "argmax_agreement": 0.95,
+        "mean_total_variation_distance": 0.05,
+        "n_trials": 10,
+    }
+    data["mcmc_prior_train_serve_consistency"] = dummy_consistency
+    torch.save(data, ds_path)
+
+    config = _make_config(tmp_path, epochs=1, warmup_epochs=0)
+    ds_path_str = str(ds_path)
+    train(config, lambda_reg=0.01, dataset_path=ds_path_str)
+
+    output_dir = Path(config.checkpoint.output_dir)
+    ckpt = torch.load(output_dir / "best_model.pth", weights_only=False)
+    assert "mcmc_prior_train_serve_consistency" in ckpt
+    assert ckpt["mcmc_prior_train_serve_consistency"] == dummy_consistency
+
+    with open(output_dir / "metrics.json") as f:
+        metrics = json.load(f)
+    assert "mcmc_prior_train_serve_consistency" in metrics
+    assert metrics["mcmc_prior_train_serve_consistency"] == dummy_consistency
 
 
 # ═════════════════════════════════════════════════════════════

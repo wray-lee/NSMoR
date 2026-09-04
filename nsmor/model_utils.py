@@ -219,32 +219,60 @@ def load_model_from_checkpoint(
 # 2b. Dataset provenance guard (Round-2 CRITICAL-A)
 # ═══════════════════════════════════════════════════════════════
 
-def validate_dataset_provenance(dataset: Dict[str, Any], path: Path) -> None:
+def validate_dataset_provenance(
+    dataset: Dict[str, Any],
+    path: Path,
+    require_animal_grouped_priors: bool = True,
+) -> None:
     """
     Assert that a loaded ``nsmor_dataset.pt`` was produced by the
-    current pipeline semantics.
+    current pipeline semantics and animal-grouped MCMC cross-fitting.
 
     Pre-2.0 datasets contain same-sample-leaked MCMC priors and
     ``np.max``-based labels; every downstream analysis run on them is
     scientifically invalid, so loading must fail loudly.
 
-    Checks the version string only. The condition stamp (stimulus_conditions,
-    is_pure_wind) was added in v2.1 but is not gated here: its absence is
-    a valid state for corpora that predate the ETL change, and consumers
-    that need it must check explicitly and derive on the fly when missing.
+    Also asserts that ``mcmc_prior_provenance`` indicates animal-grouped
+    cross-fitting ('oof_<N>fold_animal_grouped_cv') to prevent training
+    or evaluation on session-grouped leaked priors.
+
+    Checks the version string and prior provenance. The condition stamp
+    (stimulus_conditions, is_pure_wind) was added in v2.1 but is not gated
+    here: its absence is a valid state for corpora that predate the ETL
+    change, and consumers that need it must check explicitly and derive
+    on the fly when missing.
 
     Args:
         dataset: The dict returned by ``torch.load`` on a dataset file.
         path: File path (for error text only).
+        require_animal_grouped_priors: If True, raises RuntimeError if
+            ``mcmc_prior_provenance`` is missing or not animal-grouped.
 
     Raises:
         RuntimeError: If the provenance stamp is missing or mismatched.
     """
+    import re
     from nsmor.checkpoint import _require_pipeline_version
     _require_pipeline_version(
         dataset.get("pipeline_semantics_version"),
         f"dataset {path}",
     )
+
+    prior_prov = dataset.get("mcmc_prior_provenance")
+    is_valid_prov = bool(
+        prior_prov is not None
+        and re.match(r"^oof_\d+fold_animal_grouped_cv$", str(prior_prov))
+    )
+    if not is_valid_prov:
+        msg = (
+            f"dataset {path} has missing or invalid 'mcmc_prior_provenance': "
+            f"{prior_prov!r}. Expected format 'oof_<N>fold_animal_grouped_cv'. "
+            "Corpora without animal-grouped cross-fitting contain session-grouped "
+            "leaked MCMC priors and are scientifically invalid."
+        )
+        if require_animal_grouped_priors:
+            raise RuntimeError(msg)
+        logger.warning(msg)
 
 
 # ═══════════════════════════════════════════════════════════════

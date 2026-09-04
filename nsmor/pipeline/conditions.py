@@ -32,7 +32,7 @@ from typing import List, Sequence, Tuple
 
 import numpy as np
 
-__all__ = ["derive_stimulus_metadata"]
+__all__ = ["derive_stimulus_metadata", "derive_anchor_frames"]
 
 # Feature-axis indices of the two physical stimulus channels.
 _VISUAL_ANGLE_IDX = 0
@@ -92,3 +92,48 @@ def derive_stimulus_metadata(
     stimulus_conditions = np.asarray(conditions, dtype=object)
     is_pure_wind = stimulus_conditions == "wind_only"
     return stimulus_conditions, is_pure_wind
+
+
+def derive_anchor_frames(
+    x_seqs: Sequence[np.ndarray],
+    lengths: Sequence[int] | None = None,
+) -> List[int]:
+    """Derive stimulus/collision anchor frame index for each sequence.
+
+    Uses physical channels (visual angle at index 0, wind state at index 1):
+    - For trials with wind activity (channel 1 > 0.5), anchor is the first
+      wind activation frame.
+    - For visual-only trials (wind absent, visual present), anchor is the peak
+      visual angle (looming collision) frame.
+    - For no-stimulus trials (neither present), anchor defaults to 0.
+
+    Args:
+        x_seqs: List of (T, 8) trial feature arrays.
+        lengths: Optional valid (unpadded) sequence lengths.
+
+    Returns:
+        List of integer anchor frame indices, aligned 1:1 with x_seqs.
+    """
+    if lengths is not None and len(x_seqs) != len(lengths):
+        raise ValueError(
+            f"x_seqs/lengths mismatch: {len(x_seqs)} != {len(lengths)}"
+        )
+
+    anchors: List[int] = []
+    for idx, x_seq in enumerate(x_seqs):
+        valid_len = int(lengths[idx]) if lengths is not None else len(x_seq)
+        vis = np.asarray(x_seq)[:valid_len, _VISUAL_ANGLE_IDX]
+        wind = np.asarray(x_seq)[:valid_len, _WIND_STATE_IDX]
+
+        has_wind = bool(np.any(wind > 0.5))
+        has_vis = bool(np.any(np.abs(vis) > 1e-4))
+
+        if has_wind:
+            wind_active = np.where(wind > 0.5)[0]
+            anchor = int(wind_active[0]) if len(wind_active) > 0 else 0
+        elif has_vis:
+            anchor = int(np.argmax(vis))
+        else:
+            anchor = 0
+        anchors.append(anchor)
+    return anchors

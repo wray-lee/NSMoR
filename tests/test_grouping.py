@@ -253,6 +253,7 @@ class TestDeterminismAcrossProcesses:
     """
 
     def test_split_is_stable_under_hash_randomization(self) -> None:
+        import os
         prog = (
             "import numpy as np;"
             "from nsmor.pipeline.grouping import grouped_train_val_split;"
@@ -268,7 +269,7 @@ class TestDeterminismAcrossProcesses:
                 capture_output=True,
                 text=True,
                 timeout=300,
-                env={"PYTHONHASHSEED": seed, "PATH": ""},
+                env={**os.environ, "PYTHONHASHSEED": seed},
             )
             assert res.returncode == 0, res.stderr[-1500:]
             outs.add(res.stdout.strip())

@@ -188,8 +188,19 @@ def load_dataset(
 
     lengths_list = [int(l) for l in lengths]
 
-    # Load trial info from events files
-    trial_info_list = _load_trial_info_from_events(dataset_path.parent.parent / "raw")
+    # Load stimulus condition metadata from dataset or derive from channels
+    stored_cond = dataset.get("stimulus_conditions")
+    if stored_cond is not None:
+        stimulus_conditions = [str(c) for c in stored_cond]
+    else:
+        from nsmor.pipeline.conditions import derive_stimulus_metadata
+        derived_cond, _ = derive_stimulus_metadata(X_seqs, lengths)
+        stimulus_conditions = [str(c) for c in derived_cond]
+
+    trial_info_list = [
+        {"type": cond, "condition": cond}
+        for cond in stimulus_conditions
+    ]
 
     return dataloader, labels, lengths_list, X_seqs, trial_info_list
 
@@ -369,11 +380,11 @@ def group_trials_by_condition(
             trial_type = info.get('type', 'unknown')
             target_ttc_ms = info.get('target_ttc_ms')
 
-            if trial_type == 'baseline_visual':
+            if trial_type in ('baseline_visual', 'visual_only'):
                 condition = 'visual_only'
-            elif trial_type == 'baseline_wind':
+            elif trial_type in ('baseline_wind', 'wind_only'):
                 condition = 'wind_only'
-            elif trial_type == 'looming_wind' and target_ttc_ms is not None:
+            elif trial_type in ('looming_wind', 'multisensory') and target_ttc_ms is not None:
                 # Classify based on target_ttc_ms
                 if abs(target_ttc_ms - (-373)) < 50:
                     condition = 'multisensory_ttc_-373ms'

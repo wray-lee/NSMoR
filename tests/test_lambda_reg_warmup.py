@@ -142,6 +142,7 @@ def synthetic_run(tmp_path: Path):
         "lengths": lengths, "mcmc_priors": mcmc_priors,
         "session_ids": session_ids, "feature_config": FeatureConfig(),
         "pipeline_semantics_version": PIPELINE_SEMANTICS_VERSION,
+        "mcmc_prior_provenance": "oof_5fold_animal_grouped_cv",
     }, ds_path)
 
     from nsmor.config_parser import ExperimentConfig

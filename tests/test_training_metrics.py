@@ -329,6 +329,7 @@ def _make_synthetic_dataset(path: Path, n_seqs: int = 6, T: int = 12) -> None:
         "lengths": np.full(n_seqs, T, dtype=np.int64),
         # Round-3 provenance guard: loaders reject unstamped artifacts.
         "pipeline_semantics_version": PIPELINE_SEMANTICS_VERSION,
+        "mcmc_prior_provenance": "oof_5fold_animal_grouped_cv",
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(dataset, path)

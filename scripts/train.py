@@ -69,6 +69,7 @@ _PROVENANCE_KEYS = frozenset({
     "target_clip_cm_s",
     "training_phase",
     "dataset_path",
+    "mcmc_prior_train_serve_consistency",
 })
 
 
@@ -705,11 +706,85 @@ def build_dataloaders(
 
         # Create subset datasets
         from torch.utils.data import Subset
-        train_dataset = Subset(full_dataset, train_indices)
-        val_dataset = Subset(full_dataset, val_indices)
+
+        # Extract stimulus condition metadata for lazy loading
+        is_pure_wind = None
+        if full_dataset.trial_specs and any(
+            "is_pure_wind" in spec for spec in full_dataset.trial_specs
+        ):
+            is_pure_wind = np.array(
+                [
+                    bool(spec.get("is_pure_wind", False))
+                    for spec in full_dataset.trial_specs
+                ],
+                dtype=bool,
+            )
+        else:
+            raw_meta = torch.load(str(dataset_file), weights_only=False)
+            if "is_pure_wind" in raw_meta:
+                is_pure_wind = np.asarray(raw_meta["is_pure_wind"], dtype=bool)
+            elif "stimulus_conditions" in raw_meta:
+                is_pure_wind = np.asarray(
+                    [c == "wind_only" for c in raw_meta["stimulus_conditions"]],
+                    dtype=bool,
+                )
+
+        train_is_pure_wind = (
+            is_pure_wind[train_indices] if is_pure_wind is not None else None
+        )
+        val_is_pure_wind = (
+            is_pure_wind[val_indices] if is_pure_wind is not None else None
+        )
+
+        if train_is_pure_wind is not None:
+            check_routing_aux_active(
+                train_is_pure_wind,
+                np.array(
+                    ["wind_only" if pw else "other" for pw in train_is_pure_wind]
+                ),
+                config.loss.lambda_routing_aux,
+                "train",
+                str(dataset_file),
+            )
+
+        class LazySubset(Subset):
+            """Subset that preserves condition metadata for routing aux loss."""
+
+            def __init__(self, dataset, indices, is_pure_wind=None):
+                super().__init__(dataset, indices)
+                self.is_pure_wind = is_pure_wind
+
+            def __getitem__(self, idx):
+                item = self.dataset[self.indices[idx]]
+                if self.is_pure_wind is not None:
+                    return (
+                        item[0],
+                        item[1],
+                        item[2],
+                        bool(self.is_pure_wind[idx]),
+                    )
+                return item
+
+            def __getitems__(self, indices):
+                return [self.__getitem__(idx) for idx in indices]
+
+        train_dataset = LazySubset(
+            full_dataset, train_indices, train_is_pure_wind
+        )
+        val_dataset = LazySubset(
+            full_dataset, val_indices, val_is_pure_wind
+        )
 
         # Create dataloaders with collate function
         def collate_fn(batch):
+            if len(batch[0]) == 4:
+                X_seqs, Y_seqs, lengths, pure_winds = zip(*batch)
+                return (
+                    torch.nn.utils.rnn.pad_sequence(X_seqs, batch_first=True),
+                    torch.nn.utils.rnn.pad_sequence(Y_seqs, batch_first=True),
+                    torch.tensor(lengths),
+                    torch.tensor(pure_winds, dtype=torch.bool),
+                )
             X_seqs, Y_seqs, lengths = zip(*batch)
             return (
                 torch.nn.utils.rnn.pad_sequence(X_seqs, batch_first=True),
@@ -776,6 +851,23 @@ def build_dataloaders(
         "Loaded %d sequences, total_frames=%d",
         n_total, int(lengths.sum()),
     )
+
+    prior_consistency = dataset.get("mcmc_prior_train_serve_consistency")
+    if prior_consistency is not None:
+        logger.info(
+            "MCMC prior train-vs-serve consistency: %s",
+            prior_consistency,
+        )
+
+    # Resolve anchor frames for anchor-aligned cropping
+    anchor_frames = dataset.get("anchor_frames")
+    if anchor_frames is None:
+        from nsmor.pipeline.conditions import derive_anchor_frames
+        anchor_frames = derive_anchor_frames(X_seqs, lengths)
+        logger.info(
+            "Derived %d anchor frames from physical channels.",
+            len(anchor_frames),
+        )
 
     # ── Deterministic train/val split ─────────────────────────
     # The split is ANIMAL-GROUPED, not session-grouped.  Grouping by
@@ -851,6 +943,10 @@ def build_dataloaders(
         f"Val priors shape {val_priors.shape} != ({n_val}, 4)"
     )
 
+    # ── Extract anchor frames for each split ──────────────────
+    train_anchor_frames = [anchor_frames[i] for i in train_indices]
+    val_anchor_frames = [anchor_frames[i] for i in val_indices]
+
     # ── Create datasets ───────────────────────────────────────
     feature_config = dataset.get("feature_config", DEFAULT_FEATURE)
 
@@ -861,17 +957,21 @@ def build_dataloaders(
         mcmc_priors=train_priors,
         feature_config=feature_config,
         max_seq_len=max_seq_len,
+        anchor_frames=train_anchor_frames,
         source_indices=train_indices,
         is_pure_wind=train_is_pure_wind,
     )
+    train_dataset.mcmc_prior_train_serve_consistency = prior_consistency
     val_dataset = NSMoRDataset(
         sequences=val_sequences,
         mcmc_priors=val_priors,
         feature_config=feature_config,
         max_seq_len=max_seq_len,
+        anchor_frames=val_anchor_frames,
         source_indices=val_indices,
         is_pure_wind=val_is_pure_wind,
     )
+    val_dataset.mcmc_prior_train_serve_consistency = prior_consistency
 
     # ── Create dataloaders (via factory) ──────────────────────
     # Delegates to dataloader_factory for unified worker auto-scaling,
@@ -1995,6 +2095,11 @@ def train(
         if val_loader is not None
         else None
     )
+    mcmc_prior_consistency = getattr(
+        getattr(train_loader, "dataset", None),
+        "mcmc_prior_train_serve_consistency",
+        None,
+    )
 
     # ── Target normalization statistics (train split only) ──
     # When config.training.normalize_targets is enabled, the velocity
@@ -2390,6 +2495,7 @@ def train(
                 target_clip_cm_s=float(config.training.target_clip_cm_s),
                 training_phase=int(current_phase),
                 dataset_path=str(resolved_dataset_path),
+                mcmc_prior_train_serve_consistency=mcmc_prior_consistency,
             )
             logger.info("Saved periodic checkpoint: %s", epoch_path)
 
@@ -2432,6 +2538,7 @@ def train(
                 target_clip_cm_s=float(config.training.target_clip_cm_s),
                 training_phase=int(current_phase),
                 dataset_path=str(resolved_dataset_path),
+                mcmc_prior_train_serve_consistency=mcmc_prior_consistency,
             )
             logger.info("Saved best model (val_loss=%.6f): %s", val_loss, best_path)
         elif math.isfinite(val_loss):
@@ -2468,6 +2575,7 @@ def train(
         target_clip_cm_s=float(config.training.target_clip_cm_s),
         training_phase=int(current_phase),
         dataset_path=str(resolved_dataset_path),
+        mcmc_prior_train_serve_consistency=mcmc_prior_consistency,
     )
     logger.info("Saved final model: %s", final_path)
 
@@ -2525,6 +2633,8 @@ def train(
                 metrics["resting_rmse"],
             )
         metrics["eval_provenance"] = eval_provenance
+        if mcmc_prior_consistency is not None:
+            metrics["mcmc_prior_train_serve_consistency"] = mcmc_prior_consistency
         metrics_path = output_dir / "metrics.json"
         with open(metrics_path, "w") as f:
             json.dump(metrics, f, indent=2)

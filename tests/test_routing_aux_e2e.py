@@ -45,8 +45,12 @@ def synthetic_routing_aux_data(tmp_path: Path) -> Tuple[ExperimentConfig, str]:
     _exp = np.exp(_raw - _raw.max(axis=1, keepdims=True))
     mcmc_priors = (_exp / _exp.sum(axis=1, keepdims=True)).astype(np.float32)
 
-    # 5 sessions: 2 trials per session ensures both train & val get wind and visual
-    session_ids = [f"sess_{i % 5}" for i in range(n_total)]
+    # 5 animals with 2 sessions each (10 sessions total)
+    session_ids = [
+        f"0.{500 + (i % 5)}cricket_001_20260101_00000"
+        f"{i % 5}_session_{1 + (i // 5)}"
+        for i in range(n_total)
+    ]
 
     # Half pure-wind (True) / half visual (False)
     is_pure_wind = np.array([True, False] * 5, dtype=bool)
@@ -59,6 +63,7 @@ def synthetic_routing_aux_data(tmp_path: Path) -> Tuple[ExperimentConfig, str]:
             "labels": labels,
             "lengths": lengths,
             "mcmc_priors": mcmc_priors,
+            "mcmc_prior_provenance": "oof_5fold_animal_grouped_cv",
             "session_ids": session_ids,
             "feature_config": FeatureConfig(),
             "pipeline_semantics_version": PIPELINE_SEMANTICS_VERSION,
@@ -165,7 +170,11 @@ def test_routing_aux_all_visual_trials_graceful(
     _raw = rng.randn(n_total, 4).astype(np.float32)
     _exp = np.exp(_raw - _raw.max(axis=1, keepdims=True))
     mcmc_priors = (_exp / _exp.sum(axis=1, keepdims=True)).astype(np.float32)
-    session_ids = [f"sess_{i % 5}" for i in range(n_total)]
+    session_ids = [
+        f"0.{500 + (i % 5)}cricket_001_20260101_00000"
+        f"{i % 5}_session_{1 + (i // 5)}"
+        for i in range(n_total)
+    ]
     # All visual (no wind trials)
     is_pure_wind = np.zeros(n_total, dtype=bool)
 
@@ -177,6 +186,7 @@ def test_routing_aux_all_visual_trials_graceful(
             "labels": labels,
             "lengths": lengths,
             "mcmc_priors": mcmc_priors,
+            "mcmc_prior_provenance": "oof_5fold_animal_grouped_cv",
             "session_ids": session_ids,
             "feature_config": FeatureConfig(),
             "pipeline_semantics_version": PIPELINE_SEMANTICS_VERSION,

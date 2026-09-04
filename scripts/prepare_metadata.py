@@ -277,6 +277,19 @@ def main() -> None:
         # Compute anchor frame index for lazy loader crop alignment
         anchor_frame = int(np.argmin(np.abs(time_ms - anchor_ms)))
 
+        # Derive stimulus condition and pure-wind indicator from physical channels
+        has_vis = bool(np.any(np.abs(trial_data["visual_angle"]) > 0.0))
+        has_wind = bool(np.any(np.abs(trial_data["wind_state"]) > 0.0))
+        if has_vis and has_wind:
+            condition = "multisensory"
+        elif has_vis:
+            condition = "visual_only"
+        elif has_wind:
+            condition = "wind_only"
+        else:
+            condition = "no_stimulus"
+        is_pure_wind = (condition == "wind_only")
+
         trial_specs.append({
             "session_id": session_id,
             "session_dir": session_dir or "",
@@ -290,6 +303,8 @@ def main() -> None:
             "anchor_frame": anchor_frame,
             "anchor_rule": anchor_rule,
             "label": info["label"].name,  # Label enum -> string
+            "stimulus_condition": condition,
+            "is_pure_wind": is_pure_wind,
         })
 
     logger.info("Built %d trial specs.", len(trial_specs))
@@ -297,16 +312,24 @@ def main() -> None:
     # ── Step 6: Save lightweight metadata ─────────────────────────
     logger.info("[Step 6] Saving metadata to %s", output_path)
 
+    n_sessions = len(set(spec["session_id"] for spec in trial_specs))
     metadata = {
         "trial_specs": trial_specs,
         "mcmc_priors": torch.from_numpy(mcmc_priors).float(),
         "pipeline_semantics_version": PIPELINE_SEMANTICS_VERSION,
         "n_trials": len(trial_specs),
-        "label_encoder": {label.name: label.value for label in __import__("nsmor.config", fromlist=["Label"]).Label},
+        "label_encoder": {
+            label.name: label.value
+            for label in __import__("nsmor.config", fromlist=["Label"]).Label
+        },
         "feature_config": feature_config,
         "snapshot_anchor_rules": snapshot_anchor_rules,
         "n_sessions": n_sessions,
         "session_ids": [spec["session_id"] for spec in trial_specs],
+        "stimulus_conditions": [spec["stimulus_condition"] for spec in trial_specs],
+        "is_pure_wind": np.array(
+            [spec["is_pure_wind"] for spec in trial_specs], dtype=bool
+        ),
     }
 
     torch.save(metadata, output_path)

@@ -96,6 +96,8 @@ def load_validation_data(
     device: torch.device,
     max_seq_len: int = 1000,
     dataset_path: Optional[str] = None,
+    val_split: float = 0.2,
+    random_seed: int = 42,
 ):
     """
     Load ``nsmor_dataset.pt`` and return the validation split.
@@ -105,9 +107,8 @@ def load_validation_data(
     run produced — otherwise this stage silently scores whatever file is
     left over in ``data/processed`` from an earlier run.
 
-    NOTE (open provenance gap): the split here is the trailing 20% by
-    position, which is NOT the session-grouped split train.py uses.  Fix
-    that with the trial-key work, not here.
+    Uses animal-grouped train/val split (nsmor.pipeline.grouping.grouped_train_val_split)
+    matching train.py to eliminate animal leakage across splits.
     """
     if dataset_path is None:
         dataset_path = os.path.join(
@@ -127,21 +128,31 @@ def load_validation_data(
     mcmc_priors = data.get("mcmc_priors", None)
 
     n_total = len(X_seqs)
-    n_val = int(n_total * 0.2)
-    split = n_total - n_val
+    from nsmor.pipeline.grouping import grouped_train_val_split
+
+    _, val_indices = grouped_train_val_split(
+        data.get("session_ids"),
+        n_total,
+        val_split=val_split,
+        random_seed=random_seed,
+    )
 
     # Use DataLoader with collate_variable_length for proper padding
     from nsmor.nsmor_dataloader import NSMoRDataset
     from nsmor.dataloader_factory import create_optimized_dataloader
     from nsmor.config import DEFAULT_FEATURE
 
-    sequences = [(X_seqs[i], Y_seqs[i], 0) for i in range(split, n_total)]
+    sequences = [(X_seqs[i], Y_seqs[i], 0) for i in val_indices]
     feature_config = data.get("feature_config", DEFAULT_FEATURE)
-    val_priors = mcmc_priors[split:] if mcmc_priors is not None else None
+    val_priors = mcmc_priors[val_indices] if mcmc_priors is not None else None
 
     val_dataset = NSMoRDataset(
         sequences=sequences,
-        mcmc_priors=val_priors if val_priors is not None else np.ones((len(sequences), 4)) * 0.25,
+        mcmc_priors=(
+            val_priors
+            if val_priors is not None
+            else np.ones((len(sequences), 4)) * 0.25
+        ),
         feature_config=feature_config,
         max_seq_len=max_seq_len,
     )
@@ -467,7 +478,7 @@ def main() -> None:
         type=float,
         nargs="+",
         default=NOISE_LEVELS,
-        help="Visual noise σ values in degrees.",
+        help="Visual noise sigma values in degrees.",
     )
     parser.add_argument(
         "--dataset",

@@ -40,11 +40,11 @@ class ModelConfig:
     # declared in PHYSICAL TIME (ms) and converted internally via
     #   alpha = exp(-dt_ms / tau_ms)
     # so that changing the acquisition rate never silently rescales the
-    # biophysics (Reviewer Round-1 BLOCKER-1).  The default matches
-    # TimeWindowConfig.frame_interval_ms (100 Hz imaging).
-    dt_ms: float = 10.0
+    # biophysics (Reviewer Round-1 BLOCKER-1).  The default matches the
+    # hardware acquisition at nominal 250 Hz (4.0 ms median interval).
+    dt_ms: float = 4.0
 
-    lif_alpha: float = 0.9
+    lif_alpha: float = 0.9587  # LIF leak factor: exp(-4.0 / ~95ms) keeps tau_mem invariant across dt
     lif_threshold: float = 1.0
     lif_beta: float = 0.5
     # Refractory periods & synaptic dynamics (Hodgkin & Huxley 1952)
