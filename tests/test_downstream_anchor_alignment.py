@@ -216,14 +216,19 @@ def test_psychophysics_find_multisensory_ttc0_with_val_indices():
     X_seqs[2, 2000:2100, 1] = 1.0
 
     lengths = torch.tensor([T, T, T], dtype=torch.int64)
-    mask = find_multisensory_ttc0(
+    target_ttcs = [0.0, None, 800.0]
+    conditions = ["multisensory", "visual_only", "multisensory"]
+    selection = find_multisensory_ttc0(
         X_seqs,
         lengths,
         raw_dir="/nonexistent",
         val_indices=[10, 20, 30],
         stim_onset_frame=stim_onset,
         dt_ms=dt_ms,
+        target_ttc_ms=target_ttcs,
+        stimulus_conditions=conditions,
     )
+    mask = selection.mask
 
     assert mask[0].item() is True, "Trial 0 is multisensory TTC0"
     assert mask[1].item() is False, "Trial 1 is visual-only"
@@ -325,16 +330,18 @@ def test_all_six_loaders_on_real_small_dataset():
 
     # 6. Psychophysics validation loader
     device = torch.device("cpu")
-    X_val, Y_val, lengths_val = load_validation_data(
+    val_data = load_validation_data(
         device,
         max_seq_len=2400,
         pre_anchor_frames=1200,
         dataset_path=str(SUBSET_SMALL_PATH),
     )
+    X_val, Y_val, lengths_val = val_data
+    meta = val_data.meta
     assert X_val.shape[1] <= 2400
-    assert getattr(X_val, "stim_onset_frame", None) == 1200
-    assert getattr(X_val, "val_indices", None) is not None
-    assert len(getattr(X_val, "val_indices")) == X_val.shape[0]
+    assert meta.stim_onset_frame == 1200
+    assert meta.val_indices is not None
+    assert len(meta.val_indices) == X_val.shape[0]
 
 
 # =========================================================================
@@ -395,21 +402,43 @@ def test_integration_metrics_windowed_search():
     assert metrics["peak_velocities"][0] == pytest.approx(55.0, abs=1e-3)
 
 
-def test_ttc0_missing_raises_not_silently_pollutes():
-    """When TTC=0 trials are absent, find_multisensory_ttc0 must raise, not pollute."""
+def test_ttc0_absent_in_complete_declared_metadata_is_not_applicable():
+    """Complete valid declared metadata with ZERO TTC=0 returns empty mask, not raise."""
+    device = torch.device("cpu")
+    B = 4
+    T = 2400
+    X_val = torch.zeros(B, T, 8, device=device)
+    X_val[:, 1200, 0] = 90.0
+    X_val[:, 827, 2] = 1.0
+
+    lengths_val = torch.full((B,), T, device=device)
+    target_ttcs = [-373.0, -225.0, -119.0, 200.0]
+    conditions = ["multisensory"] * B
+
+    selection = find_multisensory_ttc0(
+        X_val,
+        lengths_val,
+        target_ttc_ms=target_ttcs,
+        stimulus_conditions=conditions,
+        dt_ms=4.0,
+    )
+    assert selection.status == "not_applicable"
+    assert selection.n_ttc0 == 0
+    assert selection.mask.sum().item() == 0
+    assert selection.n_candidates == B
+
+
+def test_ttc0_missing_metadata_fails_closed():
+    """Missing identity/metadata must raise, not silently pollute."""
     device = torch.device("cpu")
 
-    # Synthetic validation set with NO TTC=0 trials (only TTC-373ms and TTC+200ms)
+    # Synthetic validation set with NO declared metadata at all
     X_val = torch.zeros(10, 2400, 8, device=device)
-    # Mark all as multisensory
-    X_val[:, 1200, 0] = 90.0  # Visual
-    X_val[:, 827, 2] = 1.0    # Wind at TTC-373ms for first 5
-    X_val[:, 1400, 2] = 1.0   # Wind at TTC+200ms for last 5
+    X_val[:, 1200, 0] = 90.0
+    X_val[:, 827, 2] = 1.0
 
     lengths_val = torch.full((10,), 2400, device=device)
 
-    # Old code would silently include ALL 10 trials
-    # New code must raise ValueError
     with pytest.raises(ValueError, match="No multisensory TTC=0ms trials found"):
         find_multisensory_ttc0(X_val, lengths_val, dt_ms=4.0)
 

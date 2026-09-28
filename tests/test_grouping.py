@@ -1,13 +1,8 @@
-"""The train/val split must be ANIMAL-disjoint, not merely session-disjoint.
+"""The split must be recording-prefix disjoint.
 
-``session_ids`` look like ``0.513cricket_001_20260707_193143_session_2``.
-The ``_session_N`` suffix splits one recording of one animal into blocks,
-so grouping the split by session leaves the animal free to straddle both
-sides.  Measured on ``nsmor_dataset_3cond_v2.pt`` at the project's default
-seed, 87.5% of validation trials shared an animal with a training trial.
-
-That defect is invisible to any session-granularity assertion, which is
-why these tests assert at animal granularity and use realistic ids.
+The _session_N suffix marks blocks within a recording prefix.
+These tests verify the grouping key and disjoint partition. Separate prefixes
+are not independently verified animal identities.
 """
 
 from __future__ import annotations
@@ -159,7 +154,7 @@ class TestGroupedTrainValSplit:
         sids = _session_ids(n_animals=8)
         with caplog.at_level("INFO"):
             grouped_train_val_split(sids, len(sids), 0.2, 42)
-        assert "Animal-grouped split" in caplog.text
+        assert "Recording-prefix split" in caplog.text
         assert "target" in caplog.text
 
 

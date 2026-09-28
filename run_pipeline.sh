@@ -26,6 +26,7 @@
 #   PHASE1_EPOCHS  Hybrid-Funnel phase-1 epochs  (unset = single-phase)
 #   BATCH_SIZE     training batch size           (CONFIG)
 #   LR             learning rate                 (CONFIG)
+#   NESTED_PRIOR_ARTIFACT  generated split path  (RUN_DIR/nested_prior/nested_split_seed${SEED}.pt)
 #   PYTHON         interpreter                   (python)
 #   DRY_RUN        1 = print planned commands    (0)
 #
@@ -71,6 +72,8 @@ BATCH_SIZE="${BATCH_SIZE:-}"
 LR="${LR:-}"
 PYTHON="${PYTHON:-python}"
 DRY_RUN="${DRY_RUN:-0}"
+NESTED_PRIOR_ARTIFACT="${NESTED_PRIOR_ARTIFACT:-${RUN_DIR}/nested_prior/nested_split_seed${SEED}.pt}"
+NESTED_PRIOR_DIR="$(dirname -- "${NESTED_PRIOR_ARTIFACT}")"
 
 BEST_MODEL="${RUN_DIR}/best_model.pth"
 SIM_DIR="${OUTPUT_DIR}/sim_session"
@@ -101,12 +104,12 @@ abort() {
 run_py() {
     local label="$1"; shift
     if [[ "${DRY_RUN}" == "1" ]]; then
-        printf 'PLAN %s' "${PYTHON}"
-        printf ' %s' "$@"
+        printf 'PLAN %q' "${PYTHON}"
+        printf ' %q' "$@"
         printf '\n'
         return 0
     fi
-    printf '%s' "${PYTHON}" >>"${COMMAND_LOG}"
+    printf '%q' "${PYTHON}" >>"${COMMAND_LOG}"
     printf ' %q' "$@" >>"${COMMAND_LOG}"
     printf '\n' >>"${COMMAND_LOG}"
     local rc=0
@@ -135,6 +138,39 @@ require_outputs() {
     fi
 }
 
+# Psychophysics artefact gate: reads FRESH bayesian_reliability.json status
+# written by the current run (stale artefacts are cleared before Phase G).
+# status=not_applicable is a legitimate outcome — no PNG/summary required.
+# Any other status requires bayesian_reliability.png + psychophysics_summary.json.
+require_psychophysics_outputs() {
+    local label="$1"
+    local status_json="${OUTPUT_DIR}/bayesian_reliability.json"
+    local png="${OUTPUT_DIR}/bayesian_reliability.png"
+    local summary="${OUTPUT_DIR}/psychophysics_summary.json"
+    if [[ "${DRY_RUN}" == "1" ]]; then
+        return 0
+    fi
+    if [[ ! -f "${status_json}" || ! -s "${status_json}" ]]; then
+        abort "${label}: missing fresh status artefact ${status_json}."
+    fi
+    local status
+    status="$("${PYTHON}" - "${OUTPUT_DIR}" <<'PY'
+import sys
+from scripts.simulate_psychophysics import psychophysics_gate_verdict
+print(psychophysics_gate_verdict(sys.argv[1]))
+PY
+)" || abort "${label}: failed to read fresh status artefact ${status_json}."
+    if [[ "${status}" == "not_applicable" ]]; then
+        echo -e "${YELLOW}  ◐ ${label}: not_applicable (empty declared TTC=0 subset) — no figure required.${RESET}"
+        echo "    status: ${status_json}"
+        return 0
+    fi
+    require_outputs "${label}" "${png}" "${summary}"
+    if [[ "${status}" == "unavailable_latency" ]]; then
+        echo -e "${YELLOW}  ◐ ${label}: TTC=0 present, no finite latency measured; figure and summary retained.${RESET}"
+    fi
+}
+
 # model.dt_ms from the YAML config (empty when unavailable).
 read_config_dt_ms() {
     "${PYTHON}" - "${CONFIG}" 2>/dev/null <<'PY'
@@ -152,12 +188,30 @@ PY
 }
 
 # ── Preflight ────────────────────────────────────────────────
+# A fresh pipeline must not satisfy Phase B with a checkpoint from an older
+# run. Check before creating output directories, logs, or running stages.
+# Treat a dangling symlink as occupied too; never replace user data here.
+if [[ "${DRY_RUN}" != "1" ]]; then
+    if [[ -e "${BEST_MODEL}" || -L "${BEST_MODEL}" ]]; then
+        abort "Pre-existing checkpoint at ${BEST_MODEL}; choose a fresh RUN_DIR for this pipeline."
+    fi
+fi
+# The evaluator fixes the filename from the seed; reject a path it cannot write.
+[[ "${NESTED_PRIOR_ARTIFACT##*/}" == "nested_split_seed${SEED}.pt" ]] \
+    || abort "NESTED_PRIOR_ARTIFACT must end in nested_split_seed${SEED}.pt."
+if [[ "${DRY_RUN}" != "1" ]]; then
+    if [[ -e "${NESTED_PRIOR_ARTIFACT}" || -L "${NESTED_PRIOR_ARTIFACT}" ]]; then
+        abort "Pre-existing nested artifact at ${NESTED_PRIOR_ARTIFACT}; choose a fresh path for this pipeline."
+    fi
+fi
+
 command -v "${PYTHON}" >/dev/null 2>&1 \
     || abort "Python interpreter '${PYTHON}' not found."
 [[ -f "${CONFIG}" ]] || abort "Config file not found: ${CONFIG}"
 
 STAGE_SCRIPTS=(
     scripts/prepare_data.py
+    scripts/evaluate_nested_prior.py
     scripts/train.py
     scripts/analyze_dynamics.py
     scripts/simulate_lesion.py
@@ -199,6 +253,7 @@ TRAIN_ARGS=(
     scripts/train.py
     --config "${CONFIG}"
     --dataset "${DATASET}"
+    --nested_prior_artifact "${NESTED_PRIOR_ARTIFACT}"
     --output_dir "${RUN_DIR}"
 )
 if [[ -n "${EPOCHS}" ]]; then
@@ -227,6 +282,7 @@ echo "  Python   : ${PYTHON}"
 echo "  Config   : ${CONFIG}"
 echo "  Raw dir  : ${RAW_DIR}"
 echo "  Dataset  : ${DATASET}"
+echo "  Nested   : ${NESTED_PRIOR_ARTIFACT}"
 echo "  Run dir  : ${RUN_DIR}"
 echo "  Output   : ${OUTPUT_DIR}"
 echo "  dt_ms    : ${DT_MS}"
@@ -247,7 +303,7 @@ if [[ "${DRY_RUN}" != "1" ]]; then
     export GIT_DIRTY
     export PY_VERSION="$("${PYTHON}" -c 'import sys; print(sys.version.split()[0])' 2>/dev/null || echo unknown)"
     export STARTED_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    export CONFIG RAW_DIR DATASET RUN_DIR OUTPUT_DIR SEED DT_MS
+    export CONFIG RAW_DIR DATASET RUN_DIR OUTPUT_DIR SEED DT_MS NESTED_PRIOR_ARTIFACT
     export EPOCHS PHASE1_EPOCHS BATCH_SIZE LR COMMAND_LOG
 
     "${PYTHON}" - "${MANIFEST}" <<'PYMANIFEST'
@@ -260,6 +316,7 @@ manifest = {
     "config": os.environ.get("CONFIG", ""),
     "raw_dir": os.environ.get("RAW_DIR", ""),
     "dataset": os.environ.get("DATASET", ""),
+    "nested_prior_artifact": os.environ.get("NESTED_PRIOR_ARTIFACT", ""),
     "run_dir": os.environ.get("RUN_DIR", ""),
     "output_dir": os.environ.get("OUTPUT_DIR", ""),
     "seed": int(os.environ.get("SEED") or 0),
@@ -289,6 +346,17 @@ require_outputs "Phase A" "${DATASET}"
 stage_done "Phase A"
 
 # ═════════════════════════════════════════════════════════════
+# Nested prior fit — outer split, inner OOF on outer-train only
+# ═════════════════════════════════════════════════════════════
+stage_header "Nested prior — outer split and inner fit"
+run_py "Nested prior" scripts/evaluate_nested_prior.py \
+    --dataset "${DATASET}" \
+    --output_dir "${NESTED_PRIOR_DIR}" \
+    --split_seed "${SEED}"
+require_outputs "Nested prior" "${NESTED_PRIOR_ARTIFACT}"
+stage_done "Nested prior"
+
+# ═════════════════════════════════════════════════════════════
 # Phase B — Training (Hybrid Funnel when PHASE1_EPOCHS is set)
 # ═════════════════════════════════════════════════════════════
 stage_header "Phase B — Training Engine"
@@ -303,6 +371,7 @@ stage_header "Phase C — Dynamics & Manifold Analysis"
 run_py "Phase C" scripts/analyze_dynamics.py \
     --checkpoint "${BEST_MODEL}" \
     --dataset "${DATASET}" \
+    --nested_prior_artifact "${NESTED_PRIOR_ARTIFACT}" \
     --output "${OUTPUT_DIR}/mechanism_analysis.png"
 require_outputs "Phase C" "${OUTPUT_DIR}/mechanism_analysis.png"
 stage_done "Phase C"
@@ -314,6 +383,7 @@ stage_header "Phase D — In-Silico Lesion Analysis"
 run_py "Phase D" scripts/simulate_lesion.py \
     --checkpoint "${BEST_MODEL}" \
     --dataset "${DATASET}" \
+    --nested_prior_artifact "${NESTED_PRIOR_ARTIFACT}" \
     --output "${OUTPUT_DIR}/ablation_kinematics.png" \
     --stats_output "${OUTPUT_DIR}/lesion_statistics.csv" \
     --dt_ms "${DT_MS}"
@@ -332,6 +402,7 @@ stage_header "Phase E — Jacobian Eigenvalue Spectrum (GRU recurrence)"
 run_py "Phase E" scripts/analyze_jacobian.py \
     --checkpoint "${BEST_MODEL}" \
     --dataset "${DATASET}" \
+    --nested_prior_artifact "${NESTED_PRIOR_ARTIFACT}" \
     --output "${OUTPUT_DIR}/jacobian_spectrum.png" \
     --dt_ms "${DT_MS}" \
     --backend jax
@@ -347,6 +418,8 @@ stage_header "Phase F — Multisensory Integration Window"
 run_py "Phase F" scripts/analyze_integration.py \
     --checkpoint "${BEST_MODEL}" \
     --dataset "${DATASET}" \
+    --nested_prior_artifact "${NESTED_PRIOR_ARTIFACT}" \
+    --raw_dir "${RAW_DIR}" \
     --output "${OUTPUT_DIR}/integration_window.png" \
     --summary "${OUTPUT_DIR}/integration_summary.json" \
     --dt_ms "${DT_MS}"
@@ -359,16 +432,22 @@ stage_done "Phase F"
 # Phase G — Visual-channel noise sensitivity (psychophysics)
 # ═════════════════════════════════════════════════════════════
 stage_header "Phase G — Psychophysics: Visual Noise Sensitivity"
+# Clear previous psychophysics artefacts so the gate below cannot pass
+# from stale files left by an earlier run.
+if [[ "${DRY_RUN}" != "1" ]]; then
+    rm -f "${OUTPUT_DIR}/bayesian_reliability.png" \
+          "${OUTPUT_DIR}/psychophysics_summary.json" \
+          "${OUTPUT_DIR}/bayesian_reliability.json"
+fi
 run_py "Phase G" scripts/simulate_psychophysics.py \
     --checkpoint "${BEST_MODEL}" \
     --dataset "${DATASET}" \
+    --nested_prior_artifact "${NESTED_PRIOR_ARTIFACT}" \
     --raw_dir "${RAW_DIR}" \
     --output_dir "${OUTPUT_DIR}" \
     --dt_ms "${DT_MS}" \
     --seed "${SEED}"
-require_outputs "Phase G" \
-    "${OUTPUT_DIR}/bayesian_reliability.png" \
-    "${OUTPUT_DIR}/psychophysics_summary.json"
+require_psychophysics_outputs "Phase G"
 stage_done "Phase G"
 
 # ═════════════════════════════════════════════════════════════
@@ -380,6 +459,7 @@ stage_header "Phase H — Gating Strategy Clustering"
 run_py "Phase H" scripts/analyze_gating.py \
     --checkpoint "${BEST_MODEL}" \
     --dataset "${DATASET}" \
+    --nested_prior_artifact "${NESTED_PRIOR_ARTIFACT}" \
     --config "${CONFIG}" \
     --output_dir "${OUTPUT_DIR}"
 require_outputs "Phase H" \
@@ -444,6 +524,8 @@ echo ""
 echo "  Synthetic session:"
 echo "    ${SIM_DIR}/events.csv"
 echo "    ${SIM_DIR}/kinematics.csv"
+echo ""
+echo "  Nested prior artifact:\n    ${NESTED_PRIOR_ARTIFACT}"
 echo ""
 echo "  Provenance:"
 echo "    ${MANIFEST}"

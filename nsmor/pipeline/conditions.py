@@ -28,11 +28,11 @@ breaks ``python scripts/<name>.py``, since ``pyproject.toml`` installs
 
 from __future__ import annotations
 
-from typing import List, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 
-__all__ = ["derive_stimulus_metadata", "derive_anchor_frames"]
+__all__ = ["derive_stimulus_metadata", "derive_anchor_frames", "resolve_anchor_crop"]
 
 # Feature-axis indices of the two physical stimulus channels.
 _VISUAL_ANGLE_IDX = 0
@@ -137,3 +137,42 @@ def derive_anchor_frames(
             anchor = 0
         anchors.append(anchor)
     return anchors
+
+
+def resolve_anchor_crop(
+    n_frames: int,
+    anchor_frame: Optional[int],
+    max_seq_len: Optional[int],
+    pre_anchor_frames: int,
+) -> Tuple[int, int]:
+    """Return the ``[start, end)`` crop window applied to a trial sequence.
+
+    Single source of truth for the anchor-aligned crop arithmetic shared by
+    ``NSMoRDataset.__getitem__``, ``NSMoRLazyDataset.__getitem__`` and
+    ``scripts.simulate_psychophysics.load_validation_data``.  Downstream
+    analysis must map pre-crop metadata anchors into saved-sequence
+    coordinates with the same window, otherwise gate/latency extraction
+    silently reads a different time base than the tensors it scores.
+
+    Args:
+        n_frames: Full (pre-crop) sequence length.
+        anchor_frame: Stimulus anchor frame index in pre-crop coordinates.
+            ``None`` or negative selects the whole sequence (no crop).
+        max_seq_len: Maximum sequence length; ``None`` disables cropping.
+        pre_anchor_frames: Frames before the anchor to retain (baseline).
+
+    Returns:
+        ``(start, end)`` with ``end - start <= max_seq_len`` and
+        ``0 <= start <= end <= n_frames``.  Returns ``(0, n_frames)`` when
+        cropping is not required or not possible.
+    """
+    if max_seq_len is None or n_frames <= max_seq_len:
+        return 0, n_frames
+    if anchor_frame is None or anchor_frame < 0:
+        return 0, n_frames
+    start = max(0, int(anchor_frame) - int(pre_anchor_frames))
+    end = min(n_frames, start + int(max_seq_len))
+    # Adjust start if end clamped (keeps window size consistent)
+    if end - start < int(max_seq_len):
+        start = max(0, end - int(max_seq_len))
+    return start, end

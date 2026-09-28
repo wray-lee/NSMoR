@@ -1,21 +1,25 @@
-# MCMC Prior Cross-Fitting with Animal-Grouped Folds
+# MCMC Prior Cross-Fitting with Recording-Prefix-Grouped Folds
 
-MCMC priors are generated via K-fold cross-fitting where folds are partitioned
-by animal identity (stripping the `_session_N` suffix from session IDs) rather
-than by individual recording session. This prevents an animal's `_session_1`
-from training the prior generator evaluated on `_session_2`, eliminating cross-session
-information leakage.
+MCMC priors use K-fold cross-fitting grouped by the recording prefix obtained by
+stripping `_session_N` from a session ID. A held-out trial and its prefix stay
+out of its prior fit. Different prefixes may belong to the same animal; animal
+identity, independence, cross-recording leakage control, and animal-level
+generalization remain unverified without an auditable identity mapping and
+identity-based split.
 
-## Status of Corpora
+## Historical corpus report (not SOURCE13 revalidation)
 
-| Corpus | Status | Provenance | Trials / Animals | Notes |
+The counts below used "animals" for recording prefixes. The legacy provenance
+strings record prefix grouping only; they do not establish animal identity.
+
+| Corpus | Historical status | Legacy provenance | Trials / recording prefixes | Notes |
 |---|---|---|---|---|
-| `nsmor_dataset_full_backup.pt` | ✅ Regenerated | `oof_4fold_animal_grouped_cv` | 396 trials / 11 animals | Baseline 1-condition corpus |
+| `nsmor_dataset_full_backup.pt` | ✅ Regenerated | `oof_4fold_animal_grouped_cv` | 396 trials / 11 recording prefixes | Baseline 1-condition corpus |
 | `nsmor_subset_routing_calibration.pt` | ✅ Regenerated | `oof_4fold_animal_grouped_cv` | Derived from full_backup | Routing calibration subset |
-| `nsmor_dataset_3cond_v2.pt` | ✅ Regenerated | `oof_5fold_animal_grouped_cv` | 1332 trials / 37 animals | 3-condition corpus with dt_ms=4.0 + anchor_frames |
-| `nsmor_subset_small.pt` | ✅ Regenerated | `oof_5fold_animal_grouped_cv` | 288 trials / 8 animals | Derived from new 3cond_v2; symlinked by `nsmor_dataset.pt` |
+| `nsmor_dataset_3cond_v2.pt` | ✅ Regenerated | `oof_5fold_animal_grouped_cv` | 1332 trials / 37 recording prefixes | 3-condition corpus with dt_ms=4.0 + anchor_frames |
+| `nsmor_subset_small.pt` | ✅ Regenerated | `oof_5fold_animal_grouped_cv` | 288 trials / 8 recording prefixes | Derived from new 3cond_v2; symlinked by `nsmor_dataset.pt` |
 
-Overall progress: **100% complete (4/4 primary corpora regenerated with animal-grouped priors)**.
+Historical progress report: **4/4 primary corpora regenerated with recording-prefix-grouped priors**; no SOURCE13 corpus or animal-identity verification is implied.
 
 ## Critical Distinction: 3cond_v2 vs Backup
 
@@ -24,10 +28,10 @@ The regenerated `nsmor_dataset_3cond_v2.pt` and the preserved backup in
 directly compared as identical datasets:
 
 1. **Source cohort delta (Audit 2):**
-   - The backup (1440 trials / 40 animals) was built from `data/staging_3cond_1440`.
-   - The new `3cond_v2` (1332 trials / 37 animals) was built from `data/raw_3cond_adapted/`,
-     which staged only 37 numeric-prefixed animals.
-   - The 3 excluded animals exhibited zero escapes (58 No-Response, 48 Pre-Active,
+   - The backup (1440 trials / 40 recording prefixes) was built from `data/staging_3cond_1440`.
+   - The new `3cond_v2` (1332 trials / 37 recording prefixes) was built from `data/raw_3cond_adapted/`,
+     which staged only 37 numeric recording prefixes.
+   - The 3 excluded recording prefixes exhibited zero escapes (58 No-Response, 48 Pre-Active,
      2 Prewalk). Escape counts (label 0) are identical at 412 across both datasets;
      per-trial labels across all 74 shared sessions match 100%.
 2. **Representation & format delta (Audit 3):**
@@ -47,16 +51,16 @@ Findings from recent audits and their current resolution status:
   *Historical issue*: Passing `max_seq_len=2400` to `NSMoRDataset` without anchor indices caused random cropping that missed stimulus onset in 88%-95% of crops.
   *Resolution*: Per-trial `anchor_frames` are now derived and persisted in the dataset artifacts; all training and downstream analysis scripts use anchor-aligned cropping (`max_seq_len=2400`, `pre_anchor_frames=1200`), guaranteeing 100% stimulus capture.
 
-- **[RESOLVED] Provenance validation (Audit 5):**
+- **[HISTORICAL; ANIMAL IDENTITY UNVERIFIED] Provenance validation (Audit 5):**
   *Historical issue*: `validate_dataset_provenance` checked only `pipeline_semantics_version` (2.2), allowing un-grouped or missing prior provenance to pass silently.
-  *Resolution*: `validate_dataset_provenance()` strictly enforces `mcmc_prior_provenance="oof_5fold_animal_grouped_cv"`. All corpora including `nsmor_subset_small.pt` have been regenerated and verified.
+  *Historical resolution*: the guard checked the legacy `oof_5fold_animal_grouped_cv` string. That string cannot verify animal identity or independence. Historical corpus regeneration is reported above; SOURCE13 runtime provenance is owned separately.
 
 - **[ACTIVE TELEMETRY] MCMC prior train-serve shift (Audit 5):**
   The cross-fitted MCMC prior exhibits a distribution shift between out-of-fold training and full-fit serving (mean total variation distance 0.2739, argmax agreement 0.676). This shift is stored in `mcmc_prior_train_serve_consistency` and logged to checkpoints and metrics to ensure complete scientific auditability.
 
-## Verification
+## Historical artifact inspection
 
-Check corpus provenance and group fold resolution:
+For historical artifacts, inspect the recorded string without interpreting it as animal proof:
 
 ```python
 import torch
@@ -69,13 +73,12 @@ print("Train/serve shift:", data.get("mcmc_prior_train_serve_consistency"))
 # Output: {'argmax_agreement': 0.676, 'mean_tv_distance': 0.2739, ...}
 ```
 
-Fold count `N` adapts dynamically: when a rare class occupies fewer than 5 animals,
-`resolve_group_folds` caps `N` to the minimum animal coverage for that class
-(for `3cond_v2`, label 1 covers 17 distinct animals, safely resolving to 5 folds).
+Fold count `N` adapts to recording-prefix coverage by class; historically,
+label 1 occupied 17 distinct prefixes in `3cond_v2`, allowing 5 folds.
 
 ## Regeneration Commands
 
-To regenerate `nsmor_subset_small.pt` from the animal-grouped `3cond_v2` corpus:
+Historical command to derive `nsmor_subset_small.pt` from the prefix-grouped `3cond_v2` corpus (`--n_animals` is a legacy CLI name for prefix count):
 
 ```bash
 python scripts/make_subset_dataset.py \

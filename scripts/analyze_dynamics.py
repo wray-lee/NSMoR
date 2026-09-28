@@ -22,9 +22,14 @@ CLI::
 from __future__ import annotations
 
 import argparse
+import json
+import sys
 import logging
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
+
+# Direct CLI execution must use this checkout, including its prior/lineage helpers.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
@@ -33,12 +38,16 @@ import torch
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 (3D projection)
 from sklearn.decomposition import PCA
 
-from nsmor.analysis.uq import bootstrap_ci, cohens_d, log_pca_variance
+from nsmor.analysis.uq import cohens_d, log_pca_variance
 from nsmor.dataloader_factory import create_optimized_dataloader
 from nsmor.nsmor_dataloader import NSMoRDataset
 from nsmor.config import DEFAULT_FEATURE, Label
 from nsmor.model_nsmor_core import NSMoRCore
-from nsmor.model_utils import load_model_from_checkpoint as _shared_load_model
+from nsmor.analysis.analysis_priors import (
+    describe_analysis_population, load_analysis_priors, population_for_output,
+)
+from nsmor.pipeline.nested_prior import load_dataset_with_fingerprint
+from nsmor.analysis.prediction_units import load_model_from_checkpoint as _shared_load_model
 from nsmor.model_utils import validate_dataset_provenance
 
 # -- Logging ----------------------------------------------------------------
@@ -126,6 +135,11 @@ def load_dataset(
     batch_size: int = 32,
     max_seq_len: Optional[int] = 2400,
     pre_anchor_frames: int = 1200,
+    nested_prior_artifact: Optional[Path] = None,
+    qc_sealed_nested_prior_sha256: Optional[str] = None,
+    checkpoint_model: Optional[NSMoRCore] = None,
+    trusted_historical_checkpoint_sha256: Optional[str] = None,
+    trusted_historical_artifact_sha256: Optional[str] = None,
 ) -> Tuple[torch.utils.data.DataLoader, np.ndarray]:
     """
     Load the preprocessed dataset and create a DataLoader.
@@ -137,14 +151,19 @@ def load_dataset(
         raise FileNotFoundError(f"Dataset not found: {dataset_path}")
 
     logger.info("Loading dataset from %s", dataset_path)
-    dataset = torch.load(dataset_path, weights_only=False)
+    dataset, loaded_source_fingerprint = load_dataset_with_fingerprint(dataset_path)
 
     # Round-2 CRITICAL-A: refuse pre-2.0 datasets (leaked priors, np.max labels)
     validate_dataset_provenance(dataset, Path(dataset_path))
 
     X_seqs = dataset["X_seqs"]
     Y_seqs = dataset["Y_seqs"]
-    mcmc_priors = dataset["mcmc_priors"]
+    mcmc_priors, val_indices = load_analysis_priors(
+        dataset, dataset_path, nested_prior_artifact, checkpoint_model, qc_sealed_nested_prior_sha256,
+        loaded_source_fingerprint=loaded_source_fingerprint,
+        trusted_historical_checkpoint_sha256=trusted_historical_checkpoint_sha256,
+        trusted_historical_artifact_sha256=trusted_historical_artifact_sha256,
+    )
     labels = dataset["labels"]
 
     n_total = len(X_seqs)
@@ -175,6 +194,10 @@ def load_dataset(
         anchor_frames=anchor_frames,
     )
 
+    bio_dataset.analysis_population = describe_analysis_population(
+        n_total, val_indices, bio_dataset.source_indices,
+        getattr(checkpoint_model, "analysis_validation_scope", None),
+    )
     dataloader = create_optimized_dataloader(
         bio_dataset,
         batch_size=batch_size,
@@ -753,7 +776,7 @@ def plot_panel_b_routing_gates(
     # Axes styling
     ax.set_xlabel("Time (s)", fontsize=FONT_SIZE_AXIS_TITLE, color=AXIS_COLOR)
     ax.set_ylabel(
-        r"Routing Probability $g(t)$",
+        "Routing Probability $g(t)$ (trial SEM; descriptive)",
         fontsize=FONT_SIZE_AXIS_TITLE, color=AXIS_COLOR,
     )
     ax.set_ylim(-0.05, 1.05)
@@ -844,7 +867,7 @@ def plot_panel_c_lif_spike_rates(
     # Axes styling
     ax.set_xlabel("Time (s)", fontsize=FONT_SIZE_AXIS_TITLE, color=AXIS_COLOR)
     ax.set_ylabel(
-        "LIF Spike Rate (mean)",
+        "LIF Spike Rate (mean ± trial SEM; descriptive)",
         fontsize=FONT_SIZE_AXIS_TITLE, color=AXIS_COLOR,
     )
     ax.set_ylim(bottom=-0.005)
@@ -883,13 +906,13 @@ def plot_panel_d_pathway_dominance(
     """
     Plot Panel D: Pathway dominance per behavioral class.
 
-    Bar chart showing mean g_gru per label class with bootstrap 95% CI
-    error bars.  Values > 0.5 indicate GRU dominance; < 0.5 indicate
-    LIF dominance.
+    Bar chart showing mean g_gru per label class with SD across the
+    recorded trial means. Values > 0.5 indicate GRU dominance; < 0.5
+    indicate LIF dominance. No animal-level CI or population inference
+    is available without verified independent animal identities.
 
-    Annotates Escape vs No-Response Cohen's d effect size (the two
-    most behaviorally distinct classes) to quantify the routing
-    difference magnitude.
+    Annotates a descriptive, trial-level Escape vs No-Response Cohen's d
+    when the pooled trial spread is defined.
 
     Args:
         ax: Matplotlib axes.
@@ -902,8 +925,7 @@ def plot_panel_d_pathway_dominance(
     label_vals = sorted(g_gru_groups.keys())
     bar_positions = []
     bar_heights = []
-    bar_errors_low = []
-    bar_errors_high = []
+    bar_spread = []
     bar_colors = []
     bar_labels_list = []
     bar_counts = []
@@ -914,18 +936,16 @@ def plot_panel_d_pathway_dominance(
         if len(trajs) < 2:
             continue
 
-        # Compute per-trial mean g_gru, then bootstrap CI over trials
+        # Describe observed model routing on these trials, with no
+        # resampling claim about an unidentified animal population.
         trial_means = np.array([np.mean(t) for t in trajs])
         trial_means_dict[lbl_val] = trial_means
-        point_est, ci_low, ci_high = bootstrap_ci(
-            trial_means, statistic_fn=np.mean,
-            n_bootstrap=1000, ci_level=0.95, seed=42,
-        )
+        point_est = float(np.mean(trial_means))
+        trial_sd = float(np.std(trial_means, ddof=1))
 
         bar_positions.append(lbl_val)
         bar_heights.append(point_est)
-        bar_errors_low.append(point_est - ci_low)
-        bar_errors_high.append(ci_high - point_est)
+        bar_spread.append(trial_sd)
         bar_colors.append(LANCET_COLORS.get(lbl_val, "#888888"))
         bar_labels_list.append(LABEL_NAMES.get(lbl_val, f"Label {lbl_val}"))
         bar_counts.append(len(trajs))
@@ -936,7 +956,6 @@ def plot_panel_d_pathway_dominance(
         return
 
     x = np.arange(len(bar_positions))
-    errors = [bar_errors_low, bar_errors_high]
 
     bars = ax.bar(
         x, bar_heights,
@@ -944,7 +963,7 @@ def plot_panel_d_pathway_dominance(
         edgecolor=AXIS_COLOR,
         linewidth=1.2,
         width=0.6,
-        yerr=errors,
+        yerr=bar_spread,
         capsize=4,
         error_kw={"linewidth": 1.2, "color": AXIS_COLOR},
         alpha=0.9,
@@ -969,8 +988,9 @@ def plot_panel_d_pathway_dominance(
     # Axes styling
     ax.set_xticks(x)
     ax.set_xticklabels(bar_labels_list, rotation=30, ha="right")
+    ax.set_xlabel("Animal identity unverified (descriptive_only)")
     ax.set_ylabel(
-        r"Mean $g_{gru}$ (95% CI)",
+        r"Mean $g_{gru}$ ± trial SD (descriptive)",
         fontsize=FONT_SIZE_AXIS_TITLE, color=AXIS_COLOR,
     )
     ax.set_ylim(0.0, 1.15)
@@ -994,11 +1014,22 @@ def plot_panel_d_pathway_dominance(
     esc_val = Label.ESCAPE.value
     nr_val = Label.NO_RESPONSE.value
     if esc_val in trial_means_dict and nr_val in trial_means_dict:
-        d = cohens_d(trial_means_dict[esc_val], trial_means_dict[nr_val])
-        d_label = "large" if abs(d) >= 0.8 else ("medium" if abs(d) >= 0.5 else "small")
+        esc = trial_means_dict[esc_val]
+        nr = trial_means_dict[nr_val]
+        # Rounded gate trajectories can leave tiny floating-point pooled
+        # spread even for constant classes; standardized d is undefined.
+        pooled_variance = (
+            (len(esc) - 1) * np.var(esc, ddof=1)
+            + (len(nr) - 1) * np.var(nr, ddof=1)
+        ) / (len(esc) + len(nr) - 2)
+        pooled_sd = float(np.sqrt(pooled_variance))
+        d = (cohens_d(esc, nr) if np.isfinite(pooled_sd) and pooled_sd > 1e-12
+             else float("nan"))
+        d_text = (f"d={d:.2f} (trial-level descriptive)" if np.isfinite(d)
+                  else "d undefined (zero or nonfinite trial spread)")
         ax.text(
             0.5, 0.97,
-            f"Escape vs NoResp: d={d:.2f} ({d_label})",
+            f"Escape vs NoResp: {d_text}",
             transform=ax.transAxes, ha="center", va="top",
             fontsize=FONT_SIZE_LEGEND - 1,
             color=AXIS_COLOR,
@@ -1027,6 +1058,7 @@ def create_panel_figure(
     output_path: Path,
     layout: str = "2x2",
     dt_ms: float = 10.0,
+    analysis_population: Optional[Dict[str, object]] = None,
 ) -> None:
     """
     Create the Lancet/Cell multi-panel publication figure.
@@ -1076,8 +1108,20 @@ def create_panel_figure(
     else:
         raise ValueError(f"Unknown layout '{layout}'. Use '2x2' or '1x2'.")
 
+    if analysis_population is not None:
+        fig.suptitle(
+            "%s — %s (train=%s, outer val=%s)"
+            % (analysis_population["selection"].replace("_", " "),
+               analysis_population["evidence_scope"].replace("_", " "),
+               analysis_population["n_analyzed_train"], analysis_population["n_analyzed_val"]),
+            fontsize=12, y=1.02,
+        )
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(output_path, dpi=DPI, bbox_inches="tight", pad_inches=0.1)
+    plt.savefig(
+        output_path, dpi=DPI, bbox_inches="tight", pad_inches=0.1,
+        metadata={"Description": json.dumps({"analysis_population": analysis_population})}
+        if analysis_population is not None else None,
+    )
     logger.info("Saved %s figure to %s (%d DPI)", layout, output_path, DPI)
     plt.close(fig)
 
@@ -1094,6 +1138,10 @@ def run_analysis(
     max_seq_len: Optional[int] = 2400,
     pre_anchor_frames: int = 1200,
     layout: str = "2x2",
+    nested_prior_artifact: Optional[Path] = None,
+    qc_sealed_nested_prior_sha256: Optional[str] = None,
+    trusted_historical_checkpoint_sha256: Optional[str] = None,
+    trusted_historical_artifact_sha256: Optional[str] = None,
 ) -> None:
     """
     Run the full multi-panel mechanism analysis pipeline.
@@ -1124,6 +1172,11 @@ def run_analysis(
         batch_size=batch_size,
         max_seq_len=max_seq_len,
         pre_anchor_frames=pre_anchor_frames,
+        nested_prior_artifact=nested_prior_artifact,
+        qc_sealed_nested_prior_sha256=qc_sealed_nested_prior_sha256,
+        checkpoint_model=model,
+        trusted_historical_checkpoint_sha256=trusted_historical_checkpoint_sha256,
+        trusted_historical_artifact_sha256=trusted_historical_artifact_sha256,
     )
 
     # Single-pass extraction of all dynamics
@@ -1145,6 +1198,8 @@ def run_analysis(
         bundle=bundle,
         output_path=output_path,
         layout=layout,
+        dt_ms=float(model.dt_ms),
+        analysis_population=population_for_output(dataloader, len(labels)),
     )
 
     logger.info("=" * 60)
@@ -1173,6 +1228,24 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default="data/processed/nsmor_dataset.pt",
         help="Path to preprocessed dataset.",
+    )
+    parser.add_argument(
+        "--nested_prior_artifact",
+        type=str,
+        default=None,
+        help="Optional validated nested prior artifact used by the checkpoint.",
+    )
+    parser.add_argument(
+        "--qc_sealed_nested_prior_sha256", type=str, default=None,
+        help="Optional external QC-sealed SHA-256 to check the nested checkpoint's embedded artifact digest; cannot authenticate a checkpoint missing that digest.",
+    )
+    parser.add_argument(
+        "--trusted_historical_checkpoint_sha256", type=str, default=None,
+        help="Independently pinned SHA-256 of historical checkpoint bytes (required for historical analysis).",
+    )
+    parser.add_argument(
+        "--trusted_historical_artifact_sha256", type=str, default=None,
+        help="Independently pinned SHA-256 of historical nested artifact bytes.",
     )
     parser.add_argument(
         "--output",
@@ -1218,6 +1291,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     run_analysis(
         checkpoint_path=Path(args.checkpoint),
         dataset_path=Path(args.dataset),
+        nested_prior_artifact=Path(args.nested_prior_artifact) if args.nested_prior_artifact else None,
+        qc_sealed_nested_prior_sha256=args.qc_sealed_nested_prior_sha256,
+        trusted_historical_checkpoint_sha256=args.trusted_historical_checkpoint_sha256,
+        trusted_historical_artifact_sha256=args.trusted_historical_artifact_sha256,
         output_path=Path(args.output),
         batch_size=args.batch_size,
         max_seq_len=max_seq_len,

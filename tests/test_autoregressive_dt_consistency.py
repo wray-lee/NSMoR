@@ -2,7 +2,7 @@
 Tests for physical clock consistency in scripts/simulate_autoregressive.py.
 
 Verifies:
-1. Default frame interval is 4.0 ms (250 Hz nominal biophysical rate).
+1. Model-driven rollout inherits the checkpoint clock; standalone synthesis defaults to 4.0 ms.
 2. Stimulus paradigm generator respects dt_ms (sampling interval, total frames, pure wind prepend).
 3. export_kinematics_csv computes dx = velocity * (dt_ms / 1000.0) without hardcoding 10.0 ms.
 4. log_trial_summary calculates onset frame and peak latency using passed/trial dt_ms.
@@ -35,8 +35,8 @@ from scripts.simulate_autoregressive import (
 # 1. Default dt_ms Parameter Values
 # =========================================================================
 
-def test_default_dt_ms_is_4ms():
-    """All function signatures and dataclass defaults must specify dt_ms=4.0."""
+def test_default_dt_ms_inherits_model_clock_for_rollout():
+    """Only model-driven rollout uses None; standalone synthesis retains 4 ms."""
     sig_gen = inspect.signature(generate_stimulus_paradigm)
     assert sig_gen.parameters["dt_ms"].default == 4.0, (
         f"generate_stimulus_paradigm default dt_ms={sig_gen.parameters['dt_ms'].default}, expected 4.0"
@@ -44,8 +44,8 @@ def test_default_dt_ms_is_4ms():
 
     from scripts.simulate_autoregressive import run_autoregressive_trial
     sig_trial = inspect.signature(run_autoregressive_trial)
-    assert sig_trial.parameters["dt_ms"].default == 4.0, (
-        f"run_autoregressive_trial default dt_ms={sig_trial.parameters['dt_ms'].default}, expected 4.0"
+    assert sig_trial.parameters["dt_ms"].default is None, (
+        "run_autoregressive_trial must inherit model.dt_ms when no cadence is requested"
     )
 
     sig_res = inspect.signature(TrialResult)
@@ -55,12 +55,16 @@ def test_default_dt_ms_is_4ms():
 
 
 def test_cli_parser_dt_ms_default():
-    """CLI parser default for --dt_ms must be 4.0."""
+    """Model-driven CLI inherits the saved clock; explicit intervals are validated."""
+    import ast
     script_path = Path(__file__).resolve().parents[1] / "scripts" / "simulate_autoregressive.py"
-    content = script_path.read_text(encoding="utf-8")
-    match = re.search(r'--dt_ms[\s\S]*?default=([0-9.]+)', content)
-    assert match is not None, "Could not find --dt_ms argument in simulate_autoregressive.py"
-    assert float(match.group(1)) == 4.0, f"--dt_ms default is {match.group(1)}, expected 4.0"
+    tree = ast.parse(script_path.read_text(encoding="utf-8"))
+    actions = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+               and isinstance(node.func, ast.Attribute) and node.func.attr == 'add_argument'
+               and node.args and isinstance(node.args[0], ast.Constant) and node.args[0].value == '--dt_ms']
+    assert len(actions) == 1
+    default, = [kw.value for kw in actions[0].keywords if kw.arg == 'default']
+    assert isinstance(default, ast.Constant) and default.value is None
 
 
 # =========================================================================

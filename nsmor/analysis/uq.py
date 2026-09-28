@@ -264,13 +264,16 @@ def cohens_d(group1: np.ndarray, group2: np.ndarray, paired: bool = False) -> fl
         paired: If True, compute paired Cohen's d.
 
     Returns:
-        Cohen's d (signed).
+        Cohen's d (signed), or NaN when fewer than two observations or
+        a zero/nonfinite standard deviation makes the effect undefined.
     """
+    if len(group1) < 2 or len(group2) < 2:
+        return float("nan")
     if paired:
         diff = group1 - group2
         sd_diff = np.std(diff, ddof=1)
-        if sd_diff < 1e-12:
-            return 0.0
+        if not np.isfinite(sd_diff) or sd_diff == 0:
+            return float("nan")
         return float(np.mean(diff) / sd_diff)
 
     n1, n2 = len(group1), len(group2)
@@ -278,8 +281,8 @@ def cohens_d(group1: np.ndarray, group2: np.ndarray, paired: bool = False) -> fl
     var2 = np.var(group2, ddof=1)
     pooled_std = np.sqrt(((n1 - 1) * var1 + (n2 - 1) * var2) / (n1 + n2 - 2))
 
-    if pooled_std < 1e-12:
-        return 0.0
+    if not np.isfinite(pooled_std) or pooled_std == 0:
+        return float("nan")
 
     return float((np.mean(group1) - np.mean(group2)) / pooled_std)
 

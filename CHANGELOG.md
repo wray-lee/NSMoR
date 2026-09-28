@@ -9,13 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### SOURCE15 candidate (review and integration pending)
+
+- Current processed datasets stamp `oof_<folds>fold_recording_prefix_grouped_cv` with `animal_identity_status="unverified"`. Historical animal-named tags have `historical_unknown` status and do not establish animal identity.
+- Scored `scripts/train.py` CLI requires `--nested_prior_artifact`; `--diagnostic_only` permits nonnested global OOF runs with `validation_scope="diagnostic_global_oof"`. Outer-validation labels may enter those prior fits, so their metrics and checkpoints cannot support unbiased holdout, generalization, strict QC, or release claims. A validated nested artifact reports `nested_outer_validation`, without establishing animal-independent generalization.
+- `scripts/train_jax.py` remains a `diagnostic_global_oof` development path. Its `jax_development_only` checkpoints are for matching JAX resume, not canonical downstream analysis.
+- `scripts/make_subset_dataset.py` counts recording prefixes (`--n_recording_prefixes`; `--n_animals` is a legacy alias), slices per-trial session/trial identity, and retains parent priors; subsetting is not a fresh fit or independent evaluation.
+- `make nested-prior` requires the processed dataset, checks the seed-specific artifact name, and refuses an existing artifact. `make train` requires that artifact and forwards it to scored training. `make pipeline` generates a fresh dataset and nested artifact, forwards the artifact to training and six dataset analyses, and rejects an existing artifact or best checkpoint; container targets use the same Makefile. These command plans have not yet passed strict real-data QC.
+
 ### Added
 
 #### Pipeline Semantics v2.2 & Physical Alignment (Current)
-- **Animal-grouped cross-validation (`oof_5fold_animal_grouped_cv`)**
-  - MCMC prior generation partitions folds strictly by animal identity (stripping `_session_N` suffixes from session IDs)
-  - Eliminates cross-session animal leakage present in historical session-grouped partitioning
-  - Provenance guard enforces `mcmc_prior_provenance="oof_5fold_animal_grouped_cv"`, rejecting un-grouped or session-grouped artifacts
+- **Recording-prefix-grouped cross-validation**
+  - MCMC prior generation groups by stripping `_session_N` from session IDs; folds exclude the held-out trial and its recording prefix
+  - Distinct prefixes are not verified independent animals; animal-level leakage control and generalization remain unverified
+  - `oof_5fold_animal_grouped_cv` is a historical artifact label, not evidence of animal identity or current provenance
 - **Physical Sampling Cadence Alignment (250 Hz / 4.0 ms)**
   - Fully aligned `dt_ms=4.0` across default YAML configuration, `ModelConfig`, ETL CLI, and all data extraction functions
   - Pure-wind prepend zero-padding aligned to 1425 frames (5.7 s @ 250 Hz / 4.0 ms), resolving historical 3.41 s (851-frame) offset caused by legacy 100 Hz / 10.0 ms default (570 frames)
@@ -34,7 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 #### Phase 3: Data Preparation Parallelization
 - **Parallel MCMC training** (`scripts/prepare_data.py`)
   - Concurrent 5-fold model training with `ThreadPoolExecutor` (max_workers=5)
-  - Grouped fold assignments ensure zero leakage (historical: session-grouped; current: animal-grouped)
+  - Grouped fold assignments exclude the held-out trial and recording prefix; animal-level independence is unverified
   - Out-of-fold (OOF) prior aggregation with deterministic ordering
   - Per-fold provenance logging with entity IDs and class distributions
   - Train-vs-serve distribution consistency diagnostics (KS statistic, variance ratio)
@@ -52,8 +60,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 #### Round-3: Scientific Rigor Enhancements
 - **Pipeline semantics v2.1 (Historical Baseline)** with escape-first branch ordering
   - Fixed PREWALK label collapse via responder-priority decision tree
-  - Session-grouped 5-fold cross-validation (historical; superseded by animal-grouped in v2.2)
-  - Dataset provenance stamping: `pipeline_semantics_version="2.1"` and `mcmc_prior_provenance="oof_5fold_session_grouped_cv"` (historical; v2.2 requires `"oof_5fold_animal_grouped_cv"`)
+  - Session-grouped 5-fold cross-validation (historical; superseded by recording-prefix grouping in v2.2)
+  - Dataset provenance stamping: `pipeline_semantics_version="2.1"` and `mcmc_prior_provenance="oof_5fold_session_grouped_cv"` (historical; `"oof_5fold_animal_grouped_cv"` is a legacy label for prefix grouping, not animal proof)
   - Version guard in `model_utils.validate_dataset_provenance()` prevents loading datasets with mismatched semantics
 
 - **Jacobian analysis GMM+BIC calibration** (`scripts/analyze_jacobian.py`)
@@ -64,7 +72,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Wilson score confidence intervals for small-sample binomial proportions
 
 - **MCMC cross-validation diagnostics** (`nsmor/mcmc_module.py`)
-  - Per-class per-fold sample count assertions to detect data leakage
+  - Per-class per-fold sample count assertions detect missing class coverage, not animal overlap
   - OOF prior variance lower-bound checks (min > 1e-6)
   - Train-vs-serve distribution consistency tests (KS statistic, variance ratio)
   - Fold-level provenance logging with session assignments and class histograms
@@ -141,7 +149,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Minor**: Per-sequence escape guard to prevent cross-sequence gradient contamination
 - **Minor**: Missing `dt_ms` parameter now raises explicit error (was silent NaN cascade)
 
-### Verified
+### Historical v2.1 verification (not SOURCE14)
 
 - **Dataset provenance**: All generated datasets carry v2.1 semantics and OOF provenance keys
 - **Label distribution health**:
@@ -150,7 +158,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - PREWALK: 11 trials (recovered from 0 via branch reordering)
   - PRE_ACTIVE: 52 trials
 - **Threshold sensitivity**: PREWALK count ∈ [8, 15] across ±25% threshold perturbation
-- **Convergence**: 150-epoch training achieves R² = 0.3655, val_loss = 0.561 (honest generalization without session leakage)
+- **Convergence**: historical 150-epoch training reported R² = 0.3655, val_loss = 0.561; unbiased holdout and animal-independent generalization were not established
 - **Analysis pipeline**: All 6 analysis scripts execute without errors (EXIT=0) on v2.1 checkpoint and dataset
 - **Test suite**: 114 tests passed (baseline 111 + 3 new tests for Round-3 mechanisms)
 - **Backward compatibility**: Factory integration preserves existing API contracts; legacy `create_dataloader()` still functional
@@ -226,6 +234,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## Notes
 
 - **Breaking change in v2.1**: Datasets generated with v2.0 semantics cannot be loaded by v2.1+ code due to version guard enforcement.
-- **Performance**: Two-phase training with v2.1 semantics achieves R² ≈ 0.37 (honest generalization) vs. R² ≈ 0.47 (inflated by session leakage in pre-v2.1 pipeline).
+- **Performance**: Historical two-phase training reported R² ≈ 0.37 (v2.1) vs. R² ≈ 0.47 (pre-v2.1); these figures do not establish independent-animal generalization or isolate the cause of the difference.
 - **PREWALK label**: Small sample size (n=11) may limit statistical power for this category in some analyses.
 

@@ -8,7 +8,7 @@
 # Shell:  docker compose run --rm nsmor bash
 # ═══════════════════════════════════════════════════════════════
 
-FROM pytorch/pytorch:2.0.1-cuda11.7-cudnn8-runtime
+FROM pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime
 
 LABEL maintainer="NSMoR Team"
 LABEL description="Hermetic container for Tier-1 scientific reproducibility"
@@ -29,14 +29,13 @@ WORKDIR /workspace
 COPY pyproject.toml requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Ensure umap-learn is installed (may not be in requirements.txt during transition)
-RUN pip install --no-cache-dir umap-learn>=0.5.0 || true
 
 # ── Source code ─────────────────────────────────────────────
 COPY . .
 
 # Editable install (source now present) — reuses cached deps above.
 RUN pip install --no-cache-dir -e ".[dev]"
+RUN python -c "import torch, numpy as np; from torch.serialization import get_safe_globals, get_unsafe_globals_in_checkpoint, safe_globals, clear_safe_globals, add_safe_globals; assert torch.__version__.split('+')[0] == '2.6.0'; assert tuple(map(int, np.__version__.split('.')[:2])) >= (1, 26); print(torch.__version__, np.__version__)"
 
 # ── Entrypoint ──────────────────────────────────────────────
 ENTRYPOINT ["make"]

@@ -228,15 +228,17 @@ class NSMoRDataset(Dataset):
         # ── Crop long sequences ──
         if self.max_seq_len is not None and X_seq.shape[0] > self.max_seq_len:
             if self.anchor_frames is not None:
-                # Anchor-aligned crop (preserves stimulus + response)
+                # Anchor-aligned crop (preserves stimulus + response).
+                # Single source of truth: nsmor.pipeline.conditions.resolve_anchor_crop
+                from nsmor.pipeline.conditions import resolve_anchor_crop
+
                 anchor_frame = self.anchor_frames[idx]
-                start = max(0, anchor_frame - self.pre_anchor_frames)
-                end = min(X_seq.shape[0], start + self.max_seq_len)
-
-                # Adjust start if end clamped (keeps window size consistent)
-                if end - start < self.max_seq_len:
-                    start = max(0, end - self.max_seq_len)
-
+                start, end = resolve_anchor_crop(
+                    n_frames=X_seq.shape[0],
+                    anchor_frame=anchor_frame,
+                    max_seq_len=self.max_seq_len,
+                    pre_anchor_frames=self.pre_anchor_frames,
+                )
                 X_seq = X_seq[start:end]
                 Y_seq = Y_seq[start:end]
             else:

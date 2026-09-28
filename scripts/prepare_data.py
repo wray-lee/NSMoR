@@ -25,9 +25,11 @@ Output
 ``data/processed/nsmor_dataset.pt`` containing:
     - ``X_seqs``: List of ``np.ndarray (T_i, 8)``
     - ``Y_seqs``: List of ``np.ndarray (T_i,)``
+    - ``snapshots``: ``np.ndarray (N, 5)`` canonical MCMC snapshots
     - ``mcmc_priors``: ``np.ndarray (N, 4)``
     - ``labels``: ``np.ndarray (N,)``
     - ``lengths``: ``np.ndarray (N,)``
+    - ``trial_ids``: ``np.ndarray (N,)``
 
 Usage
 -----
@@ -40,10 +42,15 @@ CLI::
 from __future__ import annotations
 
 import argparse
+import sys
 import logging
+import math
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+# Direct CLI execution must use this checkout, including its prior/lineage helpers.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import numpy as np
 import pandas as pd
@@ -67,6 +74,7 @@ from nsmor.data_extractor import (
     _compute_pure_wind_prepend_frames,
 )
 from nsmor.mcmc_module import MCMCPriorGenerator, train_mcmc, train_mcmc_cross_fitted
+from nsmor.pipeline.events import parse_declared_ttc, parse_event_details
 from nsmor.pipeline.grouping import animal_keys_of, resolve_group_folds
 from nsmor.pipeline.io import EVENT_COLUMNS, KINEMATICS_COLUMNS
 from nsmor.pipeline.labeling import (
@@ -137,8 +145,17 @@ def compute_sampling_diagnostics(
         .diff()
         .dropna()
     )
-    positive_gaps = gaps[gaps > 0].values
+    return _summarize_sampling_gaps(
+        gaps[gaps > 0].values, int((gaps <= 0).sum()),
+        configured_dt_ms, mismatch_ratio_threshold,
+    )
 
+
+def _summarize_sampling_gaps(
+    positive_gaps: np.ndarray, n_nonpositive: int,
+    configured_dt_ms: float, mismatch_ratio_threshold: float = 1.5,
+) -> Dict[str, Any]:
+    """Same exact corpus statistics for both concatenated and sessionwise input."""
     if positive_gaps.size == 0:
         return {
             "observed_median_ms": float("nan"),
@@ -149,7 +166,7 @@ def compute_sampling_diagnostics(
             "observed_p01_ms": float("nan"),
             "observed_p99_ms": float("nan"),
             "n_positive_gaps": 0,
-            "n_zero_or_negative_gaps": int((gaps <= 0).sum()),
+            "n_zero_or_negative_gaps": n_nonpositive,
             "configured_dt_ms": float(configured_dt_ms),
             "ratio_configured_over_observed": float("nan"),
             "mismatch_flag": True,
@@ -171,7 +188,7 @@ def compute_sampling_diagnostics(
         "observed_p01_ms": float(np.percentile(positive_gaps, 1)),
         "observed_p99_ms": float(np.percentile(positive_gaps, 99)),
         "n_positive_gaps": int(positive_gaps.size),
-        "n_zero_or_negative_gaps": int((gaps <= 0).sum()),
+        "n_zero_or_negative_gaps": n_nonpositive,
         "configured_dt_ms": float(configured_dt_ms),
         "ratio_configured_over_observed": float(ratio),
         "mismatch_flag": bool(mismatch),
@@ -895,6 +912,112 @@ def audit_prior_train_serve_shift(
 # 5.  Main ETL Pipeline
 # ═══════════════════════════════════════════════════════════════
 
+def _load_trials_and_diagnostics(
+    csv_pairs: List[Tuple[Path, Path]], dt_ms: float,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any], int, int]:
+    """Load one session pair at a time and extract only its current trial rows.
+
+    Positive sampling gaps are retained for exact corpus percentiles, without
+    retaining the concatenated kinematics table. Split trials are reloaded
+    only when a trial spans CSV pairs.
+    """
+    trials: List[Dict[str, Any]] = []
+    trial_index: Dict[Tuple[str, int], int] = {}
+    sources: Dict[Tuple[str, int], List[Tuple[Path, Path]]] = {}
+    event_only: Dict[Tuple[str, int], List[Tuple[Path, Path]]] = {}
+    declared_trials: set[Tuple[str, int]] = set()
+    last_times: Dict[Tuple[str, int], float] = {}
+    positive_chunks: List[np.ndarray] = []
+    event_samples = []
+    n_nonpositive = n_kin = n_evt = 0
+
+    for kin_path, evt_path in csv_pairs:
+        data = load_and_concat_sessions([kin_path], [evt_path])
+        kin, evt = data["kinematics"], data["events"]
+        n_kin += len(kin)
+        n_evt += len(evt)
+        event_samples.append(evt[["event_value"]].head(1).copy())
+        kin_groups = kin.groupby(["session_id", "trial_id"])
+        evt_groups = evt.groupby(["session_id", "trial_id"], sort=False)
+        declared_trials.update(evt.loc[
+            evt["event_type"].eq("trial_start"), ["session_id", "trial_id"]
+        ].itertuples(index=False, name=None))
+        gaps = kin_groups["time_ms"].diff()
+
+        for key in evt_groups.indices:
+            if key not in kin_groups.indices:
+                event_only.setdefault(key, []).append((kin_path, evt_path))
+
+        for key, kin_trial in kin_groups:
+            sid, tid = key
+            if key in last_times:
+                gaps.loc[kin_trial.index[0]] = kin_trial["time_ms"].iloc[0] - last_times[key]
+            last_times[key] = kin_trial["time_ms"].iloc[-1]
+            sources.setdefault(key, []).append((kin_path, evt_path))
+            if key in trial_index:
+                continue  # Re-extract the complete split trial below.
+            evt_trial = evt_groups.get_group(key) if key in evt_groups.indices else evt.iloc[:0]
+            try:
+                trial = extract_trial_data(
+                    {"kinematics": kin_trial, "events": evt_trial}, sid, tid,
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    f"Trial extraction failed for session={sid!r}, trial={tid!r}: {exc}"
+                ) from exc
+            trial_index[key] = len(trials)
+            trials.append(trial)
+
+        valid_gaps = gaps.dropna()
+        positive_chunks.append(valid_gaps[valid_gaps > 0].to_numpy())
+        n_nonpositive += int((valid_gaps <= 0).sum())
+        del data, kin, evt, kin_groups, evt_groups, gaps, valid_gaps
+
+    missing = sorted(declared_trials - sources.keys(), key=repr)
+    if missing:
+        raise ValueError(f"Event-declared trial(s) {missing!r} missing kinematics")
+
+    positive = np.concatenate(positive_chunks) if positive_chunks else np.empty(0)
+    diagnostics = _summarize_sampling_gaps(positive, n_nonpositive, dt_ms)
+    del positive, positive_chunks
+    # Rare split trials or event-only continuations: re-read their source
+    # pairs in original file order and extract from only matching rows.
+    for key, paths in sources.items():
+        all_paths = sorted(set(paths + event_only.get(key, [])), key=csv_pairs.index)
+        if len(all_paths) == 1:
+            continue
+        kin_parts, evt_parts = [], []
+        sid, tid = key
+        for kin_path, evt_path in all_paths:
+            old = load_and_concat_sessions([kin_path], [evt_path])
+            for table, parts in (("kinematics", kin_parts), ("events", evt_parts)):
+                frame = old[table]
+                parts.append(frame.loc[
+                    (frame["session_id"] == sid) & (frame["trial_id"] == tid)
+                ])
+            del old
+        try:
+            trials[trial_index[key]] = extract_trial_data(
+                {"kinematics": pd.concat(kin_parts, ignore_index=True),
+                 "events": pd.concat(evt_parts, ignore_index=True)}, sid, tid,
+            )
+        except ValueError as exc:
+            raise ValueError(
+                f"Trial extraction failed for session={sid!r}, trial={tid!r}: {exc}"
+            ) from exc
+    # concat_sessions promotes event_value across CSVs before extracting trials.
+    event_dtype = pd.concat(event_samples, ignore_index=True)["event_value"].to_numpy().dtype
+    for trial in trials:
+        trial["event_values"] = trial["event_values"].astype(event_dtype, copy=False)
+    # Match the old pandas groupby order without retaining the corpus table.
+    identities = pd.DataFrame(
+        [(t["session_id"], t["trial_id"]) for t in trials],
+        columns=["session_id", "trial_id"],
+    )
+    trials = [trials[group.index[0]] for _, group in identities.groupby(["session_id", "trial_id"])]
+    return trials, diagnostics, n_kin, n_evt
+
+
 def prepare_dataset(
     raw_dir: Path,
     output_path: Path,
@@ -921,22 +1044,22 @@ def prepare_dataset(
     logger.info("NSMoR Data Preparation Pipeline")
     logger.info("=" * 60)
 
+    if dt_ms is None or not (isinstance(dt_ms, (int, float)) and math.isfinite(dt_ms) and dt_ms > 0):
+        raise ValueError(
+            f"prepare_dataset requires explicit positive finite dt_ms, got {dt_ms!r} (fail closed)"
+        )
+
     # ── Step 1: Data Pairing ──────────────────────────────────
     logger.info("[Step 1] Scanning for data pairs in %s", raw_dir)
     csv_pairs = pair_csv_files(raw_dir)
     logger.info("Found %d session pairs.", len(csv_pairs))
 
-    # ── Step 2: Load and concatenate sessions ─────────────────
-    logger.info("[Step 2] Loading and concatenating sessions...")
-    kin_paths = [p[0] for p in csv_pairs]
-    evt_paths = [p[1] for p in csv_pairs]
-
-    session_data = load_and_concat_sessions(kin_paths, evt_paths)
-    logger.info(
-        "Loaded %d kinematics rows, %d events rows.",
-        len(session_data["kinematics"]),
-        len(session_data["events"]),
+    # ── Step 2: Load and extract one session at a time ───────
+    logger.info("[Step 2] Loading and extracting sessions...")
+    trials, sampling_diagnostics, n_kin, n_evt = _load_trials_and_diagnostics(
+        csv_pairs, dt_ms,
     )
+    logger.info("Loaded %d kinematics rows, %d events rows.", n_kin, n_evt)
 
     # ── Step 2b: Sampling interval diagnostics ───────────────
     # Surface the dt_ms mismatch as a first-class, auditable check.
@@ -945,9 +1068,6 @@ def prepare_dataset(
     # the observed intervals per-trial, aggregate, and compare against
     # the config.  Persisted in the dataset artefact as
     # ``sampling_diagnostics`` so the discrepancy is impossible to miss.
-    sampling_diagnostics = compute_sampling_diagnostics(
-        session_data["kinematics"], dt_ms,
-    )
     logger.info(
         "[Step 2b] Sampling diagnostics — observed median=%.3f ms, "
         "mean=%.3f ms, p99=%.3f ms, configured dt_ms=%.1f ms",
@@ -970,19 +1090,8 @@ def prepare_dataset(
             sampling_diagnostics["observed_median_ms"],
         )
 
-    # ── Step 3: Per-trial extraction and labeling ─────────────
-    logger.info("[Step 3] Extracting trials and assigning labels...")
-
-    # Get unique session/trial pairs
-    trial_groups = session_data["kinematics"].groupby(["session_id",    "trial_id"])
-    trials = []
-    for (session_id, trial_id), _ in trial_groups:
-        try:
-            trial = extract_trial_data(session_data, session_id, trial_id)
-            trials.append(trial)
-        except ValueError as e:
-            logger.warning("Skipping trial: %s", e)
-            continue
+    # ── Step 3: Per-trial labeling ─────────────────────────────
+    logger.info("[Step 3] Assigning labels to extracted trials...")
 
     logger.info("Extracted %d valid trials.", len(trials))
 
@@ -1065,13 +1174,8 @@ def prepare_dataset(
     # ── Step 4: MCMC Prior Generation ────────────────────────
     logger.info("[Step 4] Training MCMC prior generator...")
 
-    # ``on_unanchorable="skip"`` is passed EXPLICITLY, and every drop is
-    # accounted for per class and per condition below.  The extractor's
-    # default is now strict precisely because the previous unconditional
-    # ``except ValueError: continue`` deleted every visual-only trial in
-    # the corpus without a word (36 of 396, all No_Response) — and those
-    # trials vanished from the regression sequence set too, since the
-    # retention identity carries the snapshot drop forward.
+    # A trial with no physical anchor fails the production ETL with its
+    # session/trial context; it cannot silently leave the prior or sequence set.
     snapshots, snapshot_labels, kept_indices, snapshot_anchor_rules = (
         build_snapshot_dataset(
             labeled_trials,
@@ -1079,7 +1183,7 @@ def prepare_dataset(
             feature_config=feature_config,
             return_kept_indices=True,
             return_anchor_rules=True,
-            on_unanchorable="skip",
+            on_unanchorable="raise",
         )
     )
     snapshot_drop_audit = _audit_snapshot_drops(labeled_trials, kept_indices)
@@ -1112,24 +1216,16 @@ def prepare_dataset(
     # 5-fold cross-fitting, every prior row is produced by a generator
     # that never saw that trial's label.
     #
-    # Fold membership is GROUPED BY ANIMAL.  Grouping by session is not
-    # enough: ``_session_N`` splits ONE recording of ONE animal into
-    # blocks, so a session-grouped fold let an animal's _session_1 train
-    # the generator that produced _session_2's "held-out" prior.  Trials
-    # of one animal share that animal's baseline locomotor statistics,
-    # gain state, and body mass, so the prior was not out-of-fold in any
-    # meaningful sense -- and these priors become input channels 4-7, so
-    # the leak enters the model as a feature.  Session ids are aligned
-    # through kept_indices because build_snapshot_dataset may skip trials
-    # whose snapshot cannot be extracted -- and only when this caller
-    # explicitly opts in via on_unanchorable="skip" (a plain zip with
-    # labeled_trials misaligns groups when any is dropped).
+    # Fold membership groups `_session_N` blocks by their recording prefix.
+    # This prevents within-recording overlap in OOF priors (input channels
+    # 4-7). Independent animal identities across prefixes are unverified.
+    # Keep the explicit snapshot-to-trial index alignment.
     labeled_kept = [labeled_trials[i] for i in kept_indices]
     snapshot_groups = animal_keys_of(
         [info["session_id"] for info in labeled_kept]
     )
     assert len(snapshot_groups) == len(snapshots), (
-        f"Animal-group count {len(snapshot_groups)} != "
+        f"Recording-prefix group count {len(snapshot_groups)} != "
         f"snapshot count {len(snapshots)}"
     )
 
@@ -1150,22 +1246,21 @@ def prepare_dataset(
     # guarantee balanced class composition across folds.  Persist the
     # per-fold (session count, class histogram) so fold imbalance is
     # auditable in the saved dataset instead of only logged.
-    # The diagnostic keys are named n_*_sessions in the frozen module; the
-    # groups passed in are now animals, so these are animal counts.
+    # Historical n_*_sessions keys count recording-prefix groups here.
     for diag in fold_diagnostics:
         logger.info(
-            "[MCMC-CV] fold %d: train animals=%d classes=%s | "
-            "oof animals=%d classes=%s",
+            "[MCMC-CV] fold %d: train prefixes=%d classes=%s | "
+            "oof prefixes=%d classes=%s",
             diag["fold"], diag["n_train_sessions"],
             np.bincount(diag["train_classes"], minlength=4).tolist(),
             diag["n_oof_sessions"],
             np.bincount(diag["oof_classes"], minlength=4).tolist(),
         )
-    n_animals = len(set(snapshot_groups.tolist()))
+    n_prefixes = len(set(snapshot_groups.tolist()))
     logger.info(
-        "Generated out-of-fold MCMC priors (%d-fold animal-grouped "
-        "cross-fitting over %d animals): %s",
-        n_folds, n_animals, mcmc_priors.shape,
+        "Generated out-of-fold MCMC priors (%d-fold recording-prefix grouped "
+        "cross-fitting over %d prefixes): %s",
+        n_folds, n_prefixes, mcmc_priors.shape,
     )
     assert mcmc_priors.shape == (len(snapshots), feature_config.mcmc_dim), (
         f"mcmc_priors shape {mcmc_priors.shape} != "
@@ -1287,26 +1382,41 @@ def prepare_dataset(
     logger.info("[Step 5] Extracting continuous sequences with visual physics reconstruction...")
 
     sequences = []
+    from nsmor.pipeline.conditions import derive_anchor_frames
+    anchor_frames_before_cast: List[int] = []
     valid_snaps = []  # 仅收集快照输入，不在循环内推理
     seq_session_ids: List[str] = []  # Round-3 CRITICAL-3b: session id per kept trial
-    kept_seq_indices: List[int] = []  # Track which trials succeed (Flaw 2 fix)
+    seq_trial_ids: List[int] = []  # Stable trial id per kept trial
+    seq_target_ttc_ms: List[Optional[float]] = []  # Keyed declared target TTC (ms)
     # Stimulus modality per kept trial.  The MoR Router's routing
     # hypothesis is per modality, so the condition has to travel with the
     # sequence rather than be re-derived from the 8-D features later (the
     # pure-wind zero-prepend makes that ambiguous downstream).
     seq_conditions: List[str] = []
 
-    # Iterate over labeled_kept ONLY: trials dropped during snapshot
-    # extraction have no out-of-fold prior row, so including them here
-    # would misalign sequences against mcmc_priors (the count assert
-    # below catches it).  Note the clamp inside this loop makes every
-    # kept trial's snapshot succeed, so sequences/priors/snaps stay
-    # row-for-row aligned.
-    for trial_idx, info in enumerate(labeled_kept):
-        try:
-            trial_data = info["trial_data"]
-            stimulus_onset_ms = info["stimulus_onset_ms"]
+    # Step 4 fitted OOF priors on this cohort. Any Step 5 failure must abort
+    # before save so sequences and trained prior rows stay aligned.
+    for info in labeled_kept:
+        trial_data = info["trial_data"]
+        stimulus_onset_ms = info["stimulus_onset_ms"]
 
+        # Extract declared target_ttc_ms from trial events outside the catchable sequence extraction
+        if "event_types" not in trial_data or "event_values" not in trial_data:
+            raise KeyError(
+                f"trial_data for session {info.get('session_id')}, trial {info.get('trial_id')} "
+                "lacks mandatory 'event_types' or 'event_values' field (fail closed)"
+            )
+        target_ttc_ms_val: Optional[float] = None
+        for etype, evalue in zip(trial_data["event_types"], trial_data["event_values"]):
+            if str(etype) == "trial_start":
+                det = parse_event_details(evalue)
+                raw_ttc = det.get("target_ttc_ms")
+                target_ttc_ms_val = parse_declared_ttc(
+                    raw_ttc, str(info["session_id"]), int(info["trial_id"]),
+                )
+                break
+
+        try:
             # 1. 提取快照
             # For baseline_visual trials, stimulus_onset_ms may be 0,
             # making snapshot_time negative. Clamp to trial start.
@@ -1331,7 +1441,11 @@ def prepare_dataset(
             else:
                 l_v_ratio = 0.0
 
-            # 3. 提取序列
+            # 3. 提取序列（严格传递真实 dt_ms，拒绝未校准默认值）
+            if dt_ms is None or not (isinstance(dt_ms, (int, float)) and math.isfinite(dt_ms) and dt_ms > 0):
+                raise ValueError(
+                    f"prepare_dataset requires explicit positive finite dt_ms, got {dt_ms!r} (fail closed)"
+                )
             X_seq, Y_seq = extract_trial_sequence(
                 trial_data,
                 feature_config=feature_config,
@@ -1384,11 +1498,21 @@ def prepare_dataset(
 
             X_seq[:, 0] = visual_angle_to_use
 
+            # Keep the float64 anchor for an exact comparison with the
+            # float32 sequence used by the DataLoader and persisted below.
+            anchor_frames_before_cast.append(derive_anchor_frames([X_seq])[0])
+            X_saved = X_seq.astype(np.float32)
+            Y_saved = Y_seq.astype(np.float32)
+            assert X_saved.shape == X_seq.shape
+            assert Y_saved.shape == Y_seq.shape
+            assert np.isfinite(X_saved).all(), "non-finite X after float32 conversion (fail closed)"
+            assert np.isfinite(Y_saved).all(), "non-finite Y after float32 conversion (fail closed)"
             # 同步入库：保证 sequences 和 valid_snaps 绝对对齐
-            sequences.append((X_seq, Y_seq, int(info["label"])))
+            sequences.append((X_saved, Y_saved, int(info["label"])))
             valid_snaps.append(snap)
             seq_session_ids.append(str(info["session_id"]))
-            kept_seq_indices.append(trial_idx)  # Track successful trial index
+            seq_trial_ids.append(int(info["trial_id"]))
+            seq_target_ttc_ms.append(target_ttc_ms_val)
             seq_conditions.append(classify_stimulus_condition(trial_data))
 
             logger.debug(
@@ -1402,35 +1526,20 @@ def prepare_dataset(
                 has_raw_visual,
             )
 
-        except (ValueError, KeyError) as e:
-            logger.warning(
-                "Skipping trial [%s, %d] in Step 5: %s",
-                info.get("session_id", "UNKNOWN"),
-                info.get("trial_id", -1),
-                e
-            )
-            continue
+        except (ValueError, KeyError, AssertionError) as exc:
+            raise type(exc)(
+                f"Step 5 sequence extraction failed for session={info.get('session_id')!r}, "
+                f"trial={info.get('trial_id')!r}: {exc}"
+            ) from exc
 
-    # Round-3 Flaw 2 fix: if any trials failed during sequence extraction,
-    # filter mcmc_priors and ens_probs to maintain row-for-row alignment.
-    # The kept_seq_indices mask tracks which trials succeeded.
-    skipped_count = len(labeled_kept) - len(kept_seq_indices)
-    if skipped_count > 0:
-        logger.warning(
-            "Skipped %d/%d trials during sequence extraction; filtering "
-            "mcmc_priors to maintain alignment.",
-            skipped_count, len(labeled_kept),
-        )
-        mcmc_priors = mcmc_priors[kept_seq_indices]
-        ens_probs = ens_probs[kept_seq_indices]
-
-        # Re-audit on the surviving rows (same instrument, same gates).
-        prior_consistency = audit_prior_train_serve_shift(
-            mcmc_priors, ens_probs, label_names_in_col,
-        )
-        logger.info(
-            "Recomputed prior_consistency on %d kept trials.", len(kept_seq_indices)
-        )
+    # Assert canonical snapshots stay row-for-row aligned with retained trials
+    assert len(snapshots) == len(sequences), (
+        f"Snapshot count {len(snapshots)} != sequence count {len(sequences)}"
+    )
+    assert snapshots.shape == (len(sequences), feature_config.snapshot_dim), (
+        f"Snapshot shape {snapshots.shape} != ({len(sequences)}, {feature_config.snapshot_dim})"
+    )
+    assert np.isfinite(snapshots).all(), "Persisted snapshots contain non-finite values"
 
     # 5. 批量推理：一次性处理所有快照，原生输出 (N, 4) 矩阵，彻底规避降维风险
     # Reviewer Round-1 BLOCKER-2: the priors used downstream are the
@@ -1510,7 +1619,7 @@ def prepare_dataset(
         "n_prefilter_labeled_trials": len(labeled_trials),
         "n_retained_sequences": len(sequences),
         "n_dropped_before_snapshot": len(labeled_trials) - len(labeled_kept),
-        "n_dropped_during_sequence_extraction": skipped_count,
+        "n_dropped_during_sequence_extraction": 0,
         # Totals alone hid a 100%-single-condition loss; see
         # :func:`_audit_snapshot_drops`.
         "snapshot_drops_by_class": snapshot_drop_audit["dropped_by_class"],
@@ -1537,12 +1646,24 @@ def prepare_dataset(
         float(lengths.mean()), int(lengths.max()),
     )
 
+    # Labeling and sensitivity persist summaries; release the raw trial
+    # arrays before the full X/Y sequence dataset enters serialization.
+    del trials, labeled_trials, labeled_alt, labeled_kept, info, trial_data
+
     # ── Save ─────────────────────────────────────────────────
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     dataset = {
         "X_seqs": X_seqs,
         "Y_seqs": Y_seqs,
+        # Canonical MCMC snapshots: 5-D feature vectors exactly aligned with sequences
+        "snapshots": snapshots,
+        "mcmc_snapshots": snapshots,
+        "trial_ids": np.array(seq_trial_ids, dtype=np.int64),
+        "target_ttc_ms": np.array(
+            [np.nan if v is None else float(v) for v in seq_target_ttc_ms],
+            dtype=np.float64,
+        ),
         "mcmc_priors": mcmc_priors,  # OUT-OF-FOLD (cross-fitted) priors
         # Reviewer Round-2 M-3: persist the fold models and document the
         # inference-time prior protocol so downstream scripts never have
@@ -1550,9 +1671,10 @@ def prepare_dataset(
         # reintroduce the Round-1 leakage).  Protocol: predict with every
         # fold model, average the probability rows, renormalise.
         # Records the fold count ACTUALLY used, not a literal: the count
-        # adapts down when a rare class occupies too few animals, and a
+        # adapts down when a rare class occupies too few prefixes, and a
         # stale "5fold" claim in the artifact would misstate provenance.
-        "mcmc_prior_provenance": f"oof_{n_folds}fold_animal_grouped_cv",
+        "mcmc_prior_provenance": f"oof_{n_folds}fold_recording_prefix_grouped_cv",
+        "animal_identity_status": "unverified",
         "mcmc_fold_models": fold_models,
         # Round-3 (Reviewer A MAJ-3C): per-fold composition records so
         # StratifiedGroupKFold imbalance is auditable post hoc.
@@ -1566,16 +1688,8 @@ def prepare_dataset(
         ),
         "labels": labels,
         "lengths": lengths,
-        # Per-sequence session ids, stored with the ``_session_N`` suffix
-        # INTACT.  Downstream splits group by ANIMAL, deriving the animal
-        # key by stripping that suffix
-        # (nsmor.pipeline.grouping.animal_of), so the finer granularity is
-        # kept here and coarsened at the point of use — the reverse would
-        # discard information no consumer can recover.  Grouping by
-        # session alone is insufficient: ``_session_N`` blocks belong to
-        # one animal, and trials of one animal share its baseline
-        # locomotor statistics, gain state, and body mass.  (Full nested CV
-        # remains a documented limitation in the analysis report.)
+        # Preserve full session ids; grouping strips `_session_N` at use time.
+        # This proves recording-prefix disjointness, not animal independence.
         "session_ids": snapshot_groups_aligned,
         # Per-trial stimulus modality, read off the physical channels at
         # ETL time.  ``is_pure_wind`` is the boolean the routing-aux loss
@@ -1612,14 +1726,18 @@ def prepare_dataset(
     # stimulus-loss bug where random crops miss the stimulus in 88-95%
     # of trials when sequences are uncapped).  Stored per-trial so
     # NSMoRDataset can crop deterministically around the stimulus onset.
-    from nsmor.pipeline.conditions import derive_anchor_frames
     anchor_frames_list = derive_anchor_frames(X_seqs, lengths)
+    assert anchor_frames_list == anchor_frames_before_cast, (
+        "Float32 conversion changed stimulus anchor frames"
+    )
     dataset["anchor_frames"] = anchor_frames_list
     logger.info(
         "Derived %d anchor frames from physical channels.",
         len(anchor_frames_list),
     )
 
+    # Sequences are float32 at extraction, matching DataLoader precision and
+    # bounding the ZIP pickle buffer while preserving every trial and frame.
     torch.save(dataset, output_path)
     logger.info("Saved dataset to %s", output_path)
 

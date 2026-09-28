@@ -25,6 +25,8 @@ CONFIG   ?= config/default.yaml
 RUN_DIR  ?= runs/default
 OUTPUT   ?= results
 SEED     ?= 42
+NESTED_PRIOR_ARTIFACT ?= $(RUN_DIR)/nested_prior/nested_split_seed$(SEED).pt
+NESTED_PRIOR_DIR = $(shell dirname -- "$(NESTED_PRIOR_ARTIFACT)")
 BATCH_SIZE ?=
 LR       ?=
 BEST     := $(RUN_DIR)/best_model.pth
@@ -39,7 +41,7 @@ DT_MS ?= $(shell $(PYTHON) -c 'import yaml; cfg = yaml.safe_load(open("$(CONFIG)
 # every target below works from a bare clone, installed or not.
 export PYTHONPATH := $(CURDIR)$(if $(PYTHONPATH),:$(PYTHONPATH),)
 
-.PHONY: install test data train analyze analyze-torch jacobian-torch pipeline clean help
+.PHONY: install test data nested-prior check-checkpoint check-nested-prior train analyze analyze-torch jacobian-torch pipeline clean help
 
 # ── Default target ───────────────────────────────────────────
 help: ## Show available targets
@@ -59,25 +61,38 @@ install: ## Install package in editable mode with dev deps
 test: ## Run full test suite with verbose output
 	$(PYTHON) -m pytest tests/ -v
 
-modeltest:
-	$(PYTHON) scripts/train.py --config $(CONFIG) --dataset $(DATA) --epochs 1 --phase1_epochs 1 --output_dir $(RUN_DIR)/test
+modeltest: check-nested-prior
+	$(PYTHON) scripts/train.py --config "$(CONFIG)" --dataset "$(DATA)" --epochs 1 --phase1_epochs 1 --output_dir "$(RUN_DIR)/test" --nested_prior_artifact "$(NESTED_PRIOR_ARTIFACT)"
 # ── Pre Data loading ─────────────────────────────────────────
 load:
-	$(PYTHON) scripts/pre_load_data.py $(RAW)
-	$(PYTHON) scripts/pre_load_adapt.py $(RAW)
+	$(PYTHON) scripts/pre_load_data.py "$(RAW)"
+	$(PYTHON) scripts/pre_load_adapt.py "$(RAW)"
 
 # ── Data Preparation ─────────────────────────────────────────
 data: ## Run ETL pipeline (prepare_data.py)
-	$(PYTHON) scripts/prepare_data.py --raw_dir $(RAW) --output $(DATA) --dt_ms $(DT_MS) --seed $(SEED)
+	$(PYTHON) scripts/prepare_data.py --raw_dir "$(RAW)" --output "$(DATA)" --dt_ms $(DT_MS) --seed $(SEED)
 
-# ── Training ─────────────────────────────────────────────────
-pretrain:
-	$(PYTHON) scripts/train.py --config $(CONFIG) --dataset $(DATA) --phase1_epochs $(PRE_EPOCHS) --output_dir $(RUN_DIR)
-posttrain:
-	$(PYTHON) scripts/train.py --config $(CONFIG) --dataset $(DATA) --epochs $(EPOCHS) --output_dir $(RUN_DIR)
+# ── Nested priors and training ────────────────────────────────
+# Run after `make data`. The evaluator refuses an existing artifact.
+nested-prior: ## Fit outer-split, inner-OOF priors for the processed dataset
+	@test -s "$(DATA)" || { echo "Missing dataset: $(DATA)" >&2; exit 1; }
+	@test "$$(basename -- "$(NESTED_PRIOR_ARTIFACT)")" = "nested_split_seed$(SEED).pt" || { echo "Nested artifact filename must match SEED=$(SEED)" >&2; exit 1; }
+	@test ! -e "$(NESTED_PRIOR_ARTIFACT)" && test ! -L "$(NESTED_PRIOR_ARTIFACT)" || { echo "Nested artifact already exists: $(NESTED_PRIOR_ARTIFACT)" >&2; exit 1; }
+	$(PYTHON) scripts/evaluate_nested_prior.py --dataset "$(DATA)" --output_dir "$(NESTED_PRIOR_DIR)" --split_seed "$(SEED)"
 
-train: ## Run training engine (train.py)
-	$(PYTHON) scripts/train.py --config $(CONFIG) --dataset $(DATA) --epochs $(EPOCHS) --phase1_epochs $(PRE_EPOCHS) --output_dir $(RUN_DIR)
+check-nested-prior:
+	@test -s "$(NESTED_PRIOR_ARTIFACT)" || { echo "Missing nested artifact: $(NESTED_PRIOR_ARTIFACT); run make nested-prior after make data" >&2; exit 1; }
+
+check-checkpoint:
+	@test -s "$(BEST)" || { echo "Missing checkpoint: $(BEST)" >&2; exit 1; }
+
+pretrain: check-nested-prior
+	$(PYTHON) scripts/train.py --config "$(CONFIG)" --dataset "$(DATA)" --phase1_epochs $(PRE_EPOCHS) --output_dir "$(RUN_DIR)" --nested_prior_artifact "$(NESTED_PRIOR_ARTIFACT)"
+posttrain: check-nested-prior
+	$(PYTHON) scripts/train.py --config "$(CONFIG)" --dataset "$(DATA)" --epochs $(EPOCHS) --output_dir "$(RUN_DIR)" --nested_prior_artifact "$(NESTED_PRIOR_ARTIFACT)"
+
+train: check-nested-prior ## Run training engine (train.py)
+	$(PYTHON) scripts/train.py --config "$(CONFIG)" --dataset "$(DATA)" --epochs $(EPOCHS) --phase1_epochs $(PRE_EPOCHS) --output_dir "$(RUN_DIR)" --nested_prior_artifact "$(NESTED_PRIOR_ARTIFACT)"
 
 # ── Analysis ───────────────────────────────────────────────────
 # Default `analyze` is hybrid: GRU Jacobian uses JAX jacfwd (~20x on this
@@ -90,30 +105,30 @@ analyze: dynamics lesion jacobian integration psychophysics cluster ## Hybrid an
 
 analyze-torch: dynamics lesion jacobian-torch integration psychophysics cluster ## All-PyTorch analysis (pre-JAX default)
 
-dynamics: $(BEST) ## Run dynamics & manifold analysis
-	$(PYTHON) scripts/analyze_dynamics.py --checkpoint $(BEST) --dataset $(DATA) --output $(OUTPUT)/mechanism_analysis.png
+dynamics: check-checkpoint check-nested-prior ## Run dynamics & manifold analysis
+	$(PYTHON) scripts/analyze_dynamics.py --checkpoint "$(BEST)" --dataset "$(DATA)" --output "$(OUTPUT)/mechanism_analysis.png" --nested_prior_artifact "$(NESTED_PRIOR_ARTIFACT)"
 
-lesion: $(BEST) ## Run in-silico lesion analysis
-	$(PYTHON) scripts/simulate_lesion.py --checkpoint $(BEST) --dataset $(DATA) --output $(OUTPUT)/ablation_kinematics.png --stats_output $(OUTPUT)/lesion_statistics.csv --dt_ms $(DT_MS)
+lesion: check-checkpoint check-nested-prior ## Run in-silico lesion analysis
+	$(PYTHON) scripts/simulate_lesion.py --checkpoint "$(BEST)" --dataset "$(DATA)" --output "$(OUTPUT)/ablation_kinematics.png" --stats_output "$(OUTPUT)/lesion_statistics.csv" --dt_ms $(DT_MS) --nested_prior_artifact "$(NESTED_PRIOR_ARTIFACT)"
 
-jacobian: $(BEST) ## Run Jacobian eigenvalue spectrum (JAX jacfwd)
-	$(PYTHON) scripts/analyze_jacobian.py --checkpoint $(BEST) --dataset $(DATA) --output $(OUTPUT)/jacobian_spectrum.png --dt_ms $(DT_MS) --backend jax
+jacobian: check-checkpoint check-nested-prior ## Run Jacobian eigenvalue spectrum (JAX jacfwd)
+	$(PYTHON) scripts/analyze_jacobian.py --checkpoint "$(BEST)" --dataset "$(DATA)" --output "$(OUTPUT)/jacobian_spectrum.png" --dt_ms $(DT_MS) --backend jax --nested_prior_artifact "$(NESTED_PRIOR_ARTIFACT)"
 
-jacobian-torch: $(BEST) ## Jacobian spectrum with PyTorch autograd
-	$(PYTHON) scripts/analyze_jacobian.py --checkpoint $(BEST) --dataset $(DATA) --output $(OUTPUT)/jacobian_spectrum.png --dt_ms $(DT_MS) --backend torch
+jacobian-torch: check-checkpoint check-nested-prior ## Jacobian spectrum with PyTorch autograd
+	$(PYTHON) scripts/analyze_jacobian.py --checkpoint "$(BEST)" --dataset "$(DATA)" --output "$(OUTPUT)/jacobian_spectrum.png" --dt_ms $(DT_MS) --backend torch --nested_prior_artifact "$(NESTED_PRIOR_ARTIFACT)"
 
-integration: $(BEST) ## Run multisensory integration window
-	$(PYTHON) scripts/analyze_integration.py --checkpoint $(BEST) --dataset $(DATA) --output $(OUTPUT)/integration_window.png --summary $(OUTPUT)/integration_summary.json --dt_ms $(DT_MS)
+integration: check-checkpoint check-nested-prior ## Run multisensory integration window
+	$(PYTHON) scripts/analyze_integration.py --checkpoint "$(BEST)" --dataset "$(DATA)" --raw_dir "$(RAW)" --output "$(OUTPUT)/integration_window.png" --summary "$(OUTPUT)/integration_summary.json" --dt_ms $(DT_MS) --nested_prior_artifact "$(NESTED_PRIOR_ARTIFACT)"
 
-psychophysics: $(BEST) ## Run Bayesian reliability analysis
-	$(PYTHON) scripts/simulate_psychophysics.py --checkpoint $(BEST) --dataset $(DATA) --raw_dir $(RAW) --output_dir $(OUTPUT) --dt_ms $(DT_MS) --seed $(SEED)
+psychophysics: check-checkpoint check-nested-prior ## Run visual-noise sensitivity (MCMC priors fixed; descriptive)
+	$(PYTHON) scripts/simulate_psychophysics.py --checkpoint "$(BEST)" --dataset "$(DATA)" --raw_dir "$(RAW)" --output_dir "$(OUTPUT)" --dt_ms $(DT_MS) --seed $(SEED) --nested_prior_artifact "$(NESTED_PRIOR_ARTIFACT)"
 
-cluster: $(BEST) ## Run unsupervised gating strategy clustering
-	$(PYTHON) scripts/analyze_gating.py --checkpoint $(BEST) --dataset $(DATA) --config $(CONFIG) --output_dir $(OUTPUT)
+cluster: check-checkpoint check-nested-prior ## Run unsupervised gating strategy clustering
+	$(PYTHON) scripts/analyze_gating.py --checkpoint "$(BEST)" --dataset "$(DATA)" --config "$(CONFIG)" --output_dir "$(OUTPUT)" --nested_prior_artifact "$(NESTED_PRIOR_ARTIFACT)"
 
 # ── Autoregressive Generation ────────────────────────────────
-generate: $(BEST) ## Run autoregressive closed-loop generation
-	$(PYTHON) scripts/simulate_autoregressive.py --checkpoint $(BEST) --output_dir $(OUTPUT)/sim_session --dt_ms $(DT_MS)
+generate: check-checkpoint ## Run autoregressive closed-loop generation
+	$(PYTHON) scripts/simulate_autoregressive.py --checkpoint "$(BEST)" --output_dir "$(OUTPUT)/sim_session" --dt_ms $(DT_MS)
 
 # ── Full Pipeline ────────────────────────────────────────────
 # Forwards the Makefile variables so `make pipeline` and `make train` +
@@ -124,7 +139,7 @@ pipeline: ## Execute full end-to-end experimental pipeline
 	RUN_DIR="$(RUN_DIR)" OUTPUT_DIR="$(OUTPUT)" DT_MS="$(DT_MS)" \
 	EPOCHS="$(EPOCHS)" PHASE1_EPOCHS="$(PHASE1_EPOCHS)" \
 	BATCH_SIZE="$(BATCH_SIZE)" LR="$(LR)" SEED="$(SEED)" \
-	bash run_pipeline.sh
+	NESTED_PRIOR_ARTIFACT="$(NESTED_PRIOR_ARTIFACT)" bash run_pipeline.sh
 
 # ── Cleanup ──────────────────────────────────────────────────
 clean: ## Remove caches, build artefacts, and old runs

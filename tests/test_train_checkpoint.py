@@ -12,8 +12,10 @@ All tests use tiny synthetic data to run in <10s on CPU.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import pickle
 import signal
 import threading
 import time
@@ -27,6 +29,10 @@ import torch
 
 from nsmor.config import PIPELINE_SEMANTICS_VERSION, FeatureConfig
 from nsmor.pipeline.grouping import animal_of as _animal_of
+
+
+def _checkpoint_shas(*paths: Path) -> tuple[str, ...]:
+    return tuple(hashlib.sha256(path.read_bytes()).hexdigest() for path in paths)
 
 # ── Fixtures ────────────────────────────────────────────────────────
 
@@ -162,6 +168,54 @@ def test_best_checkpoint_always_written(tmp_path: Path) -> None:
 # Test 2: atomic-write — no partial file left on interrupted save
 # ═════════════════════════════════════════════════════════════
 
+@pytest.mark.parametrize("val_loss", [float("nan"), float("inf"), -float("inf")])
+def test_fresh_train_rejects_existing_best_before_model_or_output_writes(
+    tmp_path: Path, val_loss: float,
+) -> None:
+    """Fresh training cannot select stale weights when validation is invalid."""
+    from scripts.train import build_model, train
+
+    ds_path = _make_synthetic_dataset(tmp_path)
+    config = _make_config(tmp_path, epochs=1, warmup_epochs=0)
+    output_dir = Path(config.checkpoint.output_dir)
+    output_dir.mkdir()
+    best_path = output_dir / "best_model.pth"
+    stale_model = build_model(config)
+    stale_weights = {
+        key: value.detach().clone() for key, value in stale_model.state_dict().items()
+    }
+    torch.save(
+        {"model_state_dict": stale_weights, "val_loss": 0.125, "epoch": 8},
+        best_path,
+    )
+    sentinel_bytes = best_path.read_bytes()
+    metrics_path = output_dir / "metrics.json"
+    metrics_sentinel = b"previous run's metrics\n"
+    metrics_path.write_bytes(metrics_sentinel)
+
+    with (
+        mock.patch("scripts.train.build_model") as model_builder,
+        mock.patch("scripts.train.train_one_epoch") as epoch_runner,
+        mock.patch("scripts.train.validate", return_value=val_loss) as validator,
+        mock.patch("scripts.train._atomic_save_checkpoint") as saver,
+    ):
+        with pytest.raises(FileExistsError, match="Pre-existing checkpoint") as error:
+            train(config, lambda_reg=0.01, dataset_path=str(ds_path))
+        assert str(best_path) in str(error.value)
+        model_builder.assert_not_called()
+        epoch_runner.assert_not_called()
+        validator.assert_not_called()
+        saver.assert_not_called()
+
+    assert set(output_dir.iterdir()) == {best_path, metrics_path}
+    assert best_path.read_bytes() == sentinel_bytes
+    assert metrics_path.read_bytes() == metrics_sentinel
+    saved_weights = torch.load(best_path, weights_only=False)["model_state_dict"]
+    assert saved_weights.keys() == stale_weights.keys()
+    for key, expected in stale_weights.items():
+        assert torch.equal(saved_weights[key], expected), f"stale weight {key} was changed"
+
+
 def test_atomic_save_no_partial_file(tmp_path: Path) -> None:
     """If torch.save raises mid-write, the TARGET path must not exist
     (only the .tmp file may be left)."""
@@ -207,7 +261,8 @@ def test_atomic_save_no_partial_file(tmp_path: Path) -> None:
 # Test 3: non-finite val loss is surfaced, not silently swallowed
 # ═════════════════════════════════════════════════════════════
 
-def test_nonfinite_val_loss_handled(tmp_path: Path) -> None:
+@pytest.mark.parametrize("val_loss", [float("nan"), float("inf"), -float("inf")])
+def test_nonfinite_val_loss_handled(tmp_path: Path, val_loss: float) -> None:
     """When val_loss is NaN/Inf, the run must still complete and:
     - best_val_loss should remain inf (no best checkpoint from bad loss)
     - final_model.pth should exist as fallback
@@ -218,17 +273,17 @@ def test_nonfinite_val_loss_handled(tmp_path: Path) -> None:
     ds_path = _make_synthetic_dataset(tmp_path)
     config = _make_config(tmp_path, epochs=1, warmup_epochs=0)
 
-    # Patch validate to return NaN
-    with mock.patch("scripts.train.validate", return_value=float("nan")):
+    # No non-finite validation value may select a best checkpoint, including -Inf.
+    with mock.patch("scripts.train.validate", return_value=val_loss):
         results = train(config, lambda_reg=0.01, dataset_path=str(ds_path))
 
     output_dir = Path(config.checkpoint.output_dir)
     best_path = output_dir / "best_model.pth"
     final_path = output_dir / "final_model.pth"
 
-    # best_model.pth should NOT be written (NaN < anything is False)
+    # best_model.pth must not be written for any non-finite validation loss.
     assert not best_path.exists(), (
-        "best_model.pth should not be written when val_loss is NaN"
+        "best_model.pth should not be written when val_loss is non-finite"
     )
     # final_model.pth should exist as fallback
     assert final_path.exists(), "final_model.pth must always be written"
@@ -495,6 +550,234 @@ def test_provenance_two_phase(tmp_path: Path) -> None:
         expected_dataset_path=ds_path_str,
     )
 
+
+def test_two_phase_patience_and_best_checkpoint_are_phase_local(tmp_path: Path) -> None:
+    """Phase 1 must finish, and phase 2 must choose its own best model."""
+    from scripts.train import train
+
+    ds_path = _make_synthetic_dataset(tmp_path)
+    config = _make_config(tmp_path, epochs=6, warmup_epochs=0)
+    config.training.early_stopping_patience = 1
+
+    with mock.patch("scripts.train.validate", side_effect=[0.1, 0.2, 0.3, 4.0, 5.0]):
+        results = train(
+            config, lambda_reg=0.01, phase1_epochs=3, dataset_path=str(ds_path),
+        )
+
+    assert results["history"]["val_loss"] == [0.1, 0.2, 0.3, 4.0, 5.0]
+    assert results["best_val_loss"] == pytest.approx(4.0)
+    assert results["eval_provenance"] == "best"
+    best = torch.load(Path(config.checkpoint.output_dir) / "best_model.pth", weights_only=False)
+    assert (best["training_phase"], best["epoch"], best["val_loss"]) == (2, 3, 4.0)
+
+
+def test_resume_phase1_boundary_ignores_later_phase2_best(tmp_path: Path) -> None:
+    from scripts.train import train
+
+    ds = _make_synthetic_dataset(tmp_path)
+    source = _make_config(tmp_path, epochs=6, warmup_epochs=0)
+    source.training.checkpoint_interval = 1
+    source.training.early_stopping_patience = 1
+    with (
+        mock.patch("scripts.train.train_one_epoch", return_value=(1.0, {})),
+        mock.patch("scripts.train.validate", side_effect=[0.1, 0.2, 0.3, 4.0, 5.0]),
+    ):
+        train(source, phase1_epochs=3, dataset_path=str(ds))
+
+    source_dir = Path(source.checkpoint.output_dir)
+    periodic = source_dir / "epoch_3.pth"
+    assert torch.load(periodic, weights_only=False)["best_val_loss"] == pytest.approx(0.1)
+    assert torch.load(source_dir / "best_model.pth", weights_only=False)["training_phase"] == 2
+
+    resumed = _make_config(tmp_path, epochs=7, warmup_epochs=0)
+    resumed.checkpoint.output_dir = str(tmp_path / "resume_boundary")
+    resumed.checkpoint.resume_from = str(periodic)
+    resumed.training.early_stopping_patience = 1
+    with (
+        mock.patch("scripts.train.train_one_epoch", return_value=(1.0, {})),
+        mock.patch("scripts.train.validate", side_effect=[6.0, 7.0]),
+    ):
+        result = train(resumed, phase1_epochs=3, dataset_path=str(ds),
+                       trusted_historical_checkpoint_sha256=_checkpoint_shas(periodic))
+
+    assert result["history"]["val_loss"] == [6.0, 7.0]
+    best = torch.load(Path(resumed.checkpoint.output_dir) / "best_model.pth", weights_only=False)
+    assert (best["training_phase"], best["epoch"], best["val_loss"]) == (2, 3, 6.0)
+
+def test_resume_phase2_discards_phase1_companion(tmp_path: Path) -> None:
+    from scripts.train import train
+
+    ds = _make_synthetic_dataset(tmp_path)
+    source = _make_config(tmp_path, epochs=3, warmup_epochs=0)
+    source.training.checkpoint_interval = 1
+    with (
+        mock.patch("scripts.train.train_one_epoch", return_value=(1.0, {})),
+        mock.patch("scripts.train.validate", side_effect=[0.1, 5.0, 4.0]),
+    ):
+        train(source, phase1_epochs=1, dataset_path=str(ds))
+
+    source_dir = Path(source.checkpoint.output_dir)
+    periodic = source_dir / "epoch_3.pth"
+    assert torch.load(periodic, weights_only=False)["best_val_loss"] == pytest.approx(4.0)
+    torch.save(torch.load(source_dir / "epoch_1.pth", weights_only=False), source_dir / "best_model.pth")
+
+    resumed = _make_config(tmp_path, epochs=4, warmup_epochs=0)
+    resumed.checkpoint.output_dir = str(tmp_path / "resume_phase2")
+    resumed.checkpoint.resume_from = str(periodic)
+    with (
+        mock.patch("scripts.train.train_one_epoch", return_value=(1.0, {})),
+        mock.patch("scripts.train.validate", return_value=6.0),
+    ):
+        result = train(resumed, phase1_epochs=1, dataset_path=str(ds),
+                       trusted_historical_checkpoint_sha256=_checkpoint_shas(periodic))
+
+    best = torch.load(Path(resumed.checkpoint.output_dir) / "best_model.pth", weights_only=False)
+    assert (best["training_phase"], best["epoch"], best["val_loss"]) == (2, 2, 4.0)
+    assert result["best_val_loss"] == pytest.approx(4.0)
+
+def test_resume_phase2_preserves_same_phase_best(tmp_path: Path) -> None:
+    from scripts.train import train
+
+    ds = _make_synthetic_dataset(tmp_path)
+    source = _make_config(tmp_path, epochs=3, warmup_epochs=0)
+    source.training.checkpoint_interval = 1
+    with (
+        mock.patch("scripts.train.train_one_epoch", return_value=(1.0, {})),
+        mock.patch("scripts.train.validate", side_effect=[0.1, 4.0, 5.0]),
+    ):
+        train(source, phase1_epochs=1, dataset_path=str(ds))
+    source_dir = Path(source.checkpoint.output_dir)
+    old_best = torch.load(source_dir / "best_model.pth", weights_only=False)
+    assert (old_best["training_phase"], old_best["val_loss"]) == (2, 4.0)
+
+    resumed = _make_config(tmp_path, epochs=4, warmup_epochs=0)
+    resumed.checkpoint.output_dir = str(tmp_path / "resume_phase2_valid")
+    resumed.checkpoint.resume_from = str(source_dir / "epoch_3.pth")
+    with (
+        mock.patch("scripts.train.train_one_epoch", return_value=(1.0, {})),
+        mock.patch("scripts.train.validate", return_value=6.0),
+    ):
+        result = train(resumed, phase1_epochs=1, dataset_path=str(ds),
+                       trusted_historical_checkpoint_sha256=_checkpoint_shas(
+                           source_dir / "epoch_3.pth", source_dir / "best_model.pth"))
+
+    best = torch.load(Path(resumed.checkpoint.output_dir) / "best_model.pth", weights_only=False)
+    assert (best["training_phase"], best["epoch"], best["val_loss"]) == (2, 1, 4.0)
+    assert all(torch.equal(v, best["model_state_dict"][k]) for k, v in old_best["model_state_dict"].items())
+    assert result["best_val_loss"] == pytest.approx(4.0)
+
+    # A claimed same-phase best must have matching weights in at least one candidate.
+    claimed = torch.load(source_dir / "epoch_3.pth", weights_only=False)
+    claimed["best_val_loss"] = 3.0
+    altered = source_dir / "epoch_3_claimed.pth"
+    torch.save(claimed, altered)
+    worse = dict(old_best)
+    worse["val_loss"] = worse["best_val_loss"] = 5.0
+    destination = tmp_path / "resume_phase2_invalid"
+    destination.mkdir()
+    torch.save(worse, destination / "best_model.pth")
+    resumed.checkpoint.output_dir = str(destination)
+    resumed.checkpoint.resume_from = str(altered)
+    with pytest.raises(ValueError, match="same-phase best weights"):
+        train(resumed, phase1_epochs=1, dataset_path=str(ds),
+              trusted_historical_checkpoint_sha256=_checkpoint_shas(
+                  altered, source_dir / "best_model.pth", destination / "best_model.pth"))
+    assert torch.load(destination / "best_model.pth", weights_only=False)["val_loss"] == 5.0
+
+def test_early_stopped_final_epoch_resumes_at_next_epoch(tmp_path: Path) -> None:
+    from scripts.train import train
+
+    ds = _make_synthetic_dataset(tmp_path)
+    source = _make_config(tmp_path, epochs=6, warmup_epochs=0)
+    source.training.early_stopping_patience = 1
+    with mock.patch("scripts.train.validate", side_effect=[0.1, 0.2, 0.3, 4.0, 5.0]):
+        result = train(source, phase1_epochs=3, dataset_path=str(ds))
+
+    assert len(result["history"]["val_loss"]) == 5
+    final_path = Path(source.checkpoint.output_dir) / "final_model.pth"
+    final = torch.load(final_path, weights_only=False)
+    assert (final["training_phase"], final["epoch"]) == (2, 4)
+
+    resumed = _make_config(tmp_path, epochs=6, warmup_epochs=0)
+    resumed.checkpoint.output_dir = str(tmp_path / "resume_final")
+    resumed.checkpoint.resume_from = str(final_path)
+    executed = []
+    restored = []
+
+    def run_epoch(**kwargs):
+        executed.append(kwargs["epoch"])
+        restored.append(kwargs["optimizer"].state_dict())
+        return 1.0, {}
+
+    with (
+        mock.patch("scripts.train.train_one_epoch", side_effect=run_epoch),
+        mock.patch("scripts.train.validate", return_value=3.0),
+    ):
+        train(resumed, phase1_epochs=3, dataset_path=str(ds),
+              trusted_historical_checkpoint_sha256=_checkpoint_shas(
+                  final_path, Path(source.checkpoint.output_dir) / "best_model.pth"))
+
+    assert executed == [5]
+    prior_state = final["optimizer_state_dict"]
+    first_key = next(iter(prior_state["state"]))
+    assert torch.equal(restored[0]["state"][first_key]["exp_avg"].cpu(), prior_state["state"][first_key]["exp_avg"])
+    assert [g["lr"] for g in restored[0]["param_groups"]] == [g["lr"] for g in prior_state["param_groups"]]
+    resumed_final = torch.load(Path(resumed.checkpoint.output_dir) / "final_model.pth", weights_only=False)
+    assert resumed_final["epoch"] == 5
+    assert resumed_final["scheduler_state_dict"]["last_epoch"] == final["scheduler_state_dict"]["last_epoch"] + 1
+
+def test_resume_earlier_phase1_uses_own_certified_best(tmp_path: Path) -> None:
+    from scripts.train import train
+
+    ds = _make_synthetic_dataset(tmp_path)
+    source = _make_config(tmp_path, epochs=4, warmup_epochs=0)
+    source.training.checkpoint_interval = 1
+    with (
+        mock.patch("scripts.train.train_one_epoch", return_value=(1.0, {})),
+        mock.patch("scripts.train.validate", side_effect=[0.1, 0.2, 0.3, 4.0]),
+    ):
+        train(source, phase1_epochs=3, dataset_path=str(ds))
+
+    source_dir = Path(source.checkpoint.output_dir)
+    periodic = source_dir / "epoch_1.pth"
+    assert torch.load(source_dir / "best_model.pth", weights_only=False)["training_phase"] == 2
+    resumed = _make_config(tmp_path, epochs=3, warmup_epochs=0)
+    resumed.checkpoint.output_dir = str(tmp_path / "resume_phase1_early")
+    resumed.checkpoint.resume_from = str(periodic)
+    with (
+        mock.patch("scripts.train.train_one_epoch", return_value=(1.0, {})),
+        mock.patch("scripts.train.validate", side_effect=[0.2, 0.3]),
+    ):
+        result = train(resumed, phase1_epochs=3, dataset_path=str(ds),
+                       trusted_historical_checkpoint_sha256=_checkpoint_shas(periodic))
+
+    best = torch.load(Path(resumed.checkpoint.output_dir) / "best_model.pth", weights_only=False)
+    assert (best["training_phase"], best["epoch"], best["val_loss"]) == (1, 0, 0.1)
+    assert result["best_val_loss"] == pytest.approx(0.1)
+
+def test_resume_earlier_phase1_refuses_missing_same_phase_best(tmp_path: Path) -> None:
+    from scripts.train import train
+
+    ds = _make_synthetic_dataset(tmp_path)
+    source = _make_config(tmp_path, epochs=4, warmup_epochs=0)
+    source.training.checkpoint_interval = 1
+    with (
+        mock.patch("scripts.train.train_one_epoch", return_value=(1.0, {})),
+        mock.patch("scripts.train.validate", side_effect=[0.1, 0.2, 0.3, 4.0]),
+    ):
+        train(source, phase1_epochs=3, dataset_path=str(ds))
+
+    source_dir = Path(source.checkpoint.output_dir)
+    periodic = source_dir / "epoch_2.pth"
+    saved = torch.load(periodic, weights_only=False)
+    assert (saved["training_phase"], saved["val_loss"], saved["best_val_loss"]) == (1, 0.2, 0.1)
+    assert torch.load(source_dir / "best_model.pth", weights_only=False)["training_phase"] == 2
+    resumed = _make_config(tmp_path, epochs=3, warmup_epochs=0)
+    resumed.checkpoint.output_dir = str(tmp_path / "resume_phase1_missing")
+    resumed.checkpoint.resume_from = str(periodic)
+    with pytest.raises(ValueError, match="absent historical best model"):
+        train(resumed, phase1_epochs=3, dataset_path=str(ds),
+              trusted_historical_checkpoint_sha256=_checkpoint_shas(periodic))
 
 def test_provenance_with_normalization(tmp_path: Path) -> None:
     """When target normalization is enabled, the provenance fields
@@ -842,6 +1125,7 @@ def test_resume_within_phase1(tmp_path: Path) -> None:
         lambda_reg=0.01,
         phase1_epochs=10,
         dataset_path=str(ds_path),
+        trusted_historical_checkpoint_sha256=_checkpoint_shas(ckpt_path, output_dir / "best_model.pth"),
     )
 
     assert np.isfinite(results_resume["best_val_loss"])
@@ -900,6 +1184,7 @@ def test_resume_boundary_landing(tmp_path: Path) -> None:
             lambda_reg=0.01,
             phase1_epochs=10,
             dataset_path=str(ds_path),
+            trusted_historical_checkpoint_sha256=_checkpoint_shas(ckpt_path),
         )
 
     # Verify that Phase 2 optimizer created upon landing has 2 param groups
@@ -982,6 +1267,7 @@ def test_resume_mid_phase2(tmp_path: Path) -> None:
             lambda_reg=0.01,
             phase1_epochs=10,
             dataset_path=str(ds_path),
+            trusted_historical_checkpoint_sha256=_checkpoint_shas(ckpt_path, output_dir / "best_model.pth"),
         )
 
     assert restored_opt_before_step is not None
@@ -1077,4 +1363,500 @@ def test_train_enforces_phase_freeze_schedule(tmp_path: Path) -> None:
         )
 
 
+def test_resume_into_new_output_dir_preserves_best_model(tmp_path: Path) -> None:
+    """Resuming into a fresh output_dir must preserve genuine historical best model
+    and evaluate as 'best' even if resumed epochs show higher val_loss (no improvement)."""
+    from scripts.train import train
 
+    ds_path = _make_synthetic_dataset(tmp_path)
+    run1_dir = tmp_path / "run1"
+    config1 = _make_config(tmp_path, epochs=1, warmup_epochs=0)
+    config1.checkpoint.output_dir = str(run1_dir)
+    config1.training.checkpoint_interval = 1
+
+    res1 = train(config1, lambda_reg=0.01, dataset_path=str(ds_path))
+    best1_val = res1["best_val_loss"]
+    assert (run1_dir / "best_model.pth").exists()
+    assert (run1_dir / "epoch_1.pth").exists()
+
+    # Resume from epoch_1 into run2_dir with higher val_loss simulation
+    run2_dir = tmp_path / "run2"
+    config2 = _make_config(tmp_path, epochs=2, warmup_epochs=0)
+    config2.checkpoint.output_dir = str(run2_dir)
+    config2.checkpoint.resume_from = str(run1_dir / "epoch_1.pth")
+
+    # Patch validate to return worse val_loss (best1_val + 50.0) so epoch 2 does NOT improve
+    with mock.patch("scripts.train.validate", return_value=best1_val + 50.0):
+        res2 = train(config2, lambda_reg=0.01, dataset_path=str(ds_path),
+                     trusted_historical_checkpoint_sha256=_checkpoint_shas(
+                         run1_dir / "epoch_1.pth", run1_dir / "best_model.pth"))
+
+    assert (run2_dir / "best_model.pth").exists(), (
+        "best_model.pth must be preserved in fresh output_dir from genuine historical best"
+    )
+    assert res2["eval_provenance"] == "best", (
+        f"Expected eval_provenance='best', got {res2['eval_provenance']}"
+    )
+    assert res2["best_val_loss"] == pytest.approx(best1_val)
+
+
+def test_resume_never_falls_back_to_training_loss_as_best_val_loss(tmp_path: Path) -> None:
+    """A checkpoint with training loss only (no validation loss metadata) must NOT
+    use train loss as best_val_loss (must initialize best_val_loss to inf)."""
+    from scripts.train import train
+
+    ds_path = _make_synthetic_dataset(tmp_path)
+    run1_dir = tmp_path / "run1_trainonly"
+    config1 = _make_config(tmp_path, epochs=1, warmup_epochs=0)
+    config1.checkpoint.output_dir = str(run1_dir)
+    config1.training.checkpoint_interval = 1
+
+    train(config1, lambda_reg=0.01, dataset_path=str(ds_path))
+    epoch1_ckpt = run1_dir / "epoch_1.pth"
+    assert epoch1_ckpt.exists()
+
+    # Strip validation loss keys from checkpoint so it only carries train loss in ckpt['loss']
+    ckpt_data = torch.load(epoch1_ckpt, weights_only=False)
+    ckpt_data.pop("val_loss", None)
+    ckpt_data.pop("best_val_loss", None)
+    ckpt_data["loss"] = 0.05  # train loss is very small (0.05)
+    torch.save(ckpt_data, epoch1_ckpt)
+
+    # Resume into run2
+    run2_dir = tmp_path / "run2_res"
+    config2 = _make_config(tmp_path, epochs=2, warmup_epochs=0)
+    config2.checkpoint.output_dir = str(run2_dir)
+    config2.checkpoint.resume_from = str(epoch1_ckpt)
+
+    # If train loss was wrongly used, val_loss ~1.0 > 0.05 would not save best_model.pth.
+    # With correct inf initialization, the epoch 2 val_loss (~1.0) must be saved as best!
+    res2 = train(config2, lambda_reg=0.01, dataset_path=str(ds_path),
+                 trusted_historical_checkpoint_sha256=_checkpoint_shas(
+                     epoch1_ckpt, run1_dir / "best_model.pth"))
+    assert (run2_dir / "best_model.pth").exists()
+    assert res2["eval_provenance"] == "best"
+    assert res2["best_val_loss"] > 0.05  # Recorded genuine validation loss, not 0.05 train loss
+
+
+def test_nonnested_resume_and_best_reject_changed_bytes_at_same_path(tmp_path: Path) -> None:
+    """Checkpoint and companion best selection bind the actual nonnested source bytes."""
+    import hashlib
+    from scripts.train import train
+
+    ds_path = _make_synthetic_dataset(tmp_path)
+    cfg_a = _make_config(tmp_path, epochs=1, warmup_epochs=0)
+    cfg_a.training.checkpoint_interval = 1
+    train(cfg_a, dataset_path=str(ds_path))
+    run_a = Path(cfg_a.checkpoint.output_dir)
+    digest_a = hashlib.sha256(ds_path.read_bytes()).hexdigest()
+    source_b = torch.load(ds_path, weights_only=False)
+    source_b["Y_seqs"] = [y + 4.0 for y in source_b["Y_seqs"]]
+    source_b["mcmc_priors"] = np.roll(source_b["mcmc_priors"], 1, axis=1)
+    torch.save(source_b, ds_path)
+    digest_b = hashlib.sha256(ds_path.read_bytes()).hexdigest()
+    assert digest_a != digest_b
+    for source_name in ("epoch_1.pth", "best_model.pth"):
+        resume = _make_config(tmp_path, epochs=2, warmup_epochs=0)
+        resume.checkpoint.output_dir = str(tmp_path / f"blocked_{source_name}")
+        resume.checkpoint.resume_from = str(run_a / source_name)
+        with pytest.raises(ValueError, match="dataset_source_sha256 mismatch"):
+            train(resume, dataset_path=str(ds_path),
+                  trusted_historical_checkpoint_sha256=_checkpoint_shas(run_a / source_name))
+
+    cfg_b = _make_config(tmp_path, epochs=1, warmup_epochs=0)
+    cfg_b.training.checkpoint_interval = 1
+    cfg_b.checkpoint.output_dir = str(tmp_path / "run_b")
+    train(cfg_b, dataset_path=str(ds_path))
+    run_b = Path(cfg_b.checkpoint.output_dir)
+    assert torch.load(run_b / "epoch_1.pth", weights_only=False)["dataset_source_sha256"] == digest_b
+    # A same-path old best can have finite, plausible validation metadata.
+    # It still cannot rank against B's current checkpoints.
+    torch.save(torch.load(run_a / "best_model.pth", weights_only=False), run_b / "best_model.pth")
+    resume = _make_config(tmp_path, epochs=2, warmup_epochs=0)
+    resume.checkpoint.output_dir = str(tmp_path / "blocked_companion")
+    resume.checkpoint.resume_from = str(run_b / "epoch_1.pth")
+    with pytest.raises(ValueError, match="dataset_source_sha256 mismatch"):
+        train(resume, dataset_path=str(ds_path),
+              trusted_historical_checkpoint_sha256=_checkpoint_shas(
+                  run_b / "epoch_1.pth", run_b / "best_model.pth"))
+
+def test_legacy_digestless_resume_keeps_historical_source_unbound(tmp_path: Path) -> None:
+    """A real old checkpoint remains usable, with its unknown training source visible."""
+    import hashlib
+    from nsmor.analysis.prediction_units import load_model_from_checkpoint
+    from scripts.analyze_dynamics import load_dataset
+    from scripts.train import train
+
+    ds_path = _make_synthetic_dataset(tmp_path)
+    first = _make_config(tmp_path, epochs=1, warmup_epochs=0)
+    first.training.checkpoint_interval = 1
+    train(first, dataset_path=str(ds_path))
+    run_dir = Path(first.checkpoint.output_dir)
+    for name in ("epoch_1.pth", "best_model.pth"):
+        path = run_dir / name
+        old = torch.load(path, weights_only=False)
+        del old["dataset_source_sha256"]
+        torch.save(old, path)
+    resumed = _make_config(tmp_path, epochs=2, warmup_epochs=0)
+    resumed.training.checkpoint_interval = 1
+    resumed.checkpoint.output_dir = str(tmp_path / "resumed")
+    resumed.checkpoint.resume_from = str(run_dir / "epoch_1.pth")
+    train(resumed, dataset_path=str(ds_path),
+          trusted_historical_checkpoint_sha256=_checkpoint_shas(
+              run_dir / "epoch_1.pth", run_dir / "best_model.pth"))
+    final = Path(resumed.checkpoint.output_dir) / "final_model.pth"
+    saved = torch.load(final, weights_only=False)
+    assert saved["dataset_source_sha256"] == hashlib.sha256(ds_path.read_bytes()).hexdigest()
+    assert saved["dataset_source_binding"] == "legacy_resume_unbound"
+    metrics = json.loads((Path(resumed.checkpoint.output_dir) / "metrics.json").read_text())
+    assert metrics["dataset_source_binding"] == "legacy_resume_unbound"
+    model = load_model_from_checkpoint(final, torch.device("cpu"))
+    load_dataset(ds_path, max_seq_len=None, checkpoint_model=model,
+                 trusted_historical_checkpoint_sha256=_checkpoint_shas(final)[0])
+    assert model.analysis_dataset_binding == "legacy_resume_unbound"
+
+class _GeneratedArtifactReducer:
+    def __init__(self, marker: Path) -> None:
+        self.marker = str(marker)
+
+    def __reduce__(self):
+        return eval, (f"__import__('pathlib').Path({self.marker!r}).write_text('executed')",)
+
+
+def test_load_checkpoint_rejects_generated_reducer_without_side_effect(tmp_path: Path) -> None:
+    """A mutable generated checkpoint must never execute its pickle reducer."""
+    from nsmor.checkpoint import load_checkpoint
+
+    model = torch.nn.Linear(2, 1)
+    checkpoint = tmp_path / "malicious.pth"
+    marker = tmp_path / "reducer-executed"
+    torch.save({
+        "pipeline_semantics_version": PIPELINE_SEMANTICS_VERSION,
+        "model_state_dict": model.state_dict(),
+        "unexpected": _GeneratedArtifactReducer(marker),
+    }, checkpoint)
+    before = {key: value.clone() for key, value in model.state_dict().items()}
+    try:
+        with pytest.raises((ValueError, pickle.UnpicklingError)):
+            load_checkpoint(checkpoint, model, map_location="cpu")
+    finally:
+        assert not marker.exists(), "generated checkpoint executed its reducer"
+    for key, expected in before.items():
+        assert torch.equal(model.state_dict()[key], expected)
+
+
+def test_atomic_promotion_rejects_replaced_generated_checkpoint(tmp_path: Path, monkeypatch) -> None:
+    """A replaced temp checkpoint cannot execute or overwrite the prior target."""
+    from scripts.train import _atomic_save_checkpoint
+
+    model = torch.nn.Linear(2, 1)
+    optimizer = torch.optim.AdamW(model.parameters())
+    target = tmp_path / "checkpoint.pth"
+    torch.save({"previous": True}, target)
+    previous = target.read_bytes()
+    marker = tmp_path / "reducer-executed"
+    real_save = torch.save
+
+    def replace_after_save(state, destination, *args, **kwargs):
+        real_save(state, destination, *args, **kwargs)
+        if Path(destination) == target.with_suffix(".pth.tmp") and "unexpected" not in state:
+            real_save(dict(state, unexpected=_GeneratedArtifactReducer(marker)), destination)
+
+    monkeypatch.setattr(torch, "save", replace_after_save)
+    try:
+        with pytest.raises((ValueError, pickle.UnpicklingError)):
+            _atomic_save_checkpoint(
+                model=model, optimizer=optimizer, epoch=0, loss=1.0,
+                config={}, path=target, target_mean=0.0,
+            )
+    finally:
+        assert not marker.exists(), "atomic promotion executed a generated reducer"
+    assert target.read_bytes() == previous
+
+
+@pytest.mark.parametrize("artifact", ["resume", "companion_best", "destination_best"])
+def test_train_rejects_generated_checkpoint_reducers_before_resume(
+    tmp_path: Path, artifact: str,
+) -> None:
+    """Every resume/best peek rejects a mutable generated reducer before training."""
+    from nsmor.pipeline.nested_prior import compute_source_fingerprint
+    from scripts.train import build_model, train
+
+    dataset = _make_synthetic_dataset(tmp_path)
+    config = _make_config(tmp_path, epochs=2, warmup_epochs=0)
+    source = tmp_path / "source"
+    source.mkdir()
+    resume = source / "epoch_1.pth"
+    state = {
+        "pipeline_semantics_version": PIPELINE_SEMANTICS_VERSION,
+        "model_state_dict": build_model(config).state_dict(),
+        "config": config.to_dict(),
+        "epoch": 0, "loss": 1.0, "val_loss": 1.0, "best_val_loss": 1.0,
+        "dataset_path": str(dataset),
+        "dataset_source_sha256": compute_source_fingerprint(dataset),
+        "is_nested_cv": False,
+        "validation_scope": "diagnostic_global_oof",
+    }
+    torch.save(state, resume)
+    config.checkpoint.resume_from = str(resume)
+    marker = tmp_path / "reducer-executed"
+    if artifact == "resume":
+        attacked = resume
+    elif artifact == "companion_best":
+        attacked = source / "best_model.pth"
+    else:
+        output = Path(config.checkpoint.output_dir)
+        output.mkdir()
+        attacked = output / "best_model.pth"
+    torch.save(dict(state, unexpected=_GeneratedArtifactReducer(marker)), attacked)
+    captured = attacked.read_bytes()
+    try:
+        with pytest.raises((ValueError, pickle.UnpicklingError), match="global"):
+            train(config, dataset_path=str(dataset),
+                  trusted_historical_checkpoint_sha256=_checkpoint_shas(resume))
+    finally:
+        assert not marker.exists(), f"{artifact} executed its generated reducer"
+    assert attacked.read_bytes() == captured
+
+
+@pytest.mark.parametrize("artifact", ["resume", "companion_best", "destination_best"])
+def test_resume_uses_captured_checkpoint_after_same_path_swap(
+    tmp_path: Path, monkeypatch, artifact: str,
+) -> None:
+    """Lineage inspection, restored tensors and best promotion share captured bytes."""
+    import io
+    from nsmor.pipeline.nested_prior import compute_source_fingerprint, load_artifact_bytes
+    from scripts.train import build_model, train
+
+    dataset = _make_synthetic_dataset(tmp_path)
+    config = _make_config(tmp_path, epochs=2, warmup_epochs=0)
+    config.training.learning_rate = 0.0
+    source = tmp_path / "source"
+    source.mkdir()
+    resume = source / "epoch_1.pth"
+    companion = source / "best_model.pth"
+    expected = {key: value.clone() for key, value in build_model(config).state_dict().items()}
+    state = {
+        "pipeline_semantics_version": PIPELINE_SEMANTICS_VERSION,
+        "model_state_dict": expected, "config": config.to_dict(),
+        "epoch": 0, "loss": 0.0, "val_loss": 0.0, "best_val_loss": 0.0,
+        "dataset_path": str(dataset),
+        "dataset_source_sha256": compute_source_fingerprint(dataset),
+        "is_nested_cv": False,
+        "validation_scope": "diagnostic_global_oof",
+    }
+    torch.save(state, resume)
+    torch.save(state, companion)
+    config.checkpoint.resume_from = str(resume)
+    if artifact == "destination_best":
+        destination = Path(config.checkpoint.output_dir)
+        destination.mkdir()
+        attacked = destination / "best_model.pth"
+        torch.save(dict(state, fixture_role="destination"), attacked)
+    else:
+        attacked = resume if artifact == "resume" else companion
+    captured = attacked.read_bytes()
+    expected_best = captured if artifact == "destination_best" else companion.read_bytes()
+    replacement = dict(state, dataset_source_sha256="f" * 64,
+                       model_state_dict={key: value + 0.5 for key, value in expected.items()})
+    buffer = io.BytesIO()
+    torch.save(replacement, buffer)
+    replacement_bytes = buffer.getvalue()
+    trusted = _checkpoint_shas(resume, companion, *([attacked] if artifact == "destination_best" else []))
+    real_load = torch.load
+    swaps = []
+
+    def replace_after_decode(stream, *args, **kwargs):
+        loaded = real_load(stream, *args, **kwargs)
+        if isinstance(stream, io.BytesIO) and stream.getvalue() == captured and not swaps:
+            attacked.write_bytes(replacement_bytes)
+            swaps.append(True)
+        return loaded
+
+    monkeypatch.setattr(torch, "load", replace_after_decode)
+    if artifact == "destination_best":
+        with pytest.raises(ValueError, match="Destination best checkpoint.*changed"):
+            train(config, dataset_path=str(dataset),
+                  trusted_historical_checkpoint_sha256=trusted)
+        assert swaps == [True]
+        assert attacked.read_bytes() == replacement_bytes
+        assert not (attacked.parent / "final_model.pth").exists()
+        return
+    train(config, dataset_path=str(dataset),
+          trusted_historical_checkpoint_sha256=trusted)
+    assert swaps == [True]
+    output = Path(config.checkpoint.output_dir)
+    assert (output / "best_model.pth").read_bytes() == expected_best
+    final = load_artifact_bytes((output / "final_model.pth").read_bytes(), map_location="cpu")
+    assert final["dataset_source_sha256"] == state["dataset_source_sha256"]
+    for key, value in expected.items():
+        assert torch.equal(final["model_state_dict"][key], value), key
+
+
+def test_lazy_metadata_snapshot_ignores_generated_reducer_after_read(tmp_path: Path, monkeypatch) -> None:
+    """One captured metadata object supplies rows, conditions and lineage after a path swap."""
+    import io
+    from scripts.train import build_dataloaders
+
+    config = _make_config(tmp_path)
+    metadata = tmp_path / "metadata.pt"
+    state = {
+        "trial_specs": [{"session_id": f"recording{i}_session_1"} for i in range(5)],
+        "mcmc_priors": torch.full((5, 4), 0.25),
+        "stimulus_conditions": ["visual_only"] * 5,
+        "dt_ms": 4.006,
+        "pipeline_semantics_version": PIPELINE_SEMANTICS_VERSION,
+        "mcmc_prior_provenance": "oof_2fold_recording_prefix_grouped_cv",
+        "animal_identity_status": "unverified",
+    }
+    torch.save(state, metadata)
+    captured = metadata.read_bytes()
+    marker = tmp_path / "reducer-executed"
+    real_load = torch.load
+    replaced = []
+
+    def replace_after_initial_metadata_read(stream, *args, **kwargs):
+        loaded = real_load(stream, *args, **kwargs)
+        if isinstance(stream, io.BytesIO) and stream.getvalue() == captured and not replaced:
+            torch.save(dict(state, unexpected=_GeneratedArtifactReducer(marker)), metadata)
+            replaced.append(True)
+        return loaded
+
+    monkeypatch.setattr(torch, "load", replace_after_initial_metadata_read)
+    try:
+        train_loader, val_loader = build_dataloaders(
+            config, dataset_path=str(metadata), use_lazy_loading=True
+        )
+        assert train_loader.dataset.prior_lineage == (
+            "oof_2fold_recording_prefix_grouped_cv", "unverified"
+        )
+        assert train_loader.dataset.dataset.trial_specs == state["trial_specs"]
+        assert len(train_loader.dataset) + len(val_loader.dataset) == 5
+        assert replaced == [True]
+        from nsmor.pipeline.nested_prior import load_artifact_bytes
+        with pytest.raises((ValueError, pickle.UnpicklingError), match="global"):
+            load_artifact_bytes(metadata.read_bytes())
+    finally:
+        assert not marker.exists(), "replaced metadata executed its reducer"
+
+
+@pytest.mark.parametrize("dt_ms", [4.006, 10.0])
+@pytest.mark.parametrize("condition_key", ["is_pure_wind", "stimulus_conditions"])
+def test_lazy_metadata_fallback_preserves_conditions_and_physical_cadence(
+    tmp_path: Path, dt_ms: float, condition_key: str,
+) -> None:
+    from scripts.train import build_dataloaders
+
+    config = _make_config(tmp_path)
+    config.model.dt_ms = dt_ms
+    flags = np.asarray([True, False, True, False, True], dtype=bool)
+    metadata = tmp_path / "metadata.pt"
+    state = {
+        "trial_specs": [{"session_id": f"recording{i}_session_1"} for i in range(5)],
+        "mcmc_priors": torch.full((5, 4), 0.25),
+        "dt_ms": dt_ms,
+        "feature_config": FeatureConfig(),
+        "pipeline_semantics_version": PIPELINE_SEMANTICS_VERSION,
+        "mcmc_prior_provenance": "oof_2fold_recording_prefix_grouped_cv",
+        "animal_identity_status": "unverified",
+    }
+    state[condition_key] = (flags if condition_key == "is_pure_wind"
+                            else ["wind_only" if flag else "visual_only" for flag in flags])
+    torch.save(state, metadata)
+    loaders = build_dataloaders(config, dataset_path=str(metadata), use_lazy_loading=True)
+    for loader in loaders:
+        assert loader is not None
+        subset = loader.dataset
+        np.testing.assert_array_equal(subset.is_pure_wind, flags[subset.indices])
+        assert subset.dataset.dt_ms == dt_ms
+        assert config.model.dt_ms == dt_ms
+
+
+def test_checkpoint_safe_decode_preserves_config_dtypes_and_deterministic_state(tmp_path: Path) -> None:
+    """Restricted loading keeps allowed config objects, NumPy dtypes and resume state."""
+    from nsmor.checkpoint import load_checkpoint, save_checkpoint
+    from nsmor.config import TimeWindowConfig
+
+    model = torch.nn.Linear(2, 1).double()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.5)
+    inputs = torch.tensor([[1.0, 2.0]], dtype=torch.float64)
+    outputs = model(inputs)
+    assert outputs.shape == (1, 1)
+    outputs.square().sum().backward()
+    optimizer.step()
+    scheduler.step()
+    optimizer.zero_grad(set_to_none=True)
+    dtypes = {
+        "bool": [True, False], "int8": [-1, 2], "int16": [-1, 2],
+        "int32": [-1, 2], "int64": [-1, 2], "uint8": [1, 2],
+        "uint16": [1, 2], "uint32": [1, 2], "uint64": [1, 2],
+        "float16": [1.25, -2.5], "float32": [1.25, -2.5],
+        "float64": [1.25, -2.5], "complex64": [1+2j, 3-4j],
+        "complex128": [1+2j, 3-4j], "str": ["visual", "wind"],
+        "bytes": [b"visual", b"wind"], "object": ["wind", 4.006],
+    }
+    arrays = {name: np.asarray(values, dtype=name) for name, values in dtypes.items()}
+    config = {
+        "model": {"dt_ms": 4.006, "hidden_dim": 16},
+        "feature_config": FeatureConfig(),
+        "time_window_config": TimeWindowConfig(frame_interval_ms=4.006),
+        "arrays": arrays,
+    }
+    checkpoint = tmp_path / "checkpoint.pth"
+    save_checkpoint(model, optimizer, epoch=3, loss=1.25, config=config,
+                    path=checkpoint, scheduler=scheduler, train_loss=1.5, val_loss=1.25)
+    saved_model = {key: value.clone() for key, value in model.state_dict().items()}
+    saved_optimizer = optimizer.state_dict()
+    saved_scheduler = scheduler.state_dict()
+    saved_rng = torch.get_rng_state().clone()
+    torch.rand(7)
+    restored_model = torch.nn.Linear(2, 1).double()
+    restored_optimizer = torch.optim.AdamW(restored_model.parameters(), lr=0.9)
+    restored_scheduler = torch.optim.lr_scheduler.StepLR(restored_optimizer, step_size=7)
+    mapped = []
+
+    def map_to_cpu(storage, location):
+        mapped.append(location)
+        return storage.cpu()
+
+    loaded = load_checkpoint(checkpoint, restored_model, restored_optimizer,
+                             restored_scheduler, map_location=map_to_cpu)
+    assert mapped and set(mapped) == {"cpu"}
+    assert loaded["epoch"] == 3 and loaded["loss"] == 1.25
+    assert loaded["train_loss"] == 1.5 and loaded["val_loss"] == 1.25
+    assert loaded["config"]["model"] == {"dt_ms": 4.006, "hidden_dim": 16}
+    assert loaded["config"]["feature_config"] == FeatureConfig()
+    assert loaded["config"]["time_window_config"] == TimeWindowConfig(frame_interval_ms=4.006)
+    for name, expected in arrays.items():
+        actual = loaded["config"]["arrays"][name]
+        assert actual.shape == (2,) and actual.dtype == expected.dtype
+        np.testing.assert_array_equal(actual, expected)
+    for key, expected in saved_model.items():
+        assert restored_model.state_dict()[key].shape == expected.shape
+        assert restored_model.state_dict()[key].dtype == torch.float64
+        assert torch.equal(restored_model.state_dict()[key], expected)
+    actual_optimizer = restored_optimizer.state_dict()
+    assert actual_optimizer["param_groups"] == saved_optimizer["param_groups"]
+    for parameter, expected in saved_optimizer["state"].items():
+        for key, value in expected.items():
+            assert torch.equal(actual_optimizer["state"][parameter][key], value)
+    assert restored_scheduler.state_dict() == saved_scheduler
+    assert torch.equal(torch.get_rng_state(), saved_rng)
+
+
+@pytest.mark.parametrize("version", [None, "0.0"])
+def test_checkpoint_safe_decode_preserves_semantics_guard(tmp_path: Path, version: Optional[str]) -> None:
+    from nsmor.checkpoint import load_checkpoint
+
+    model = torch.nn.Linear(2, 1)
+    before = {key: value.clone() for key, value in model.state_dict().items()}
+    state = {"model_state_dict": {key: value + 1.0 for key, value in before.items()}}
+    if version is not None:
+        state["pipeline_semantics_version"] = version
+    checkpoint = tmp_path / "checkpoint.pth"
+    torch.save(state, checkpoint)
+    with pytest.raises(RuntimeError, match="semantics|pipeline_semantics_version"):
+        load_checkpoint(checkpoint, model, map_location=torch.device("cpu"))
+    for key, expected in before.items():
+        assert torch.equal(model.state_dict()[key], expected)

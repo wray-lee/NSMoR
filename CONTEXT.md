@@ -67,7 +67,7 @@ A 5-dimensional feature vector extracted 50 ms before a trial's anchor instant: 
 _Avoid_: feature vector, TTC snapshot
 
 **Cross-Fitted OOF Priors**:
-Out-of-fold MCMC prior probabilities generated via K-fold cross-fitting with animal-grouped stratification, ensuring each trial's prior is produced by a model that never saw that trial's label or any trial from the same animal.
+Out-of-fold MCMC prior probabilities generated via K-fold cross-fitting grouped by recording prefix (the `_session_N` suffix is stripped from session names). Each trial's prior excludes its own label and trials with the same prefix. Distinct prefixes do not establish distinct animals.
 _Avoid_: OOF, out-of-fold priors
 
 **Ensemble Priors**:
@@ -91,7 +91,7 @@ An experimental trial with no visual looming stimulus, receiving 1425 frames (5.
 _Avoid_: wind-only trial
 
 **Animal-Grouped Split**:
-Train/val partition that assigns entire animals to one side (stripping session suffixes), preventing information leakage from shared animal baseline and gain state.
+Train/val partition that keeps all sessions with the same recording prefix on one side (stripping `_session_N` suffixes). Animal identity across different prefixes is unverified, so this split does not establish animal-disjoint validation.
 _Avoid_: animal split, session split, grouped split
 
 ### Behavioral Classification

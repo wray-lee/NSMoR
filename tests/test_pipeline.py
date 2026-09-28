@@ -9,9 +9,12 @@ all tensor shapes and invariants.
 from __future__ import annotations
 
 import dataclasses
+import json
 import math
 import os
 import tempfile
+import weakref
+import zipfile
 from pathlib import Path
 
 import numpy as np
@@ -125,6 +128,12 @@ def _make_synthetic_csvs(
                 wind_state[stim_idx:] = 1.0
 
             l_v_ratio = visual_angle * 0.1
+            if not np.any(wind_state):
+                # One stimulus has one l/v; keep its collision inside this short fixture.
+                collision_ms = stimulus_onset + 20.0 / math.tan(math.radians(1.0))
+                remaining_ms = np.maximum(collision_ms - time_ms[stim_idx:], 0.0)
+                visual_angle[stim_idx:] = np.minimum(np.degrees(2.0 * np.arctan2(20.0, remaining_ms)), 179.0)
+                l_v_ratio = np.full(frames_per_trial, 20.0)
 
             for f in range(frames_per_trial):
                 kin_rows.append({
@@ -236,24 +245,11 @@ def _make_visual_only_csvs(
     n_trials: int = 3,
     dt_ms: float = 4.0,
     lv_ratio_ms: float = 120.0,
+    init_deg: float = 2.0,
+    looming_onset_ms: float = 0.0,
 ) -> tuple[Path, Path]:
-    """
-    Write synthetic CSVs for visual-only trials, reproducing the real corpus.
-
-    The defining property, measured on ``data/raw``: looming begins at the
-    ``TrialStart -> Looming`` transition, which is the same instant as
-    ``trial_start``, so ``stimulus_onset_ms`` is 0 and any negative offset
-    from it lands before the first frame.  Every visual-only trial in the
-    corpus was silently dropped for exactly this reason -- 36 of 396, all
-    of them No_Response, with zero visual-only trials surviving.
-
-    The looming trace peaks at the collision.  Measured: the visual angle
-    argmax sits at 6873.0 ms (median) against a geometric collision time
-    of 6874.8 ms for l/v = 120 ms and a 2 deg initial angle -- inside one
-    250 Hz frame.  So the peak locates the collision without assuming any
-    geometry constant.
-    """
-    t_col_ms = (lv_ratio_ms / 1000.0) / math.tan(math.radians(1.0)) * 1000.0
+    """Write visual-only CSVs from declared, trial-specific stimulus geometry."""
+    t_col_ms = looming_onset_ms + lv_ratio_ms / math.tan(math.radians(init_deg / 2.0))
     frames_per_trial = int((t_col_ms + 2500.0) / dt_ms)
 
     kin_rows: list[dict] = []
@@ -264,7 +260,8 @@ def _make_visual_only_csvs(
         # theta(t) = 2*atan(lv / (t_col - t)), clamped past collision.
         delta_s = np.clip((t_col_ms - time_ms) / 1000.0, 1e-6, None)
         visual_angle = np.degrees(2.0 * np.arctan((lv_ratio_ms / 1000.0) / delta_s))
-        visual_angle[time_ms > t_col_ms] = 0.0
+        visual_angle[time_ms < looming_onset_ms] = init_deg
+        visual_angle[time_ms > t_col_ms] = 179.0
 
         velocity = np.random.uniform(0.0, 0.15, size=frames_per_trial)
         acceleration = np.gradient(velocity, dt_ms / 1000.0)
@@ -284,13 +281,17 @@ def _make_visual_only_csvs(
                 "l_v_ratio": float(lv_ratio_ms),
             })
 
-        for event_type in ("trial_start", "stimulus_onset"):
+        for event_type, stamp, details in (
+            ("trial_start", 0.0, {"type": "baseline_visual", "lv_ratio_ms": lv_ratio_ms, "init_deg": init_deg}),
+            ("phase_transition", looming_onset_ms, {"from_phase": "TrialStart", "to_phase": "Looming"}),
+            ("stimulus_onset", looming_onset_ms, {"source": "kinematics_injected"}),
+        ):
             evt_rows.append({
                 "session_id": "visual_session",
                 "trial_id": t,
-                "time_ms": 0.0,             # <- looming starts at trial start
+                "time_ms": stamp,
                 "event_type": event_type,
-                "event_value": 1,
+                "event_value": json.dumps(details),
             })
 
     kin_path = tmp_dir / "kinematics_visual.csv"
@@ -303,6 +304,338 @@ def _make_visual_only_csvs(
 # ═══════════════════════════════════════════════════════════════
 # Tests
 # ═══════════════════════════════════════════════════════════════
+
+def test_session_streaming_matches_corpus_extraction(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Preserve trial fields, wind side, ordering and corpus-wide cadence statistics.
+
+    The spies also fail if the loader concatenates every pair or the extractor
+    sees the whole kinematics/events corpus for any one trial.
+    """
+    from scripts import prepare_data as prep
+    from nsmor.pipeline.io import EVENT_COLUMNS, KINEMATICS_COLUMNS
+
+    # Directory order and session-id order intentionally disagree. Frames and
+    # event rows are interleaved and unsorted, as in an imperfect export.
+    for dirname, sid in (("a_directory", "z_session"), ("z_directory", "a_session")):
+        directory = tmp_path / dirname
+        directory.mkdir()
+        kin_rows = []
+        for trial_id, frame, time_ms in (
+            (2, 1, 8.0), (1, 2, 12.0), (2, 0, 0.0),
+            (1, 0, 0.0), (2, 2, 4.0), (1, 1, 4.0),
+        ):
+            kin_rows.append((
+                sid, trial_id, time_ms, float(100 * trial_id + frame),
+                float(frame), 0.0, float(frame + trial_id), 0.0,
+                float(trial_id), float(trial_id == 2), 120.0,
+            ))
+        pd.DataFrame(kin_rows, columns=KINEMATICS_COLUMNS).to_csv(
+            directory / "kinematics.csv", index=False,
+        )
+        evt_rows = [
+            (sid, 2, 8.0, "stimulus_onset", "1"),
+            (sid, 2, 0.0, "trial_start", "{'screen_side': 'right'}"),
+            (sid, 2, 4.0, "wind_onset", "{'wind_side': 'left'}"),
+        ]
+        if sid == "a_session":
+            evt_rows += [
+                (sid, 1, 0.0, "trial_start", "{'wind_dir': 'right'}"),
+                (sid, 1, 4.0, "stimulus_onset", "1"),
+            ]
+        # z_session/1 intentionally has no events.
+        pd.DataFrame(evt_rows, columns=EVENT_COLUMNS).to_csv(
+            directory / "events.csv", index=False,
+        )
+
+    # A later CSV continues z_session/2 and disagrees about wind side.
+    continuation = tmp_path / "m_directory"
+    continuation.mkdir()
+    pd.DataFrame([
+        ("z_session", 2, 16.0, 203.0, 3.0, 0.0, 5.0, 0.0, 2.0, 1.0, 120.0),
+    ], columns=KINEMATICS_COLUMNS).to_csv(continuation / "kinematics.csv", index=False)
+    pd.DataFrame([
+        ("z_session", 2, 16.0, "wind_onset", "{'wind_side': 'right'}"),
+        ("z_session", 1, 0.0, "trial_start", "{'wind_dir': 'right'}"),
+    ], columns=EVENT_COLUMNS).to_csv(continuation / "events.csv", index=False)
+
+    # A numeric-only event file must keep the corpus-wide event_value dtype.
+    numeric = tmp_path / "n_directory"
+    numeric.mkdir()
+    pd.DataFrame([
+        ("b_session", 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 120.0),
+        ("b_session", 0, 4.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 120.0),
+    ], columns=KINEMATICS_COLUMNS).to_csv(numeric / "kinematics.csv", index=False)
+    pd.DataFrame([("b_session", 0, 0.0, "trial_start", 1)],
+                 columns=EVENT_COLUMNS).to_csv(numeric / "events.csv", index=False)
+
+    pairs = prep.pair_csv_files(tmp_path)
+    full = load_and_concat_sessions([p[0] for p in pairs], [p[1] for p in pairs])
+    expected = [
+        extract_trial_data(full, sid, tid)
+        for (sid, tid), _ in full["kinematics"].groupby(["session_id", "trial_id"])
+    ]
+    expected_diagnostics = prep.compute_sampling_diagnostics(full["kinematics"], 4.0)
+    max_trial_rows = max(len(v) for _, v in full["kinematics"].groupby(["session_id", "trial_id"]))
+    max_event_rows = max(len(v) for _, v in full["events"].groupby(["session_id", "trial_id"]))
+    original_loader = prep.load_and_concat_sessions
+    original_extractor = prep.extract_trial_data
+    seen = []
+
+    def bounded_loader(kin_paths, evt_paths):
+        assert len(kin_paths) == len(evt_paths) == 1
+        return original_loader(kin_paths, evt_paths)
+
+    def bounded_extractor(data, sid, tid):
+        assert len(data["kinematics"]) <= max_trial_rows
+        assert len(data["events"]) <= max_event_rows
+        assert set(zip(data["kinematics"]["session_id"], data["kinematics"]["trial_id"])) == {(sid, tid)}
+        assert set(zip(data["events"]["session_id"], data["events"]["trial_id"])) <= {(sid, tid)}
+        seen.append((sid, tid))
+        return original_extractor(data, sid, tid)
+
+    monkeypatch.setattr(prep, "load_and_concat_sessions", bounded_loader)
+    monkeypatch.setattr(prep, "extract_trial_data", bounded_extractor)
+    actual, diagnostics, n_kin, n_evt = prep._load_trials_and_diagnostics(pairs, 4.0)
+
+    assert n_kin == len(full["kinematics"])
+    assert n_evt == len(full["events"])
+    assert len(seen) >= len(expected)
+    assert len(expected) == len(actual) == 5
+    assert diagnostics == expected_diagnostics
+    assert [(t["session_id"], t["trial_id"]) for t in actual] == [
+        (t["session_id"], t["trial_id"]) for t in expected
+    ]
+    assert [t["wind_side_original"] for t in actual] == [
+        t["wind_side_original"] for t in expected
+    ] == ["right", "left", "unknown", "right", "unknown"]
+    for old, new in zip(expected, actual):
+        assert new.keys() == old.keys()
+        for key in old:
+            if isinstance(old[key], np.ndarray):
+                np.testing.assert_array_equal(new[key], old[key], err_msg=key)
+                assert new[key].dtype == old[key].dtype
+            else:
+                assert new[key] == old[key], key
+
+
+def _assert_sessionwise_csv_parity(tmp_path: Path, sessions: list[tuple[object, list[object]]]):
+    """Compare actual CSV loading with the original corpus extractor."""
+    from scripts import prepare_data as prep
+    from nsmor.pipeline.io import EVENT_COLUMNS, KINEMATICS_COLUMNS
+
+    pairs = []
+    for index, (sid, values) in enumerate(sessions):
+        directory = tmp_path / str(index)
+        directory.mkdir()
+        kin_path, evt_path = directory / "kinematics.csv", directory / "events.csv"
+        pd.DataFrame([
+            (sid, 1, float(time), float(index + time), 0.0, 0.0,
+             float(time), 0.0, 0.0, 0.0, 120.0)
+            for time in (0, 4)
+        ], columns=KINEMATICS_COLUMNS).to_csv(kin_path, index=False)
+        pd.DataFrame([
+            (sid, 1, float(i * 4), "photodiode_trigger", value)
+            for i, value in enumerate(values)
+        ], columns=EVENT_COLUMNS).to_csv(evt_path, index=False)
+        pairs.append((kin_path, evt_path))
+
+    full = load_and_concat_sessions([kin for kin, _ in pairs], [evt for _, evt in pairs])
+    expected = [
+        extract_trial_data(full, sid, tid)
+        for (sid, tid), _ in full["kinematics"].groupby(["session_id", "trial_id"])
+    ]
+    actual, diagnostics, n_kin, n_evt = prep._load_trials_and_diagnostics(pairs, 4.0)
+    assert (n_kin, n_evt) == (len(full["kinematics"]), len(full["events"]))
+    assert diagnostics == prep.compute_sampling_diagnostics(full["kinematics"], 4.0)
+    assert len(actual) == len(expected)
+    for old, new in zip(expected, actual):
+        assert old.keys() == new.keys()
+        for key in old:
+            if isinstance(old[key], np.ndarray):
+                np.testing.assert_array_equal(new[key], old[key], err_msg=key)
+                assert new[key].dtype == old[key].dtype, key
+            else:
+                assert new[key] == old[key], key
+                assert type(new[key]) is type(old[key]), key
+    return actual
+
+
+def test_sessionwise_csv_mixed_session_id_order(tmp_path: Path) -> None:
+    trials = _assert_sessionwise_csv_parity(
+        tmp_path, [("a_session", [1, 0]), (123, [1, 0])],
+    )
+    assert [(trial["session_id"], trial["trial_id"]) for trial in trials] == [
+        (123, 1), ("a_session", 1),
+    ]
+
+
+@pytest.mark.parametrize(
+    "values_per_session",
+    [
+        ([True, False], [1, 0]),
+        ([True, False], [1.5, 0.0]),
+        ([], [True, False]),
+        ([], [1, 0]),
+        ([None, None], [1, 0]),
+    ],
+    ids=["bool-int", "bool-float", "empty-bool", "empty-int", "all-missing-int"],
+)
+def test_sessionwise_csv_event_value_promotion(
+    tmp_path: Path, values_per_session: tuple[list[object], list[object]],
+) -> None:
+    _assert_sessionwise_csv_parity(
+        tmp_path,
+        [("a_session", values_per_session[0]), ("b_session", values_per_session[1])],
+    )
+
+
+
+def _split_pair(directory: Path, sid: str, tid: int, start: int, count: int,
+                dt_ms: float, *, repeated_start: bool = False) -> tuple[Path, Path]:
+    from nsmor.pipeline.io import EVENT_COLUMNS, KINEMATICS_COLUMNS
+
+    directory.mkdir(parents=True)
+    kin_path, evt_path = directory / "kinematics.csv", directory / "events.csv"
+    pd.DataFrame([
+        (sid, tid, frame * dt_ms, 0., 0., 0., 0.1, 0., 0., 0., 120.)
+        for frame in range(start, start + count)
+    ], columns=KINEMATICS_COLUMNS).to_csv(kin_path, index=False)
+    pd.DataFrame([
+        (sid, tid, 0., "trial_start", "{}")
+    ] if repeated_start else [], columns=EVENT_COLUMNS).to_csv(evt_path, index=False)
+    return kin_path, evt_path
+
+
+@pytest.mark.parametrize("dt_ms", [4., 10.])
+@pytest.mark.parametrize("offset_frames", [0., 0.5])
+@pytest.mark.parametrize("producer", ["metadata", "eager"])
+def test_overlapping_split_trial_rejected_before_production(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    dt_ms: float, offset_frames: float, producer: str,
+) -> None:
+    from scripts import prepare_data, prepare_metadata
+    import sys
+
+    sid, tid = "animalA_session_1", 11
+    raw = tmp_path / "raw"
+    first = _split_pair(raw / "a", sid, tid, 0, 300, dt_ms, repeated_start=True)
+    second = _split_pair(raw / "b", sid, tid, 0, 300, dt_ms)
+    if offset_frames:
+        frame = pd.read_csv(second[0])
+        frame["time_ms"] += offset_frames * dt_ms
+        frame.to_csv(second[0], index=False)
+    output = tmp_path / "produced.pt"
+    if producer == "metadata":
+        monkeypatch.setattr(sys, "argv", ["prepare_metadata.py", "--raw_dir", str(raw),
+                                          "--output", str(output)])
+        run = prepare_metadata.main
+    else:
+        run = lambda: prepare_data._load_trials_and_diagnostics([first, second], dt_ms)
+    with pytest.raises(ValueError, match=r"session=.*animalA_session_1.*trial=11.*(overlap|time_ms)"):
+        run()
+    assert not output.exists()
+
+
+def test_repeated_trial_start_and_duplicate_time_rejected(tmp_path: Path) -> None:
+    from nsmor.pipeline.io import EVENT_COLUMNS
+
+    sid, tid = "animalA_session_1", 11
+    first = _split_pair(tmp_path / "a", sid, tid, 0, 10, 4., repeated_start=True)
+    second = _split_pair(tmp_path / "b", sid, tid, 10, 10, 4., repeated_start=True)
+    data = load_and_concat_sessions([first[0], second[0]], [first[1], second[1]])
+    with pytest.raises(ValueError, match="trial_start"):
+        extract_trial_data(data, sid, tid)
+    pd.DataFrame(columns=EVENT_COLUMNS).to_csv(second[1], index=False)
+    frame = pd.read_csv(second[0])
+    frame.loc[1, "time_ms"] = frame.loc[0, "time_ms"]
+    frame.to_csv(second[0], index=False)
+    data = load_and_concat_sessions([first[0], second[0]], [first[1], second[1]])
+    with pytest.raises(ValueError, match="time_ms"):
+        extract_trial_data(data, sid, tid)
+
+
+@pytest.mark.parametrize("dt_ms", [4., 10.])
+def test_ordered_split_with_event_only_continuation(tmp_path: Path, dt_ms: float) -> None:
+    from nsmor.pipeline.io import EVENT_COLUMNS
+    from scripts import prepare_data
+
+    sid, tid = "animalA_session_1", 11
+    first = _split_pair(tmp_path / "a", sid, tid, 0, 300, dt_ms)
+    second = _split_pair(tmp_path / "b", sid, tid, 300, 100, dt_ms)
+    event_only = _split_pair(tmp_path / "c", "other_session", 12, 0, 2, dt_ms)
+    pd.DataFrame([(sid, tid, 0., "trial_start", "{}"),
+                  (sid, tid, 200 * dt_ms, "stimulus_onset", "")],
+                 columns=EVENT_COLUMNS).to_csv(event_only[1], index=False)
+    trials, _, _, _ = prepare_data._load_trials_and_diagnostics(
+        [first, second, event_only], dt_ms,
+    )
+    trial = next(t for t in trials if (t["session_id"], t["trial_id"]) == (sid, tid))
+    assert trial["time_ms"].shape == (400,)
+    np.testing.assert_array_equal(trial["time_ms"], np.arange(400) * dt_ms)
+    assert trial["event_types"].tolist() == ["trial_start", "stimulus_onset"]
+
+
+def test_disjoint_split_in_reverse_pair_order_rejected(tmp_path: Path) -> None:
+    sid, tid = "animalA_session_1", 11
+    later = _split_pair(tmp_path / "a", sid, tid, 10, 10, 4.)
+    earlier = _split_pair(tmp_path / "b", sid, tid, 0, 10, 4.)
+    data = load_and_concat_sessions(
+        [later[0], earlier[0]], [later[1], earlier[1]],
+    )
+    with pytest.raises(ValueError, match="unordered CSV pair time_ms ranges"):
+        extract_trial_data(data, sid, tid)
+
+
+def test_converter_refuses_overlapping_replayed_pair(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from scripts import prepare_metadata
+    from scripts.convert_metadata_to_etl import main as convert_main
+    from nsmor.pipeline.io import EVENT_COLUMNS, KINEMATICS_COLUMNS
+    import sys
+
+    raw = tmp_path / "raw"
+    sid, tid, other_sid = "animalA_session_1", 11, "animalB_session_1"
+    first = _split_pair(raw / "a", sid, tid, 0, 300, 4.)
+    second = _split_pair(raw / "b", sid, tid, 300, 100, 4.)
+    extra = pd.DataFrame([
+        (other_sid, 12, frame * 4., 0., 0., 0., 0.2, 0.,
+         10. if frame >= 200 else 0., int(frame >= 200), 120.)
+        for frame in range(300)
+    ], columns=KINEMATICS_COLUMNS)
+    pd.concat([pd.read_csv(second[0]), extra], ignore_index=True).to_csv(second[0], index=False)
+    pd.DataFrame([
+        (sid, tid, 0., "trial_start", "{}"),
+        (sid, tid, 800., "stimulus_onset", ""),
+    ], columns=EVENT_COLUMNS).to_csv(first[1], index=False)
+    pd.DataFrame([
+        (other_sid, 12, 0., "trial_start", "{}"),
+        (other_sid, 12, 800., "stimulus_onset", ""),
+    ], columns=EVENT_COLUMNS).to_csv(second[1], index=False)
+
+    metadata = tmp_path / "metadata.pt"
+    etl = tmp_path / "etl.pt"
+    monkeypatch.setattr(prepare_metadata, "resolve_group_folds", lambda *args, **kwargs: 2)
+    monkeypatch.setattr(prepare_metadata, "train_mcmc_cross_fitted",
+                        lambda *args, **kwargs: (np.full((2, 4), 0.25), [], []))
+    monkeypatch.setattr(sys, "argv", ["prepare_metadata.py", "--raw_dir", str(raw),
+                                      "--output", str(metadata)])
+    prepare_metadata.main()
+    assert metadata.exists()
+    frame = pd.read_csv(second[0])
+    frame.loc[frame["session_id"] == sid, "time_ms"] -= 1200.
+    frame.to_csv(second[0], index=False)
+    # Bind the changed synthetic bytes to isolate the temporal invariant from
+    # the independent raw-input digest gate.
+    from hashlib import sha256
+    saved = torch.load(metadata, weights_only=False)
+    for spec in saved["trial_specs"]:
+        for source in spec["source_pairs"]:
+            if Path(source["session_dir"]) / source["kinematics_file"] == second[0]:
+                source["kinematics_sha256"] = sha256(second[0].read_bytes()).hexdigest()
+    torch.save(saved, metadata)
+    with pytest.raises(ValueError, match="overlapping|time_ms"):
+        convert_main(["--input", str(metadata), "--output", str(etl)])
+    assert not etl.exists()
+
 
 class TestPipelineIO:
     """Tests for pipeline.io module."""
@@ -533,18 +866,15 @@ class TestSnapshotExtraction:
         """
         The visual-only anchor sits 50 ms before the looming collision.
 
-        The collision is located by the visual-angle peak, which measured
-        6873.0 ms (median) against a 6874.8 ms geometric collision time --
-        within one 250 Hz frame -- so no geometry constant is assumed.
-        The expected feature values are read straight off the trace here,
-        independently of how the extractor finds them.
+        The worked 120 ms / 2 degree stimulus collides at 6874.795 ms.
+        Expected feature values are sampled from that physical instant.
         """
         kin_path, evt_path = _make_visual_only_csvs(tmp_path, n_trials=1)
         data = load_and_concat_sessions([kin_path], [evt_path])
         trial = extract_trial_data(data, "visual_session", 0)
 
         time_ms = trial["time_ms"]
-        collision_ms = float(time_ms[int(np.argmax(trial["visual_angle"]))])
+        collision_ms = 6874.795395691131
         expected_idx = int(np.argmin(np.abs(time_ms - (collision_ms - 50.0))))
 
         snapshot = extract_mcmc_snapshot(trial, stimulus_onset_ms=0.0)
@@ -1297,6 +1627,11 @@ def test_label_audit_metadata_round_trips_through_artifact(
 
     assert dataset["labeling_funnel"] == expected_funnel
     assert dataset["labeling_funnel_retention"] == expected_retention
+    assert dataset["mcmc_priors"].shape == (25, 4)
+    assert dataset["mcmc_prior_provenance"] == "oof_5fold_recording_prefix_grouped_cv"
+    assert dataset["animal_identity_status"] == "unverified"
+    assert len(dataset["mcmc_fold_models"]) == 5
+    assert dataset["mcmc_prior_train_serve_consistency"]["n_trials"] == 25
     assert "n_retained_sequences" not in dataset["labeling_funnel"]
     assert dataset["labeling_threshold_sensitivity"] == expected_sensitivity
     assert (
@@ -1305,8 +1640,114 @@ def test_label_audit_metadata_round_trips_through_artifact(
     )
 
 
-def test_label_audit_retention_with_drops(tmp_path: Path) -> None:
-    """Retention arithmetic under actual snapshot and extraction drops."""
+def test_etl_releases_raw_trials_before_serialization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The save must not retain raw trials alongside all sequence arrays."""
+    from scripts import prepare_data as prep
+    from nsmor.pipeline.conditions import derive_anchor_frames
+
+    raw_dir = tmp_path / "raw"
+    _make_label_audit_csvs(raw_dir, n_sessions=5)
+    # The previous artifact stored float64 and the DataLoader cast on read.
+    # Compare every saved sequence with that original model-facing cast.
+    expected = {}
+    for trial in _extract_label_audit_trials(raw_dir):
+        x64, y64 = extract_trial_sequence(trial, dt_ms=4.0)
+        expected[(trial["session_id"], trial["trial_id"])] = (
+            x64.copy(), y64.copy(), derive_anchor_frames([x64])[0],
+        )
+    raw_refs: list[weakref.ReferenceType[np.ndarray]] = []
+    original_loader = prep._load_trials_and_diagnostics
+    original_save = prep.torch.save
+    save_calls = 0
+
+    def record_raw_arrays(*args, **kwargs):
+        result = original_loader(*args, **kwargs)
+        raw_refs.extend(weakref.ref(trial["time_ms"]) for trial in result[0])
+        return result
+
+    def check_save(dataset, path, **kwargs):
+        nonlocal save_calls
+        save_calls += 1
+        assert len(raw_refs) == 25
+        assert all(ref() is None for ref in raw_refs), (
+            "Raw trial arrays remained live when serializing X_seqs/Y_seqs"
+        )
+        assert len(dataset["X_seqs"]) == len(dataset["Y_seqs"]) == 25
+        return original_save(dataset, path, **kwargs)
+
+    monkeypatch.setattr(prep, "_load_trials_and_diagnostics", record_raw_arrays)
+    monkeypatch.setattr(prep.torch, "save", check_save)
+    output = tmp_path / "dataset.pt"
+    prep.prepare_dataset(raw_dir=raw_dir, output_path=output, random_seed=42)
+
+    assert save_calls == 1
+    dataset = torch.load(output, weights_only=False)
+    assert len(dataset["X_seqs"]) == 25
+    assert dataset["labeling_funnel_retention"]["n_retained_sequences"] == 25
+    assert zipfile.is_zipfile(output)
+    assert len(dataset["anchor_frames"]) == 25
+    assert all(isinstance(x, np.ndarray) and x.dtype == np.float32
+               for x in dataset["X_seqs"])
+    assert all(isinstance(y, np.ndarray) and y.dtype == np.float32
+               for y in dataset["Y_seqs"])
+    old_sequences = []
+    new_sequences = []
+    for sid, tid, x, y, anchor, label in zip(
+        dataset["session_ids"], dataset["trial_ids"], dataset["X_seqs"],
+        dataset["Y_seqs"], dataset["anchor_frames"], dataset["labels"],
+    ):
+        expected_x, expected_y, expected_anchor = expected[(str(sid), int(tid))]
+        np.testing.assert_array_equal(
+            x, torch.as_tensor(expected_x, dtype=torch.float32).numpy(),
+        )
+        np.testing.assert_array_equal(
+            y, torch.as_tensor(expected_y, dtype=torch.float32).numpy(),
+        )
+        assert anchor == expected_anchor
+        old_sequences.append((expected_x, expected_y, int(label)))
+        new_sequences.append((x, y, int(label)))
+
+    # Exercise the actual DataLoader conversion and prior filling on both
+    # representations, comparing every trial at the model-facing boundary.
+    from nsmor.nsmor_dataloader import NSMoRDataset
+    old_loader = NSMoRDataset(old_sequences, dataset["mcmc_priors"], max_seq_len=None)
+    new_loader = NSMoRDataset(new_sequences, dataset["mcmc_priors"], max_seq_len=None)
+    for i in range(25):
+        old_x, old_y = old_loader[i]
+        new_x, new_y = new_loader[i]
+        torch.testing.assert_close(new_x, old_x, rtol=0, atol=0)
+        torch.testing.assert_close(new_y, old_y, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("channel", ["X", "Y"])
+def test_etl_rejects_float32_overflow_before_save(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, channel: str,
+) -> None:
+    from scripts import prepare_data as prep
+
+    raw_dir = tmp_path / "raw"
+    _make_label_audit_csvs(raw_dir, n_sessions=5)
+    original_extract = prep.extract_trial_sequence
+
+    def overflow_sequence(*args, **kwargs):
+        x, y = original_extract(*args, **kwargs)
+        if channel == "X":
+            x[0, 2] = 1e40
+        else:
+            y[0] = 1e40
+        return x, y
+
+    monkeypatch.setattr(prep, "extract_trial_sequence", overflow_sequence)
+    output = tmp_path / "overflow.pt"
+    with pytest.raises(AssertionError, match=f"non-finite {channel}"):
+        prep.prepare_dataset(raw_dir=raw_dir, output_path=output, random_seed=42)
+    assert not output.exists()
+
+
+def test_production_rejects_unanchorable_before_save(tmp_path: Path) -> None:
+    """An unanchorable trial fails with identity, before a dataset can be saved."""
     from scripts.prepare_data import prepare_dataset
 
     raw_dir = tmp_path / "raw_with_drops"
@@ -1356,26 +1797,9 @@ def test_label_audit_retention_with_drops(tmp_path: Path) -> None:
     combined_evt.to_csv(session_dir / "events.csv", index=False)
 
     output = tmp_path / "dataset_drops.pt"
-    prepare_dataset(raw_dir=raw_dir, output_path=output, random_seed=42)
-
-    dataset = torch.load(output, weights_only=False)
-    retention = dataset["labeling_funnel_retention"]
-
-    # The short trial should have been dropped
-    assert retention["n_dropped_before_snapshot"] > 0 or \
-           retention["n_dropped_during_sequence_extraction"] > 0, (
-        "Expected at least one trial to be dropped, but all were retained"
-    )
-
-    # Verify arithmetic holds
-    prefilter = retention["n_prefilter_labeled_trials"]
-    retained = retention["n_retained_sequences"]
-    drop_snapshot = retention["n_dropped_before_snapshot"]
-    drop_extraction = retention["n_dropped_during_sequence_extraction"]
-
-    assert prefilter - drop_snapshot - drop_extraction == retained, (
-        f"Retention arithmetic failed: {prefilter} - {drop_snapshot} - {drop_extraction} != {retained}"
-    )
+    with pytest.raises(ValueError, match=r"drop_session.*999.*could not be anchored"):
+        prepare_dataset(raw_dir=raw_dir, output_path=output, random_seed=42)
+    assert not output.exists()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1441,3 +1865,162 @@ class TestCLIOverrides:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+def test_float32_noninteger_lv_snapshot_and_bad_geometry(tmp_path: Path) -> None:
+    kin_path, evt_path = _make_visual_only_csvs(tmp_path, n_trials=1, lv_ratio_ms=120.1)
+    kin = pd.read_csv(kin_path)
+    stored_lv = float(np.float32(120.1))
+    kin["l_v_ratio"] = stored_lv
+    kin.to_csv(kin_path, index=False)
+    session = load_and_concat_sessions([kin_path], [evt_path])
+    trial = extract_trial_data(session, "visual_session", 0)
+    assert trial["l_v_ratio"][0] == stored_lv != 120.1
+
+    snapshot = extract_mcmc_snapshot(trial, stimulus_onset_ms=0.0)
+    collision = 120.1 / math.tan(math.radians(1.0))
+    idx = int(np.argmin(np.abs(trial["time_ms"] - (collision - 50.0))))
+    assert snapshot.shape == (5,)
+    assert snapshot[0] == pytest.approx(trial["visual_angle"][idx])
+    snapshots, _ = build_snapshot_dataset(assign_ground_truth_labels([trial]))
+    np.testing.assert_array_equal(snapshots[0], snapshot)
+
+    for bad_lv in (121.0, 0.0, -1.0, float("nan"), float("inf")):
+        bad_trial = {**trial, "l_v_ratio": np.full_like(trial["l_v_ratio"], bad_lv)}
+        with pytest.raises(ValueError, match="finite|l/v trace disagrees|positive"):
+            extract_mcmc_snapshot(bad_trial, stimulus_onset_ms=0.0)
+
+
+@pytest.mark.parametrize("producer", ["data", "metadata"])
+def test_float32_noninteger_lv_survives_both_producers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, producer: str,
+) -> None:
+    from scripts import prepare_data, prepare_metadata
+    import sys
+
+    raw_dir = tmp_path / "raw"
+    _make_label_audit_csvs(raw_dir, n_sessions=5)
+    session_id = "0.500cricket_001_20260101_000000_session_1"
+    session_dir = raw_dir / session_id
+    visual_kin, visual_evt = _make_visual_only_csvs(
+        tmp_path, n_trials=1, dt_ms=10.0, lv_ratio_ms=120.1,
+    )
+    kin = pd.read_csv(visual_kin)
+    kin["session_id"] = session_id
+    kin["trial_id"] = 5
+    kin["l_v_ratio"] = float(np.float32(120.1))
+    evt = pd.read_csv(visual_evt)
+    evt["session_id"] = session_id
+    evt["trial_id"] = 5
+    kin_path = session_dir / "kinematics.csv"
+    evt_path = session_dir / "events.csv"
+    pd.concat([pd.read_csv(kin_path), kin], ignore_index=True).to_csv(kin_path, index=False)
+    pd.concat([pd.read_csv(evt_path), evt], ignore_index=True).to_csv(evt_path, index=False)
+
+    def run(output: Path) -> None:
+        if producer == "data":
+            prepare_data.prepare_dataset(raw_dir, output, random_seed=42)
+        else:
+            monkeypatch.setattr(sys, "argv", [
+                "prepare_metadata.py", "--raw_dir", str(raw_dir), "--output", str(output),
+            ])
+            prepare_metadata.main()
+
+    output = tmp_path / f"{producer}.pt"
+    run(output)
+    saved = torch.load(output, weights_only=False)
+    assert (session_id, 5) in list(zip(saved["session_ids"], saved["trial_ids"]))
+    if producer == "metadata":
+        assert saved["snapshot_anchor_rules"].count("looming_collision") == 1
+    else:
+        assert saved["labeling_funnel_retention"]["snapshot_anchor_rules"]["looming_collision"] == 1
+
+    # A 0.9 ms trace conflict is far beyond float32 storage rounding.
+    all_kin = pd.read_csv(kin_path)
+    all_kin.loc[all_kin["trial_id"] == 5, "l_v_ratio"] = 121.0
+    all_kin.to_csv(kin_path, index=False)
+    rejected = tmp_path / f"{producer}_conflict.pt"
+    with pytest.raises(ValueError, match=r"session=.*trial=5.*l/v trace disagrees"):
+        run(rejected)
+    assert not rejected.exists()
+
+
+@pytest.mark.parametrize("producer", ["data", "metadata"])
+def test_production_extraction_error_aborts_without_artifact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, producer: str,
+) -> None:
+    from scripts import prepare_data, prepare_metadata
+    import sys
+
+    raw_dir = tmp_path / "raw"
+    _make_label_audit_csvs(raw_dir, n_sessions=5)
+    session_id = "0.500cricket_001_20260101_000000_session_1"
+    module = prepare_data if producer == "data" else prepare_metadata
+    original = module.extract_trial_data
+
+    def corrupt_trial(session_data, sid, tid):
+        if sid == session_id and tid == 4:
+            raise ValueError("corrupt kinematics")
+        return original(session_data, sid, tid)
+
+    monkeypatch.setattr(module, "extract_trial_data", corrupt_trial)
+    output = tmp_path / f"{producer}.pt"
+    if producer == "data":
+        run = lambda: prepare_data.prepare_dataset(raw_dir, output)
+    else:
+        monkeypatch.setattr(sys, "argv", [
+            "prepare_metadata.py", "--raw_dir", str(raw_dir), "--output", str(output),
+        ])
+        run = prepare_metadata.main
+
+    with pytest.raises(ValueError, match=rf"{session_id}.*4.*corrupt kinematics"):
+        run()
+    assert not output.exists()
+
+
+def test_production_sequence_error_preserves_prior_cohort(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scripts import prepare_data as prep
+
+    raw_dir = tmp_path / "raw"
+    _make_label_audit_csvs(raw_dir, n_sessions=2)
+    session_id = "0.500cricket_001_20260101_000000_session_1"
+    original = prep.extract_trial_sequence
+
+    def corrupt_sequence(trial_data, *args, **kwargs):
+        if trial_data["session_id"] == session_id and trial_data["trial_id"] == 4:
+            raise ValueError("corrupt sequence")
+        return original(trial_data, *args, **kwargs)
+
+    monkeypatch.setattr(prep, "extract_trial_sequence", corrupt_sequence)
+    output = tmp_path / "dataset.pt"
+    with pytest.raises(ValueError, match=rf"{session_id}.*4.*corrupt sequence"):
+        prep.prepare_dataset(raw_dir, output)
+    assert not output.exists()
+
+
+def test_metadata_valid_trials_keep_prior_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scripts import prepare_metadata
+    import sys
+
+    raw_dir = tmp_path / "raw"
+    _make_label_audit_csvs(raw_dir, n_sessions=2)
+    output = tmp_path / "metadata.pt"
+    monkeypatch.setattr(sys, "argv", [
+        "prepare_metadata.py", "--raw_dir", str(raw_dir), "--output", str(output),
+    ])
+    prepare_metadata.main()
+    metadata = torch.load(output, weights_only=False)
+
+    expected = [(directory.name, trial_id)
+                for directory in sorted(raw_dir.iterdir()) for trial_id in range(5)]
+    assert metadata["n_trials"] == 10
+    assert list(zip(metadata["session_ids"], metadata["trial_ids"])) == expected
+    assert metadata["mcmc_priors"].shape == (10, 4)
+    assert torch.isfinite(metadata["mcmc_priors"]).all()
+    torch.testing.assert_close(metadata["mcmc_priors"].sum(dim=1), torch.ones(10))
+    assert metadata["mcmc_prior_provenance"] == "oof_2fold_recording_prefix_grouped_cv"
+    assert metadata["animal_identity_status"] == "unverified"
+    assert len(metadata["snapshot_anchor_rules"]) == 10

@@ -11,9 +11,9 @@ Usage
 -----
 CLI::
 
-    python scripts/train.py --config config/default.yaml
-    python scripts/train.py --config config/default.yaml --lr 5e-4 --epochs 200
-    python scripts/train.py --config config/default.yaml --batch_size 64 --lambda_reg 0.05
+    python scripts/train.py --config config/default.yaml --nested_prior_artifact nested.pt
+    python scripts/train.py --config config/default.yaml --lr 5e-4 --epochs 200 --nested_prior_artifact nested.pt
+    python scripts/train.py --config config/default.yaml --diagnostic_only
 
 Programmatic::
 
@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import hashlib
 import json
 import logging
 import os
@@ -33,6 +34,13 @@ import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+# Prefer the checkout's own ``nsmor`` package over any editable install that
+# points at a different worktree/main checkout.  Running ``scripts/train.py``
+# directly puts ``scripts/`` on ``sys.path[0]``, not the repo root, so without
+# this the import would resolve to the installed ``nsmor`` and miss modules
+# that exist only in this checkout (same pattern as the other scripts).
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import math
 from contextlib import nullcontext
@@ -52,9 +60,18 @@ from nsmor.config import DEFAULT_FEATURE
 from nsmor.config_parser import ExperimentConfig
 from nsmor.dataloader_factory import create_dataloaders_from_config
 from nsmor.loss import BioJointLoss, BioDecisionLoss, FrontendLoss
+from nsmor.model_utils import (
+    require_trusted_historical_checkpoint_sha256, resolve_dataset_session_ids,
+)
 from nsmor.model_nsmor_core import NSMoRCore
 from nsmor.pipeline.conditions import derive_stimulus_metadata
-from nsmor.pipeline.grouping import grouped_train_val_split
+from nsmor.pipeline.grouping import grouped_train_val_split, prior_identity_status
+from nsmor.pipeline.nested_prior import (
+    compute_source_fingerprint,
+    load_artifact_bytes,
+    load_dataset_with_fingerprint,
+    load_nested_prior_split,
+)
 
 
 # ── Deployment provenance keys ────────────────────────────────
@@ -63,13 +80,32 @@ from nsmor.pipeline.grouping import grouped_train_val_split
 # save_checkpoint signature.  The wrapper pops them before
 # forwarding kwargs, then patches them into the saved state
 # dict on disk before the atomic rename.
+#
+# nested_prior_artifact / nested_prior_fingerprint / is_nested_cv are
+# mandatory when the opt-in nested seam is used: a checkpoint that does
+# not record which nested artifact produced its split/priors cannot be
+# audited later, and a downstream consumer cannot refuse a mismatched
+# resumption.  mcmc_prior_provenance is the human-readable lineage
+# string (legacy OOF or nested).
 _PROVENANCE_KEYS = frozenset({
     "target_mean",
     "target_std",
     "target_clip_cm_s",
     "training_phase",
     "dataset_path",
+    "dataset_source_sha256",
+    "dataset_source_binding",
     "mcmc_prior_train_serve_consistency",
+    "nested_prior_artifact",
+    "nested_prior_artifact_sha256",
+    "nested_prior_fingerprint",
+    "nested_split_seed",
+    "nested_val_split",
+    "is_nested_cv",
+    "validation_scope",
+    "mcmc_prior_provenance",
+    "animal_identity_status",
+    "best_val_loss",
 })
 
 
@@ -109,7 +145,7 @@ def _atomic_save_checkpoint(**kwargs) -> Path:
 
     # Patch provenance fields into the saved state dict on disk.
     if provenance:
-        state = torch.load(tmp, map_location="cpu", weights_only=False)
+        state = load_artifact_bytes(tmp.read_bytes(), map_location="cpu")
         state.update(provenance)
         torch.save(state, tmp)
 
@@ -128,6 +164,182 @@ def _atomic_save_checkpoint(**kwargs) -> Path:
     os.replace(tmp, target)
     return target
 
+
+def _check_checkpoint_prior_lineage(ckpt: Dict[str, Any], expected: Dict[str, Any], path: Path, *,
+                                    trusted_historical_checkpoint_sha256=None,
+                                    checkpoint_sha256=None) -> None:
+    """Refuse a changed prior source or animal-identity claim on resume/best selection."""
+    status = expected["animal_identity_status"]
+    recorded_status = ckpt.get("animal_identity_status", "historical_unknown")
+    if recorded_status != status:
+        raise ValueError(f"Checkpoint at {path} animal_identity_status mismatch; fail closed")
+    if status == "historical_unknown" and not expected.get("is_nested_cv", False):
+        require_trusted_historical_checkpoint_sha256(
+            checkpoint_sha256, trusted_historical_checkpoint_sha256,
+        )
+    if status == "unverified":
+        expected_digest = expected.get("dataset_source_sha256")
+        if expected_digest is None or ckpt.get("dataset_source_sha256") != expected_digest:
+            raise ValueError(f"modern checkpoint at {path} requires matching dataset_source_sha256; fail closed")
+        if ckpt.get("dataset_source_binding", "sha256_bound") != "sha256_bound":
+            raise ValueError(f"modern checkpoint at {path} requires sha256_bound dataset_source_binding; fail closed")
+    expected_scope = expected.get("validation_scope")
+    if expected_scope is not None and ckpt.get("validation_scope") != expected_scope:
+        if not (status == "historical_unknown" and not expected.get("is_nested_cv", False)
+                and ckpt.get("validation_scope") is None):
+            raise ValueError(f"Checkpoint at {path} validation_scope mismatch; fail closed")
+    recorded_tag = ckpt.get("mcmc_prior_provenance")
+    if recorded_tag != expected["mcmc_prior_provenance"]:
+        from nsmor.pipeline.grouping import prior_identity_status
+        legacy_alias = (
+            status == "historical_unknown"
+            and ckpt.get("is_nested_cv", False) is False
+            and expected.get("is_nested_cv", False) is False
+            and recorded_tag in (None, "global_oof_animal_grouped_cv")
+            and (expected["mcmc_prior_provenance"] == "global_oof_animal_grouped_cv"
+                 or prior_identity_status(expected["mcmc_prior_provenance"]) == "historical_unknown")
+        )
+        if not legacy_alias:
+            raise ValueError(f"Checkpoint at {path} mcmc_prior_provenance mismatch; fail closed")
+
+
+def _validate_best_checkpoint(
+    ckpt: Dict[str, Any],
+    path: Path,
+    expected_lineage: Dict[str, Any],
+    *,
+    trusted_historical_checkpoint_sha256=None,
+    checkpoint_sha256=None,
+) -> float:
+    """Validate that candidate checkpoint is a certified best model matching active lineage.
+
+    Enforces:
+    1. Lineage consistency (is_nested_cv, artifact/content SHA-256, source fingerprint, split_seed, val_split).
+    2. Finite OWN validation metric (ckpt['val_loss']).
+    3. Scalar-weight coupling: ckpt['best_val_loss'] must equal ckpt['val_loss'] (or be absent).
+       A historical scalar cannot be attached to different candidate tensors.
+
+    Returns:
+        Certified validation loss float.
+
+    Raises:
+        ValueError: If checkpoint fails lineage, finite metric, or scalar-weight coupling checks.
+    """
+    ckpt_is_nested = ckpt.get("is_nested_cv", False)
+    exp_is_nested = expected_lineage.get("is_nested_cv", False)
+    if ckpt_is_nested != exp_is_nested:
+        raise ValueError(
+            f"Checkpoint at {path} has mismatched is_nested_cv "
+            f"({ckpt_is_nested} vs {exp_is_nested}); fail closed."
+        )
+    _check_checkpoint_prior_lineage(
+        ckpt, expected_lineage, path,
+        trusted_historical_checkpoint_sha256=trusted_historical_checkpoint_sha256,
+        checkpoint_sha256=checkpoint_sha256,
+    )
+    if exp_is_nested:
+        for mkey in (
+            "nested_prior_fingerprint",
+            "nested_prior_artifact_sha256",
+            "nested_split_seed",
+            "nested_val_split",
+            "nested_prior_artifact",
+        ):
+            c_val = ckpt.get(mkey)
+            e_val = expected_lineage.get(mkey)
+            if c_val is None:
+                raise ValueError(
+                    f"Checkpoint at {path} is missing mandatory nested provenance key {mkey!r}; fail closed."
+                )
+            if mkey == "nested_prior_artifact":
+                if Path(c_val).resolve() != Path(e_val).resolve():
+                    raise ValueError(
+                        f"Checkpoint at {path} has mismatched nested prior artifact "
+                        f"({c_val!r} vs {e_val!r}); fail closed."
+                    )
+            elif mkey == "nested_val_split":
+                try:
+                    c_f = float(c_val)
+                    e_f = float(e_val)
+                except (ValueError, TypeError):
+                    raise ValueError(
+                        f"Checkpoint at {path} has non-numeric nested val_split ({c_val!r}); fail closed."
+                    )
+                if not math.isfinite(c_f) or not math.isfinite(e_f) or abs(c_f - e_f) > 1e-6:
+                    raise ValueError(
+                        f"Checkpoint at {path} has mismatched or non-finite nested val_split "
+                        f"({c_val} vs {e_val}); fail closed."
+                    )
+            elif mkey == "nested_split_seed":
+                if isinstance(c_val, float) and not c_val.is_integer():
+                    raise ValueError(
+                        f"Checkpoint at {path} has fractional nested split_seed ({c_val!r}); fail closed."
+                    )
+                try:
+                    c_int = int(c_val)
+                    e_int = int(e_val)
+                except (ValueError, TypeError):
+                    raise ValueError(
+                        f"Checkpoint at {path} has non-integer nested split_seed ({c_val!r}); fail closed."
+                    )
+                if float(c_val) != float(c_int) or c_int != e_int:
+                    raise ValueError(
+                        f"Checkpoint at {path} has mismatched nested split_seed "
+                        f"({c_val} vs {e_val}); fail closed."
+                    )
+            else:
+                if str(c_val) != str(e_val):
+                    raise ValueError(
+                        f"Checkpoint at {path} has mismatched lineage key {mkey} "
+                        f"({c_val!r} vs {e_val!r}); fail closed."
+                    )
+    else:
+        expected_digest = expected_lineage.get("dataset_source_sha256")
+        if "dataset_source_sha256" in ckpt:
+            if ckpt["dataset_source_sha256"] != expected_digest:
+                raise ValueError(f"Checkpoint at {path} dataset_source_sha256 mismatch; fail closed.")
+        elif expected_lineage.get("dataset_source_binding") not in ("legacy_resume_unbound", "unbound_lazy"):
+            raise ValueError(f"Checkpoint at {path} missing dataset_source_sha256; fail closed.")
+        else:
+            logger.warning("Best checkpoint %s has unbound dataset content", path)
+        candidate_binding = ckpt.get(
+            "dataset_source_binding",
+            "sha256_bound" if "dataset_source_sha256" in ckpt else "legacy_resume_unbound",
+        )
+        if candidate_binding != expected_lineage.get("dataset_source_binding", "sha256_bound"):
+            raise ValueError(f"Checkpoint at {path} dataset_source_binding mismatch; fail closed.")
+        exp_ds = expected_lineage.get("dataset_path")
+        c_ds = ckpt.get("dataset_path")
+        if exp_ds is not None and c_ds is not None:
+            if Path(c_ds).resolve() != Path(exp_ds).resolve():
+                raise ValueError(
+                    f"Checkpoint at {path} has mismatched dataset_path "
+                    f"({c_ds!r} vs {exp_ds!r}); fail closed."
+                )
+
+    own_val = ckpt.get("val_loss")
+    if own_val is None or not math.isfinite(float(own_val)):
+        raise ValueError(
+            f"Checkpoint at {path} lacks finite OWN validation loss metric (val_loss={own_val}); fail closed."
+        )
+    own_val_f = float(own_val)
+
+    reported_best = ckpt.get("best_val_loss")
+    if reported_best is not None:
+        if not math.isfinite(float(reported_best)):
+            raise ValueError(
+                f"Checkpoint at {path} has non-finite best_val_loss={reported_best}; fail closed."
+            )
+        reported_best_f = float(reported_best)
+        if abs(own_val_f - reported_best_f) > 1e-5:
+            raise ValueError(
+                f"Checkpoint at {path} is not a certified best model: OWN val_loss "
+                f"({own_val_f:.6f}) differs from best_val_loss ({reported_best_f:.6f}); "
+                "filename or scalar cannot certify non-best weights (fail closed)."
+            )
+
+    return own_val_f
+
 # ── Logging setup ──────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
@@ -140,15 +352,11 @@ logger = logging.getLogger(__name__)
 # --sweep_escape_band and consumed by train().  ``None`` disables (default).
 _SWEEP_BANDS: Optional[List[float]] = None
 
-# Single source of truth for the train/val split fraction, threaded to BOTH
-# build_dataloaders and compute_target_stats — otherwise a non-default split
-# silently desynchronises the normalization statistics from the training set
-# (validation leakage into target mean/std).
+# Default split for the loader and public standalone target-stat helper.
+# train() fits eager statistics directly from its selected loader dataset.
 _VAL_SPLIT = 0.2
 
-# Default dataset for build_dataloaders and compute_target_stats.  Both
-# call sites receive the same resolved path, which ``--dataset`` overrides
-# so a run trains on the dataset its own ETL stage produced.
+# Default dataset path, overridden by ``--dataset`` for the current ETL output.
 _DATASET_PATH = "data/processed/nsmor_dataset.pt"
 
 
@@ -188,6 +396,31 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Use ELT mode with lazy loading (requires metadata file from prepare_metadata.py). "
              "Dramatically reduces memory usage for large datasets.",
+    )
+    parser.add_argument(
+        "--nested_prior_artifact",
+        type=str,
+        default=None,
+        help="Optional nested-prior artifact (.pt) from evaluate_nested_prior.py. "
+             "When set, train/val indices and MCMC priors come EXACTLY from the "
+             "artifact (fail-closed on fingerprint/split mismatch) instead of "
+             "recomputing a recording-prefix grouped split over global OOF priors.",
+    )
+
+    parser.add_argument(
+        "--trusted_historical_checkpoint_sha256", action="append", default=None,
+        help="Independent SHA-256 pin for each historical checkpoint used for resume/best selection; repeat for a separate best file.",
+    )
+    parser.add_argument(
+        "--trusted_historical_artifact_sha256", type=str, default=None,
+        help="Independently pinned SHA-256 of historical nested artifact bytes.",
+    )
+    parser.add_argument(
+        "--diagnostic_only",
+        action="store_true",
+        help="Allow global OOF diagnostic validation without a nested artifact. "
+             "Scores can contain outer-validation label leakage and are "
+             "ineligible for strict QC/release gates.",
     )
 
     # ── Training overrides ────────────────────────────────────
@@ -637,11 +870,41 @@ def check_routing_aux_active(
     return False
 
 
+def assert_finite_targets(Y_seqs: Sequence[Any]) -> None:
+    """Fail closed on any non-finite target value.
+
+    A single NaN/Inf in ``Y_seqs`` (train *or* val) poisons target
+    statistics and then every standardized loss/metric for the whole run
+    — silent, total corruption.  One guard, called from every entry point
+    that touches ``Y_seqs`` (``build_dataloaders`` and
+    ``compute_target_stats``).
+
+    Args:
+        Y_seqs: Per-trial 1-D continuous velocity targets.
+
+    Raises:
+        ValueError: On the first trial containing a NaN/Inf.
+    """
+    for i, y in enumerate(Y_seqs):
+        y_arr = np.asarray(y)
+        if not np.isfinite(y_arr).all():
+            n_bad = int(y_arr.size - np.isfinite(y_arr).sum())
+            raise ValueError(
+                f"Y_seqs[{i}] contains {n_bad} non-finite value(s) "
+                "(NaN/Inf). Target statistics would be non-finite and "
+                "silently corrupt normalization/loss for the entire run; "
+                "fail closed. Regenerate the dataset after sanitizing "
+                "kinematics."
+            )
+
+
 def build_dataloaders(
     config: ExperimentConfig,
     dataset_path: str = "data/processed/nsmor_dataset.pt",
     val_split: float = 0.2,
     use_lazy_loading: bool = False,
+    nested_prior_artifact: Optional[str] = None,
+    trusted_historical_artifact_sha256: Optional[str] = None,
 ) -> Tuple[Optional[torch.utils.data.DataLoader], Optional[torch.utils.data.DataLoader]]:
     """
     Build train and validation dataloaders from the prepared dataset.
@@ -653,8 +916,15 @@ def build_dataloaders(
     Args:
         config: Parsed experiment configuration.
         dataset_path: Path to dataset/metadata file.
-        val_split: Fraction of data to use for validation (0-1).
+        val_split: Fraction of data to use for validation (0-1).  Ignored
+            when ``nested_prior_artifact`` is set, which prescribes the
+            exact outer split.
         use_lazy_loading: If True, use ELT mode with lazy loading.
+        nested_prior_artifact: Optional ``nested_split_seed*.pt`` produced
+            by ``scripts/evaluate_nested_prior.py``.  When set, the exact
+            persisted train/val indices and nested priors replace the
+            recomputed split and global OOF priors.  Fail-closed on any
+            fingerprint/split/recording-prefix disjointness mismatch.
 
     Returns:
         ``(train_loader, val_loader)`` — either may be ``None`` if
@@ -662,6 +932,8 @@ def build_dataloaders(
 
     Raises:
         FileNotFoundError: If the dataset file does not exist.
+        ValueError: If the nested artifact is incompatible with the dataset
+            or is combined with lazy loading.
     """
     dataset_file = Path(dataset_path)
     if not dataset_file.exists():
@@ -673,28 +945,39 @@ def build_dataloaders(
         )
         return None, None
 
+    if nested_prior_artifact is not None and use_lazy_loading:
+        raise ValueError(
+            "--nested_prior_artifact requires ETL mode: lazy loading rebuilds "
+            "rows on demand and cannot guarantee the persisted outer split "
+            "aligns with the artifact. Refusing to run (fail closed)."
+        )
+
+    from nsmor.model_utils import validate_dataset_provenance
+
     # ── ELT Mode: Lazy Loading ────────────────────────────────
     if use_lazy_loading:
         from nsmor.lazy_dataloader import NSMoRLazyDataset
 
         logger.info("Loading metadata from %s (lazy mode)", dataset_file)
 
-        # Create full dataset
+        # Read one metadata snapshot for both lazy rows and provenance.
+        raw_meta, loaded_source_fingerprint = load_dataset_with_fingerprint(dataset_file)
+        prior_status = validate_dataset_provenance(raw_meta, dataset_file)
+        prior_tag = raw_meta["mcmc_prior_provenance"]
         full_dataset = NSMoRLazyDataset(
             metadata_path=str(dataset_file),
             max_seq_len=config.training.max_seq_len,
             dt_ms=config.model.dt_ms,
+            metadata=raw_meta,
         )
 
-        # Animal-grouped split, via the same helper the eager path uses.
+        # Recording-prefix grouped split, via the eager-path helper.
         # The previous implementation derived unique keys from
         # ``list(set(...))``, whose iteration order varies with
         # PYTHONHASHSEED — so the lazy split was not reproducible across
         # processes even at a fixed seed, and could not match the eager
         # path or compute_target_stats.
-        session_ids = [
-            full_dataset.get_session_id(i) for i in range(len(full_dataset))
-        ]
+        session_ids = resolve_dataset_session_ids(raw_meta)
         train_indices, val_indices = grouped_train_val_split(
             session_ids,
             len(full_dataset),
@@ -720,7 +1003,6 @@ def build_dataloaders(
                 dtype=bool,
             )
         else:
-            raw_meta = torch.load(str(dataset_file), weights_only=False)
             if "is_pure_wind" in raw_meta:
                 is_pure_wind = np.asarray(raw_meta["is_pure_wind"], dtype=bool)
             elif "stimulus_conditions" in raw_meta:
@@ -771,6 +1053,8 @@ def build_dataloaders(
         train_dataset = LazySubset(
             full_dataset, train_indices, train_is_pure_wind
         )
+        train_dataset.prior_lineage = (prior_tag, prior_status)
+        train_dataset.dataset_source_sha256 = loaded_source_fingerprint
         val_dataset = LazySubset(
             full_dataset, val_indices, val_is_pure_wind
         )
@@ -821,18 +1105,21 @@ def build_dataloaders(
     from nsmor.nsmor_dataloader import NSMoRDataset
 
     logger.info("Loading dataset from %s", dataset_file)
-    dataset = torch.load(dataset_file, weights_only=False)
+    dataset, loaded_source_fingerprint = load_dataset_with_fingerprint(dataset_file)
 
     # Round-2 CRITICAL-A: refuse pre-2.0 datasets (leaked priors,
     # np.max labels) — training on them is scientifically invalid.
-    from nsmor.model_utils import validate_dataset_provenance
-    validate_dataset_provenance(dataset, Path(dataset_file))
+    animal_identity_status = validate_dataset_provenance(dataset, dataset_file)
+    session_ids = resolve_dataset_session_ids(dataset)
 
     X_seqs = dataset["X_seqs"]
     Y_seqs = dataset["Y_seqs"]
     mcmc_priors = dataset["mcmc_priors"]
     labels = dataset["labels"]
     lengths = dataset["lengths"]
+    # Fail closed on NaN/Inf targets before any split/prior work: a
+    # non-finite Y poisons target stats, loss and metrics silently.
+    assert_finite_targets(Y_seqs)
 
     # Ticket #16: stimulus condition metadata for the routing aux loss.
     # Derived when the corpus lacks the stamp -- version 2.2 does not imply
@@ -870,22 +1157,53 @@ def build_dataloaders(
         )
 
     # ── Deterministic train/val split ─────────────────────────
-    # The split is ANIMAL-GROUPED, not session-grouped.  Grouping by
-    # session is not enough: ``_session_N`` splits ONE recording of one
-    # animal into blocks, so a session-grouped split let an animal's
-    # _session_1 sit in train while its _session_2 sat in validation.
-    # Trials of one animal share that animal's baseline locomotor
-    # statistics, gain state, and body mass, so those val trials were
-    # not held out in any meaningful sense.  (Full nested CV — outer
-    # NSMoR split, inner cross-fitting restricted to outer-training
-    # animals — remains a documented limitation; grouping by animal
-    # removes the dominant first-order channel at negligible cost.)
-    train_indices, val_indices = grouped_train_val_split(
-        dataset.get("session_ids"),
-        n_total,
-        val_split=val_split,
-        random_seed=config.training.random_seed,
-    )
+    # The split groups `_session_N` blocks by recording prefix to prevent
+    # within-recording overlap. Distinct prefixes are not verified animals.
+    # Full nested CV is available through `--nested_prior_artifact`.
+    if nested_prior_artifact is not None:
+        # Opt-in nested-prior seam: consume the EXACT persisted outer
+        # split and the leak-free nested priors.  Recomputing a split
+        # here would discard the outer hold-out the nested protocol
+        # established; falling back to global OOF priors would let
+        # outer-train fold models encode outer-val prefix group labels.
+        feature_config = dataset.get("feature_config", DEFAULT_FEATURE)
+        (
+            train_indices,
+            val_indices,
+            nested_priors,
+            nested_info,
+        ) = load_nested_prior_split(
+            Path(nested_prior_artifact),
+            Path(dataset_file),
+            n_total,
+            session_ids,
+            feature_config=feature_config,
+            loaded_source_fingerprint=loaded_source_fingerprint,
+            trusted_historical_artifact_sha256=trusted_historical_artifact_sha256,
+        )
+        mcmc_priors = nested_priors
+        # Honest provenance — from the validated artifact, never a
+        # hardcoded string.  mcmc_prior_provenance is the generator's
+        # own lineage tag; nested_prior_fingerprint is the SHA-256 of
+        # the source dataset the artifact was validated against.
+        logger.info(
+            "Nested-prior mode: replaced global OOF priors with nested "
+            "priors from %s (provenance=%s, fingerprint=%s, split_seed=%s, "
+            "val_split=%.3f requested / %.3f realized trials).",
+            nested_info["nested_prior_artifact"],
+            nested_info["mcmc_prior_provenance"],
+            nested_info["nested_prior_fingerprint"][:12],
+            nested_info["split_seed"],
+            nested_info["val_split"],
+            nested_info["val_trial_fraction"],
+        )
+    else:
+        train_indices, val_indices = grouped_train_val_split(
+            session_ids,
+            n_total,
+            val_split=val_split,
+            random_seed=config.training.random_seed,
+        )
     n_train = len(train_indices)
     n_val = len(val_indices)
 
@@ -962,6 +1280,12 @@ def build_dataloaders(
         is_pure_wind=train_is_pure_wind,
     )
     train_dataset.mcmc_prior_train_serve_consistency = prior_consistency
+    train_dataset.dataset_source_sha256 = loaded_source_fingerprint
+    train_dataset.prior_lineage = (dataset["mcmc_prior_provenance"], animal_identity_status)
+    if nested_prior_artifact is not None:
+        # Carried to train() so checkpoints/results record the exact
+        # nested artifact + fingerprint the split/priors came from.
+        train_dataset.nested_prior_info = nested_info
     val_dataset = NSMoRDataset(
         sequences=val_sequences,
         mcmc_priors=val_priors,
@@ -972,6 +1296,8 @@ def build_dataloaders(
         is_pure_wind=val_is_pure_wind,
     )
     val_dataset.mcmc_prior_train_serve_consistency = prior_consistency
+    if nested_prior_artifact is not None:
+        val_dataset.nested_prior_info = nested_info
 
     # ── Create dataloaders (via factory) ──────────────────────
     # Delegates to dataloader_factory for unified worker auto-scaling,
@@ -994,12 +1320,15 @@ def compute_target_stats(
     dataset_path: str,
     config: ExperimentConfig,
     val_split: float = 0.2,
+    nested_prior_artifact: Optional[str] = None,
+    trusted_historical_artifact_sha256: Optional[str] = None,
 ) -> Tuple[float, float, np.ndarray]:
     """
     Compute training-split velocity mean and std for target normalization.
 
     Uses the *same* deterministic train/val split as
-    :func:`build_dataloaders` (seeded by ``config.training.random_seed``)
+    :func:`build_dataloaders` (seeded by ``config.training.random_seed``,
+    or the exact persisted split when ``nested_prior_artifact`` is set)
     and aggregates only the training sequences, so no validation signal
     leaks into the normalization statistics.
 
@@ -1015,7 +1344,12 @@ def compute_target_stats(
         dataset_path: Path to the preprocessed ``nsmor_dataset.pt``.
         config: Parsed experiment configuration (for the split seed).
         val_split: Fraction held out for validation (must match
-            :func:`build_dataloaders`).
+            :func:`build_dataloaders`).  Ignored when
+            ``nested_prior_artifact`` is set.
+        nested_prior_artifact: Optional nested-prior artifact whose
+            persisted ``train_indices`` replace the recomputed split, so
+            target statistics are fit on exactly the trials the dataloader
+            trains on (no target-stat split mismatch).
 
     Returns:
         ``(train_mean, train_std, train_indices)`` where ``train_indices``
@@ -1034,9 +1368,13 @@ def compute_target_stats(
         )
         return 0.0, 1.0, np.empty(0, dtype=np.int64)
 
-    dataset = torch.load(dataset_file, weights_only=False)
+    dataset, loaded_source_fingerprint = load_dataset_with_fingerprint(dataset_file)
+    from nsmor.model_utils import validate_dataset_provenance
+    validate_dataset_provenance(dataset, dataset_file)
+    session_ids = resolve_dataset_session_ids(dataset)
     Y_seqs = dataset["Y_seqs"]
     n_total = len(Y_seqs)
+    assert_finite_targets(Y_seqs)
 
     # ── Grouped split (must mirror build_dataloaders exactly) ─────────
     # Normalization statistics must be fit on the training split only, so
@@ -1044,16 +1382,39 @@ def compute_target_stats(
     # implementations previously drifted apart (sample-level here vs
     # session-level there), fitting the statistics on data that included
     # validation trials — a leakage channel that no test could catch while
-    # both copies existed.  One shared function, one split.
-    train_indices, _val_indices = grouped_train_val_split(
-        dataset.get("session_ids"),
-        n_total,
-        val_split=val_split,
-        random_seed=config.training.random_seed,
-    )
+    # both copies existed.  One shared function, one split.  With a nested
+    # artifact, the same persisted indices are consumed here and in
+    # ``build_dataloaders`` for standalone calls. train() instead fits from its
+    # already-loaded train dataset so a same-path artifact swap cannot drift.
+    if nested_prior_artifact is not None:
+        feature_config = dataset.get("feature_config", DEFAULT_FEATURE)
+        train_indices, _val_indices, _nested_priors, _info = load_nested_prior_split(
+            Path(nested_prior_artifact),
+            dataset_file,
+            n_total,
+            session_ids,
+            feature_config=feature_config,
+            loaded_source_fingerprint=loaded_source_fingerprint,
+            trusted_historical_artifact_sha256=trusted_historical_artifact_sha256,
+        )
+    else:
+        train_indices, _val_indices = grouped_train_val_split(
+            session_ids,
+            n_total,
+            val_split=val_split,
+            random_seed=config.training.random_seed,
+        )
 
     train_y = np.concatenate([Y_seqs[i] for i in train_indices]).astype(np.float64)
+    return _fit_target_stats(train_y, config, train_indices)
 
+
+def _fit_target_stats(
+    train_y: np.ndarray,
+    config: ExperimentConfig,
+    train_indices: np.ndarray,
+) -> Tuple[float, float, np.ndarray]:
+    """Fit the existing clip/trim transform on selected raw training targets."""
     # Fit the statistic in the SAME space the loss sees.  ``train_one_epoch``
     # clips the target to ``[-target_clip_cm_s, +target_clip_cm_s]`` before
     # standardising, so we clip here first; otherwise the ±(81..100] cm/s band
@@ -1926,7 +2287,12 @@ def train(
     phase1_epochs: Optional[int] = None,
     dataset_path: Optional[str] = None,
     use_lazy_loading: bool = False,
-) -> Dict[str, float]:
+    nested_prior_artifact: Optional[str] = None,
+    *,
+    require_nested_validation: bool = False,
+    trusted_historical_checkpoint_sha256=None,
+    trusted_historical_artifact_sha256=None,
+) -> Dict[str, Any]:
     """
     Full training pipeline.
 
@@ -1960,13 +2326,45 @@ def train(
             historical default (``data/processed/nsmor_dataset.pt``);
             the pipeline passes the dataset the current ETL produced so
             training cannot silently consume a leftover file.
+        use_lazy_loading: Use ELT lazy-loading mode (incompatible with
+            ``nested_prior_artifact``).
+        nested_prior_artifact: Optional nested-prior artifact from
+            ``scripts/evaluate_nested_prior.py``.  When set, the exact
+            persisted outer train/val split and leak-free nested priors
+            replace the recomputed split and global OOF priors.
+            ``None`` produces diagnostic global OOF validation, which can
+            encode eventual outer-validation labels and is ineligible for
+            strict QC/release gates.
+        require_nested_validation: Refuse diagnostic global OOF validation.
+            The CLI enables this by default; programmatic diagnostic callers
+            keep the compatibility default with explicit validation_scope.
 
     Returns:
         Dictionary with ``"best_val_loss`` and ``"final_train_loss"``.
 
     Raises:
         ValueError: If no training data is provided (loader is None).
+        FileExistsError: If a fresh run would reuse an existing best checkpoint.
     """
+    if require_nested_validation and nested_prior_artifact is None:
+        raise ValueError(
+            "Scored validation requires a nested prior artifact; global OOF "
+            "scores are diagnostic only. Supply --nested_prior_artifact or "
+            "explicitly use --diagnostic_only for diagnostics."
+        )
+
+    # Reject stale best weights before building a model or writing any outputs.
+    # Explicit resumes keep their lineage validation and best-model reconciliation.
+    output_dir = Path(config.checkpoint.output_dir)
+    best_path = output_dir / "best_model.pth"
+    if config.checkpoint.resume_from is None and (
+        best_path.exists() or best_path.is_symlink()
+    ):
+        raise FileExistsError(
+            f"Pre-existing checkpoint at {best_path}; choose a fresh output_dir "
+            "or set checkpoint.resume_from explicitly."
+        )
+
     # ── Reproducibility ───────────────────────────────────────
     torch.manual_seed(config.training.random_seed)
     np.random.seed(config.training.random_seed)
@@ -2080,6 +2478,8 @@ def train(
         dataset_path=resolved_dataset_path,
         val_split=_VAL_SPLIT,
         use_lazy_loading=use_lazy_loading,
+        nested_prior_artifact=nested_prior_artifact,
+        trusted_historical_artifact_sha256=trusted_historical_artifact_sha256,
     )
 
     if train_loader is None:
@@ -2101,6 +2501,78 @@ def train(
         None,
     )
 
+    # ── Nested-prior provenance (opt-in seam) ──────────────────
+    # Every checkpoint and the returned result dict must record which
+    # nested artifact (path + content SHA-256 + source dataset fingerprint)
+    # produced the split/priors when the seam is active — without it a
+    # checkpoint cannot be audited for split-mismatch after the fact.
+    # Legacy (no artifact) runs record is_nested_cv=False explicitly.
+    nested_info = getattr(
+        getattr(train_loader, "dataset", None), "nested_prior_info", None
+    )
+    if nested_prior_artifact is not None and nested_info is None:
+        raise RuntimeError(
+            "nested_prior_artifact was set but the train dataset carries "
+            "no nested_prior_info; provenance would be lost. Fail closed."
+        )
+    lineage = getattr(train_loader.dataset, "prior_lineage", None)
+    if lineage is None:
+        raise ValueError("Train dataset lacks validated MCMC prior lineage; fail closed")
+    prior_tag, prior_status = lineage
+    prior_identity_status(prior_tag, prior_status)
+    nested_provenance: Dict[str, Any] = {
+        "nested_prior_artifact": (
+            str(nested_info["nested_prior_artifact"]) if nested_info else ""
+        ),
+        "nested_prior_artifact_sha256": (
+            str(nested_info["nested_prior_artifact_sha256"]) if nested_info else ""
+        ),
+        "nested_prior_fingerprint": (
+            str(nested_info["nested_prior_fingerprint"]) if nested_info else ""
+        ),
+        "nested_split_seed": int(nested_info["split_seed"]) if nested_info else -1,
+        "nested_val_split": float(nested_info["val_split"]) if nested_info else -1.0,
+        "is_nested_cv": bool(nested_info is not None),
+        "validation_scope": ("nested_outer_validation" if nested_info else "diagnostic_global_oof"),
+        "mcmc_prior_provenance": (
+            str(nested_info["mcmc_prior_provenance"])
+            if nested_info
+            else prior_tag
+        ),
+        "animal_identity_status": (
+            prior_identity_status(
+                nested_info["mcmc_prior_provenance"],
+                nested_info.get("animal_identity_status"), nested=True,
+            ) if nested_info else prior_status
+        ),
+    }
+    if nested_info is None:
+        logger.warning(
+            "validation_scope=diagnostic_global_oof: global OOF prior fits can "
+            "include eventual outer-validation labels. Scores are contaminated "
+            "diagnostics, ineligible for strict QC/release gates; use a nested artifact."
+        )
+    active_lineage: Dict[str, Any] = dict(nested_provenance)
+    active_lineage["dataset_path"] = str(resolved_dataset_path)
+    dataset_source_sha256 = getattr(train_loader.dataset, "dataset_source_sha256", None)
+    if not use_lazy_loading and dataset_source_sha256 is None:
+        raise ValueError("Loaded train dataset lacks its source SHA-256")
+    active_lineage["dataset_source_sha256"] = dataset_source_sha256
+
+    def certify_best_checkpoint(state, candidate_path, payload):
+        return _validate_best_checkpoint(
+            state, candidate_path, active_lineage,
+            trusted_historical_checkpoint_sha256=trusted_historical_checkpoint_sha256,
+            checkpoint_sha256=hashlib.sha256(payload).hexdigest(),
+        )
+    dataset_source_binding = "sha256_bound" if dataset_source_sha256 is not None else "unbound_lazy"
+    logger.info(
+        "Checkpoint provenance: is_nested_cv=%s artifact=%s fingerprint=%s",
+        nested_provenance["is_nested_cv"],
+        nested_provenance["nested_prior_artifact"] or "<none>",
+        (nested_provenance["nested_prior_fingerprint"][:12] or "<none>"),
+    )
+
     # ── Target normalization statistics (train split only) ──
     # When config.training.normalize_targets is enabled, the velocity
     # target is mean-centered and std-scaled using training-split
@@ -2108,11 +2580,34 @@ def train(
     # validate, and compute_metrics so the loss, the selection-criteria,
     # and the reported metrics all live in one consistent space, and the
     # final metrics are rescaled back to cm/s.
-    target_mean, target_std, _train_indices = compute_target_stats(
-        resolved_dataset_path,
-        config,
-        val_split=_VAL_SPLIT,
-    )
+    if config.training.normalize_targets and not use_lazy_loading:
+        # The loaded train dataset owns the selected split
+        # and raw target copies. Reopening the source path could select a
+        # different valid object after the loader captured its source bytes.
+        train_dataset = train_loader.dataset
+        if not (
+            hasattr(train_dataset, "sequences")
+            and hasattr(train_dataset, "source_indices")
+        ):
+            raise ValueError(
+                "Loaded train dataset lacks source targets/indices for normalization"
+            )
+        train_targets = [sequence[1] for sequence in train_dataset.sequences]
+        train_indices = np.asarray(train_dataset.source_indices, dtype=np.int64)
+        if not train_targets or train_indices.shape != (len(train_targets),):
+            raise ValueError("Loaded train targets/indices are empty or misaligned")
+        assert_finite_targets(train_targets)
+        target_mean, target_std, _train_indices = _fit_target_stats(
+            np.concatenate(train_targets).astype(np.float64), config, train_indices,
+        )
+    else:
+        target_mean, target_std, _train_indices = compute_target_stats(
+            resolved_dataset_path,
+            config,
+            val_split=_VAL_SPLIT,
+            nested_prior_artifact=nested_prior_artifact,
+            trusted_historical_artifact_sha256=trusted_historical_artifact_sha256,
+        )
 
     # Statistical coherence guard: normalizing without a target clip amplifies
     # the very heavy-tail (tracking-artifact) frames it is meant to suppress —
@@ -2166,105 +2661,352 @@ def train(
 
     if config.checkpoint.resume_from is not None:
         ckpt_path = Path(config.checkpoint.resume_from)
-        if ckpt_path.exists():
-            logger.info("Resuming from checkpoint: %s", ckpt_path)
-            # Peek BEFORE load_checkpoint: (a) detect legacy checkpoints
-            # without scheduler state (loud warning instead of silent LR
-            # restart), and (b) learn start_epoch so the restore can match
-            # the phase the run will continue in.
-            ckpt_peek = torch.load(
-                ckpt_path, map_location="cpu", weights_only=False,
+        if not ckpt_path.exists():
+            raise FileNotFoundError(
+                f"Checkpoint file to resume from not found: {ckpt_path} "
+                "(fail closed on missing resume checkpoint)"
             )
-            if "scheduler_state_dict" not in ckpt_peek:
-                logger.warning(
-                    "Checkpoint %s has NO scheduler_state_dict (legacy "
-                    "format) — LR schedule restarts from scratch; resumed "
-                    "runs will NOT match an uninterrupted trajectory.",
-                    ckpt_path,
-                )
-            start_epoch = ckpt_peek.get("epoch", -1) + 1
+        logger.info("Resuming from checkpoint: %s", ckpt_path)
+        # Peek BEFORE load_checkpoint: (a) detect legacy checkpoints
+        # without scheduler state (loud warning instead of silent LR
+        # restart), and (b) learn start_epoch so the restore can match
+        # the phase the run will continue in.
+        resume_payload = ckpt_path.read_bytes()
+        ckpt_peek = load_artifact_bytes(resume_payload, map_location="cpu")
 
-            # Resume x two-phase: when the resume point is at/past the
-            # phase-1→2 boundary, an uninterrupted run would have built a
-            # FRESH phase-2 optimizer at the boundary (the phase-1 Adam
-            # moments are deliberately discarded there).  Mirror that
-            # exactly: restore ONLY model weights here and let the
-            # in-loop transition construct the fresh phase-2 optimizer on
-            # the first epoch.  Restoring into (or pre-building) the
-            # phase-2 optimizer either crashes (1-group checkpoint vs
-            # 2-group optimizer) or silently diverges from the canonical
-            # uninterrupted trajectory.
-            # Resume phase is decided by start_epoch, NOT the init-time
-            # current_phase (which is 1 whenever phase1_epochs>0 and takes no
-            # account of where the checkpoint actually is):
-            #   * start_epoch <  phase1_epochs: within phase 1 → restore the
-            #     full phase-1 optimizer/scheduler state (moment continuity).
-            #   * start_epoch == phase1_epochs: landing exactly at the
-            #     phase-1→2 boundary → restore ONLY model weights and let the
-            #     in-loop transition build the fresh phase-2 optimizer
-            #     (an uninterrupted run discards the phase-1 Adam moments
-            #     there, so the resumed run must too).
-            #   * start_epoch >  phase1_epochs: resuming inside an ESTABLISHED
-            #     phase 2 → the checkpoint holds the 2-group phase-2 optimizer
-            #     and scheduler.  Rebuild that exact optimizer (via the shared
-            #     builder) BEFORE restoring so load_state_dict can rehydrate
-            #     the saved Adam moments and scheduling instead of silently
-            #     resetting them via a second in-loop transition.
-            _landing_phase2 = two_phase and start_epoch > phase1_epochs
-            _crosses_boundary = two_phase and start_epoch == phase1_epochs
+        # ── Fail-closed nested resume validation ──
+        # Checkpoint provenance vs active run configuration:
+        # 1. is_nested_cv mode mismatch
+        # 2. artifact identity / content SHA-256 / source fingerprint mismatch
+        # 3. exact split configuration (split_seed, val_split) mismatch
+        ckpt_is_nested = ckpt_peek.get("is_nested_cv", False)
+        run_is_nested = bool(nested_prior_artifact is not None)
 
-            if _landing_phase2:
-                # Restore the phase-2 freeze state (requires_grad is NOT carried
-                # by the checkpoint): init leaves frontend unfrozen/backend frozen
-                # (the phase-1 posture), but a mid-phase-2 checkpoint implies the
-                # opposite.  Without this the rebuilt backend optimizer would hold
-                # frozen params (dead groups) while the unfrozen frontend is not
-                # covered by any optimizer — silently training nothing.
-                for param in model.frontend.parameters():
-                    param.requires_grad = False
-                for param in model.backend.parameters():
-                    param.requires_grad = True
-                optimizer, scheduler = _build_phase2_optimizer_scheduler(
-                    model, config, start_epoch,
+        if run_is_nested != ckpt_is_nested:
+            raise ValueError(
+                f"Resume nested mode mismatch: active run is_nested_cv={run_is_nested} "
+                f"but checkpoint {ckpt_path} has is_nested_cv={ckpt_is_nested}. "
+                "Refusing cross-mode resumption (fail closed)."
+            )
+
+        if run_is_nested:
+            ckpt_art = ckpt_peek.get("nested_prior_artifact")
+            run_art = str(nested_info["nested_prior_artifact"])
+            # Resolve both paths for robust comparison
+            if not ckpt_art or Path(ckpt_art).resolve() != Path(run_art).resolve():
+                raise ValueError(
+                    f"Resume nested prior artifact mismatch: checkpoint recorded artifact "
+                    f"{ckpt_art!r} vs active run artifact {run_art!r}. "
+                    "Refusing resume with mismatched nested prior artifact (fail closed)."
                 )
-                criterion = backend_criterion
-                current_phase = 2
-                load_checkpoint(
-                    path=ckpt_path,
-                    model=model,
-                    optimizer=optimizer,
-                    scheduler=scheduler,
-                    map_location=device,
+
+            ckpt_fp = ckpt_peek.get("nested_prior_fingerprint")
+            run_fp = str(nested_info["nested_prior_fingerprint"])
+            if not ckpt_fp or ckpt_fp != run_fp:
+                raise ValueError(
+                    f"Resume nested prior source fingerprint mismatch: checkpoint recorded "
+                    f"{ckpt_fp!r} vs active run {run_fp!r}. "
+                    "Refusing resume on mismatched source dataset (fail closed)."
                 )
-            elif _crosses_boundary:
-                logger.info(
-                    "Resume past phase boundary (start_epoch=%d >= "
-                    "phase1_epochs=%d) — restoring model weights only; "
-                    "fresh phase-2 optimizer built by the in-loop "
-                    "transition",
-                    start_epoch, phase1_epochs,
+
+            ckpt_artifact_sha256 = ckpt_peek.get("nested_prior_artifact_sha256")
+            run_artifact_sha256 = nested_provenance["nested_prior_artifact_sha256"]
+            if ckpt_artifact_sha256 != run_artifact_sha256:
+                raise ValueError(
+                    "Resume nested prior artifact SHA-256 mismatch: "
+                    f"{ckpt_artifact_sha256!r} vs {run_artifact_sha256!r}; fail closed."
                 )
-                load_checkpoint(
-                    path=ckpt_path,
-                    model=model,
-                    map_location=device,
+
+            ckpt_seed = ckpt_peek.get("nested_split_seed")
+            run_seed = int(nested_info["split_seed"])
+            if ckpt_seed is None:
+                raise ValueError("Resume checkpoint missing nested_split_seed (fail closed).")
+            if isinstance(ckpt_seed, float) and not ckpt_seed.is_integer():
+                raise ValueError(
+                    f"Resume nested split_seed is fractional ({ckpt_seed}); refusing resume (fail closed)."
                 )
-            else:
-                load_checkpoint(
-                    path=ckpt_path,
-                    model=model,
-                    optimizer=optimizer,
-                    scheduler=scheduler,
-                    map_location=device,
+            if int(ckpt_seed) != run_seed:
+                raise ValueError(
+                    f"Resume nested split_seed mismatch: checkpoint recorded seed={ckpt_seed} "
+                    f"vs active run seed={run_seed}. Refusing resume on altered split (fail closed)."
                 )
-            best_val_loss = ckpt_peek.get("loss", float("inf"))
-            logger.info("Resumed at epoch %d, loss=%.6f", start_epoch, best_val_loss)
+
+            ckpt_val_split = ckpt_peek.get("nested_val_split")
+            run_val_split = float(nested_info["val_split"])
+            if (
+                ckpt_val_split is None
+                or not math.isfinite(float(ckpt_val_split))
+                or not math.isfinite(run_val_split)
+                or abs(float(ckpt_val_split) - run_val_split) > 1e-6
+            ):
+                raise ValueError(
+                    f"Resume nested val_split mismatch or non-finite: checkpoint recorded val_split={ckpt_val_split} "
+                    f"vs active run val_split={run_val_split}. Refusing resume on altered split (fail closed)."
+                )
         else:
-            logger.warning("Checkpoint not found: %s — starting fresh", ckpt_path)
+            if prior_status == "unverified" and (
+                ckpt_peek.get("dataset_source_sha256") != dataset_source_sha256
+                or ckpt_peek.get("dataset_source_binding", "sha256_bound") != "sha256_bound"
+            ):
+                raise ValueError("modern checkpoint requires matching dataset_source_sha256 and sha256_bound binding; fail closed")
+            if "dataset_source_sha256" in ckpt_peek:
+                if ckpt_peek["dataset_source_sha256"] != dataset_source_sha256:
+                    raise ValueError("Resume non-nested dataset_source_sha256 mismatch; fail closed.")
+                dataset_source_binding = ckpt_peek.get("dataset_source_binding", "sha256_bound")
+                if dataset_source_binding not in ("sha256_bound", "legacy_resume_unbound"):
+                    raise ValueError("Resume non-nested invalid dataset_source_binding; fail closed.")
+            else:
+                dataset_source_binding = ckpt_peek.get("dataset_source_binding", "legacy_resume_unbound")
+                if dataset_source_binding not in ("legacy_resume_unbound", "unbound_lazy"):
+                    raise ValueError("Resume checkpoint missing dataset_source_sha256 with invalid binding status")
+                logger.warning("Resume checkpoint %s has %s dataset content; historical weights cannot be content-bound",
+                               ckpt_path, dataset_source_binding)
+            active_lineage["dataset_source_binding"] = dataset_source_binding
+            ckpt_ds = ckpt_peek.get("dataset_path")
+            if ckpt_ds is not None and resolved_dataset_path is not None:
+                if Path(ckpt_ds).resolve() != Path(resolved_dataset_path).resolve():
+                    raise ValueError(
+                        f"Resume non-nested dataset_path mismatch: checkpoint recorded dataset_path={ckpt_ds!r} "
+                        f"vs active run dataset_path={str(resolved_dataset_path)!r}. "
+                        "Refusing resume on mismatched source dataset (fail closed)."
+                    )
+
+        _check_checkpoint_prior_lineage(
+            ckpt_peek, active_lineage, ckpt_path,
+            trusted_historical_checkpoint_sha256=trusted_historical_checkpoint_sha256,
+            checkpoint_sha256=hashlib.sha256(resume_payload).hexdigest(),
+        )
+        if "scheduler_state_dict" not in ckpt_peek:
+            logger.warning(
+                "Checkpoint %s has NO scheduler_state_dict (legacy "
+                "format) — LR schedule restarts from scratch; resumed "
+                "runs will NOT match an uninterrupted trajectory.",
+                ckpt_path,
+            )
+        start_epoch = ckpt_peek.get("epoch", -1) + 1
+        if start_epoch >= config.training.num_epochs:
+            raise ValueError(
+                f"Cannot resume checkpoint {ckpt_path} at epoch {start_epoch}: "
+                f"target num_epochs ({config.training.num_epochs}) <= start_epoch ({start_epoch}); "
+                "no remaining epochs to train (fail closed on validation provenance)."
+            )
+        if two_phase and ckpt_peek.get("training_phase") != (1 if start_epoch <= phase1_epochs else 2):
+            raise ValueError(
+                f"Resume checkpoint {ckpt_path} has missing or inconsistent training_phase "
+                f"({ckpt_peek.get('training_phase')!r}) for start_epoch={start_epoch}; fail closed."
+            )
+
+        if ckpt_path.name == "best_model.pth":
+            certify_best_checkpoint(ckpt_peek, ckpt_path, resume_payload)
+
+        # Resume x two-phase: when the resume point is at/past the
+        # phase-1→2 boundary, an uninterrupted run would have built a
+        # FRESH phase-2 optimizer at the boundary (the phase-1 Adam
+        # moments are deliberately discarded there).  Mirror that
+        # exactly: restore ONLY model weights here and let the
+        # in-loop transition construct the fresh phase-2 optimizer on
+        # the first epoch.  Restoring into (or pre-building) the
+        # phase-2 optimizer either crashes (1-group checkpoint vs
+        # 2-group optimizer) or silently diverges from the canonical
+        # uninterrupted trajectory.
+        # Resume phase is decided by start_epoch, NOT the init-time
+        # current_phase (which is 1 whenever phase1_epochs>0 and takes no
+        # account of where the checkpoint actually is):
+        #   * start_epoch <  phase1_epochs: within phase 1 → restore the
+        #     full phase-1 optimizer/scheduler state (moment continuity).
+        #   * start_epoch == phase1_epochs: landing exactly at the
+        #     phase-1→2 boundary → restore ONLY model weights and let the
+        #     in-loop transition build the fresh phase-2 optimizer
+        #     (an uninterrupted run discards the phase-1 Adam moments
+        #     there, so the resumed run must too).
+        #   * start_epoch >  phase1_epochs: resuming inside an ESTABLISHED
+        #     phase 2 → the checkpoint holds the 2-group phase-2 optimizer
+        #     and scheduler.  Rebuild that exact optimizer (via the shared
+        #     builder) BEFORE restoring so load_state_dict can rehydrate
+        #     the saved Adam moments and scheduling instead of silently
+        #     resetting them via a second in-loop transition.
+        _landing_phase2 = two_phase and start_epoch > phase1_epochs
+        _crosses_boundary = two_phase and start_epoch == phase1_epochs
+
+        if _landing_phase2:
+            # Restore the phase-2 freeze state (requires_grad is NOT carried
+            # by the checkpoint): init leaves frontend unfrozen/backend frozen
+            # (the phase-1 posture), but a mid-phase-2 checkpoint implies the
+            # opposite.  Without this the rebuilt backend optimizer would hold
+            # frozen params (dead groups) while the unfrozen frontend is not
+            # covered by any optimizer — silently training nothing.
+            for param in model.frontend.parameters():
+                param.requires_grad = False
+            for param in model.backend.parameters():
+                param.requires_grad = True
+            optimizer, scheduler = _build_phase2_optimizer_scheduler(
+                model, config, start_epoch,
+            )
+            criterion = backend_criterion
+            current_phase = 2
+            load_checkpoint(
+                path=ckpt_path,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                map_location=device,
+                payload=resume_payload,
+            )
+        elif _crosses_boundary:
+            logger.info(
+                "Resume past phase boundary (start_epoch=%d >= "
+                "phase1_epochs=%d) — restoring model weights only; "
+                "fresh phase-2 optimizer built by the in-loop "
+                "transition",
+                start_epoch, phase1_epochs,
+            )
+            load_checkpoint(
+                path=ckpt_path,
+                model=model,
+                map_location=device,
+                payload=resume_payload,
+            )
+        else:
+            load_checkpoint(
+                path=ckpt_path,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                map_location=device,
+                payload=resume_payload,
+            )
+        # Restore best_val_loss faithfully across resume:
+        # Never trust filename or fall back to train_loss (ckpt['loss'])!
+        if "best_val_loss" in ckpt_peek and ckpt_peek["best_val_loss"] is not None and math.isfinite(ckpt_peek["best_val_loss"]):
+            best_val_loss = float(ckpt_peek["best_val_loss"])
+        elif "val_loss" in ckpt_peek and ckpt_peek["val_loss"] is not None and math.isfinite(ckpt_peek["val_loss"]):
+            best_val_loss = float(ckpt_peek["val_loss"])
+        else:
+            best_val_loss = float("inf")
+            logger.warning(
+                "Checkpoint %s lacks finite validation loss metadata (never falling back to train loss); "
+                "best_val_loss initialized to inf.",
+                ckpt_path,
+            )
+        logger.info("Resumed at epoch %d, best_val_loss=%.6f", start_epoch, best_val_loss)
 
     # ── Output directory ──────────────────────────────────────
-    output_dir = Path(config.checkpoint.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Phase-1 best is discarded at the boundary; its loss cannot rank Phase-2 weights.
+    if config.checkpoint.resume_from is not None and not _crosses_boundary:
+        best_target = output_dir / "best_model.pth"
+        claimed_best: Optional[float] = None
+        if "best_val_loss" in ckpt_peek and ckpt_peek["best_val_loss"] is not None and math.isfinite(float(ckpt_peek["best_val_loss"])):
+            claimed_best = float(ckpt_peek["best_val_loss"])
+        elif "val_loss" in ckpt_peek and ckpt_peek["val_loss"] is not None and math.isfinite(float(ckpt_peek["val_loss"])):
+            claimed_best = float(ckpt_peek["val_loss"])
+
+        # Discover and validate only best weights scored under this phase's objective.
+        src_cand_path: Optional[Path] = None
+        src_cand_payload: Optional[bytes] = None
+        src_cand_val: Optional[float] = None
+        if ckpt_path.name == "best_model.pth":
+            src_cand_path = ckpt_path
+            src_cand_payload = resume_payload
+            src_cand_val = certify_best_checkpoint(ckpt_peek, ckpt_path, resume_payload)
+        else:
+            companion = ckpt_path.parent / "best_model.pth"
+            if companion.exists() and companion.resolve() != ckpt_path.resolve():
+                companion_payload = companion.read_bytes()
+                comp_peek = load_artifact_bytes(companion_payload, map_location="cpu")
+                if two_phase and comp_peek.get("training_phase") not in (1, 2):
+                    raise ValueError(f"Best checkpoint {companion} lacks training_phase; fail closed.")
+                if two_phase and comp_peek["training_phase"] != current_phase:
+                    if claimed_best is not None and ckpt_peek.get("val_loss") == claimed_best:
+                        src_cand_path = ckpt_path
+                        src_cand_payload = resume_payload
+                        src_cand_val = certify_best_checkpoint(ckpt_peek, ckpt_path, resume_payload)
+                else:
+                    src_cand_path = companion
+                    src_cand_payload = companion_payload
+                    src_cand_val = certify_best_checkpoint(comp_peek, companion, companion_payload)
+
+        # Discover and validate destination candidate best model
+        dest_val: Optional[float] = None
+        dest_stale = False
+        if best_target.exists():
+            destination_payload = best_target.read_bytes()
+            dest_peek = load_artifact_bytes(destination_payload, map_location="cpu")
+            if best_target.read_bytes() != destination_payload:
+                raise ValueError(f"Destination best checkpoint {best_target} changed after validation; fail closed.")
+            if two_phase and dest_peek.get("training_phase") not in (1, 2):
+                raise ValueError(f"Best checkpoint {best_target} lacks training_phase; fail closed.")
+            if two_phase and dest_peek["training_phase"] != current_phase:
+                dest_stale = True
+            else:
+                dest_val = certify_best_checkpoint(dest_peek, best_target, destination_payload)
+
+        if src_cand_val is not None:
+            assert src_cand_payload is not None
+
+        # Symmetric reconciliation between source and destination candidates
+        if dest_val is not None and src_cand_val is not None:
+            if claimed_best is not None and min(dest_val, src_cand_val) > claimed_best + 1e-5:
+                raise ValueError(
+                    f"Claimed historical best_val_loss={claimed_best:.6f} has no matching "
+                    "same-phase best weights; fail closed."
+                )
+            # Both source and destination exist: select the superior candidate
+            if src_cand_val < dest_val:
+                best_target.write_bytes(src_cand_payload)
+                best_val_loss = src_cand_val
+                logger.info(
+                    "Replaced worse destination best model (val_loss=%.6f) with superior source "
+                    "best model from %s (val_loss=%.6f)",
+                    dest_val, src_cand_path, best_val_loss,
+                )
+            else:
+                best_val_loss = dest_val
+                logger.info(
+                    "Retained existing destination best model at %s (val_loss=%.6f <= source %.6f)",
+                    best_target, dest_val, src_cand_val,
+                )
+        elif dest_val is not None:
+            # Only destination exists: refuse silent degradation if claimed historical best is better
+            if claimed_best is not None and dest_val > claimed_best + 1e-5:
+                raise ValueError(
+                    f"Claimed historical best_val_loss={claimed_best:.6f} is unavailable: "
+                    f"destination {best_target} has worse val_loss={dest_val:.6f} and companion "
+                    f"source best model is absent; refusing to silently degrade best score (fail closed)."
+                )
+            best_val_loss = dest_val
+            logger.info(
+                "Validated existing destination best_model.pth at %s (val_loss=%.6f)",
+                best_target, dest_val,
+            )
+        elif src_cand_val is not None:
+            # Only source exists: copy certified candidate to destination
+            if claimed_best is not None and src_cand_val > claimed_best + 1e-5:
+                raise ValueError(
+                    f"Source best model {src_cand_path} val_loss ({src_cand_val:.6f}) is worse than "
+                    f"claimed best_val_loss ({claimed_best:.6f}); fail closed."
+                )
+            best_target.write_bytes(src_cand_payload)
+            best_val_loss = src_cand_val
+            logger.info(
+                "Preserved certified resume best model from %s to %s (val_loss=%.6f)",
+                src_cand_path, best_target, best_val_loss,
+            )
+        else:
+            # Neither source candidate nor destination candidate exists
+            if claimed_best is not None:
+                raise ValueError(
+                    f"Cannot resume checkpoint {ckpt_path} into fresh directory {output_dir}: "
+                    f"absent historical best model {ckpt_path.parent / 'best_model.pth'} (fail closed)."
+                )
+            if dest_stale:
+                best_target.unlink()
+            best_val_loss = float("inf")
+            logger.warning(
+                "Checkpoint %s lacks historical best model; best_val_loss initialized to inf.",
+                ckpt_path,
+            )
 
     # ── Training loop ─────────────────────────────────────────
     logger.info("=" * 60)
@@ -2272,6 +3014,8 @@ def train(
     logger.info("=" * 60)
 
     history = {"train_loss": [], "val_loss": []}
+    train_loss: float = float("nan")
+    val_loss: float = float("nan")
 
     # ── Early stopping ───────────────────────────────────────
     early_stopping_patience = getattr(
@@ -2282,6 +3026,7 @@ def train(
     # ── Bio-loss warmup schedule ─────────────────────────────
     warmup_epochs = config.loss.warmup_epochs
 
+    epoch = start_epoch - 1
     for epoch in range(start_epoch, config.training.num_epochs):
         t0 = time.time()
 
@@ -2330,6 +3075,9 @@ def train(
             # the full base LR instead of ramp-into-decayed-cosine.
             criterion = backend_criterion
             current_phase = 2
+            best_val_loss = float("inf")
+            epochs_without_improvement = 0
+            best_path.unlink(missing_ok=True)  # Phase 1 loss cannot select Phase 2 weights.
 
         # ── Warmup factor for bio-loss terms (energy/sparse/jerk ONLY) ──
         # lambda_reg is NOT warmup-scaled: the router needs anti-collapse
@@ -2477,28 +3225,6 @@ def train(
                 )
 
         # ── Checkpointing ─────────────────────────────────────
-        # Periodic checkpoint
-        if (epoch + 1) % config.training.checkpoint_interval == 0:
-            epoch_path = output_dir / f"epoch_{epoch + 1}.pth"
-            _atomic_save_checkpoint(
-                model=model,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                epoch=epoch,
-                loss=train_loss,
-                config=config.to_dict(),
-                path=epoch_path,
-                train_loss=train_loss,
-                val_loss=val_loss if val_loss != float("inf") else None,
-                target_mean=float(target_mean),
-                target_std=float(target_std),
-                target_clip_cm_s=float(config.training.target_clip_cm_s),
-                training_phase=int(current_phase),
-                dataset_path=str(resolved_dataset_path),
-                mcmc_prior_train_serve_consistency=mcmc_prior_consistency,
-            )
-            logger.info("Saved periodic checkpoint: %s", epoch_path)
-
         # Best-model checkpoint.
         # Round-4 fix: the previous gate ``warmup_factor >= 1.0`` made it
         # impossible to save *any* best checkpoint when the total number of
@@ -2538,15 +3264,46 @@ def train(
                 target_clip_cm_s=float(config.training.target_clip_cm_s),
                 training_phase=int(current_phase),
                 dataset_path=str(resolved_dataset_path),
+                **({"dataset_source_sha256": dataset_source_sha256} if dataset_source_sha256 is not None else {}),
+                **({"dataset_source_binding": dataset_source_binding} if dataset_source_binding != "sha256_bound" else {}),
                 mcmc_prior_train_serve_consistency=mcmc_prior_consistency,
+                best_val_loss=float(best_val_loss),
+                **nested_provenance,
             )
             logger.info("Saved best model (val_loss=%.6f): %s", val_loss, best_path)
         elif math.isfinite(val_loss):
             epochs_without_improvement += 1
 
+        # Periodic checkpoint (saved after best_val_loss update so best_val_loss is consistent)
+        if (epoch + 1) % config.training.checkpoint_interval == 0:
+            epoch_path = output_dir / f"epoch_{epoch + 1}.pth"
+            _atomic_save_checkpoint(
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                epoch=epoch,
+                loss=train_loss,
+                config=config.to_dict(),
+                path=epoch_path,
+                train_loss=train_loss,
+                val_loss=val_loss if val_loss != float("inf") else None,
+                target_mean=float(target_mean),
+                target_std=float(target_std),
+                target_clip_cm_s=float(config.training.target_clip_cm_s),
+                training_phase=int(current_phase),
+                dataset_path=str(resolved_dataset_path),
+                **({"dataset_source_sha256": dataset_source_sha256} if dataset_source_sha256 is not None else {}),
+                **({"dataset_source_binding": dataset_source_binding} if dataset_source_binding != "sha256_bound" else {}),
+                mcmc_prior_train_serve_consistency=mcmc_prior_consistency,
+                best_val_loss=float(best_val_loss),
+                **nested_provenance,
+            )
+            logger.info("Saved periodic checkpoint: %s", epoch_path)
+
         # ── Early stopping check ─────────────────────────────
         if (
             early_stopping_patience > 0
+            and not (two_phase and current_phase == 1 and config.training.num_epochs > phase1_epochs)
             and epochs_without_improvement >= early_stopping_patience
         ):
             logger.info(
@@ -2564,7 +3321,7 @@ def train(
         model=model,
         optimizer=optimizer,
         scheduler=scheduler,
-        epoch=config.training.num_epochs - 1,
+        epoch=epoch,
         loss=train_loss,
         config=config.to_dict(),
         path=final_path,
@@ -2575,7 +3332,11 @@ def train(
         target_clip_cm_s=float(config.training.target_clip_cm_s),
         training_phase=int(current_phase),
         dataset_path=str(resolved_dataset_path),
+        **({"dataset_source_sha256": dataset_source_sha256} if dataset_source_sha256 is not None else {}),
+        **({"dataset_source_binding": dataset_source_binding} if dataset_source_binding != "sha256_bound" else {}),
         mcmc_prior_train_serve_consistency=mcmc_prior_consistency,
+        best_val_loss=float(best_val_loss),
+        **nested_provenance,
     )
     logger.info("Saved final model: %s", final_path)
 
@@ -2592,7 +3353,7 @@ def train(
     # If no best checkpoint was saved (e.g. val_loss was never finite),
     # fall back to the final checkpoint and flag the provenance so
     # downstream consumers know the model was NOT selected by val_loss.
-    metrics: Dict[str, float] = {}
+    metrics: Dict[str, Any] = {}
     best_ckpt_path = output_dir / "best_model.pth"
     eval_ckpt_path: Optional[Path] = None
     eval_provenance = "best"
@@ -2635,6 +3396,14 @@ def train(
         metrics["eval_provenance"] = eval_provenance
         if mcmc_prior_consistency is not None:
             metrics["mcmc_prior_train_serve_consistency"] = mcmc_prior_consistency
+        # Nested-prior provenance in metrics.json — a downstream reader
+        # must be able to tie these numbers to a specific nested artifact
+        # (or confirm the run was legacy) without loading the checkpoint.
+        metrics.update(nested_provenance)
+        if dataset_source_binding != "sha256_bound":
+            metrics["dataset_source_binding"] = dataset_source_binding
+        if dataset_source_sha256 is not None:
+            metrics["dataset_source_sha256"] = dataset_source_sha256
         metrics_path = output_dir / "metrics.json"
         with open(metrics_path, "w") as f:
             json.dump(metrics, f, indent=2)
@@ -2645,17 +3414,19 @@ def train(
             all_true: List[np.ndarray] = []
             all_pred: List[np.ndarray] = []
             for batch in val_loader:
-                x_batch, y_batch, lengths = batch
+                assert len(batch) in (3, 4), f"Expected 3 or 4 batch fields, got {len(batch)}"
+                x_batch, y_batch, lengths = batch[:3]
                 x_batch = x_batch.to(device).contiguous()
                 lengths = lengths.to(device).contiguous()
-                y_pred, _ = model(x_batch, lengths, return_internals=True)
-                for i in range(x_batch.size(0)):
-                    n = int(lengths[i])
-                    p = y_pred[i, :n].cpu().numpy()
-                    if target_std != 1.0 or target_mean != 0.0:
-                        p = p * target_std + target_mean
-                    all_pred.append(p)
-                    all_true.append(y_batch[i, :n].cpu().numpy())
+                with torch.no_grad():
+                    y_pred, _ = model(x_batch, lengths, return_internals=True)
+                    for i in range(x_batch.size(0)):
+                        n = int(lengths[i])
+                        p = y_pred[i, :n].cpu().numpy()
+                        if target_std != 1.0 or target_mean != 0.0:
+                            p = p * target_std + target_mean
+                        all_pred.append(p)
+                        all_true.append(y_batch[i, :n].cpu().numpy())
             rows = sweep_escape_sensitivity(
                 all_true, all_pred, _SWEEP_BANDS,
             )
@@ -2687,6 +3458,19 @@ def train(
         "metrics": metrics,
         "eval_provenance": eval_provenance,
         "history": history,
+        # Nested-prior provenance (empty artifact / is_nested_cv False =
+        # legacy run).  Mirrors what every checkpoint carries.
+        "nested_prior_artifact": nested_provenance["nested_prior_artifact"],
+        "nested_prior_artifact_sha256": nested_provenance["nested_prior_artifact_sha256"],
+        "nested_prior_fingerprint": nested_provenance["nested_prior_fingerprint"],
+        "nested_split_seed": nested_provenance["nested_split_seed"],
+        "nested_val_split": nested_provenance["nested_val_split"],
+        "is_nested_cv": nested_provenance["is_nested_cv"],
+        "validation_scope": nested_provenance["validation_scope"],
+        "mcmc_prior_provenance": nested_provenance["mcmc_prior_provenance"],
+        "animal_identity_status": nested_provenance["animal_identity_status"],
+        "dataset_source_sha256": dataset_source_sha256,
+        "dataset_source_binding": dataset_source_binding,
     }
 
 
@@ -2707,6 +3491,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     args = build_arg_parser().parse_args(argv)
     dataset_path = args.dataset
     lazy_loading = args.lazy_loading
+    nested_prior_artifact = args.nested_prior_artifact
     logger.info("Config loaded: %s", config.checkpoint.output_dir)
 
     output_dir = Path(config.checkpoint.output_dir)
@@ -2716,6 +3501,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         phase1_epochs=phase1_epochs,
         dataset_path=dataset_path,
         use_lazy_loading=lazy_loading,
+        nested_prior_artifact=nested_prior_artifact,
+        require_nested_validation=not args.diagnostic_only,
+        trusted_historical_checkpoint_sha256=args.trusted_historical_checkpoint_sha256,
+        trusted_historical_artifact_sha256=args.trusted_historical_artifact_sha256,
     )
     train_log_path = output_dir / "train.log"
     with open(train_log_path, "w") as f:

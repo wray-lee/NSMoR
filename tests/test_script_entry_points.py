@@ -30,6 +30,15 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 # Scripts with an argparse CLI that must be runnable directly.
 _ENTRY_POINTS = [
     "analyze_gating.py",
+    "analyze_dynamics.py",
+    "analyze_integration.py",
+    "analyze_jacobian.py",
+    "simulate_lesion.py",
+    "simulate_psychophysics.py",
+    "simulate_autoregressive.py",
+    "prepare_data.py",
+    "prepare_metadata.py",
+    "evaluate_nested_prior.py",
     "make_subset_dataset.py",
     "train.py",
 ]

@@ -50,7 +50,7 @@ scripts/
 ├── analyze_integration.py    # Multisensory integration window
 ├── analyze_gating.py         # Unsupervised gating strategy clustering (NEW)
 ├── simulate_lesion.py        # In-silico lesion analysis
-├── simulate_psychophysics.py # Bayesian reliability analysis
+├── simulate_psychophysics.py # Routing-gate visual-noise sensitivity
 └── simulate_autoregressive.py # Closed-loop autoregressive generation
 ```
 
@@ -65,13 +65,13 @@ NSMoR provides 6 analysis modules for mechanistic interpretation:
 | `make dynamics` | `mechanism_analysis.png` | 3D phase-space manifold, routing gates |
 | `make jacobian` | `jacobian_spectrum.png` + `.json` | Jacobian eigenvalue spectrum with GMM+BIC gating |
 | `make integration` | `integration_window.png` | Multisensory integration window |
-| `make psychophysics` | `bayesian_reliability.png` + `.json` | Routing-gate noise sensitivity (Wilcoxon+HL) |
-| `make lesion` | `ablation_kinematics.png` + `.csv` | In-silico lesion (block-bootstrap CI) |
+| `make psychophysics` | `bayesian_reliability.png` + `.json` | Descriptive visual-noise sensitivity; MCMC priors fixed |
+| `make lesion` | `ablation_kinematics.png` + `.csv` | Descriptive in-silico lesion; population CIs/p-values unavailable |
 | `make cluster` | `gating_*.png, *.json` | Unsupervised gating strategy clustering |
 
-Run all analyses:
+Run all analyses after generating the nested artifact and training with the same dataset:
 ```bash
-make analyze  # Runs all 6 analysis scripts
+make analyze  # Runs all 6 dataset analyses with the nested artifact
 ```
 
 ### Gating Cluster Analysis (Window-Free)
@@ -104,24 +104,33 @@ assign_ground_truth_labels()      →  ESCAPE / PREWALK / PRE_ACTIVE / NO_RESPON
 extract_mcmc_snapshot()           →  5-D vector at TTC − 50 ms
 extract_trial_sequence()          →  (X_seq, Y_seq) anchored at Trial Start
     ↓
-train_mcmc()                      →  Animal-grouped 5-fold OOF priors (no leakage)
+train_mcmc()                      →  MCMC fit (grouped OOF requires cross-fitting)
     ↓
 create_dataloader()               →  DataLoader yielding (X_batch, Y_batch)
     X: (batch, seq_len, 8)
     Y: (batch, seq_len)
 ```
 
-### Pipeline Semantics v2.1
+### Pipeline Semantics v2.2
 
-The dataset carries two provenance keys embedded at generation time:
+Current processed datasets carry:
 
 | Key | Value | Purpose |
 |-----|-------|---------|
-| `pipeline_semantics_version` | `"2.1"` | Labels use escape-first branch ordering (PREWALK recovery) |
-| `mcmc_prior_provenance` | `"oof_5fold_animal_grouped_cv"` | Animal-grouped OOF priors (no animal-level leakage) |
+| `pipeline_semantics_version` | `"2.2"` | Current extraction and labeling semantics |
+| `mcmc_prior_provenance` | `"oof_<folds>fold_recording_prefix_grouped_cv"` | Actual fold count and recording-prefix grouping |
+| `animal_identity_status` | `"unverified"` | Animal identity across recording prefixes is unverified |
 
-The version guard in `model_utils.validate_dataset_provenance()` refuses to load
-datasets generated under older semantics, preventing silent regression.
+Grouping strips `_session_N` from session IDs. A global OOF prior fit excludes the
+held-out trial and its recording prefix, but may include labels from the later outer
+validation partition. Historical `oof_..._animal_grouped_cv` is a legacy label with
+`animal_identity_status="historical_unknown"`; its spelling does not prove animal
+identity. Neither lineage establishes animal-independent generalization.
+
+`python scripts/make_subset_dataset.py --input source.pt --output subset.pt --n_recording_prefixes 8` selects whole recording prefixes (`--n_animals` is a legacy
+alias). Per-trial `session_ids` and `trial_ids` follow the selected rows. Source priors
+are retained and may depend on labels outside the subset; this is not a new prior fit
+or independent validation dataset.
 
 ---
 
@@ -148,7 +157,7 @@ labeled = assign_ground_truth_labels(trials)
 snapshots, labels = build_snapshot_dataset(labeled)
 sequences = build_sequence_dataset(labeled)
 
-# 4. Train MCMC (animal-grouped 5-fold OOF — no leakage)
+# 4. Fit MCMC (prediction below is in-sample; grouped OOF requires cross-fitting)
 model = train_mcmc(snapshots, labels)
 
 # 5. Create DataLoader
@@ -245,7 +254,7 @@ pip install -e ".[dev]"
 pytest tests/ -v
 ```
 
-**Current test coverage**: 114 tests covering core model, data pipeline, analysis modules, and v2.1 semantics.
+**Historical v2.1 test baseline**: 114 tests; this count is not SOURCE14 regression evidence.
 
 ---
 
@@ -268,17 +277,17 @@ pytest tests/ -v
 
 See [CHANGELOG.md](CHANGELOG.md) for detailed release notes.
 
-### Version 2.1 Highlights (Current)
+### Recent v2.1/v2.2 highlights
 
-- **Pipeline semantics v2.1**: Fixed PREWALK label collapse via escape-first branch ordering; animal-grouped 5-fold CV eliminates data leakage
+- **Pipeline semantics v2.1**: Fixed PREWALK label collapse via escape-first branch ordering; recording-prefix-grouped 5-fold CV prevents within-prefix overlap
 - **DataLoader factory**: Intelligent worker auto-scaling (datasets <200 sequences use single-process, larger datasets scale to 4 workers)
 - **Jacobian GMM+BIC calibration**: Replaces ad-hoc thresholds with principled Gaussian Mixture Model + Bayesian Information Criterion selection
 - **Two-phase Hybrid Funnel training**: Gradient-isolated frontend (Phase 1: MSE) → backend (Phase 2: bio-physical losses)
-- **MCMC cross-validation diagnostics**: Per-fold leakage detection, OOF prior variance checks, train-vs-serve distribution consistency tests
+- **MCMC cross-validation diagnostics**: Per-fold recording-prefix overlap checks, OOF prior variance checks, train-vs-serve distribution consistency tests
 - **Biophysical completeness**: Added `lif_rel_refract_ms`, `sensory_noise_std`, `lif_lateral_inhibition` with sampling-rate-invariant conversion
-- **Statistical rigor**: Fixed nonparametric psychophysics analysis (Wilcoxon + Hodges-Lehmann), Holm-Bonferroni FWER correction, Wilson score CIs
+- **Analysis statistics**: Phase C trial SD/effect size, Phase D descriptive recording-prefix effects, Phase G paired-trial latency shifts with MCMC priors fixed; Jacobian Wilson score CIs
 
-**Performance**: Training with v2.1 semantics achieves **R² ≈ 0.37** (honest generalization without animal leakage), compared to R² ≈ 0.47 in the pre-v2.1 inflated pipeline.
+**Performance interpretation**: Recording-prefix-disjoint validation alone cannot establish animal-independent generalization or a causal data-quality benefit. Both require verified animal IDs and separate evaluation.
 
 ---
 
@@ -303,20 +312,27 @@ All time constants are converted internally via `alpha = exp(-dt_ms / tau_ms)`.
 Changing the acquisition rate (`dt_ms`) rescales the per-step coefficients
 automatically — the declared biophysics are sampling-rate invariant.
 
-### Statistical Methodology (Uncertainty Quantification)
+### Statistical Methodology (Descriptive Analyses)
 
-The analysis pipeline uses `nsmor.analysis.uq` for publication-grade inference:
+Phases C, D, and G summarize fixed recorded trials. Recording prefixes do not verify
+independent animals, so these outputs do not support animal-population confidence
+intervals or significance tests:
 
-- **Block bootstrap CI** (Künsch 1989) — preserves temporal autocorrelation in
-  per-trial MSE sequences; block_size=5 (fixed, conservative) with runtime
-  sensitivity check at block_size ∈ {2, 5, 10}.
-- **BCa bootstrap** — bias-corrected and accelerated intervals with extreme-z
-  warning when |z₀| > 0.25.
-- **Paired Cohen's d** — effect size for lesion conditions vs intact.
-- **Holm-Bonferroni correction** — family-wise error rate control across multiple
-  lesion comparisons; NaN p-values excluded from the family.
-- **Wilcoxon signed-rank + Hodges-Lehmann estimator** — distribution-free test
-  for psychophysics (no Shapiro pre-screening; fixed nonparametric by design).
+- **Dynamics (Phase C)** — Panel D reports mean routing gate ± trial SD and a
+  descriptive trial-level Cohen's d for Escape vs No-Response when defined.
+- **Lesion (Phase D)** — the CSV contains per-trial peak velocity, latency, and
+  MSE; the sidecar reports condition MSE and descriptive paired recording-prefix
+  Cohen's dz when defined. Animal-population CIs and p-values are unavailable;
+  `p_value`, `p_adjusted`, and `significant` are `null`.
+- **Psychophysics (Phase G)** — visual-angle noise on fixed trials labeled TTC=0 with
+  MCMC prior columns held fixed. Gate trajectories, trial latency mean ± SEM,
+  and paired-trial Hodges-Lehmann latency shifts vs σ=0 are descriptive (when
+  available). This is not a cue-combination test; `test`, uncorrected p-values,
+  and Holm-corrected p-values are `null`.
+- **Reusable `nsmor.analysis.uq` helpers** — block bootstrap CIs (Künsch 1989)
+  allow temporal blocks; BCa intervals provide bias correction for i.i.d.
+  resampling; Holm-Bonferroni correction adjusts a family of valid p-values.
+  These utilities are not animal-population inference in Phases C, D, or G.
 - **Wilson score CI** — for Jacobian accept/reject proportions (small-sample
   binomial).
 - **GMM + BIC threshold calibration** — Gaussian Mixture Model with Bayesian
@@ -495,9 +511,9 @@ finetune:
 CLI overrides for rapid experimentation:
 
 ```bash
-python train.py --config config/base.yaml --lr 5e-4 --freeze lif_cell router
-python train.py --config config/base.yaml --hidden-dim 128 --epochs 200
-python train.py --config config/base.yaml --phase1_epochs 30  # Two-phase training
+python scripts/train.py --config config/default.yaml --nested_prior_artifact results/nested_prior/nested_split_seed42.pt --lr 5e-4 --freeze lif_cell router
+python scripts/train.py --config config/default.yaml --nested_prior_artifact results/nested_prior/nested_split_seed42.pt --hidden_dim 128 --epochs 200
+python scripts/train.py --config config/default.yaml --nested_prior_artifact results/nested_prior/nested_split_seed42.pt --phase1_epochs 30
 ```
 
 Dynamic dataset combination for mixed experimental conditions:
@@ -576,15 +592,31 @@ loss = criterion(y_pred, y_true, lengths, g_gru, lambda_reg=0.01)
 Full training pipeline with **two-phase Hybrid Funnel** or single-phase mode:
 
 ```bash
-# Single-phase (backward compatible — all parameters trainable)
-python scripts/train.py --config config/default.yaml --epochs 100
+# Given a processed dataset, create an outer-split, inner-fit prior artifact first.
+python scripts/evaluate_nested_prior.py --dataset data/processed/nsmor_dataset.pt --output_dir results/nested_prior
 
-# Two-phase: Phase 1 (30 epochs, frontend MSE) → Phase 2 (70 epochs, bio loss)
-python scripts/train.py --config config/default.yaml --epochs 100 --phase1_epochs 30
+# Scored validation: single-phase or two-phase (30 frontend + 70 backend epochs).
+python scripts/train.py --config config/default.yaml --dataset data/processed/nsmor_dataset.pt --nested_prior_artifact results/nested_prior/nested_split_seed42.pt --epochs 100
+python scripts/train.py --config config/default.yaml --dataset data/processed/nsmor_dataset.pt --nested_prior_artifact results/nested_prior/nested_split_seed42.pt --epochs 100 --phase1_epochs 30
 
-# Skip Phase 1, start directly with Phase 2 (bio loss from epoch 0)
-python scripts/train.py --config config/default.yaml --epochs 100 --phase1_epochs 0
+# Deliberate nonnested diagnostic (including --phase1_epochs 0 if desired).
+python scripts/train.py --config config/default.yaml --dataset data/processed/nsmor_dataset.pt --diagnostic_only --epochs 100
 ```
+
+The CLI requires `--nested_prior_artifact` for scored validation. Without it,
+`--diagnostic_only` marks metrics, results, and checkpoints with
+`validation_scope="diagnostic_global_oof"`: global OOF prior fits may have used
+outer-validation labels. These scores, including best-checkpoint selection, cannot
+support unbiased holdout, generalization, strict QC, or release claims. A validated
+nested artifact records `validation_scope="nested_outer_validation"`; recording-prefix
+splits still do not verify independent animals. The nested path is incompatible with
+`--lazy_loading`. Programmatic `train()` retains diagnostic compatibility unless
+`require_nested_validation=True` is set.
+
+JAX `scripts/train_jax.py` uses global OOF priors and saves
+`checkpoint_type="jax_development_only"` checkpoints for development and matching
+JAX resume. Its validation is `diagnostic_global_oof`; the checkpoints are not
+canonical downstream analysis checkpoints.
 
 **Two-phase training schedule:**
 
@@ -640,8 +672,11 @@ J_batch = adapter.compute_jacobian_batch(h_states, x_inputs)  # (N, H, H)
 
 ## Execution & Reproducibility
 
-NSMoR uses industrial-grade DevOps standards for biological simulations.
-Every figure in the paper can be reproduced from a fresh clone with a single command.
+Run commands in the repository's WSL Zsh/torch environment. `make pipeline` runs
+ETL, fits outer-split/inner-OOF priors from that dataset, trains with the generated
+artifact, then forwards it to all six dataset analyses. The autoregressive stage
+uses only the checkpoint. No pipeline output alone establishes independent-animal
+validation or QC approval.
 
 ### Quick Start
 
@@ -651,8 +686,14 @@ git clone https://github.com/<your-org>/nsmor.git
 cd nsmor
 make install
 
-# 2. Run the full experimental pipeline (ETL → Train → 5 Analyses)
+# 2. Run the full pipeline with a fresh RUN_DIR (or run the stages below).
 make pipeline
+
+# Separate stages after providing raw data:
+make data
+make nested-prior
+make train
+make analyze
 ```
 
 ### Individual Stages
@@ -661,29 +702,33 @@ make pipeline
 | -------------------- | ------------------------------------------------ |
 | `make load`          | Preload raw CSVs                                 |
 | `make data`          | ETL: raw CSVs → processed PyTorch dataset        |
-| `make train`         | Train NSMoR model (100 epochs by default)        |
+| `make nested-prior` | Fit a fresh nested artifact from `DATA` using `SEED` |
+| `make train`         | Scored trainer using `NESTED_PRIOR_ARTIFACT` |
+| `make pipeline`      | ETL → nested priors → scored training → analyses → simulation |
 | `make analyze`       | Run all 6 analysis scripts sequentially          |
 | `make dynamics`      | Dynamics & manifold visualisation                |
 | `make lesion`        | In-silico lesion (virtual ablation)              |
 | `make jacobian`      | Jacobian eigenvalue spectrum                     |
 | `make integration`   | Multisensory integration window                  |
-| `make psychophysics` | Bayesian reliability & cue combination           |
+| `make psychophysics` | Visual-noise sensitivity (MCMC priors fixed)     |
 | `make generate`      | Autoregressive closed-loop trajectory generation |
 | `make test`          | Run full test suite                              |
 | `make clean`         | Remove caches and build artefacts                |
 
 ### Configuration
 
-All hyperparameters are centralised in `config/default.yaml` and can be overridden via environment variables:
-
-```bash
-EPOCHS=200 LR=0.0005 make train
-CONFIG=config/fast.yaml make pipeline
-```
+`NESTED_PRIOR_ARTIFACT` defaults to `$(RUN_DIR)/nested_prior/nested_split_seed$(SEED).pt`.
+`make nested-prior` requires an existing `DATA` and refuses to overwrite that
+artifact. `make train` and `make analyze` use the same path; override it for an
+existing, dataset-matched artifact. `make pipeline` creates the artifact after ETL
+and requires its filename to match `SEED`, refusing a pre-existing artifact or
+checkpoint before running stages. For a deliberate global-OOF diagnostic, invoke
+`scripts/train.py --diagnostic_only` explicitly; those scores are ineligible for
+unbiased holdout or QC claims.
 
 ### Output Figures
 
-After `make pipeline`, all publication-ready figures (300 DPI, Lancet/Cell aesthetic) are in `results/`:
+The analysis commands can write the following files to `results/` when supplied with suitable inputs; no publication or QC claim follows from their presence:
 
 | File                       | Analysis                        |
 | -------------------------- | ------------------------------- |
@@ -709,34 +754,28 @@ After `make pipeline`, all publication-ready figures (300 DPI, Lancet/Cell aesth
 
 ### Docker & CI/CD
 
-NSMoR provides a hermetic Docker container with GPU passthrough to eliminate
-all host-OS dependencies. A reviewer can reproduce the entire paper without
-installing PyTorch, CUDA, or Python locally.
+Docker commands use the same scored-training artifact requirement as the local
+Makefile and pipeline script.
 
 #### Prerequisites
 
 - [Docker](https://docs.docker.com/get-docker/) with Compose V2
 - [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/) (GPU only)
 
-#### Reproduce the Paper from a Fresh Clone
+#### Container outputs
 
-```bash
-git clone https://github.com/<your-org>/nsmor.git
-cd nsmor
-docker compose run --rm nsmor pipeline     # ETL → Train → 6 Analyses
-```
-
-All figures and data outputs persist in the host `results/` directory via bind mounts.
+Generated files persist in the host `results/` directory via bind mounts. The
+container pipeline uses the same ETL → nested-prior → scored-training → analysis DAG described above; a fresh artifact and checkpoint are required. A plan or produced figure alone does not establish strict QC acceptance.
 
 #### Containerised Targets
 
 | Command                                  | Description                           |
 | ---------------------------------------- | ------------------------------------- |
-| `docker compose run --rm nsmor pipeline` | Full end-to-end experimental pipeline |
+| `docker compose run --rm nsmor pipeline` | Generates and forwards the nested artifact through the scored pipeline |
 | `docker compose run --rm nsmor test`     | Pytest suite                          |
-| `docker compose run --rm nsmor train`    | Training engine only                  |
+| `docker compose run --rm nsmor train`    | Requires and forwards an existing nested artifact |
 | `docker compose run --rm nsmor analyze`  | All 6 analysis scripts                |
-| `docker compose run --rm nsmor bash`     | Interactive shell inside container    |
+| `docker compose run --rm --entrypoint bash nsmor` | Interactive shell inside container |
 
 #### CI/CD
 

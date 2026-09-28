@@ -11,7 +11,9 @@ Provides accelerated, JIT-compiled dual-pathway recurrent architecture:
 
 Sequence unrolling is fused into a single ``jax.lax.scan`` kernel, eliminating
 per-timestep Python interpretation overhead and achieving multi-fold speedup.
-Full bidirectional weight compatibility with PyTorch NSMoRCore is provided.
+Bidirectional parameter mapping uses the PyTorch NSMoRCore weight layout.
+Weight layout compatibility does not certify canonical analysis checkpoint
+provenance or numerical equivalence. JAX training artifacts are development only.
 """
 
 from __future__ import annotations
@@ -549,8 +551,9 @@ def to_torch_state_dict(flax_params: Dict[str, Any]) -> Dict[str, Any]:
     """
     Convert Flax parameter PyTree back to a PyTorch state_dict.
 
-    Provides compatibility so checkpoints trained in JAX can be loaded by
-    evaluation and analysis tools in PyTorch.
+    Converts parameter layouts only. Canonical PyTorch analysis additionally
+    requires its checkpoint schema and valid dataset/prior provenance; JAX
+    development training artifacts are outside that pipeline.
     """
     import torch
 

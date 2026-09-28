@@ -12,7 +12,10 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
+import os
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -32,14 +35,18 @@ from nsmor.config import (
     TimeWindowConfig,
 )
 from nsmor.data_extractor import (
+    _compute_pure_wind_prepend_frames,
     build_snapshot_dataset,
     resolve_snapshot_anchor,
 )
+from nsmor.lazy_dataloader import load_csv_snapshot, verify_source_pair
+from nsmor.pipeline.events import parse_event_details
 from nsmor.mcmc_module import train_mcmc_cross_fitted
 from nsmor.pipeline.grouping import animal_keys_of, resolve_group_folds
 from nsmor.pipeline.io import (
     extract_trial_data,
-    load_and_concat_sessions,
+    load_events_csv,
+    load_kinematics_csv,
 )
 from nsmor.pipeline.labeling import (
     assign_ground_truth_labels,
@@ -52,6 +59,86 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
+
+
+def parse_declared_ttc_ms(
+    raw_ttc: Any,
+    session_id: str,
+    trial_id: int,
+) -> Optional[float]:
+    """Parse declared target_ttc_ms from raw event details, failing closed on corrupt values.
+
+    Preserves legitimate null (None / NaN float) for unimodal trials.  Raises
+    ``ValueError`` on non-numeric or non-finite values, matching the
+    ``nsmor.pipeline.events.parse_events_file`` contract so corrupt TTC can
+    never be laundered into a silent ``None``.
+
+    Args:
+        raw_ttc: Raw value from event details (may be None, float, str, …).
+        session_id: Session identifier for error messages.
+        trial_id: Trial identifier for error messages.
+
+    Returns:
+        Parsed finite float, or ``None`` for legitimate null.
+
+    Raises:
+        ValueError: If *raw_ttc* is non-null but not a finite number.
+    """
+    if raw_ttc is None or (isinstance(raw_ttc, float) and math.isnan(raw_ttc)):
+        return None
+    try:
+        val = float(raw_ttc)
+    except (ValueError, TypeError) as e:
+        raise ValueError(
+            f"Corrupt target_ttc_ms {raw_ttc!r} in trial_start details "
+            f"for session {session_id}, trial {trial_id}: {e}"
+        ) from e
+    if math.isnan(val) or math.isinf(val):
+        raise ValueError(
+            f"Non-finite target_ttc_ms {val} in trial_start details "
+            f"for session {session_id}, trial {trial_id}"
+        )
+    return val
+
+
+def parse_declared_lv_ratio_ms(
+    raw_lv: Any,
+    session_id: str,
+    trial_id: int,
+) -> Optional[float]:
+    """Parse declared lv_ratio_ms from raw event details, failing closed on corrupt values.
+
+    Preserves legitimate null (None / NaN float) for trials without a
+    declared LV ratio.  Raises ``ValueError`` on non-numeric or non-finite
+    values so corrupt ratios can never be laundered into a silent ``None``
+    (which would fabricate "no LV ratio declared" for a trial that has one).
+
+    Args:
+        raw_lv: Raw value from event details (may be None, float, str, …).
+        session_id: Session identifier for error messages.
+        trial_id: Trial identifier for error messages.
+
+    Returns:
+        Parsed finite float, or ``None`` for legitimate null.
+
+    Raises:
+        ValueError: If *raw_lv* is non-null but not a finite number.
+    """
+    if raw_lv is None or (isinstance(raw_lv, float) and math.isnan(raw_lv)):
+        return None
+    try:
+        val = float(raw_lv)
+    except (ValueError, TypeError) as e:
+        raise ValueError(
+            f"Corrupt lv_ratio_ms {raw_lv!r} in trial_start details "
+            f"for session {session_id}, trial {trial_id}: {e}"
+        ) from e
+    if math.isnan(val) or math.isinf(val):
+        raise ValueError(
+            f"Non-finite lv_ratio_ms {val} in trial_start details "
+            f"for session {session_id}, trial {trial_id}"
+        )
+    return val
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -137,10 +224,33 @@ def main() -> None:
 
     # ── Step 2: Load and concatenate sessions ─────────────────────
     logger.info("[Step 2] Loading and concatenating sessions...")
-    kin_paths = [p[0] for p in csv_pairs]
-    evt_paths = [p[1] for p in csv_pairs]
-
-    session_data = load_and_concat_sessions(kin_paths, evt_paths)
+    kin_parts = []
+    evt_parts = []
+    source_pairs_by_key: Dict[Tuple[str, int], List[Dict[str, str]]] = {}
+    all_source_pairs = []
+    for kin_path, evt_path in csv_pairs:
+        kin_df, kin_digest = load_csv_snapshot(kin_path, load_kinematics_csv)
+        evt_df, evt_digest = load_csv_snapshot(evt_path, load_events_csv)
+        kin_parts.append(kin_df)
+        evt_parts.append(evt_df)
+        pair = {
+            "session_dir": str(kin_path.parent.resolve()),
+            "kinematics_file": kin_path.name,
+            "events_file": evt_path.name,
+            "kinematics_sha256": kin_digest,
+            "events_sha256": evt_digest,
+        }
+        verify_source_pair(pair)
+        all_source_pairs.append(pair)
+        keys = set(kin_df[["session_id", "trial_id"]].itertuples(index=False, name=None))
+        keys.update(evt_df[["session_id", "trial_id"]].itertuples(index=False, name=None))
+        for key in keys:
+            source_pairs_by_key.setdefault(key, []).append(pair)
+    session_data = {
+        "kinematics": pd.concat(kin_parts, ignore_index=True),
+        "events": pd.concat(evt_parts, ignore_index=True),
+    }
+    del kin_parts, evt_parts
     logger.info(
         "Loaded %d kinematics rows, %d events rows.",
         len(session_data["kinematics"]),
@@ -150,14 +260,22 @@ def main() -> None:
     # ── Step 3: Per-trial extraction and labeling ─────────────────
     logger.info("[Step 3] Extracting trials and assigning labels...")
     trial_groups = session_data["kinematics"].groupby(["session_id", "trial_id"])
+    events = session_data["events"]
+    declared_trials = set(events.loc[
+        events["event_type"].eq("trial_start"), ["session_id", "trial_id"]
+    ].itertuples(index=False, name=None))
+    missing = sorted(declared_trials - trial_groups.indices.keys(), key=repr)
+    if missing:
+        raise ValueError(f"Event-declared trial(s) {missing!r} missing kinematics")
     trials: List[Dict[str, Any]] = []
     for (session_id, trial_id), _ in trial_groups:
         try:
             trial = extract_trial_data(session_data, session_id, trial_id)
             trials.append(trial)
-        except ValueError as e:
-            logger.warning("Skipping trial: %s", e)
-            continue
+        except ValueError as exc:
+            raise ValueError(
+                f"Trial extraction failed for session={session_id!r}, trial={trial_id!r}: {exc}"
+            ) from exc
 
     logger.info("Extracted %d valid trials.", len(trials))
 
@@ -178,7 +296,7 @@ def main() -> None:
             feature_config=feature_config,
             return_kept_indices=True,
             return_anchor_rules=True,
-            on_unanchorable="skip",
+            on_unanchorable="raise",
         )
     )
     logger.info(
@@ -191,10 +309,8 @@ def main() -> None:
         },
     )
 
-    # Animal-grouped cross-fitted MCMC priors (same as prepare_data.py).
-    # Grouping by session would let an animal's _session_1 train the
-    # generator that produced _session_2's "held-out" prior; those priors
-    # become input channels 4-7, so the leak enters the model as a feature.
+    # Recording-prefix grouped OOF priors prevent within-recording overlap.
+    # Independent animal identities across prefixes are unverified.
     torch.manual_seed(random_seed)
     np.random.seed(random_seed)
 
@@ -203,7 +319,7 @@ def main() -> None:
         [info["session_id"] for info in labeled_kept]
     )
     assert len(snapshot_groups) == len(snapshots), (
-        f"Animal-group count {len(snapshot_groups)} != "
+        f"Recording-prefix group count {len(snapshot_groups)} != "
         f"snapshot count {len(snapshots)}"
     )
 
@@ -217,12 +333,12 @@ def main() -> None:
         groups=snapshot_groups,
         verbose=True,
     )
-    n_animals = len(set(snapshot_groups.tolist()))
+    n_prefixes = len(set(snapshot_groups.tolist()))
     logger.info(
-        "Generated out-of-fold MCMC priors (%d-fold animal-grouped "
-        "cross-fitting over %d animals): %s",
+        "Generated out-of-fold MCMC priors (%d-fold recording-prefix grouped "
+        "cross-fitting over %d prefixes): %s",
         n_folds,
-        n_animals,
+        n_prefixes,
         mcmc_priors.shape,
     )
     assert mcmc_priors.shape == (len(snapshots), feature_config.mcmc_dim), (
@@ -246,33 +362,25 @@ def main() -> None:
             trial_data, stimulus_onset_ms,
         )
 
-        # Find source CSV paths: match session_id back to csv_pairs
-        # Session data is concat'd, so we find the session dir from the
-        # original csv_pairs list.
-        session_dir: Optional[str] = None
-        kin_file: Optional[str] = None
-        evt_file: Optional[str] = None
-        for kin_path, evt_path in csv_pairs:
-            if session_id in kin_path.stem or session_id in kin_path.parent.name:
-                session_dir = str(kin_path.parent)
-                kin_file = kin_path.name
-                evt_file = evt_path.name
-                break
-
-        if session_dir is None:
-            # Fallback: derive from session_id pattern
-            # Session dirs are named by session_id in the staging layout
-            candidate = raw_dir / session_id
-            if candidate.is_dir():
-                session_dir = str(candidate)
-                kin_candidates = list(candidate.glob("*kinematics*.csv"))
-                evt_candidates = list(candidate.glob("*events*.csv"))
-                if kin_candidates and evt_candidates:
-                    kin_file = kin_candidates[0].name
-                    evt_file = evt_candidates[0].name
+        # Preserve every pair that contributed frames or events to this trial,
+        # in the same order used by the producer's concatenated tables.
+        source_pairs = source_pairs_by_key[(session_id, trial_id)]
+        source = source_pairs[0]
 
         time_ms = trial_data["time_ms"]
         n_frames = len(time_ms)
+
+        # Extract declared target_ttc_ms and lv_ratio_ms from trial events if available
+        target_ttc_ms: Optional[float] = None
+        lv_ratio_ms: Optional[float] = None
+        for etype, evalue in zip(trial_data.get("event_types", []), trial_data.get("event_values", [])):
+            if str(etype) == "trial_start":
+                det = parse_event_details(evalue)
+                raw_ttc = det.get("target_ttc_ms")
+                target_ttc_ms = parse_declared_ttc_ms(raw_ttc, session_id, trial_id)
+                raw_lv = det.get("lv_ratio_ms")
+                lv_ratio_ms = parse_declared_lv_ratio_ms(raw_lv, session_id, trial_id)
+                break
 
         # Compute anchor frame index for lazy loader crop alignment
         anchor_frame = int(np.argmin(np.abs(time_ms - anchor_ms)))
@@ -290,12 +398,25 @@ def main() -> None:
             condition = "no_stimulus"
         is_pure_wind = (condition == "wind_only")
 
+        # Pure-wind baseline alignment: NSMoRLazyDataset prepends baseline frames
+        # in _build_sequence. Adjust spec anchor_frame and n_frames to match the
+        # built sequence so lazy-cropping aligns correctly on stimulus.
+        prepend_frames = 0
+        if is_pure_wind:
+            dt_ms_eff = float(np.median(np.diff(time_ms))) if n_frames > 1 else args.dt_ms
+            prepend_frames = _compute_pure_wind_prepend_frames(dt_ms_eff)
+            anchor_frame += prepend_frames
+            n_frames += prepend_frames
+
         trial_specs.append({
             "session_id": session_id,
-            "session_dir": session_dir or "",
-            "kinematics_file": kin_file or "",
-            "events_file": evt_file or "",
+            "session_dir": source["session_dir"],
+            "kinematics_file": source["kinematics_file"],
+            "events_file": source["events_file"],
+            "source_pairs": source_pairs,
             "trial_id": trial_id,
+            "target_ttc_ms": target_ttc_ms,
+            "lv_ratio_ms": lv_ratio_ms,
             "n_frames": n_frames,
             "trial_start_ms": float(time_ms[0]),
             "stimulus_onset_ms": stimulus_onset_ms,
@@ -305,6 +426,7 @@ def main() -> None:
             "label": info["label"].name,  # Label enum -> string
             "stimulus_condition": condition,
             "is_pure_wind": is_pure_wind,
+            "pure_wind_prepended_frames": prepend_frames,
         })
 
     logger.info("Built %d trial specs.", len(trial_specs))
@@ -314,9 +436,14 @@ def main() -> None:
 
     n_sessions = len(set(spec["session_id"] for spec in trial_specs))
     metadata = {
+        "raw_input_revision": {
+            "claim": "SHA-256 of captured CSV bytes; paths are labels, not a live-path guarantee",
+            "source_pairs": all_source_pairs,
+        },
         "trial_specs": trial_specs,
         "mcmc_priors": torch.from_numpy(mcmc_priors).float(),
-        "mcmc_prior_provenance": f"oof_{n_folds}fold_animal_grouped_cv",
+        "mcmc_prior_provenance": f"oof_{n_folds}fold_recording_prefix_grouped_cv",
+        "animal_identity_status": "unverified",
         "pipeline_semantics_version": PIPELINE_SEMANTICS_VERSION,
         "n_trials": len(trial_specs),
         "label_encoder": {
@@ -327,6 +454,8 @@ def main() -> None:
         "snapshot_anchor_rules": snapshot_anchor_rules,
         "n_sessions": n_sessions,
         "session_ids": [spec["session_id"] for spec in trial_specs],
+        "trial_ids": [spec["trial_id"] for spec in trial_specs],
+        "target_ttc_ms": [spec.get("target_ttc_ms") for spec in trial_specs],
         "anchor_frames": [spec["anchor_frame"] for spec in trial_specs],
         "stimulus_conditions": [spec["stimulus_condition"] for spec in trial_specs],
         "is_pure_wind": np.array(
@@ -334,7 +463,19 @@ def main() -> None:
         ),
     }
 
-    torch.save(metadata, output_path)
+    for pair in all_source_pairs:
+        verify_source_pair(pair)
+    with tempfile.NamedTemporaryFile(
+        dir=output_path.parent, prefix=f".{output_path.name}.", suffix=".tmp", delete=False,
+    ) as temporary:
+        temporary_path = Path(temporary.name)
+    try:
+        torch.save(metadata, temporary_path)
+        for pair in all_source_pairs:
+            verify_source_pair(pair)
+        os.replace(temporary_path, output_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
     logger.info("Saved metadata to %s (%.2f MB)", output_path, output_path.stat().st_size / 1e6)
 
     # Print statistics

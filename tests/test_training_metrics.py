@@ -329,10 +329,29 @@ def _make_synthetic_dataset(path: Path, n_seqs: int = 6, T: int = 12) -> None:
         "lengths": np.full(n_seqs, T, dtype=np.int64),
         # Round-3 provenance guard: loaders reject unstamped artifacts.
         "pipeline_semantics_version": PIPELINE_SEMANTICS_VERSION,
-        "mcmc_prior_provenance": "oof_5fold_animal_grouped_cv",
+        "mcmc_prior_provenance": "oof_5fold_recording_prefix_grouped_cv",
+        "animal_identity_status": "unverified",
+        "session_ids": [f"recording{i}_session_1" for i in range(n_seqs)],
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(dataset, path)
+
+
+def _nested_prefix_metadata(session_ids, train_idx, val_idx):
+    from nsmor.pipeline.grouping import animal_keys_of
+
+    prefixes = animal_keys_of(session_ids)
+    train_prefixes = sorted(set(prefixes[train_idx].tolist()))
+    val_prefixes = sorted(set(prefixes[val_idx].tolist()))
+    return {
+        "recording_prefix_keys": prefixes,
+        "train_recording_prefixes": train_prefixes,
+        "val_recording_prefixes": val_prefixes,
+        "n_train_recording_prefixes": len(train_prefixes),
+        "n_val_recording_prefixes": len(val_prefixes),
+        "n_inner_folds": 5,
+        "animal_identity_status": "unverified",
+    }
 
 
 def _tiny_config(mod, output_dir):
@@ -346,6 +365,381 @@ def _tiny_config(mod, output_dir):
     cfg.training.lr_warmup_epochs = 0
     cfg.checkpoint.output_dir = str(output_dir)
     return cfg
+
+
+def test_post_training_sweep_accepts_metadata_and_legacy_batches(tmp_path, monkeypatch):
+    """Export a 12-cell sweep from best Phase 2 weights after one tiny epoch."""
+    import csv
+    import json
+    from nsmor.nsmor_dataloader import collate_with_metadata
+    from nsmor.pipeline.grouping import grouped_train_val_split
+
+    mod = _load_train_module()
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(mod, "_SWEEP_BANDS", None)
+    monkeypatch.setattr(mod, "_VAL_SPLIT", 0.5)
+    ds_path = tmp_path / "synthetic.pt"
+    _make_synthetic_dataset(ds_path)
+    dataset = torch.load(ds_path, weights_only=False)
+    dataset["session_ids"] = [f"animal{i}_session_1" for i in range(6)]
+    for i in range(6):
+        n = 6 + i
+        dataset["X_seqs"][i] = dataset["X_seqs"][i][:n]
+        dataset["Y_seqs"][i] = np.array([0, 0, 60, 60, 60] + [0] * (n - 5), dtype=np.float32)
+        dataset["lengths"][i] = n
+        assert dataset["X_seqs"][i].shape == (n, 8)
+        assert dataset["Y_seqs"][i].shape == (n,)
+    torch.save(dataset, ds_path)
+    _, val_idx = grouped_train_val_split(dataset["session_ids"], 6, val_split=0.5,
+                                        random_seed=42)
+    n_escape = 3 * len(val_idx)  # One three-frame raw 60 cm/s run per trial.
+    escape_ratio = n_escape / sum(int(dataset["lengths"][i]) for i in val_idx)
+
+    real_build_model = mod.build_model
+    observations = []
+
+    def observed_model(config):
+        model = real_build_model(config)
+
+        def observe_forward(module, inputs, output):
+            best_path = Path(config.checkpoint.output_dir) / "best_model.pth"
+            if not best_path.exists():  # Initial training/validation precede selection.
+                return
+            pred, _ = output
+            assert pred.shape == inputs[0].shape[:2]
+            assert not module.training and not torch.is_grad_enabled()
+            assert not pred.requires_grad
+            assert any(p.requires_grad for p in module.backend.parameters())
+            best = torch.load(best_path, map_location="cpu", weights_only=False)
+            for name, param in module.named_parameters():
+                assert torch.equal(param.detach().cpu(), best["model_state_dict"][name])
+            observations.append(True)
+
+        model.register_forward_hook(observe_forward)
+        return model
+
+    monkeypatch.setattr(mod, "build_model", observed_model)
+    real_build_dataloaders = mod.build_dataloaders
+
+    def validation_loader(*args, **kwargs):
+        train_loader, val_loader = real_build_dataloaders(*args, **kwargs)
+        if width == 3:
+            # Existing collate adapter: same padded data, no condition mask.
+            val_loader.collate_fn = collate_with_metadata
+        batch = next(iter(val_loader))
+        assert isinstance(batch, tuple) and len(batch) == width
+        assert batch[0].shape[:2] == batch[1].shape
+        assert batch[2].shape == (batch[0].size(0),)
+        if width == 4:
+            assert batch[3].dtype == torch.bool and batch[3].shape == batch[2].shape
+        return train_loader, val_loader
+
+    bands = [5.0, 10.0, 20.0, 50.0]
+    monkeypatch.setattr(mod, "_SWEEP_BANDS", bands)
+    exports, headlines = [], []
+    for width in (4, 3):
+        with monkeypatch.context() as patch:
+            patch.setattr(mod, "build_dataloaders", validation_loader)
+            output_dir = tmp_path / f"batch{width}"
+            cfg = _tiny_config(mod, output_dir)
+            cfg.training.num_epochs = 1
+            cfg.training.random_seed = 42
+            cfg.training.num_workers = 0
+            cfg.training.normalize_targets = True
+            cfg.training.target_clip_cm_s = 100.0
+            result = mod.train(cfg, phase1_epochs=0, dataset_path=str(ds_path))
+
+        assert len(result["history"]["train_loss"]) == len(result["history"]["val_loss"]) == 1
+        assert result["eval_provenance"] == "best"
+        final = torch.load(output_dir / "final_model.pth", map_location="cpu", weights_only=False)
+        metrics = json.loads((output_dir / "metrics.json").read_text())
+        best = torch.load(output_dir / "best_model.pth", map_location="cpu", weights_only=False)
+        periodic = torch.load(output_dir / "epoch_1.pth", map_location="cpu", weights_only=False)
+        for record in (best, periodic, final, metrics, result, result["metrics"]):
+            assert record["is_nested_cv"] is False
+            assert record["nested_prior_artifact_sha256"] == ""
+            assert record["validation_scope"] == "diagnostic_global_oof"
+        with (output_dir / "escape_sensitivity.csv").open(newline="") as f:
+            rows = [{key: float(value) for key, value in row.items()}
+                    for row in csv.DictReader(f)]
+        assert len(rows) == 12
+        assert {(row["band_cm_s"], row["min_run"]) for row in rows} == {
+            (band, run) for band in bands for run in (1, 2, 3)
+        }
+        assert all(np.isfinite(list(row.values())).all() for row in rows)
+        for row in rows:
+            assert row["n_escape_frames"] == n_escape
+            assert row["n_escape_events"] == len(val_idx)
+            assert row["escape_ratio"] == pytest.approx(escape_ratio)
+        exports.append(rows)
+        headlines.append(metrics)
+    assert observations
+    assert exports[0] == exports[1]
+    assert headlines[0] == headlines[1]
+
+
+def test_nested_prior_normalization_uses_loaded_split_after_valid_same_path_swap(tmp_path, monkeypatch):
+    """A held-out animal in sidecar A cannot enter train target statistics via B."""
+    import hashlib
+    from nsmor.pipeline.grouping import grouped_train_val_split
+    from nsmor.pipeline.nested_prior import load_nested_prior_split
+
+    mod = _load_train_module()
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    ds_path = tmp_path / "synthetic.pt"
+    _make_synthetic_dataset(ds_path)
+    dataset = torch.load(ds_path, weights_only=False)
+    dataset["session_ids"] = [f"animal{i}_session_1" for i in range(6)]
+    dataset["Y_seqs"] = [np.full(12, value, dtype=np.float32)
+                         for value in (90.0, 1.0, 2.0, 3.0, 4.0, 5.0)]
+    torch.save(dataset, ds_path)
+    source_sha = hashlib.sha256(ds_path.read_bytes()).hexdigest()
+    priors = np.tile([0.4, 0.3, 0.2, 0.1], (6, 1))
+    artifact_path = tmp_path / "nested.pt"
+    artifacts = []
+    for seed in (42, 43):
+        train_idx, val_idx = grouped_train_val_split(
+            dataset["session_ids"], 6, val_split=0.2, random_seed=seed,
+        )
+        sidecar = {
+            "nested_priors": priors, "train_priors": priors[train_idx],
+            "val_priors": priors[val_idx], "train_indices": train_idx,
+            "val_indices": val_idx, "is_nested_cv": True,
+            "source_fingerprint": source_sha,
+            "pipeline_semantics_version": dataset["pipeline_semantics_version"],
+            "split_seed": seed, "val_split": 0.2,
+            "mcmc_prior_provenance": f"nested_outer_seed{seed}_inner_5fold_recording_prefix_grouped",
+            **_nested_prefix_metadata(dataset["session_ids"], train_idx, val_idx),
+        }
+        path = artifact_path if seed == 42 else tmp_path / "replacement.pt"
+        torch.save(sidecar, path)
+        loaded_train, loaded_val, _, info = load_nested_prior_split(
+            path, ds_path, 6, dataset["session_ids"],
+            feature_config=dataset.get("feature_config", mod.DEFAULT_FEATURE),
+        )
+        np.testing.assert_array_equal(loaded_train, train_idx)
+        np.testing.assert_array_equal(loaded_val, val_idx)
+        assert info["nested_prior_artifact_sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
+        artifacts.append((train_idx, path))
+
+    np.testing.assert_array_equal(artifacts[0][0], [1, 2, 3, 4, 5])
+    np.testing.assert_array_equal(artifacts[1][0], [0, 1, 2, 3, 4])
+    digest_a = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+    bytes_b = artifacts[1][1].read_bytes()
+    assert hashlib.sha256(bytes_b).hexdigest() != digest_a
+
+    cfg = _tiny_config(mod, tmp_path / "run")
+    cfg.training.num_epochs = 1
+    cfg.training.num_workers = 0
+    cfg.training.normalize_targets = True
+    cfg.training.target_clip_cm_s = 100.0
+    mean_a, _, idx_a = mod.compute_target_stats(
+        str(ds_path), cfg, nested_prior_artifact=str(artifact_path),
+    )
+    np.testing.assert_array_equal(idx_a, artifacts[0][0])
+    assert mean_a == pytest.approx(3.0)
+    build = mod.build_dataloaders
+
+    def swap_after_load(*args, **kwargs):
+        train_loader, val_loader = build(*args, **kwargs)
+        np.testing.assert_array_equal(train_loader.dataset.source_indices, idx_a)
+        artifact_path.write_bytes(bytes_b)
+        return train_loader, val_loader
+
+    monkeypatch.setattr(mod, "build_dataloaders", swap_after_load)
+    result = mod.train(cfg, dataset_path=str(ds_path),
+                       nested_prior_artifact=str(artifact_path))
+    mean_b, _, idx_b = mod.compute_target_stats(
+        str(ds_path), cfg, nested_prior_artifact=str(artifact_path),
+    )
+    np.testing.assert_array_equal(idx_b, artifacts[1][0])
+    assert mean_b == pytest.approx(20.0)
+    assert mean_b != pytest.approx(mean_a)
+    saved = torch.load(tmp_path / "run" / "best_model.pth", map_location="cpu",
+                       weights_only=False)
+    assert saved["target_mean"] == pytest.approx(mean_a)
+    final = torch.load(tmp_path / "run" / "final_model.pth", map_location="cpu",
+                       weights_only=False)
+    assert final["target_mean"] == pytest.approx(mean_a)
+    assert saved["nested_split_seed"] == 42
+    assert saved["nested_prior_artifact_sha256"] == digest_a
+    assert result["nested_prior_artifact_sha256"] == digest_a
+
+
+def test_nested_prior_digest_uses_loaded_bytes_when_sidecar_changes_before_recording(tmp_path, monkeypatch):
+    """The training matrix and checkpoint digest must come from the same read."""
+    import hashlib
+    from nsmor.pipeline.grouping import grouped_train_val_split
+    from nsmor.analysis.analysis_priors import load_analysis_priors
+    from nsmor.analysis.prediction_units import load_model_from_checkpoint
+
+    mod = _load_train_module()
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    ds_path = tmp_path / "synthetic.pt"
+    _make_synthetic_dataset(ds_path)
+    dataset = torch.load(ds_path, weights_only=False)
+    sessions = [f"animal{i}_session_1" for i in range(6)]
+    dataset["session_ids"] = sessions
+    torch.save(dataset, ds_path)
+    train_idx, val_idx = grouped_train_val_split(sessions, 6, val_split=0.2, random_seed=42)
+    original = np.tile([0.4, 0.3, 0.2, 0.1], (6, 1))
+    replacement = np.tile([0.1, 0.2, 0.3, 0.4], (6, 1))
+    artifact = {
+        "nested_priors": original, "train_priors": original[train_idx],
+        "val_priors": original[val_idx], "train_indices": train_idx,
+        "val_indices": val_idx, "is_nested_cv": True,
+        "source_fingerprint": hashlib.sha256(ds_path.read_bytes()).hexdigest(),
+        "pipeline_semantics_version": dataset["pipeline_semantics_version"],
+        "split_seed": 42, "val_split": 0.2,
+        "mcmc_prior_provenance": "nested_outer_seed42_inner_5fold_recording_prefix_grouped",
+        **_nested_prefix_metadata(sessions, train_idx, val_idx),
+    }
+    artifact_path = tmp_path / "nested.pt"
+    torch.save(artifact, artifact_path)
+    loaded_digest = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+    build = mod.build_dataloaders
+
+    def replace_after_load(*args, **kwargs):
+        train_loader, val_loader = build(*args, **kwargs)
+        np.testing.assert_allclose(train_loader.dataset.sequences[0][0][0, 4:8], original[train_idx[0]])
+        changed = dict(artifact, nested_priors=replacement,
+                       train_priors=replacement[train_idx], val_priors=replacement[val_idx])
+        torch.save(changed, artifact_path)
+        return train_loader, val_loader
+
+    monkeypatch.setattr(mod, "build_dataloaders", replace_after_load)
+    output_dir = tmp_path / "run"
+    cfg = _tiny_config(mod, output_dir)
+    cfg.training.num_epochs = 1
+    cfg.training.num_workers = 0
+    result = mod.train(cfg, dataset_path=str(ds_path), nested_prior_artifact=str(artifact_path))
+    assert hashlib.sha256(artifact_path.read_bytes()).hexdigest() != loaded_digest
+    saved = torch.load(output_dir / "best_model.pth", map_location="cpu", weights_only=False)
+    assert result["nested_prior_artifact_sha256"] == saved["nested_prior_artifact_sha256"] == loaded_digest
+    model = load_model_from_checkpoint(output_dir / "best_model.pth", torch.device("cpu"))
+    with pytest.raises(ValueError, match="Nested artifact SHA-256 mismatch"):
+        load_analysis_priors(dataset, ds_path, artifact_path, model,
+                             loaded_source_fingerprint=artifact["source_fingerprint"])
+
+
+def test_nested_prior_content_digest_binds_checkpoints_and_analysis_inputs(tmp_path, monkeypatch):
+    """A valid replacement at the same path must differ from recorded content."""
+    import hashlib
+    import json
+    from nsmor.pipeline.grouping import grouped_train_val_split
+    from nsmor.analysis.analysis_priors import load_analysis_priors
+    from nsmor.analysis.prediction_units import load_model_from_checkpoint as load_analysis_model
+
+    mod = _load_train_module()
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    ds_path = tmp_path / "synthetic.pt"
+    _make_synthetic_dataset(ds_path)
+    dataset = torch.load(ds_path, weights_only=False)
+    session_ids = [f"animal{i}_session_1" for i in range(6)]
+    dataset["session_ids"] = session_ids
+    torch.save(dataset, ds_path)
+    source_digest = hashlib.sha256(ds_path.read_bytes()).hexdigest()
+    train_idx, val_idx = grouped_train_val_split(
+        session_ids, 6, val_split=0.2, random_seed=42,
+    )
+    priors = np.tile([0.4, 0.3, 0.2, 0.1], (6, 1))
+    assert priors.shape == (6, 4)
+    artifact = {
+        "nested_priors": priors,
+        "train_priors": priors[train_idx],
+        "val_priors": priors[val_idx],
+        "train_indices": train_idx,
+        "val_indices": val_idx,
+        "is_nested_cv": True,
+        "source_fingerprint": source_digest,
+        "pipeline_semantics_version": dataset["pipeline_semantics_version"],
+        "split_seed": 42,
+        "val_split": 0.2,
+        "mcmc_prior_provenance": "nested_outer_seed42_inner_5fold_recording_prefix_grouped",
+        **_nested_prefix_metadata(session_ids, train_idx, val_idx),
+    }
+    artifact_path = tmp_path / "nested.pt"
+    torch.save(artifact, artifact_path)
+    original_digest = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+    output_dir = tmp_path / "run"
+    cfg = _tiny_config(mod, output_dir)
+    cfg.training.num_epochs = 1
+    cfg.training.num_workers = 0
+    result = mod.train(
+        cfg, dataset_path=str(ds_path), nested_prior_artifact=str(artifact_path),
+        require_nested_validation=True,
+    )
+    checkpoints = [
+        torch.load(output_dir / name, map_location="cpu", weights_only=False)
+        for name in ("best_model.pth", "epoch_1.pth", "final_model.pth")
+    ]
+    metrics = json.loads((output_dir / "metrics.json").read_text())
+    assert np.isfinite(checkpoints[0]["val_loss"])
+    for record in (*checkpoints, metrics, result):
+        assert record["nested_prior_artifact_sha256"] == original_digest
+        assert record["nested_prior_artifact"] == str(artifact_path)
+        assert record["nested_prior_fingerprint"] == source_digest
+        assert record["validation_scope"] == "nested_outer_validation"
+
+    analysis_model = load_analysis_model(output_dir / "best_model.pth", torch.device("cpu"))
+    analysis_priors, analysis_val_idx = load_analysis_priors(
+        dataset, ds_path, artifact_path, analysis_model,
+        loaded_source_fingerprint=source_digest,
+    )
+    np.testing.assert_allclose(analysis_priors, priors)
+    np.testing.assert_array_equal(analysis_val_idx, val_idx)
+
+    replacement = np.tile([0.1, 0.2, 0.3, 0.4], (6, 1))
+    assert replacement.shape == (6, 4)
+    artifact.update(nested_priors=replacement, train_priors=replacement[train_idx],
+                    val_priors=replacement[val_idx])
+    torch.save(artifact, artifact_path)
+    changed_train, changed_val, changed_priors, info = mod.load_nested_prior_split(
+        artifact_path, ds_path, 6, session_ids,
+    )
+    np.testing.assert_array_equal(changed_train, train_idx)
+    np.testing.assert_array_equal(changed_val, val_idx)
+    np.testing.assert_allclose(changed_priors, replacement)
+    assert not np.allclose(changed_priors, priors)
+    # Path/source/split still match; the real analysis boundary must now
+    # reject these valid inputs on the saved content digest alone.
+    saved = checkpoints[0]
+    assert info["nested_prior_artifact"] == saved["nested_prior_artifact"]
+    assert info["nested_prior_fingerprint"] == saved["nested_prior_fingerprint"]
+    current_digest = mod.compute_source_fingerprint(artifact_path)
+    assert current_digest == hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+    assert current_digest != saved["nested_prior_artifact_sha256"]
+    with pytest.raises(ValueError, match="Nested artifact SHA-256 mismatch"):
+        load_analysis_priors(dataset, ds_path, artifact_path, analysis_model,
+                             loaded_source_fingerprint=source_digest)
+
+    resume_cfg = _tiny_config(mod, tmp_path / "blocked_resume")
+    resume_cfg.training.num_epochs = 2
+    resume_cfg.training.num_workers = 0
+    resume_cfg.checkpoint.resume_from = str(output_dir / "epoch_1.pth")
+    with pytest.raises(ValueError, match="nested prior artifact SHA-256 mismatch"):
+        mod.train(resume_cfg, dataset_path=str(ds_path),
+                  nested_prior_artifact=str(artifact_path))
+
+    # Resume weights with the current digest are valid; an older companion
+    # best checkpoint at the identical sidecar path still must be rejected.
+    current_dir = tmp_path / "current_content"
+    current_cfg = _tiny_config(mod, current_dir)
+    current_cfg.training.num_epochs = 1
+    current_cfg.training.num_workers = 0
+    mod.train(current_cfg, dataset_path=str(ds_path),
+              nested_prior_artifact=str(artifact_path))
+    current_resume = torch.load(current_dir / "epoch_1.pth", map_location="cpu",
+                                weights_only=False)
+    assert current_resume["nested_prior_artifact_sha256"] == current_digest
+    torch.save(saved, current_dir / "best_model.pth")
+    candidate_cfg = _tiny_config(mod, tmp_path / "blocked_best")
+    candidate_cfg.training.num_epochs = 2
+    candidate_cfg.training.num_workers = 0
+    candidate_cfg.checkpoint.resume_from = str(current_dir / "epoch_1.pth")
+    with pytest.raises(ValueError, match="mismatched lineage key nested_prior_artifact_sha256"):
+        mod.train(candidate_cfg, dataset_path=str(ds_path),
+                  nested_prior_artifact=str(artifact_path))
 
 
 def test_resume_past_phase_boundary_restores_state(tmp_path, monkeypatch):
@@ -547,3 +941,332 @@ def test_scheduler_released_only_after_warmup():
         warmup_epoch=0,
     )
     assert s.steps == 2
+
+def _nested_source_replacement_case(tmp_path):
+    """Two valid sources share row/group layout but differ in X, Y and labels."""
+    import hashlib
+    from nsmor.pipeline.grouping import grouped_train_val_split
+
+    dataset_path = tmp_path / "source.pt"
+    _make_synthetic_dataset(dataset_path)
+    source_a = torch.load(dataset_path, weights_only=False)
+    source_a["session_ids"] = [f"animal{i}_session_1" for i in range(6)]
+    source_a["Y_seqs"] = [np.linspace(-3.0, 7.0, 12, dtype=np.float32) + i
+                          for i in range(6)]
+    torch.save(source_a, dataset_path)
+    bytes_a = dataset_path.read_bytes()
+    source_b = dict(source_a,
+                    X_seqs=[values + 2.0 for values in source_a["X_seqs"]],
+                    Y_seqs=[values + 30.0 for values in source_a["Y_seqs"]],
+                    labels=np.ones(6, dtype=np.int64))
+    replacement_path = tmp_path / "replacement.pt"
+    torch.save(source_b, replacement_path)
+    bytes_b = replacement_path.read_bytes()
+    digest_a = hashlib.sha256(bytes_a).hexdigest()
+    digest_b = hashlib.sha256(bytes_b).hexdigest()
+    assert digest_a != digest_b
+    assert not np.array_equal(source_a["Y_seqs"], source_b["Y_seqs"])
+    train_idx, val_idx = grouped_train_val_split(
+        source_a["session_ids"], 6, val_split=0.2, random_seed=42,
+    )
+    priors = np.tile([0.4, 0.3, 0.2, 0.1], (6, 1))
+    artifact_path = tmp_path / "nested.pt"
+    sidecar = {
+        "nested_priors": priors, "train_priors": priors[train_idx],
+        "val_priors": priors[val_idx], "train_indices": train_idx,
+        "val_indices": val_idx, "source_fingerprint": digest_a,
+        "is_nested_cv": True,
+        "pipeline_semantics_version": source_a["pipeline_semantics_version"],
+        "split_seed": 42, "val_split": 0.2,
+        "mcmc_prior_provenance": "nested_outer_seed42_inner_5fold_recording_prefix_grouped",
+        **_nested_prefix_metadata(source_a["session_ids"], train_idx, val_idx),
+    }
+    torch.save(sidecar, artifact_path)
+    return (dataset_path, artifact_path, source_a, source_b, bytes_a, bytes_b,
+            digest_a, digest_b, train_idx, sidecar)
+
+
+def _replace_loaded_source(monkeypatch, dataset_path, bytes_a, bytes_b):
+    """Intercept both legacy path loads and the repaired BytesIO production load."""
+    import io
+
+    real_load = torch.load
+    reads = []
+
+    def replace_after_deserialization(source, *args, **kwargs):
+        loaded = real_load(source, *args, **kwargs)
+        is_dataset = (source.getvalue() == bytes_a if isinstance(source, io.BytesIO)
+                      else isinstance(source, (str, Path))
+                      and Path(source).resolve() == dataset_path.resolve())
+        if is_dataset and not reads:
+            reads.append(loaded)
+            dataset_path.write_bytes(bytes_b)
+        return loaded
+
+    monkeypatch.setattr(torch, "load", replace_after_deserialization)
+    return reads
+
+
+@pytest.mark.parametrize("dt_ms", [4.0, 10.0])
+@pytest.mark.parametrize("entry", ["dataloaders", "target_stats", "train"])
+def test_source_dataset_replacement_rejected(tmp_path, monkeypatch, dt_ms, entry):
+    """Loaded A must never authorize B's valid sidecar or reach an optimizer."""
+    import hashlib
+
+    mod = _load_train_module()
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    (dataset_path, artifact_path, source_a, source_b, bytes_a, bytes_b,
+     digest_a, digest_b, train_idx, sidecar) = _nested_source_replacement_case(tmp_path)
+    sidecar["source_fingerprint"] = digest_b
+    torch.save(sidecar, artifact_path)
+    # Confirm B and its sidecar are valid together before setting up the race.
+    dataset_path.write_bytes(bytes_b)
+    mod.load_nested_prior_split(artifact_path, dataset_path, 6, source_b["session_ids"])
+    dataset_path.write_bytes(bytes_a)
+    reads = _replace_loaded_source(monkeypatch, dataset_path, bytes_a, bytes_b)
+    output_dir = tmp_path / "run"
+    cfg = _tiny_config(mod, output_dir)
+    cfg.model.dt_ms = dt_ms
+    cfg.training.num_epochs = 1
+    cfg.training.num_workers = 0
+    cfg.training.normalize_targets = True
+    cfg.training.target_clip_cm_s = 80.0
+    cfg.loss.lambda_routing_aux = 0.0
+
+    def forbidden_epoch(**kwargs):
+        raise AssertionError("Mixed source objects reached the optimizer")
+
+    monkeypatch.setattr(mod, "train_one_epoch", forbidden_epoch)
+    with pytest.raises(ValueError, match="fingerprint mismatch"):
+        if entry == "dataloaders":
+            mod.build_dataloaders(cfg, str(dataset_path), nested_prior_artifact=str(artifact_path))
+        elif entry == "target_stats":
+            mod.compute_target_stats(str(dataset_path), cfg, nested_prior_artifact=str(artifact_path))
+        else:
+            mod.train(cfg, dataset_path=str(dataset_path), nested_prior_artifact=str(artifact_path))
+    assert len(reads) == 1
+    np.testing.assert_array_equal(reads[0]["Y_seqs"], source_a["Y_seqs"])
+    assert hashlib.sha256(dataset_path.read_bytes()).hexdigest() == digest_b != digest_a
+    assert not list(output_dir.glob("*.pth"))
+
+
+@pytest.mark.parametrize("dt_ms", [4.0, 10.0])
+def test_source_snapshot_normalization_and_checkpoint_lineage_stay_honest(
+        tmp_path, monkeypatch, dt_ms):
+    """A's accepted snapshot keeps A's fitted units and digest despite path B."""
+    import hashlib
+    import json
+    from scripts.analyze_dynamics import load_dataset
+    from nsmor.analysis.prediction_units import load_model_from_checkpoint
+
+    mod = _load_train_module()
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    (dataset_path, artifact_path, source_a, source_b, bytes_a, bytes_b,
+     digest_a, digest_b, train_idx, sidecar) = _nested_source_replacement_case(tmp_path)
+    output_dir = tmp_path / "run"
+    cfg = _tiny_config(mod, output_dir)
+    cfg.model.dt_ms = dt_ms
+    cfg.training.num_epochs = 1
+    cfg.training.num_workers = 0
+    cfg.training.normalize_targets = True
+    cfg.training.target_clip_cm_s = 80.0
+    cfg.loss.lambda_routing_aux = 0.0
+    mean_a, std_a, _ = mod._fit_target_stats(
+        np.concatenate([source_a["Y_seqs"][i] for i in train_idx]).astype(np.float64),
+        cfg, train_idx,
+    )
+    mean_b, std_b, _ = mod._fit_target_stats(
+        np.concatenate([source_b["Y_seqs"][i] for i in train_idx]).astype(np.float64),
+        cfg, train_idx,
+    )
+    assert not np.isclose(mean_a, mean_b)
+    reads = _replace_loaded_source(monkeypatch, dataset_path, bytes_a, bytes_b)
+    result = mod.train(cfg, dataset_path=str(dataset_path), nested_prior_artifact=str(artifact_path))
+    checkpoints = [torch.load(output_dir / name, map_location="cpu", weights_only=False)
+                   for name in ("best_model.pth", "epoch_1.pth", "final_model.pth")]
+    metrics = json.loads((output_dir / "metrics.json").read_text())
+    assert len(reads) == 1
+    assert hashlib.sha256(dataset_path.read_bytes()).hexdigest() == digest_b
+    artifact_digest = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+    for record in (*checkpoints, metrics, result):
+        assert record["nested_prior_fingerprint"] == digest_a != digest_b
+        assert record["nested_prior_artifact_sha256"] == artifact_digest
+    for checkpoint in checkpoints:
+        assert np.isclose(checkpoint["target_mean"], mean_a)
+        assert np.isclose(checkpoint["target_std"], std_a)
+    assert all(np.isfinite(record["val_loss"]) for record in checkpoints)
+    model = load_model_from_checkpoint(output_dir / "best_model.pth", torch.device("cpu"))
+    assert np.isclose(model.target_mean, mean_a) and np.isclose(model.target_std, std_a)
+    with pytest.raises(ValueError, match="fingerprint mismatch"):
+        load_dataset(dataset_path, max_seq_len=None, checkpoint_model=model)
+
+
+def test_nonnested_train_uses_loaded_targets_and_source_digest_after_same_path_swap(
+        tmp_path, monkeypatch):
+    """A's loader must set normalization and checkpoint identity after valid B replaces its path."""
+    import hashlib
+    import json
+
+    mod = _load_train_module()
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    dataset_path = tmp_path / "dataset.pt"
+    _make_synthetic_dataset(dataset_path)
+    source_a = torch.load(dataset_path, weights_only=False)
+    source_b = dict(source_a, Y_seqs=[y + 30.0 for y in source_a["Y_seqs"]],
+                    mcmc_priors=np.roll(source_a["mcmc_priors"], 1, axis=1))
+    bytes_a = dataset_path.read_bytes()
+    replacement = tmp_path / "replacement.pt"
+    torch.save(source_b, replacement)
+    bytes_b = replacement.read_bytes()
+    digest_a = hashlib.sha256(bytes_a).hexdigest()
+    assert digest_a != hashlib.sha256(bytes_b).hexdigest()
+    cfg = _tiny_config(mod, tmp_path / "run")
+    cfg.training.num_epochs = 1
+    cfg.training.num_workers = 0
+    cfg.training.normalize_targets = True
+    cfg.training.target_clip_cm_s = 80.0
+    cfg.loss.lambda_routing_aux = 0.0
+    build = mod.build_dataloaders
+    expected = []
+
+    def swap_after_loader(*args, **kwargs):
+        train_loader, val_loader = build(*args, **kwargs)
+        selected = train_loader.dataset
+        targets = [sequence[1] for sequence in selected.sequences]
+        indices = np.asarray(selected.source_indices, dtype=np.int64)
+        expected.extend(mod._fit_target_stats(
+            np.concatenate(targets).astype(np.float64), cfg, indices,
+        )[:2])
+        dataset_path.write_bytes(bytes_b)
+        return train_loader, val_loader
+
+    monkeypatch.setattr(mod, "build_dataloaders", swap_after_loader)
+    result = mod.train(cfg, dataset_path=str(dataset_path))
+    assert len(expected) == 2
+    assert hashlib.sha256(dataset_path.read_bytes()).hexdigest() != digest_a
+    for name in ("best_model.pth", "epoch_1.pth", "final_model.pth"):
+        saved = torch.load(tmp_path / "run" / name, weights_only=False)
+        assert saved["target_mean"] == pytest.approx(expected[0])
+        assert saved["target_std"] == pytest.approx(expected[1])
+        assert saved["dataset_source_sha256"] == digest_a
+    metrics = json.loads((tmp_path / "run" / "metrics.json").read_text())
+    assert metrics["dataset_source_sha256"] == digest_a
+    assert result["dataset_source_sha256"] == digest_a
+
+def test_scored_training_requires_nested_artifact_and_cli_diagnostic_opt_in(tmp_path, monkeypatch):
+    """Scored entry points reject global OOF; deliberate diagnostics label every output."""
+    import json
+
+    mod = _load_train_module()
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    dataset_path = tmp_path / "synthetic.pt"
+    _make_synthetic_dataset(dataset_path)
+    output_dir = tmp_path / "run"
+    cfg = _tiny_config(mod, output_dir)
+    cfg.training.num_epochs = 1
+    cfg.training.num_workers = 0
+    config_path = cfg.to_yaml(tmp_path / "config.yaml")
+    with pytest.raises(ValueError, match="nested.*artifact"):
+        mod.train(cfg, dataset_path=str(dataset_path), require_nested_validation=True)
+    argv = ["--config", str(config_path), "--dataset", str(dataset_path)]
+    with pytest.raises(ValueError, match="nested.*artifact"):
+        mod.main(argv)
+    assert not output_dir.exists()
+
+    mod.main([*argv, "--diagnostic_only"])
+    result = json.loads((output_dir / "train.log").read_text())
+    metrics = json.loads((output_dir / "metrics.json").read_text())
+    assert result["validation_scope"] == metrics["validation_scope"] == "diagnostic_global_oof"
+    assert result["metrics"]["validation_scope"] == "diagnostic_global_oof"
+
+
+@pytest.mark.parametrize("lineage", ["invalid_version", "missing_tag", "modern", "historical"])
+def test_lazy_training_metadata_requires_shared_provenance_gate(tmp_path, lineage):
+    """Lazy rows and prior lineage come from one validated captured metadata object."""
+    import hashlib
+    from nsmor.config import PIPELINE_SEMANTICS_VERSION
+
+    mod = _load_train_module()
+    sessions = [f"recording{i}_session_1" for i in range(4)]
+    metadata = {
+        "trial_specs": [{"session_id": session} for session in sessions],
+        "mcmc_priors": torch.full((4, 4), 0.25),
+        "pipeline_semantics_version": PIPELINE_SEMANTICS_VERSION,
+        "mcmc_prior_provenance": "oof_2fold_recording_prefix_grouped_cv",
+        "animal_identity_status": "unverified",
+    }
+    if lineage == "invalid_version":
+        metadata["pipeline_semantics_version"] = "1.0-invalid"
+    elif lineage == "missing_tag":
+        metadata.pop("mcmc_prior_provenance")
+        metadata.pop("animal_identity_status")
+    elif lineage == "historical":
+        metadata["mcmc_prior_provenance"] = "oof_2fold_animal_grouped_cv"
+        metadata["animal_identity_status"] = "historical_unknown"
+    path = tmp_path / "metadata.pt"
+    torch.save(metadata, path)
+    cfg = _tiny_config(mod, tmp_path / "unused")
+    cfg.loss.lambda_routing_aux = 0.0
+    if lineage in ("invalid_version", "missing_tag"):
+        with pytest.raises(RuntimeError, match="semantics|mcmc_prior_provenance"):
+            mod.build_dataloaders(cfg, str(path), use_lazy_loading=True)
+    else:
+        train_loader, val_loader = mod.build_dataloaders(cfg, str(path), use_lazy_loading=True)
+        assert len(train_loader.dataset) + len(val_loader.dataset) == 4
+        assert train_loader.dataset.prior_lineage == (
+            metadata["mcmc_prior_provenance"], metadata["animal_identity_status"])
+        assert train_loader.dataset.dataset_source_sha256 == hashlib.sha256(path.read_bytes()).hexdigest()
+        assert train_loader.dataset.dataset.trial_specs == metadata["trial_specs"]
+
+
+@pytest.mark.parametrize("session_ids", [None, ["recording_session_1"], [""] * 6])
+@pytest.mark.parametrize("entry", ["dataloaders", "target_stats"])
+def test_modern_training_rejects_unusable_recording_prefix_identities(tmp_path, session_ids, entry):
+    mod = _load_train_module()
+    path = tmp_path / "synthetic.pt"
+    _make_synthetic_dataset(path)
+    dataset = torch.load(path, weights_only=False)
+    if session_ids is None:
+        dataset.pop("session_ids")
+    else:
+        dataset["session_ids"] = session_ids
+    torch.save(dataset, path)
+    cfg = _tiny_config(mod, tmp_path / "unused")
+    cfg.training.normalize_targets = True
+    cfg.training.num_workers = 0
+    with pytest.raises((ValueError, RuntimeError), match="session_ids"):
+        if entry == "dataloaders":
+            mod.build_dataloaders(cfg, str(path))
+        else:
+            mod.compute_target_stats(str(path), cfg)
+
+
+@pytest.mark.parametrize("binding", [None, "legacy_resume_unbound", "unbound_lazy"])
+@pytest.mark.parametrize("checkpoint_kind", ["resume", "companion_best", "direct_best"])
+def test_modern_digestless_resume_cannot_downgrade_to_historical_binding(
+        tmp_path, monkeypatch, binding, checkpoint_kind):
+    """Removing SHA from modern resume/best bytes must never enable a legacy fallback."""
+    mod = _load_train_module()
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    path = tmp_path / "synthetic.pt"
+    _make_synthetic_dataset(path)
+    source_dir = tmp_path / "source"
+    cfg = _tiny_config(mod, source_dir)
+    cfg.training.num_epochs = 1
+    cfg.training.num_workers = 0
+    result = mod.train(cfg, dataset_path=str(path))
+    assert result["animal_identity_status"] == "unverified"
+    assert result["validation_scope"] == "diagnostic_global_oof"
+    attacked = source_dir / ("epoch_1.pth" if checkpoint_kind == "resume" else "best_model.pth")
+    checkpoint = torch.load(attacked, weights_only=False)
+    checkpoint.pop("dataset_source_sha256")
+    if binding is not None:
+        checkpoint["dataset_source_binding"] = binding
+    torch.save(checkpoint, attacked)
+    resumed = _tiny_config(mod, tmp_path / "rejected")
+    resumed.training.num_workers = 0
+    resume_name = "best_model.pth" if checkpoint_kind == "direct_best" else "epoch_1.pth"
+    resumed.checkpoint.resume_from = str(source_dir / resume_name)
+    with pytest.raises(ValueError, match="modern.*dataset_source_sha256"):
+        mod.train(resumed, dataset_path=str(path))
+    assert not (tmp_path / "rejected" / "final_model.pth").exists()

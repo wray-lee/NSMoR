@@ -271,16 +271,21 @@ class TestLoomingOnset:
         assert 0 in trial_info
         assert trial_info[0]["looming_onset_ms"] == pytest.approx(137.5)
 
-    def test_guard_fires_on_large_deviation(self, tmp_path: Path):
-        """Warning emitted when parsed onset deviates from trial start
-        by more than one median frame gap.
+    def test_normal_delayed_looming_no_spurious_warning(self, tmp_path: Path):
+        """A normal delayed looming (onset at 100 ms) must NOT warn.
+
+        The retired 1-median-gap heuristic false-positived on every correct
+        shared-clock trial (v4 review A5).  Genuine anomalies are handled by
+        the missing-Looming / non-expanding guards instead.
         """
+        import warnings as _warnings
+
         session_dir = tmp_path / "session_001"
         session_dir.mkdir()
         evt_path = session_dir / "session_001_events.csv"
         kin_path = session_dir / "session_001_kinematics.csv"
 
-        # Events with Looming transition at 100.0 ms (> 1 median gap of 4.0 ms)
+        # Events with Looming transition at 100.0 ms (normal delayed onset)
         evt_df = pd.DataFrame([
             {
                 "session_id": "session_001",
@@ -322,11 +327,20 @@ class TestLoomingOnset:
         })
         kin_df.to_csv(kin_path, index=False)
 
-        with pytest.warns(UserWarning, match="deviates from trial start"):
+        with _warnings.catch_warnings(record=True) as caught:
+            _warnings.simplefilter("always")
             adapt_cercus_to_nsmor(raw_dir=str(tmp_path))
+        noisy = [w for w in caught if "deviates" in str(w.message)]
+        assert not noisy, f"Spurious deviation warning on normal onset: {noisy}"
 
-    def test_fallback_when_missing(self, tmp_path: Path):
-        """When looming_onset_ms is None, stimulus_onset falls back to 0.0."""
+    def test_missing_looming_no_fabricated_onset(self, tmp_path: Path):
+        """Missing Looming must NOT fabricate stimulus_onset or a visual curve.
+
+        Former contract injected stimulus_onset at 0.0 and expanded theta(t)
+        from t=0 as if looming began at trial start (v4 review A4 / B F2).
+        """
+        import warnings as _warnings
+
         session_dir = tmp_path / "session_001"
         session_dir.mkdir()
         evt_path = session_dir / "session_001_events.csv"
@@ -352,7 +366,7 @@ class TestLoomingOnset:
         trial_info = parse_trial_events(evt_path)
         assert trial_info[0]["looming_onset_ms"] is None
 
-        # 2. adapt_cercus_to_nsmor fallback contract: stimulus_onset at 0.0
+        # 2. adapt_cercus_to_nsmor: no fabricated stimulus_onset, no visual curve
         n_samples = 20
         kin_df = pd.DataFrame({
             "session_id": ["session_001"] * n_samples,
@@ -369,12 +383,23 @@ class TestLoomingOnset:
         })
         kin_df.to_csv(kin_path, index=False)
 
-        adapt_cercus_to_nsmor(raw_dir=str(tmp_path))
+        with _warnings.catch_warnings(record=True) as caught:
+            _warnings.simplefilter("always")
+            adapt_cercus_to_nsmor(raw_dir=str(tmp_path))
 
         rewritten_events = pd.read_csv(evt_path)
         stim_onset_events = rewritten_events[rewritten_events["event_type"] == "stimulus_onset"]
-        assert len(stim_onset_events) == 1
-        assert stim_onset_events.iloc[0]["time_ms"] == pytest.approx(0.0)
+        assert len(stim_onset_events) == 0, (
+            f"Missing Looming must not fabricate stimulus_onset, got:\n"
+            f"{stim_onset_events}"
+        )
+        rewritten_kin = pd.read_csv(kin_path)
+        assert np.allclose(rewritten_kin["visual_angle"].values, 0.0), (
+            "Missing Looming must not fabricate an expanding visual curve"
+        )
+        assert any("Looming" in str(w.message) for w in caught), (
+            "Missing Looming on a visual trial should emit an informative warning"
+        )
 
 
 # ═══════════════════════════════════════════════════════════════

@@ -94,3 +94,53 @@ def test_group_trials_by_condition_uses_stimulus_conditions(tmp_path: Path):
     assert "wind_only" in groups
     assert groups["visual_only"] == [1, 4]
     assert groups["wind_only"] == [2, 5]
+
+@pytest.mark.parametrize("dt_ms", [4.0, 10.0])
+def test_phase_f_tonic_latency_gate_and_signed_peak_compatibility(tmp_path: Path, dt_ms: float):
+    """Flat magnitude has vigor but no measurable timing; signed peaks remain timed."""
+    import json
+
+    from scripts.analyze_integration import (
+        compute_condition_statistics, create_integration_figure,
+        export_integration_summary, extract_predicted_metrics,
+    )
+
+    anchor = int(2000 / dt_ms)
+    length = int(6000 / dt_ms)
+    for level in (5.0, 0.0):
+        stats = compute_condition_statistics(extract_predicted_metrics(
+            [np.full(length, level, dtype=np.float32)], [0],
+            dt_ms=dt_ms, anchor_frames=[anchor],
+        ))
+        assert stats["peak_velocity"] == {"mean": level, "sem": 0.0, "n": 1}
+        assert stats["latency"] == {"mean": None, "sem": None, "n": 0}
+        summary_path = tmp_path / f"{level}.json"
+        figure_path = tmp_path / f"{level}.png"
+        export_integration_summary({"visual_only": stats}, summary_path, dt_ms=dt_ms)
+        summary = json.loads(summary_path.read_text(encoding="utf-8"),
+                             parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)))
+        assert summary["status"] == "unavailable"
+        assert summary["baseline_reference"] is None
+        assert summary["conditions"]["visual_only"]["latency_to_peak_ms"] == stats["latency"]
+        assert summary["conditions"]["visual_only"]["peak_velocity_cms"] == stats["peak_velocity"]
+        with pytest.raises(ValueError, match="no measurable peak latencies"):
+            create_integration_figure({"visual_only": stats}, figure_path)
+        assert not figure_path.exists()
+
+    pre = np.zeros(length, dtype=np.float32)
+    post = pre.copy()
+    pre[anchor - int(500 / dt_ms)] = -30.0
+    post[anchor + int(500 / dt_ms)] = 25.0
+    metrics = extract_predicted_metrics(
+        [pre, post], [0, 1], dt_ms=dt_ms, anchor_frames=[anchor, anchor],
+    )
+    assert metrics == {"peak_velocities": [30.0, 25.0], "latencies": [-500.0, 500.0]}
+    stats = compute_condition_statistics(metrics)
+    assert stats["latency"] == {"mean": 0.0, "sem": 500.0, "n": 2}
+    assert stats["peak_velocity"]["n"] == 2
+    summary_path = tmp_path / "response.json"
+    figure_path = tmp_path / "response.png"
+    export_integration_summary({"visual_only": stats}, summary_path, dt_ms=dt_ms)
+    assert json.loads(summary_path.read_text(encoding="utf-8"))["status"] == "ok"
+    create_integration_figure({"visual_only": stats}, figure_path)
+    assert figure_path.stat().st_size > 0

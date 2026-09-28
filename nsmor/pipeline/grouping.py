@@ -1,28 +1,10 @@
-"""Canonical animal-level grouping for leakage-free dataset splits.
+"""Recording-prefix grouping for train/validation splits.
 
-``session_ids`` look like ``0.513cricket_001_20260707_193143_session_2``.
-The ``_session_N`` suffix splits **one recording of one animal** into
-blocks, so two ids sharing the prefix are the *same animal*.  Grouping a
-train/val split by session therefore does **not** prevent leakage: an
-animal's ``_session_1`` can land in train while its ``_session_2`` lands
-in validation, and trials of one animal share that animal's baseline
-locomotor statistics, gain state, and body mass.
-
-Measured on the corpora as of this module's introduction, a
-session-grouped split at ``val_split=0.2``, ``random_seed=42`` put this
-fraction of validation trials in the same animal as a training trial:
-
-- ``nsmor_dataset.pt``          33.3% (1 of 2 val animals)
-- ``nsmor_dataset_full_backup`` 50.0% (2 of 3 val animals)
-- ``nsmor_dataset_3cond_v2.pt`` 87.5% (14 of 15 val animals)
-
-Animal grouping is strictly coarser than session grouping, so an
-animal-disjoint split is automatically session-disjoint.
-
-The trade-off is split granularity: with few animals, whole-animal
-assignment cannot hit the requested fraction exactly (8 animals at
-``val_split=0.2`` yields 1 val animal, ~12.5% of trials).  The achieved
-fraction is logged so the coarsening is visible rather than silent.
+Session ids ending in _session_N share a recording prefix. Keeping those
+blocks together prevents within-prefix overlap. Distinct prefixes are not
+verified independent animals, so this split cannot prove animal-independent
+generalization or eliminate cross-recording leakage. The achieved validation
+trial fraction is logged because grouping constrains split granularity.
 """
 
 from __future__ import annotations
@@ -41,25 +23,46 @@ __all__ = [
     "check_group_disjoint",
     "grouped_train_val_split",
     "resolve_group_folds",
+    "prior_identity_status",
 ]
 
-# ``..._session_1`` / ``..._session_12`` -> animal-recording prefix.
+# ``..._session_1`` / ``..._session_12`` -> recording prefix.
 _SESSION_SUFFIX = re.compile(r"_session_\d+$")
 
 
+def prior_identity_status(provenance: Any, status: Any = None, *, nested: bool = False) -> str:
+    """Validate cross-fitted lineage; historical tag spelling never authenticates age."""
+    stem = r"nested_outer_seed-?\d+_inner_(?P<folds>\d+)fold" if nested else r"oof_(?P<folds>\d+)fold"
+    suffix = "" if nested else "_cv"
+    match = re.fullmatch(
+        stem + r"_(?P<grouping>recording_prefix|animal)_grouped" + suffix, provenance
+    ) if isinstance(provenance, str) else None
+    if match is None:
+        raise ValueError(f"invalid mcmc_prior_provenance: {provenance!r}")
+    if int(match["folds"]) < 2:
+        raise ValueError("cross-fitted mcmc_prior_provenance requires at least 2 folds")
+    if match["grouping"] == "recording_prefix":
+        if status != "unverified":
+            raise ValueError("recording-prefix lineage requires animal_identity_status='unverified'")
+        return "unverified"
+    if status not in (None, "historical_unknown"):
+        raise ValueError("historical animal-named lineage requires animal_identity_status='historical_unknown'")
+    return "historical_unknown"
+
+
 def animal_of(session_id: Any) -> str:
-    """Strip the ``_session_N`` block suffix to get the animal key."""
+    """Strip the ``_session_N`` block suffix to get the recording-prefix key."""
     return _SESSION_SUFFIX.sub("", str(session_id))
 
 
 def animal_keys_of(session_ids: Sequence[Any]) -> np.ndarray:
-    """Map per-trial session ids to per-trial animal keys.
+    """Map per-trial session ids to recording-prefix keys.
 
     Args:
         session_ids: Per-trial session identifiers.
 
     Returns:
-        ``(n_trials,)`` object array of animal keys.
+        ``(n_trials,)`` object array of recording-prefix keys.
     """
     keys = np.array([animal_of(s) for s in session_ids], dtype=object)
     assert keys.shape == (len(session_ids),), (
@@ -112,7 +115,7 @@ def resolve_group_folds(
     hard error, so the fold count must be chosen to fit the corpus rather
     than fixed at a literal.
 
-    Coarsening from session groups to animal groups roughly halves the
+    Coarsening from session blocks to recording-prefix groups reduces the
     group count, which is exactly the point -- but it can push a rare
     class below ``max_folds``.  On the escape class (~3% of trials) this
     is reachable on the small corpora, so the fold count adapts instead of
@@ -154,7 +157,7 @@ def resolve_group_folds(
         raise ValueError(
             f"Class(es) {scarce} occupy fewer than 2 groups "
             f"(coverage={coverage}); no grouped stratified split can put "
-            f"the class on both sides of any fold.  Collect more animals "
+            f"the class on both sides of any fold.  Collect more recorded groups "
             f"carrying that class, or drop grouped cross-fitting."
         )
 
@@ -165,7 +168,7 @@ def resolve_group_folds(
             "occupies only %d groups (per-class group coverage %s). "
             "Grouping is NOT weakened to compensate -- fewer folds means "
             "each fold trains on less data, which is the honest cost of "
-            "a rare class concentrated in few animals.",
+            "a rare class concentrated in few recording prefixes.",
             max_folds,
             n_folds,
             min_coverage,
@@ -180,7 +183,7 @@ def grouped_train_val_split(
     val_split: float = 0.2,
     random_seed: int = 42,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Split trial indices so that no *animal* spans train and validation.
+    """Split trial indices so that no recording prefix spans train and validation.
 
     Deterministic across processes: unique keys come from ``np.unique``
     (sorted) rather than ``set`` iteration order, which varies with
@@ -190,24 +193,24 @@ def grouped_train_val_split(
         session_ids: Per-trial session identifiers, or None/wrong-length
             to force the ungrouped fallback.
         n_total: Number of trials.
-        val_split: Target fraction of *animals* held out (0-1).
-        random_seed: Seed for the animal shuffle.
+        val_split: Target fraction of recording prefixes held out (0-1).
+        random_seed: Seed for the recording-prefix shuffle.
 
     Returns:
         ``(train_indices, val_indices)`` as int64 arrays.
 
     Raises:
-        ValueError: If the resulting split leaks an animal across sides.
+        ValueError: If a recording prefix spans both sides.
     """
     rng = np.random.RandomState(random_seed)
 
     if session_ids is None or len(session_ids) != n_total:
         # Synthetic / single-session data only.  Warn loudly: without
-        # group ids there is no way to keep an animal on one side.
+        # group ids there is no way to keep a recording prefix on one side.
         logger.warning(
             "Dataset lacks per-sequence 'session_ids' (got %s for %d "
             "trials); falling back to sample-level train/val split. "
-            "Animal-level information may inflate validation metrics. "
+            "Within-prefix overlap may inflate validation metrics. "
             "Re-run prepare_data to regenerate the dataset with them.",
             None if session_ids is None else len(session_ids),
             n_total,
@@ -231,8 +234,8 @@ def grouped_train_val_split(
     check_group_disjoint(train_indices, val_indices, group_keys)
 
     logger.info(
-        "Animal-grouped split: %d train (%d animals) / %d val (%d "
-        "animals) -- %.1f%% of trials held out (target %.0f%%)",
+        "Recording-prefix split: %d train (%d prefixes) / %d val (%d "
+        "prefixes) -- %.1f%% of trials held out (target %.0f%%)",
         len(train_indices),
         len(unique_animals) - n_val_animals,
         len(val_indices),

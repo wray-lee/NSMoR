@@ -42,6 +42,26 @@ EVENT_COLUMNS: List[str] = [
 ]
 
 
+class _SourceKinematics(pd.DataFrame):
+    """Keep CSV row boundaries across concat without changing public columns."""
+
+    _metadata = ["_source_lengths"]
+
+    @property
+    def _constructor(self):
+        return _SourceKinematics
+
+    def __finalize__(self, other, method=None, **kwargs):
+        super().__finalize__(other, method=method, **kwargs)
+        if method == "concat":
+            lengths = []
+            for frame in other.objs:
+                parts = getattr(frame, "_source_lengths", ())
+                lengths.extend(parts if parts and sum(parts) == len(frame) else (len(frame),))
+            self._source_lengths = tuple(lengths)
+        return self
+
+
 def _parse_event_value(value: Any) -> Dict[str, Any]:
     """Parse JSON-like event metadata without failing legacy scalar values.
 
@@ -206,7 +226,9 @@ def load_kinematics_csv(
             acc[0] = 0.0  # first frame: no prior sample
             acc_out[idx] = acc
         df["acceleration"] = acc_out
-    return df
+    loaded = _SourceKinematics(df)
+    loaded._source_lengths = (len(loaded),)
+    return loaded
 
 
 def load_events_csv(path: Union[str, Path]) -> pd.DataFrame:
@@ -296,20 +318,47 @@ def extract_trial_data(
         - ``trial_id``         — int (scalar)
 
     Raises:
-        ValueError: If no matching rows are found.
+        ValueError: If rows are missing or trial timestamps/declarations are ambiguous.
     """
     kin = session_data["kinematics"]
     mask_kin = (kin["session_id"] == session_id) & (kin["trial_id"] == trial_id)
-    kin_trial = kin.loc[mask_kin].sort_values("time_ms")
-
+    kin_trial = kin.loc[mask_kin]
     if kin_trial.empty:
         raise ValueError(
             f"No kinematics data for session={session_id!r}, trial={trial_id}"
         )
 
+    identity = f"session={session_id!r}, trial={trial_id!r}"
+    times = kin_trial["time_ms"].to_numpy(dtype=np.float64)
+    if not np.isfinite(times).all() or np.any(np.diff(np.sort(times)) <= 0):
+        raise ValueError(f"Ambiguous {identity}: repeated or non-finite time_ms")
+    lengths = getattr(kin, "_source_lengths", ())
+    if lengths and sum(lengths) == len(kin):
+        end = 0
+        previous_end = -np.inf
+        for length in lengths:
+            part = kin.iloc[end:end + length]
+            end += length
+            part_times = part.loc[
+                (part["session_id"] == session_id) & (part["trial_id"] == trial_id),
+                "time_ms",
+            ]
+            if part_times.empty:
+                continue  # Event-only continuation has no kinematics range.
+            first, last = float(part_times.min()), float(part_times.max())
+            if first <= previous_end:
+                raise ValueError(
+                    f"Ambiguous {identity}: overlapping or unordered CSV pair time_ms ranges"
+                )
+            previous_end = last
+
     evt = session_data["events"]
     mask_evt = (evt["session_id"] == session_id) & (evt["trial_id"] == trial_id)
-    evt_trial = evt.loc[mask_evt].sort_values("time_ms")
+    evt_trial = evt.loc[mask_evt]
+    if evt_trial["event_type"].eq("trial_start").sum() > 1:
+        raise ValueError(f"Ambiguous {identity}: repeated trial_start declarations")
+    kin_trial = kin_trial.sort_values("time_ms")
+    evt_trial = evt_trial.sort_values("time_ms")
     wind_side = _trial_wind_side(evt, session_id, trial_id)
 
     time_ms_arr = kin_trial["time_ms"].to_numpy(dtype=np.float64)

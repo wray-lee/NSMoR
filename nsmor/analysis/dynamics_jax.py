@@ -20,6 +20,7 @@ Falls back gracefully to PyTorch :class:`FixedPointAdapter` if JAX is unavailabl
 from __future__ import annotations
 
 import logging
+from functools import partial
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -115,7 +116,7 @@ if JAX_AVAILABLE:
             eigs = jnp.linalg.eigvals(J)
             return J, eigs
 
-        @jax.jit
+        @partial(jax.jit, static_argnums=(2,))
         def rollout_k_steps_jit(h_init: jnp.ndarray, x_fixed: jnp.ndarray, K: int) -> jnp.ndarray:
             """Roll out GRU for K steps under constant input x_fixed."""
             def scan_body(h_prev, _):

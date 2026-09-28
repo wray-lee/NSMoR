@@ -25,6 +25,7 @@ import numpy as np
 import torch
 
 from nsmor.model_nsmor_core import NSMoRCore
+from nsmor.analysis.prediction_units import prediction_to_physical
 
 logger = logging.getLogger(__name__)
 
@@ -118,7 +119,7 @@ class JAXEvalWrapper:
             sensory_noise_std=float(model.sensory_encoder.noise_std),
         )
         params = load_from_torch_state_dict(jax_model, model.state_dict())
-        return cls(
+        wrapper = cls(
             jax_model=jax_model,
             params=params,
             device=device,
@@ -127,6 +128,9 @@ class JAXEvalWrapper:
             sensory_dim=model.sensory_dim,
             mcmc_dim=model.mcmc_dim,
         )
+        for key, default in (('target_mean', 0.0), ('target_std', 1.0), ('target_clip_cm_s', 0.0)):
+            setattr(wrapper, key, getattr(model, key, default))
+        return wrapper
 
     def eval(self) -> JAXEvalWrapper:
         return self
@@ -194,7 +198,7 @@ class JAXEvalWrapper:
         if return_internals:
             y_j, internals_j = out
             y_j.block_until_ready()
-            y = _to_torch(y_j, device=device, dtype=torch.float32)
+            y = prediction_to_physical(_to_torch(y_j, device=device, dtype=torch.float32), self)
             internals: Dict[str, torch.Tensor] = {}
             for key, value in internals_j.items():
                 arr = np.asarray(value)
@@ -205,7 +209,7 @@ class JAXEvalWrapper:
             return y, internals
 
         out.block_until_ready()
-        return _to_torch(out, device=device, dtype=torch.float32)
+        return prediction_to_physical(_to_torch(out, device=device, dtype=torch.float32), self)
 
 
 def wrap_eval_model(

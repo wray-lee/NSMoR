@@ -19,6 +19,7 @@ from __future__ import annotations
 import ast
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -35,6 +36,7 @@ MAKEFILE = REPO_ROOT / "Makefile"
 # plus the two stages that produce their inputs.
 REQUIRED_PIPELINE_SCRIPTS = {
     "scripts/prepare_data.py",
+    "scripts/evaluate_nested_prior.py",
     "scripts/train.py",
     "scripts/analyze_dynamics.py",
     "scripts/simulate_lesion.py",
@@ -114,6 +116,81 @@ def _run_runner(**env_overrides: str) -> subprocess.CompletedProcess:
     )
 
 
+@pytest.mark.parametrize("existing_outputs", [False, True])
+def test_runner_rejects_existing_best_checkpoint_before_writing_or_running(
+    tmp_path: Path, existing_outputs: bool,
+) -> None:
+    """Reject a stale best model before any stage or output mutation."""
+    run_dir = tmp_path / "run with spaces"
+    run_dir.mkdir()
+    checkpoint = run_dir / "best_model.pth"
+    sentinel = b"previous run's best checkpoint\n"
+    checkpoint.write_bytes(sentinel)
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    output_dir = tmp_path / "results"
+    dataset = tmp_path / "processed" / "dataset.pt"
+    output_sentinels = {
+        output_dir / "pipeline_manifest.json": b"previous manifest\n",
+        output_dir / "pipeline_commands.log": b"previous command log\n",
+    }
+    if existing_outputs:
+        output_dir.mkdir()
+        for path, contents in output_sentinels.items():
+            path.write_bytes(contents)
+
+    # Record stage calls even if a stage exits early without writing an artefact.
+    stage_calls = tmp_path / "stage_calls"
+    python_spy = tmp_path / "python_spy"
+    python_spy.write_text(
+        '#!/usr/bin/env bash\n'
+        'case "$1" in scripts/*) printf "%s\\n" "$*" >> "$STAGE_CALLS"; exit 99;; esac\n'
+        'exec "$REAL_PYTHON" "$@"\n',
+        encoding="utf-8",
+    )
+    python_spy.chmod(0o755)
+    result = _run_runner(
+        DRY_RUN="0",
+        PYTHON=str(python_spy),
+        REAL_PYTHON=sys.executable,
+        STAGE_CALLS=str(stage_calls),
+        RAW_DIR=str(raw_dir),
+        RUN_DIR=str(run_dir),
+        OUTPUT_DIR=str(output_dir),
+        DATASET=str(dataset),
+    )
+    assert result.returncode != 0
+    assert "Pre-existing checkpoint" in result.stderr
+    assert str(checkpoint) in result.stderr
+    assert not stage_calls.exists(), "a pipeline stage ran before checkpoint rejection"
+    assert "Phase A" not in result.stdout
+    assert checkpoint.read_bytes() == sentinel
+    assert sorted(run_dir.iterdir()) == [checkpoint]
+    assert not dataset.parent.exists()
+    if existing_outputs:
+        assert set(output_dir.iterdir()) == set(output_sentinels)
+        for path, contents in output_sentinels.items():
+            assert path.read_bytes() == contents
+    else:
+        assert not output_dir.exists()
+
+    dry_run = _run_runner(
+        RUN_DIR=str(run_dir),
+        RAW_DIR=str(raw_dir),
+        OUTPUT_DIR=str(output_dir),
+        DATASET=str(dataset),
+    )
+    assert dry_run.returncode == 0, dry_run.stderr
+    assert set(_planned_stage_map(dry_run.stdout)) == REQUIRED_PIPELINE_SCRIPTS
+    assert checkpoint.read_bytes() == sentinel
+    assert not dataset.parent.exists()
+    if existing_outputs:
+        for path, contents in output_sentinels.items():
+            assert path.read_bytes() == contents
+    else:
+        assert not output_dir.exists()
+
+
 def _planned_stages() -> List[List[str]]:
     """``[[script, *args], ...]`` as the runner would really invoke them."""
     result = _run_runner()
@@ -123,7 +200,7 @@ def _planned_stages() -> List[List[str]]:
     stages: List[List[str]] = []
     for line in result.stdout.splitlines():
         if line.startswith("PLAN "):
-            tokens = line.split()[1:]  # drop "PLAN"
+            tokens = shlex.split(line)[1:]  # drop "PLAN"
             assert len(tokens) >= 2, f"malformed plan line: {line}"
             stages.append(tokens[1:])  # drop the interpreter
     assert stages, "runner emitted no stages"
@@ -394,7 +471,7 @@ def _planned_stage_map(output: str) -> dict[str, List[str]]:
     for line in output.splitlines():
         if not line.startswith("PLAN "):
             continue
-        tokens = line.split()
+        tokens = shlex.split(line)
         assert len(tokens) >= 3, f"malformed plan line: {line}"
         stages[tokens[2]] = tokens[3:]
     assert stages, "pipeline emitted no planned stages"
@@ -406,6 +483,94 @@ def _arg_value(tokens: List[str], flag: str) -> str:
     index = tokens.index(flag)
     assert index + 1 < len(tokens), f"{flag} has no value in {tokens}"
     return tokens[index + 1]
+
+
+def test_scored_wrappers_forward_one_nested_artifact_to_every_dataset_consumer(
+    tmp_path: Path,
+) -> None:
+    """Command plans preserve paths with spaces and use the same nested split."""
+    dataset = tmp_path / "processed data" / "dataset.pt"
+    artifact = tmp_path / "nested priors" / "nested_split_seed73.pt"
+    run_dir = tmp_path / "run with spaces"
+    overrides = dict(
+        DATA=str(dataset), RAW=str(tmp_path / "raw sessions"),
+        RUN_DIR=str(run_dir), OUTPUT=str(tmp_path / "figure outputs"),
+        NESTED_PRIOR_ARTIFACT=str(artifact), SEED="73",
+    )
+    consumers = {
+        "scripts/analyze_dynamics.py", "scripts/simulate_lesion.py",
+        "scripts/analyze_jacobian.py", "scripts/analyze_integration.py",
+        "scripts/simulate_psychophysics.py", "scripts/analyze_gating.py",
+    }
+
+    for result in (
+        _run_runner(
+            DATASET=overrides["DATA"], RAW_DIR=overrides["RAW"],
+            RUN_DIR=overrides["RUN_DIR"], OUTPUT_DIR=overrides["OUTPUT"],
+            NESTED_PRIOR_ARTIFACT=overrides["NESTED_PRIOR_ARTIFACT"], SEED="73",
+        ),
+        _run_make_pipeline(**overrides),
+    ):
+        assert result.returncode == 0, result.stderr
+        stages = _planned_stage_map(result.stdout)
+        assert list(stages).index("scripts/prepare_data.py") < list(stages).index(
+            "scripts/evaluate_nested_prior.py"
+        ) < list(stages).index("scripts/train.py")
+        nested = stages["scripts/evaluate_nested_prior.py"]
+        assert _arg_value(nested, "--dataset") == str(dataset)
+        assert _arg_value(nested, "--output_dir") == str(artifact.parent)
+        assert _arg_value(nested, "--split_seed") == "73"
+        for script in {"scripts/train.py", *consumers}:
+            args = stages[script]
+            assert _arg_value(args, "--nested_prior_artifact") == str(artifact)
+            assert _arg_value(args, "--dataset") == str(dataset)
+            assert "--diagnostic_only" not in args
+            assert "--qc_sealed_nested_prior_sha256" not in args
+        assert "--nested_prior_artifact" not in stages["scripts/simulate_autoregressive.py"]
+
+    make = shutil.which("make")
+    assert make is not None
+    plan = subprocess.run(
+        [make, "--no-print-directory", "-n", "nested-prior", "train", "analyze",
+         *(f"{key}={value}" for key, value in overrides.items())],
+        cwd=REPO_ROOT, capture_output=True, text=True, timeout=300,
+    )
+    assert plan.returncode == 0, plan.stderr
+    for script in {"scripts/train.py", *consumers}:
+        commands = [shlex.split(line) for line in plan.stdout.splitlines()
+                    if f"scripts/{script.split('/')[-1]} " in line]
+        assert commands, f"make -n omitted {script}"
+        assert all(_arg_value(cmd, "--nested_prior_artifact") == str(artifact)
+                   for cmd in commands)
+    evaluator = next(line for line in plan.stdout.splitlines()
+                     if "scripts/evaluate_nested_prior.py " in line)
+    assert _arg_value(shlex.split(evaluator), "--output_dir") == str(artifact.parent)
+    docs = (REPO_ROOT / "CHANGELOG.md").read_text(encoding="utf-8") + (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    assert "do not forward the required nested artifact" not in docs
+    assert "make pipeline` generates a fresh dataset and nested artifact" in docs
+    assert "container pipeline uses the same ETL" in docs
+    assert not artifact.exists() and not run_dir.exists()
+
+
+def test_runner_rejects_existing_nested_artifact_before_mutation(tmp_path: Path) -> None:
+    artifact = tmp_path / "nested priors" / "nested_split_seed42.pt"
+    artifact.parent.mkdir()
+    artifact.write_bytes(b"existing artifact")
+    output_dir = tmp_path / "figure outputs"
+    result = _run_runner(
+        DRY_RUN="0", NESTED_PRIOR_ARTIFACT=str(artifact),
+        RUN_DIR=str(tmp_path / "new run"), OUTPUT_DIR=str(output_dir),
+    )
+    assert result.returncode != 0
+    assert "Pre-existing nested artifact" in result.stderr
+    assert "PLAN " not in result.stdout and "Phase A" not in result.stdout
+    assert artifact.read_bytes() == b"existing artifact"
+    assert not output_dir.exists()
+
+    wrong_name = _run_runner(NESTED_PRIOR_ARTIFACT=str(artifact.with_name("other.pt")))
+    assert wrong_name.returncode != 0
+    assert "must end in nested_split_seed42.pt" in wrong_name.stderr
+    assert "PLAN " not in wrong_name.stdout
 
 
 def test_makefile_pipeline_dry_run_forwards_all_required_variables() -> None:

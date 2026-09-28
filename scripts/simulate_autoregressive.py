@@ -49,7 +49,8 @@ sys.path.insert(0, _PROJECT_ROOT)
 
 from nsmor.data_extractor import _compute_pure_wind_prepend_frames  # noqa: E402
 from nsmor.model_nsmor_core import NSMoRCore  # noqa: E402
-from nsmor.model_utils import load_model_from_checkpoint as _shared_load_model  # noqa: E402
+from nsmor.analysis.prediction_units import resolve_dt_ms
+from nsmor.analysis.prediction_units import load_model_from_checkpoint as _shared_load_model  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -68,14 +69,16 @@ class StimulusParadigm:
     """Specification for a single stimulus condition."""
     name: str
     description: str
-    target_ttc_ms: float           # ms relative to stimulus onset
+    target_ttc_ms: float           # collision offset from baseline reference
     lv_ratio: float                # l/v ratio (object size / speed)
     has_visual: bool               # whether visual looming is present
     has_wind: bool                 # whether wind step is present
     wind_onset_delta_ms: float = 0.0  # ms relative to TTC (negative = early)
     wind_offset_delta_ms: float = 0.0  # 0 = no offset (sustained)
     total_duration_ms: float = 5000.0  # total trial duration
-    baseline_ms: float = 2000.0    # pre-stimulus baseline
+    baseline_ms: float = 2000.0    # collision reference at target_ttc_ms=0
+    visual_lead_ms: float = 1000.0  # sampled approach before collision
+    wind_gap_deltas_ms: Optional[Tuple[float, float]] = None  # off interval relative to TTC
 
 
 # ── The 9 experimental paradigms ──────────────────────────────
@@ -108,7 +111,7 @@ PARADIGMS: Dict[str, StimulusParadigm] = {
     ),
     "early_wind_ttc_neg373": StimulusParadigm(
         name="early_wind_ttc_neg373",
-        description="Wind leads visual by 373ms",
+        description="Wind begins 373ms before visual collision",
         target_ttc_ms=0.0,
         lv_ratio=120.0,
         has_visual=True,
@@ -117,7 +120,7 @@ PARADIGMS: Dict[str, StimulusParadigm] = {
     ),
     "early_wind_ttc_neg119": StimulusParadigm(
         name="early_wind_ttc_neg119",
-        description="Wind leads visual by 119ms",
+        description="Wind begins 119ms before visual collision",
         target_ttc_ms=0.0,
         lv_ratio=120.0,
         has_visual=True,
@@ -126,7 +129,7 @@ PARADIGMS: Dict[str, StimulusParadigm] = {
     ),
     "late_wind_ttc_plus200": StimulusParadigm(
         name="late_wind_ttc_plus200",
-        description="Visual leads wind by 200ms",
+        description="Wind begins 200ms after visual collision",
         target_ttc_ms=0.0,
         lv_ratio=120.0,
         has_visual=True,
@@ -157,7 +160,8 @@ PARADIGMS: Dict[str, StimulusParadigm] = {
         has_visual=True,
         has_wind=True,
         wind_onset_delta_ms=-200.0,
-        wind_offset_delta_ms=100.0,  # wind off at TTC+100ms
+        wind_offset_delta_ms=100.0,  # second pulse ends at TTC+100ms
+        wind_gap_deltas_ms=(-100.0, 0.0),  # off between first and second pulses
     ),
 }
 
@@ -223,8 +227,11 @@ def generate_stimulus_paradigm(
     time_ms = np.arange(total_frames) * dt_ms
 
     # ── Absolute timing ─────────────────────────────────────
-    stimulus_onset_ms = paradigm.baseline_ms
-    ttc_absolute_ms = stimulus_onset_ms + paradigm.target_ttc_ms
+    ttc_absolute_ms = paradigm.baseline_ms + paradigm.target_ttc_ms
+    stimulus_onset_ms = (
+        ttc_absolute_ms - paradigm.visual_lead_ms
+        if paradigm.has_visual else paradigm.baseline_ms
+    )
 
     # ── Visual channel ──────────────────────────────────────
     v_vis = np.zeros(total_frames, dtype=np.float64)
@@ -247,9 +254,14 @@ def generate_stimulus_paradigm(
             else paradigm.total_duration_ms  # sustained
         )
 
-        for i in range(total_frames):
-            if wind_onset_ms <= time_ms[i] < wind_offset_ms:
-                wind[i] = 1.0
+        wind[(time_ms >= wind_onset_ms) & (time_ms < wind_offset_ms)] = 1.0
+        if paradigm.wind_gap_deltas_ms is not None:
+            gap_start, gap_end = paradigm.wind_gap_deltas_ms
+            if not (wind_onset_ms < ttc_absolute_ms + gap_start
+                    < ttc_absolute_ms + gap_end < wind_offset_ms):
+                raise ValueError("Wind gap must lie strictly inside the wind interval")
+            wind[(time_ms >= ttc_absolute_ms + gap_start)
+                 & (time_ms < ttc_absolute_ms + gap_end)] = 0.0
 
     # ── Pure-wind prepend (5.7s structural alignment) ──
     if paradigm.has_wind and not paradigm.has_visual:
@@ -274,7 +286,7 @@ def load_model_from_checkpoint(
 ) -> NSMoRCore:
     """Load trained NSMoRCore from checkpoint.
 
-    Delegates to the shared :func:`nsmor.model_utils.load_model_from_checkpoint`
+    Delegates to the shared :func:`nsmor.analysis.prediction_units.load_model_from_checkpoint`
     which guarantees all biophysical parameters are restored.
     """
     return _shared_load_model(checkpoint_path, device)
@@ -332,13 +344,15 @@ class TrialResult:
     position: np.ndarray        # (T,) cumulative displacement (cm)
     velocity: np.ndarray        # (T,) predicted velocity (cm/s)
     acceleration: np.ndarray    # (T,) derived acceleration (cm/s²)
-    v_vis: np.ndarray           # (T,) visual angle (degrees)
+    v_vis: np.ndarray           # (T,) model input: visual angle (degrees)
     wind: np.ndarray            # (T,) wind state (0/1)
     gate_lif: np.ndarray        # (T,) LIF routing gate
     gate_gru: np.ndarray        # (T,) GRU routing gate
     target_ttc_ms: float
     lv_ratio: float
     dt_ms: float = 4.0
+    stimulus_onset_ms: float = 2000.0
+    collision_ms: float = 2000.0
 
 
 def run_autoregressive_trial(
@@ -346,7 +360,7 @@ def run_autoregressive_trial(
     paradigm: StimulusParadigm,
     mcmc_prior: np.ndarray,
     device: torch.device,
-    dt_ms: float = 4.0,
+    dt_ms: Optional[float] = None,
     current_fatigue: float = 0.0,
     max_fatigue_penalty: float = 0.0,
 ) -> TrialResult:
@@ -371,13 +385,15 @@ def run_autoregressive_trial(
         paradigm: Stimulus paradigm specification.
         mcmc_prior: ``(4,)`` base MCMC prior vector.
         device: Computation device.
-        dt_ms: Frame interval in milliseconds.
+        dt_ms: None inherits saved model.dt_ms; an explicit interval must match.
         current_fatigue: Leaky-accumulator fatigue level in [0, 1].
         max_fatigue_penalty: Maximum velocity reduction fraction [0, 1].
 
     Returns:
         TrialResult with all per-frame trajectories.
     """
+    dt_ms = resolve_dt_ms(model, dt_ms)
+
     # ── Generate stimulus ────────────────────────────────────
     time_ms, v_vis, wind = generate_stimulus_paradigm(paradigm, dt_ms)
     T = len(time_ms)
@@ -439,7 +455,8 @@ def run_autoregressive_trial(
                     X_t, lengths_t, return_internals=True, states=states,
                 )
 
-            # Soft-gain velocity scaling (preserves derivative continuity)
+            # The analysis loader restores cm/s before gain, displacement and feedback.
+            assert y_pred.shape == (1, 1), f'Per-step velocity shape: {y_pred.shape}'
             v_adjusted = y_pred.item() * gain
 
             # Derive acceleration from the adjusted velocity
@@ -477,6 +494,10 @@ def run_autoregressive_trial(
         target_ttc_ms=paradigm.target_ttc_ms,
         lv_ratio=paradigm.lv_ratio,
         dt_ms=dt_ms,
+        stimulus_onset_ms=(paradigm.baseline_ms + paradigm.target_ttc_ms
+                           - paradigm.visual_lead_ms if paradigm.has_visual
+                           else paradigm.baseline_ms),
+        collision_ms=paradigm.baseline_ms + paradigm.target_ttc_ms,
     )
 
 
@@ -521,8 +542,8 @@ def export_events_csv(
         })
 
         T = len(trial.time_ms)
-        stimulus_onset_ms = 2000.0  # 2s baseline
-        ttc_absolute_ms = stimulus_onset_ms + trial.target_ttc_ms
+        stimulus_onset_ms = trial.stimulus_onset_ms
+        ttc_absolute_ms = trial.collision_ms
 
         # trial_start
         rows.append({
@@ -630,6 +651,40 @@ def export_kinematics_csv(
     )
 
 
+def export_stimulus_evidence(trials: List[TrialResult], output_dir: Path) -> None:
+    """Export actual model inputs and the timing needed to replay their physics."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    with (output_dir / "stimuli.csv").open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(("sys_time", "global_trial_id", "visual_angle_deg", "v_vis", "wind"))
+        for trial_id, trial in enumerate(trials):
+            assert trial.time_ms.shape == trial.v_vis.shape == trial.wind.shape
+            for time, angle, wind_state in zip(trial.time_ms, trial.v_vis, trial.wind):
+                writer.writerow((format(time, ".17g"), trial_id, format(angle, ".17g"),
+                                 format(angle, ".17g"), format(wind_state, ".17g")))
+
+    summaries = []
+    for trial_id, trial in enumerate(trials):
+        active = np.flatnonzero(trial.wind > 0)
+        intervals = np.split(active, np.where(np.diff(active) > 1)[0] + 1) if active.size else []
+        summaries.append({
+            "global_trial_id": trial_id,
+            "type": trial.paradigm_name,
+            "lv_ratio": trial.lv_ratio,
+            "visual_onset_ms": trial.stimulus_onset_ms if np.any(trial.v_vis) else None,
+            "collision_ms": trial.collision_ms,
+            "wind_intervals_ms": [[float(trial.time_ms[segment[0]]),
+                                   float(trial.time_ms[segment[-1]] + trial.dt_ms)]
+                                  for segment in intervals],
+            "visual_gain": 1.0,
+            "visual_tau_ms": None,
+            "visual_input_semantics": "angle_deg",
+        })
+    with (output_dir / "stimulus_summary.json").open("w", encoding="utf-8") as stream:
+        json.dump({"schema_version": 1, "dt_ms": trials[0].dt_ms,
+                   "trials": summaries}, stream, indent=2, allow_nan=False)
+
+
 # ═══════════════════════════════════════════════════════════════
 # 7.  Summary Statistics
 # ═══════════════════════════════════════════════════════════════
@@ -642,8 +697,7 @@ def log_trial_summary(
 
     Args:
         trials: List of TrialResult objects.
-        dt_ms: Frame interval in milliseconds. If None, derived from
-            trial.dt_ms or trial.time_ms step (fallback 4.0).
+        dt_ms: Kept for caller compatibility; recorded timestamps define latency.
     """
     logger.info("=" * 70)
     logger.info("Autoregressive Generation Summary")
@@ -653,22 +707,13 @@ def log_trial_summary(
 
     for trial in trials:
         T = len(trial.time_ms)
-        effective_dt = (
-            dt_ms
-            if dt_ms is not None
-            else getattr(
-                trial,
-                "dt_ms",
-                (trial.time_ms[1] - trial.time_ms[0]) if T > 1 else 4.0,
-            )
-        )
-        stim_onset_frame = int(2000.0 / effective_dt)  # 2s baseline at effective_dt
+        stim_onset_frame = int(np.searchsorted(trial.time_ms, trial.stimulus_onset_ms))
 
         if stim_onset_frame < T:
             post_stim = trial.velocity[stim_onset_frame:]
             v_peak = float(np.max(np.abs(post_stim)))
             peak_frame = int(np.argmax(np.abs(post_stim)))
-            latency_ms = float(peak_frame * effective_dt)
+            latency_ms = float(trial.time_ms[stim_onset_frame + peak_frame] - trial.stimulus_onset_ms)
         else:
             v_peak = 0.0
             latency_ms = 0.0
@@ -719,8 +764,8 @@ def main() -> None:
     parser.add_argument(
         "--dt_ms",
         type=float,
-        default=4.0,
-        help="Frame interval in milliseconds.",
+        default=None,
+        help="Frame interval in ms (default: saved model.dt_ms; explicit value must match).",
     )
     parser.add_argument(
         "--session_num",
@@ -767,6 +812,7 @@ def main() -> None:
 
     # ── Load model ───────────────────────────────────────────
     model = load_model_from_checkpoint(Path(args.checkpoint), device)
+    args.dt_ms = resolve_dt_ms(model, args.dt_ms)
 
     # ── MCMC prior ───────────────────────────────────────────
     mcmc_prior = np.array(args.mcmc_prior, dtype=np.float64)
@@ -824,6 +870,7 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     export_events_csv(trials, output_dir / "events.csv", args.session_num)
     export_kinematics_csv(trials, output_dir / "kinematics.csv", args.session_num, dt_ms=args.dt_ms)
+    export_stimulus_evidence(trials, output_dir)
 
     logger.info("Done. Outputs in %s", output_dir)
 

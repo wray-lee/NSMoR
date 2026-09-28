@@ -1,16 +1,8 @@
-"""Out-of-fold MCMC priors must be cross-fitted by ANIMAL, not by session.
+"""OOF MCMC priors must be cross-fitted by recording prefix, not session.
 
-The priors are written into input channels 4-7, so a leak here enters the
-model as a *feature*.  Grouping folds by session is not enough:
-``_session_N`` splits one recording of one animal into blocks, so an
-animal's ``_session_1`` could train the very generator that produced
-``_session_2``'s supposedly held-out prior.
-
-These tests assert at the seam where the group array is handed to
-``train_mcmc_cross_fitted``.  That is the narrowest observable point: the
-fold assignment itself is sklearn's, and the resulting priors are a
-continuous function of it, so asserting on prior values would be a much
-weaker and flakier proxy for the property that actually matters.
+Input channels 4-7 carry the priors. Keeping blocks with the same prefix
+together avoids within-prefix reuse; distinct prefixes are not independently
+verified animal identities. The test observes groups at the real cross-fitter seam.
 """
 
 from __future__ import annotations
@@ -31,7 +23,7 @@ def _write_corpus(
     n_animals: int = 5,
     blocks_per_animal: int = 2,
 ) -> None:
-    """Write a raw corpus where animal and session are DISTINGUISHABLE.
+    """Write a raw corpus where recording prefix and session are distinct.
 
     Every animal owns ``blocks_per_animal`` sessions.  A fixture with one
     session per animal cannot tell session-grouping from animal-grouping,
@@ -61,9 +53,13 @@ def _write_corpus(
                 velocity[stim_idx:] = 0.1
                 velocity[stim_idx + 5:stim_idx + 45] = response
                 acceleration = np.gradient(velocity, _DT_MS / 1000.0)
+                lv_ms, init_deg = 30.0, 2.0
+                collision_ms = onset_ms + lv_ms / np.tan(np.deg2rad(init_deg / 2.0))
                 visual_angle = np.zeros(_FRAMES, dtype=np.float64)
-                visual_angle[stim_idx:] = np.linspace(
-                    5.0, 60.0, _FRAMES - stim_idx,
+                remaining_ms = np.maximum(collision_ms - time_ms[stim_idx:],
+                                          lv_ms / np.tan(np.deg2rad(89.0)))
+                visual_angle[stim_idx:] = np.rad2deg(
+                    2.0 * np.arctan(lv_ms / remaining_ms)
                 )
                 for frame_idx in range(_FRAMES):
                     kin_rows.append({
@@ -77,7 +73,7 @@ def _write_corpus(
                         "acceleration": float(acceleration[frame_idx]),
                         "visual_angle": float(visual_angle[frame_idx]),
                         "wind_state": 0,
-                        "l_v_ratio": 0.0,
+                        "l_v_ratio": lv_ms,
                     })
                 event_rows.extend([
                     {
@@ -182,8 +178,8 @@ def test_fold_count_is_resolved_not_hardcoded(
     )
 
 
-def test_provenance_records_animal_grouping(tmp_path_factory) -> None:
-    """The artifact must not claim session-grouped provenance."""
+def test_provenance_records_prefix_grouping(tmp_path_factory) -> None:
+    """The artifact identifies prefix grouping and unverified animal identity."""
     import torch
 
     from scripts.prepare_data import prepare_dataset
@@ -193,11 +189,9 @@ def test_provenance_records_animal_grouping(tmp_path_factory) -> None:
     out = tmp_path_factory.mktemp("out_prov") / "ds.pt"
     prepare_dataset(raw_dir=raw_dir, output_path=out, random_seed=42)
 
-    provenance = torch.load(out, weights_only=False)[
-        "mcmc_prior_provenance"
-    ]
-    assert "animal_grouped" in provenance, provenance
-    assert "session_grouped" not in provenance, provenance
+    saved = torch.load(out, weights_only=False)
+    assert saved["mcmc_prior_provenance"].endswith("recording_prefix_grouped_cv")
+    assert saved["animal_identity_status"] == "unverified"
 
 
 if __name__ == "__main__":

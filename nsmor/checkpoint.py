@@ -16,6 +16,7 @@ import torch
 import torch.nn as nn
 
 from nsmor.config import PIPELINE_SEMANTICS_VERSION
+from nsmor.pipeline.nested_prior import load_artifact_bytes
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -152,6 +153,7 @@ def load_checkpoint(
     scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
     *,
     map_location: Optional[Union[str, torch.device]] = None,
+    payload: Optional[bytes] = None,
 ) -> Dict[str, Any]:
     """
     Load a checkpoint and restore all deterministic state.
@@ -168,7 +170,9 @@ def load_checkpoint(
         model: Model whose state to restore.
         optimizer: Optimizer whose state to restore (optional).
         scheduler: LR scheduler whose state to restore (optional).
-        map_location: Device mapping for ``torch.load``.
+        map_location: Device mapping for the restricted artifact decoder.
+        payload: Captured bytes already inspected by a resume caller. When
+            supplied, restoration uses this snapshot without rereading *path*.
 
     Returns:
         The full checkpoint dictionary.  The caller can inspect
@@ -178,10 +182,12 @@ def load_checkpoint(
         FileNotFoundError: If *path* does not exist.
     """
     path = Path(path)
-    if not path.exists():
-        raise FileNotFoundError(f"Checkpoint not found: {path}")
+    if payload is None:
+        if not path.exists():
+            raise FileNotFoundError(f"Checkpoint not found: {path}")
+        payload = path.read_bytes()
 
-    checkpoint = torch.load(path, map_location=map_location, weights_only=False)
+    checkpoint = load_artifact_bytes(payload, map_location=map_location)
 
     # ── Provenance check (Round-2 CRITICAL-A) ──
     _require_pipeline_version(

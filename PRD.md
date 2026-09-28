@@ -19,12 +19,12 @@
 In computational neuroscience and animal behavior modeling, traditional neural networks suffer from a fundamental trade-off:
 1. **Black-box Deep Learning (e.g. standard LSTMs/RNNs)**: Achieves high behavioral prediction accuracy but lacks biological realism, rendering internal states uninterpretable to neuroscientists.
 2. **Hand-tuned Biophysical Models (e.g. Hodgkin-Huxley networks)**: Fully interpretable, but computationally expensive, difficult to optimize over large empirical datasets, and prone to poor generalization across variable behavioral regimes.
-3. **Data Leakage & Inconsistent Pipeline Semantics**: Unchecked temporal leakage (e.g. using future trajectory frames or session-wide priors) inflates performance metrics ($R^2 > 0.45$) while breaking true out-of-session generalization.
+3. **Data Leakage & Inconsistent Pipeline Semantics**: Temporal leakage and global OOF prior fits can contaminate outer validation: prior fits may include outer-validation labels even when the trial and its recording prefix are excluded from their own OOF prior.
 
 ### User Value
 - **White-Box Dynamical Interpretability**: All internal variables (routing gates $g(t)$, membrane potentials $V_{\text{LIF}}(t)$, spike events, GRU hidden vectors $h_{\text{GRU}}(t)$) are exposed for dynamical systems and manifold analysis.
-- **Honest Generalization (Pipeline Semantics v2.1)**: Session-grouped 5-fold Out-Of-Fold (OOF) MCMC prior estimation guarantees zero data leakage across sessions.
-- **Publication-Grade Statistical & Biophysical Rigor**: Every analysis module includes block bootstrap confidence intervals, Cohen's $d$ effect sizes, Holm-Bonferroni FWER corrections, and GMM+BIC calibrated threshold selection.
+- **OOF prior scope**: Recording-prefix-grouped folds exclude a held-out trial and its prefix from its own prior fit. Scored outer validation requires a separate nested-prior artifact; global OOF validation is diagnostic and potentially contaminated. Animal identity across prefixes remains unverified.
+- **Statistical & Biophysical Analysis**: Descriptive analyses report supported effect sizes and mark unavailable population confidence intervals and p-values; calibration and uncertainty helpers apply where their assumptions hold.
 - **Automated AI Harness Governance**: Governed by a 5-layer AI harness (`AGENTS.md`, `CLAUDE.md`, `BOUNDARY.md` matrix, `HARNESS.md`, `.claude/`), enabling double-blind review of code modifications prior to release.
 
 ---
@@ -41,12 +41,13 @@ In computational neuroscience and animal behavior modeling, traditional neural n
   - `MoRRouter`: Learned per-step blending gate producing softmax routing probabilities $[g_{\text{LIF}}, g_{\text{GRU}}]$.
   - `DirectionHead`: LayerNorm $\to$ ReLU $\to$ Linear final decoder predicting target kinematic response (velocity).
 - **[P0] Hybrid Funnel Two-Phase Training (`scripts/train.py`, `loss.py`)**:
+  - Scored CLI validation requires `--nested_prior_artifact`; deliberate `--diagnostic_only` runs have `validation_scope="diagnostic_global_oof"` and cannot support unbiased holdout, generalization, strict QC, or release claims. A validated artifact reports `nested_outer_validation`.
   - *Phase 1 (`FrontendLoss`)*: Train dendritic frontend using masked MSE.
   - *Phase 2 (`BioDecisionLoss`)*: Freeze frontend via `requires_grad=False` and train decision core using joint loss:
     $$\mathcal{L}_{\text{Phase2}} = \mathcal{L}_{\text{MSE}} + \lambda_{\text{reg}}\mathcal{L}_{\text{router}} + \lambda_{\text{energy}}\mathcal{L}_{\text{ATP}} + \lambda_{\text{sparse}}\mathcal{L}_{\text{sparse}} + \lambda_{\text{jerk}}\mathcal{L}_{\text{jerk}}$$
-- **[P0] v2.1 Data Ingestion & Feature Pipeline (`pipeline/`, `data_extractor.py`)**:
+- **[P0] v2.2 Data Ingestion & Feature Pipeline (`pipeline/`, `data_extractor.py`)**:
   - Process raw CSVs into 8D per-frame feature tensors $[B, T, 8]$ and 5D MCMC snapshots.
-  - Session-grouped 5-fold cross-validation OOF prior estimation to eliminate session leakage.
+  - Current OOF provenance is `oof_<folds>fold_recording_prefix_grouped_cv` with `animal_identity_status="unverified"`. Historical animal-named tags are `historical_unknown`, never animal proof; independent animals require verified IDs and identity-based splitting.
 - **[P1] Publication Interpretability Suite (`scripts/analyze_*.py`)**:
   - 6 mandatory analysis entry points: `dynamics`, `jacobian`, `integration`, `psychophysics`, `lesion`, `cluster`.
 - **[P1] Hermetic Execution & Reproducibility**:
@@ -65,7 +66,7 @@ In computational neuroscience and animal behavior modeling, traditional neural n
 
 ## 4. Technical Design & Architecture
 
-### System Data Flow & Pipeline Semantics v2.1
+### System Data Flow & Pipeline Semantics v2.2
 
 ```
 Raw CSV Datasets (Kinematics & Events)
@@ -77,7 +78,7 @@ load_and_concat_sessions() ──> pd.DataFrame
 assign_ground_truth_labels() ──> [ESCAPE, PREWALK, PRE_ACTIVE, NO_RESPONSE]
           │                     (v2.1 escape-first branch ordering)
           ▼
-train_mcmc() ──> Session-Grouped 5-Fold OOF Priors (No session leakage)
+train_mcmc() ──> Recording-Prefix-Grouped OOF Priors (global OOF diagnostic only)
           │
           ▼
 create_dataloader() ──> PyTorch DataLoader yielding (X_batch [B,T,8], Y_batch [B,T])
@@ -90,6 +91,14 @@ NSMoRCore (Hybrid Funnel Model)
           ▼
 Mechanistic Interpretation Engine (Dynamics, Jacobians, Lesions, Clusters)
 ```
+
+For scored training, `scripts/evaluate_nested_prior.py` builds outer-train-only
+inner OOF priors and outer-validation priors; `scripts/train.py` consumes the validated
+artifact. `scripts/train_jax.py` uses global OOF priors for development diagnostics
+(`validation_scope="diagnostic_global_oof"`) and writes `jax_development_only`
+checkpoints, which are not canonical downstream analysis checkpoints. The subset
+utility selects recording prefixes, slices session/trial identity with the selected rows,
+and retains parent priors without refitting them.
 
 ### Feature Contracts
 
@@ -113,10 +122,10 @@ $$\mathbf{s}_{\text{TTC-50ms}} = [v_{\text{vis}}, l/v \text{ ratio}, \text{wind\
 ## 6. Acceptance Criteria
 
 - [x] **Core Architecture**: Hybrid Funnel two-phase model implemented and verified with shape assertions.
-- [x] **Data Pipeline**: v2.1 semantics validated with `pipeline_semantics_version="2.1"` and session-grouped 5-fold OOF priors.
-- [x] **Generalization Performance**: Model achieves honest validation $R^2 \approx 0.37 \pm 0.03$ without session leakage.
-- [x] **Analysis Pipeline**: All 6 analysis scripts (`make analyze`) run end-to-end and generate 300 DPI publication figures in `results/`.
-- [x] **Test Infrastructure**: `pytest tests/ -v` passes 100% of 131 test cases.
+- [x] **Data Pipeline**: historical v2.1 semantics used `pipeline_semantics_version="2.1"` and session-grouped OOF priors; current v2.2 uses recording-prefix grouping with `animal_identity_status="unverified"`.
+- [ ] **Independent Generalization**: Historical validation $R^2 \approx 0.37 \pm 0.03$ is descriptive and does not establish unbiased holdout, animal-independent generalization, or absence of cross-recording leakage.
+- [ ] **Analysis Pipeline**: Six scripts are available, but SOURCE14 review and integration remain pending; generating figures does not establish QC or release readiness.
+- [ ] **Test Infrastructure**: SOURCE14 regression verification is pending; the historical 131-test claim is not current candidate evidence.
 - [x] **Harness Governance**: 5-layer harness framework operational (`AGENTS.md`, `CLAUDE.md`, path `BOUNDARY.md` files, `HARNESS.md`, `.claude/`).
 
 ---
@@ -125,6 +134,6 @@ $$\mathbf{s}_{\text{TTC-50ms}} = [v_{\text{vis}}, l/v \text{ ratio}, \text{wind\
 
 | Risk Area | Risk Description | Mitigation Strategy |
 | :--- | :--- | :--- |
-| **Data Leakage** | Session overlap in prior estimation inflates $R^2$. | `validate_dataset_provenance()` guard rejects pre-v2.1 dataset artifacts. |
+| **Data Leakage** | Global OOF prior fits can include outer-validation labels; distinct recording prefixes may share an animal. | Require a validated nested artifact for scored validation; record diagnostic scope for global OOF and require verified IDs before animal-level claims. |
 | **Numerical Instability** | Non-differentiable spiking boundaries generate `NaN` gradients. | AMP FP16/FP32 master weights, loss scaling, and post-clip gradient finiteness checks. |
 | **Multi-Agent Deadlocks** | Developer and Reviewer loop endlessly on hyperparameter tweaks. | Orchestrator watchdog imposes max iteration limit ($N=10$) with user intervention hooks. |

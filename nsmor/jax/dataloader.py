@@ -1,10 +1,8 @@
 """
 JAX DataLoader for NSMoR — High-Throughput Sequence Ingestion.
 
-Compatible with PyTorch ETL preprocessed datasets (e.g. ``nsmor_dataset_3cond_v2.pt``).
-Provides session-grouped train/val splitting identical to PyTorch pipelines,
-automatic MCMC prior broadcasting into feature columns 4..8, and zero-overhead
-batched slice generation into contiguous JAX arrays.
+Reads provenance-checked PyTorch ETL datasets. The shared splitter groups
+recording prefixes; distinct prefixes do not verify distinct animals.
 """
 
 from __future__ import annotations
@@ -16,7 +14,9 @@ from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import torch
 
+from nsmor.model_utils import validate_dataset_provenance
 from nsmor.pipeline.grouping import grouped_train_val_split
+from nsmor.pipeline.nested_prior import load_dataset_with_fingerprint
 
 try:
     import jax
@@ -45,9 +45,29 @@ def load_nsmor_dataset(dataset_path: Union[str, Path]) -> Dict[str, Any]:
     if not path.exists():
         raise FileNotFoundError(f"Dataset not found at {path}")
 
-    data = torch.load(path, weights_only=False)
+    data, fingerprint = load_dataset_with_fingerprint(path, map_location="cpu")
     if not isinstance(data, dict):
         raise ValueError(f"Expected dataset dict, got {type(data)}")
+    required = ("X_seqs", "Y_seqs", "mcmc_priors", "lengths", "labels")
+    missing = [key for key in required if key not in data]
+    if missing:
+        raise ValueError(f"Dataset missing required keys: {missing}")
+    identity_status = validate_dataset_provenance(data, path)
+    n_total = len(data["X_seqs"])
+    sessions = data.get("session_ids")
+    if sessions is None and isinstance(data.get("trial_specs"), (list, tuple)):
+        sessions = [spec.get("session_id") if isinstance(spec, dict) else None
+                    for spec in data["trial_specs"]]
+    if (not isinstance(sessions, (list, tuple, np.ndarray))
+            or len(sessions) != n_total
+            or any(not isinstance(s, str) or not s.strip()
+                   or s.strip().lower() in ("nan", "none") for s in sessions)):
+        raise ValueError("session_ids must contain one usable recording id per trial")
+    priors = np.asarray(data["mcmc_priors"])
+    if (priors.shape != (n_total, 4) or not np.isfinite(priors).all()
+            or np.any(priors < 0) or np.any(priors > 1)
+            or not np.allclose(priors.sum(axis=1), 1.0, atol=1e-4)):
+        raise ValueError(f"mcmc_priors must be finite ({n_total}, 4) probability rows")
 
     # Convert torch tensors to numpy arrays if necessary
     def _to_np(x):
@@ -62,32 +82,29 @@ def load_nsmor_dataset(dataset_path: Union[str, Path]) -> Dict[str, Any]:
         else:
             converted[k] = _to_np(v)
 
+    converted["session_ids"] = sessions
+    converted["animal_identity_status"] = identity_status
+    converted["dataset_sha256"] = fingerprint
     return converted
 
 
-def session_grouped_train_val_split(
+def recording_prefix_train_val_split(
     session_ids: Sequence[Any],
     n_total: int,
     val_split: float = 0.2,
     random_seed: int = 42,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Deterministic **animal**-grouped train/val split.
-
-    Thin delegation to :func:`nsmor.pipeline.grouping.grouped_train_val_split`
-    so the JAX and PyTorch pipelines cannot drift apart.  This was a
-    fourth hand-written copy of the split; grouping by session is
-    insufficient because ``_session_N`` blocks belong to one animal, and
-    its fallback branch also disagreed with ``scripts/train.py`` about
-    which end of the shuffled index array became validation.
-
-    The name is kept for backward compatibility with existing callers.
-    """
+    """Split by recording prefix; animal identity remains unverified."""
     return grouped_train_val_split(
         session_ids,
         n_total,
         val_split=val_split,
         random_seed=random_seed,
     )
+
+
+# Historical public name is an interface alias, not an animal-level claim.
+session_grouped_train_val_split = recording_prefix_train_val_split
 
 
 def compute_target_stats(

@@ -8,11 +8,11 @@ version = "0.1.0"
 description = "Bio-inspired Multi-sensory Object Recognition: Cricket Neural Modeling"
 requires-python = ">=3.10"
 dependencies = [
-    "numpy>=1.24.0",
+    "numpy>=1.26.0",
     "pandas>=2.0.0",
     # CI should use --extra-index-url https://download.pytorch.org/whl/cpu
     # to install CPU-only PyTorch (~200 MB) instead of the CUDA build (~2.5 GB)
-    "torch>=2.0.0",
+    "torch>=2.6.0",
     "scikit-learn>=1.3.0",
     "scipy>=1.10.0",
     "PyYAML>=6.0",

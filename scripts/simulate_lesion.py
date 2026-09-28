@@ -23,12 +23,15 @@ CLI::
 from __future__ import annotations
 
 import argparse
+import sys
 import csv
 import json
 import logging
-import math
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
+
+# Direct CLI execution must use this checkout, including its prior/lineage helpers.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
@@ -40,7 +43,12 @@ from nsmor.dataloader_factory import create_optimized_dataloader
 from nsmor.checkpoint import load_checkpoint
 from nsmor.config import DEFAULT_FEATURE, Label
 from nsmor.model_nsmor_core import NSMoRCore
-from nsmor.model_utils import load_model_from_checkpoint as _shared_load_model
+from nsmor.analysis.analysis_priors import (
+    describe_analysis_population, load_analysis_priors, population_for_output,
+)
+from nsmor.pipeline.nested_prior import load_dataset_with_fingerprint
+from nsmor.analysis.prediction_units import resolve_dt_ms
+from nsmor.analysis.prediction_units import load_model_from_checkpoint as _shared_load_model
 from nsmor.model_utils import validate_dataset_provenance
 
 # ── Logging ────────────────────────────────────────────────────
@@ -104,7 +112,7 @@ def load_model_from_checkpoint(
 ) -> NSMoRCore:
     """Load trained NSMoRCore from checkpoint.
 
-    Delegates to the shared :func:`nsmor.model_utils.load_model_from_checkpoint`
+    Delegates to the shared :func:`nsmor.analysis.prediction_units.load_model_from_checkpoint`
     which guarantees all biophysical parameters are restored.
     """
     return _shared_load_model(checkpoint_path, device)
@@ -119,6 +127,11 @@ def load_dataset(
     batch_size: int = 32,
     max_seq_len: Optional[int] = 2400,
     pre_anchor_frames: int = 1200,
+    nested_prior_artifact: Optional[Path] = None,
+    qc_sealed_nested_prior_sha256: Optional[str] = None,
+    checkpoint_model: Optional[NSMoRCore] = None,
+    trusted_historical_checkpoint_sha256: Optional[str] = None,
+    trusted_historical_artifact_sha256: Optional[str] = None,
 ) -> Tuple[torch.utils.data.DataLoader, np.ndarray, List[int]]:
     """
     Load the preprocessed dataset and create a DataLoader.
@@ -130,7 +143,9 @@ def load_dataset(
         pre_anchor_frames: Baseline frames before anchor.
 
     Returns:
-        ``(dataloader, labels, lengths_list)`` tuple.
+        ``(dataloader, labels, cropped_lengths_list)`` tuple. The dataset carries
+        ``cropped_reference_frames`` and ``analysis_reference_trials`` in loader
+        order, without changing the tuple or the batches.
 
     Raises:
         FileNotFoundError: If dataset file does not exist.
@@ -139,24 +154,53 @@ def load_dataset(
         raise FileNotFoundError(f"Dataset not found: {dataset_path}")
 
     logger.info("Loading dataset from %s", dataset_path)
-    dataset = torch.load(dataset_path, weights_only=False)
+    dataset, loaded_source_fingerprint = load_dataset_with_fingerprint(dataset_path)
 
     # Round-2 CRITICAL-A: refuse pre-2.0 datasets (leaked priors, np.max labels)
     validate_dataset_provenance(dataset, Path(dataset_path))
 
     X_seqs = dataset["X_seqs"]
     Y_seqs = dataset["Y_seqs"]
-    mcmc_priors = dataset["mcmc_priors"]
+    mcmc_priors, val_indices = load_analysis_priors(
+        dataset, dataset_path, nested_prior_artifact, checkpoint_model, qc_sealed_nested_prior_sha256,
+        loaded_source_fingerprint=loaded_source_fingerprint,
+        trusted_historical_checkpoint_sha256=trusted_historical_checkpoint_sha256,
+        trusted_historical_artifact_sha256=trusted_historical_artifact_sha256,
+    )
     labels = dataset["labels"]
     lengths = dataset["lengths"]
 
     n_total = len(X_seqs)
     logger.info("Loaded %d sequences.", n_total)
+    session_ids = dataset.get("session_ids")
+    trial_ids = dataset.get("trial_ids")
+    if trial_ids is None and ("trial_ids" in dataset or "stimulus_conditions" in dataset):
+        raise ValueError("modern dataset requires source trial_ids aligned with all trials")
+    if session_ids is not None and (
+        not isinstance(session_ids, (list, tuple, np.ndarray))
+        or isinstance(session_ids, np.ndarray) and session_ids.ndim != 1
+        or len(session_ids) != n_total
+    ):
+        raise ValueError("session_ids must be a one-dimensional sequence aligned with all trials")
+    if trial_ids is not None:
+        if (not isinstance(trial_ids, (list, tuple, np.ndarray))
+                or isinstance(trial_ids, np.ndarray) and trial_ids.ndim != 1
+                or len(trial_ids) != n_total
+                or any(isinstance(value, (bool, np.bool_))
+                       or not isinstance(value, (int, np.integer)) for value in trial_ids)):
+            raise ValueError("source trial_ids must be one-dimensional, aligned integer IDs")
+        if session_ids is None or any(not isinstance(value, (str, np.str_)) or not value.strip()
+                                      for value in session_ids):
+            raise ValueError("source trial_ids require aligned, nonblank string session_ids")
+        if len(set(zip(session_ids, trial_ids))) != n_total:
+            raise ValueError("duplicate (session_id, source trial_id) in dataset")
 
     anchor_frames = dataset.get("anchor_frames")
+    reference_source = "recorded_dataset_anchor"
     if anchor_frames is None:
         from nsmor.pipeline.conditions import derive_anchor_frames
         anchor_frames = derive_anchor_frames(X_seqs, lengths)
+        reference_source = "derived_physical_channel_anchor"
         logger.info(
             "Derived %d anchor frames from physical channels.",
             len(anchor_frames),
@@ -179,6 +223,10 @@ def load_dataset(
         anchor_frames=anchor_frames,
     )
 
+    bio_dataset.analysis_population = describe_analysis_population(
+        n_total, val_indices, bio_dataset.source_indices,
+        getattr(checkpoint_model, "analysis_validation_scope", None),
+    )
     dataloader = create_optimized_dataloader(
         bio_dataset,
         batch_size=batch_size,
@@ -186,7 +234,70 @@ def load_dataset(
         num_workers=-1,  # Auto-scale based on dataset size
     )
 
-    lengths_list = [int(l) for l in lengths]
+    # Use the same crop resolver as NSMoRDataset.__getitem__, including
+    # the end-clamped start. A recorded anchor is not necessarily onset.
+    from nsmor.pipeline.conditions import resolve_anchor_crop
+    from nsmor.pipeline.grouping import animal_keys_of
+
+    if len(anchor_frames) != n_total or len(labels) != n_total or len(lengths) != n_total:
+        raise ValueError("anchor_frames must be aligned with dataset trials")
+    if max_seq_len is not None and max_seq_len < 1:
+        raise ValueError("max_seq_len must be positive or None")
+    # Reuse the canonical suffix stripping only to identify recording prefixes;
+    # these keys do not establish independent animals for statistical inference.
+    groups = animal_keys_of(session_ids) if session_ids is not None else [None] * n_total
+    rules = next((dataset[key] for key in ("anchor_rules", "anchor_rule")
+                  if key in dataset and isinstance(dataset[key], (list, tuple, np.ndarray))), None)
+    if rules is not None and len(rules) != n_total:
+        raise ValueError("per-trial anchor rules must be aligned with dataset trials")
+    reference_trials = []
+    for i, anchor in enumerate(anchor_frames):
+        start, end = resolve_anchor_crop(len(X_seqs[i]), anchor, max_seq_len, pre_anchor_frames)
+        original = int(anchor) if anchor is not None and anchor >= 0 else None
+        rule = str(rules[i]) if rules is not None and rules[i] is not None else None
+        if reference_source == "derived_physical_channel_anchor" or (rule is None and original == 0):
+            physical = np.asarray(X_seqs[i])[:int(lengths[i])]
+            if np.any(physical[:, 1] > 0.5):
+                if reference_source == "derived_physical_channel_anchor":
+                    rule = "first_wind_channel_gt_0.5"
+            elif np.any(np.abs(physical[:, 0]) > 1e-4):
+                if reference_source == "derived_physical_channel_anchor":
+                    rule = "peak_visual_angle_proxy"
+            else:
+                rule = "no_stimulus_frame_zero_fallback"
+        reference_status = (
+            "recorded_reference_rule_available" if rule is not None else "recorded_reference_rule_unavailable"
+        ) if reference_source == "recorded_dataset_anchor" else {
+            "first_wind_channel_gt_0.5": "derived_wind_threshold_reference",
+            "peak_visual_angle_proxy": "derived_peak_visual_proxy_reference",
+            "no_stimulus_frame_zero_fallback": "unavailable_no_stimulus_reference",
+        }[rule]
+        cropped_reference = (original - start if original is not None and start <= original < end
+                             else None)
+        if cropped_reference is None:
+            reference_status = "unavailable_reference_outside_crop"
+        if rule == "no_stimulus_frame_zero_fallback":
+            reference_status = "unavailable_no_stimulus_reference"
+        if reference_status == "unavailable_no_stimulus_reference":
+            cropped_reference = None  # A no-stimulus fallback is not an observed event.
+        session = session_ids[i] if session_ids is not None else None
+        valid_session = isinstance(session, (str, np.str_)) and bool(session.strip())
+        reference_trials.append({
+            "trial_id": i, "row_index": i,
+            "source_trial_id": int(trial_ids[i]) if trial_ids is not None else None,
+            "label": int(labels[i]),
+            "original_reference_frame": original,
+            "crop_start_frame": start, "crop_end_frame": end,
+            "cropped_length": end - start,
+            "cropped_reference_frame": cropped_reference,
+            "reference_source": reference_source, "anchor_rule": rule,
+            "reference_status": reference_status,
+            "session_id": str(session) if valid_session else None,
+            "recording_prefix": str(groups[i]) if valid_session else None,
+        })
+    bio_dataset.analysis_reference_trials = reference_trials
+    bio_dataset.cropped_reference_frames = [trial["cropped_reference_frame"] for trial in reference_trials]
+    lengths_list = [trial["cropped_length"] for trial in reference_trials]
     return dataloader, labels, lengths_list
 
 
@@ -249,7 +360,7 @@ def run_ablation_condition(
                 y_trues.append(y_true_i)
 
                 # Get label
-                global_idx = batch_idx * B + i
+                global_idx = len(trial_labels)
                 if global_idx < len(dataloader.dataset):
                     _, _, label_val = dataloader.dataset.sequences[global_idx]
                     trial_labels.append(int(label_val))
@@ -312,6 +423,55 @@ def run_full_ablation(
 # 4.  Class-Specific Trajectory Averaging
 # ═══════════════════════════════════════════════════════════════
 
+def _resolve_reference_frames(
+    n_trials: int, stim_onset_frame: int,
+    reference_frames: Optional[Sequence[Optional[int]]],
+) -> List[Optional[int]]:
+    """Resolve per-trial references; retain the legacy scalar for direct callers."""
+    frames = list(reference_frames) if reference_frames is not None else [stim_onset_frame] * n_trials
+    if len(frames) != n_trials:
+        raise ValueError("reference_frames must be aligned with all trials")
+    if any(frame is not None and (isinstance(frame, (bool, np.bool_))
+           or not isinstance(frame, (int, np.integer)) or frame < 0) for frame in frames):
+        raise ValueError("reference frames must be nonnegative integers or None (unavailable)")
+    return frames
+
+
+def _eligible_post_reference(
+    pred: np.ndarray, true: np.ndarray, frame: Optional[int],
+) -> Optional[Tuple[np.ndarray, np.ndarray, float]]:
+    """Return one observed finite trial and its finite MSE, or no measurement.
+
+    The figure, scalar metrics, CSV and schema-2 support use the same trial
+    eligibility. A nonfinite sample anywhere in the observed window excludes
+    that trial, including when the figure displays only its first time bins.
+    """
+    if frame is None:
+        return None
+    n = min(len(pred), len(true))
+    if n <= frame:
+        return None
+    post_pred = np.asarray(pred[frame:n], dtype=np.float64)
+    post_true = np.asarray(true[frame:n], dtype=np.float64)
+    assert post_pred.shape == post_true.shape == (n - frame,)
+    if not np.isfinite(post_pred).all() or not np.isfinite(post_true).all():
+        return None
+    with np.errstate(over="ignore", invalid="ignore"):
+        mse = float(np.mean((post_pred - post_true) ** 2))
+    if not np.isfinite(mse):
+        return None
+    return post_pred, post_true, mse
+
+
+def _observed_peak(post_true: np.ndarray, dt_ms: float) -> Tuple[float, Optional[float]]:
+    """Observed target magnitude and measurable post-reference peak timing."""
+    absolute = np.abs(post_true)
+    assert absolute.ndim == 1 and absolute.size > 0 and np.isfinite(absolute).all()
+    maximum = float(np.max(absolute))
+    # ponytail: same absolute-range floor as Phase F/G; calibrate prominence if drift matters.
+    latency = None if maximum - float(np.min(absolute)) < 1e-6 else float(np.argmax(absolute) * dt_ms)
+    return maximum, latency
+
 def average_trajectories_by_class(
     y_preds: List[np.ndarray],
     y_trues: List[np.ndarray],
@@ -320,12 +480,13 @@ def average_trajectories_by_class(
     dt_ms: float = 10.0,
     max_time_ms: float = 5000.0,
     stim_onset_frame: int = 1200,
+    reference_frames: Optional[Sequence[Optional[int]]] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Average velocity trajectories across trials of a specific class.
 
-    Aligns trajectories relative to stimulus onset (t=0) and averages
-    them.  Trajectories shorter than the analysis window are zero-padded.
+    Aligns trajectories relative to each trial reference (t=0) and averages
+    them.  Each time bin averages only trials observed at that time.
 
     Args:
         y_preds: List of predicted velocity arrays.
@@ -334,7 +495,9 @@ def average_trajectories_by_class(
         target_class: Label value to filter by.
         dt_ms: Frame interval in milliseconds.
         max_time_ms: Maximum analysis window in ms.
-        stim_onset_frame: Frame index of stimulus anchor.
+        stim_onset_frame: Legacy scalar reference index (used without a vector).
+        reference_frames: Optional cropped reference per trial, aligned with
+            all trials. None entries have no supported reference.
 
     Returns:
         ``(time_ms, mean_pred, mean_true)`` arrays, all (n_frames,).
@@ -351,36 +514,32 @@ def average_trajectories_by_class(
         Label(target_class).name if target_class in [e.value for e in Label] else "Unknown",
     )
 
-    # Determine analysis window
-    n_frames = int(max_time_ms / dt_ms)
-    time_ms = (np.arange(n_frames) - stim_onset_frame) * dt_ms
+    if not np.isfinite(dt_ms) or dt_ms <= 0:
+        raise ValueError("dt_ms must be finite and positive")
+    window_frames = int(max_time_ms / dt_ms)
+    frames = _resolve_reference_frames(len(trial_labels), stim_onset_frame, reference_frames)
+    observed = []
+    for i in class_indices:
+        eligible = _eligible_post_reference(y_preds[i], y_trues[i], frames[i])
+        if eligible is not None:
+            observed.append(eligible[:2])
+    n_frames = min(window_frames, max(
+        (min(len(pred), len(true)) for pred, true in observed), default=0
+    ))
+    if n_frames <= 0:
+        raise ValueError(f"No observed post-reference samples for class {target_class}")
 
-    # Collect and align trajectories
-    pred_matrix = np.zeros((len(class_indices), n_frames))
-    true_matrix = np.zeros((len(class_indices), n_frames))
-
-    for idx, trial_idx in enumerate(class_indices):
-        y_pred = y_preds[trial_idx]
-        y_true = y_trues[trial_idx]
-
-        stim_frame = min(stim_onset_frame, max(0, len(y_pred) - 1))
-
-        # Extract post-stimulus portion
-        post_stim_pred = y_pred[stim_frame:]
-        post_stim_true = y_true[stim_frame:]
-
-        # Copy into matrix (zero-pad if shorter)
-        n_copy = min(len(post_stim_pred), n_frames)
-        pred_matrix[idx, :n_copy] = post_stim_pred[:n_copy]
-        true_matrix[idx, :n_copy] = post_stim_true[:n_copy]
-
-    # Average across trials
-    mean_pred = np.mean(pred_matrix, axis=0)
-    mean_true = np.mean(true_matrix, axis=0)
-    sem_pred = np.std(pred_matrix, axis=0) / np.sqrt(len(class_indices))
-    sem_true = np.std(true_matrix, axis=0) / np.sqrt(len(class_indices))
-
-    return time_ms, mean_pred, mean_true
+    pred_sum = np.zeros(n_frames)
+    true_sum = np.zeros(n_frames)
+    support = np.zeros(n_frames, dtype=np.int64)
+    for post_pred, post_true in observed:
+        n_copy = min(len(post_pred), len(post_true), n_frames)
+        pred_sum[:n_copy] += post_pred[:n_copy]
+        true_sum[:n_copy] += post_true[:n_copy]
+        support[:n_copy] += 1
+    assert support.shape == (n_frames,) and np.all(support > 0)
+    time_ms = np.arange(n_frames) * dt_ms
+    return time_ms, pred_sum / support, true_sum / support
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -394,17 +553,18 @@ def extract_scalar_metrics(
     target_class: int,
     dt_ms: float = 10.0,
     stim_onset_frame: int = 1200,
-) -> Dict[str, float]:
+    reference_frames: Optional[Sequence[Optional[int]]] = None,
+) -> Dict[str, Optional[float]]:
     """
     Extract scalar metrics from velocity trajectories for a given class.
 
     Computes:
         - **Peak Velocity (V_max):** Maximum absolute velocity in the
-          post-stimulus window.
-        - **Latency to Peak (T_max):** Time (ms) relative to stimulus
-          onset when V_max is reached.
+          observed post-reference window.
+        - **Latency to Peak (T_max):** Time (ms) relative to the trial
+          reference when V_max is reached.
         - **Mean MSE:** Mean squared error between predicted and true
-          velocity across all frames.
+          velocity over observed post-reference frames.
 
     Args:
         y_preds: List of predicted velocity arrays, each (T_i,).
@@ -412,14 +572,14 @@ def extract_scalar_metrics(
         trial_labels: List of label values for each trial.
         target_class: Label value to filter by.
         dt_ms: Frame interval in milliseconds.
-        stim_onset_frame: Frame index of stimulus onset (default 1200
-            for anchor-aligned data).
+        stim_onset_frame: Legacy scalar reference index (default 1200).
+        reference_frames: Optional per-trial cropped reference indices.
 
     Returns:
         Dictionary with keys:
         - ``"Peak_Velocity_cms"``: Max absolute velocity (cm/s).
-        - ``"Latency_to_Peak_ms"``: Time of peak relative to stimulus (ms).
-        - ``"Mean_MSE"``: Mean squared error across all frames.
+        - ``"Latency_to_Peak_ms"``: Time of target peak relative to reference (ms).
+        - ``"Mean_MSE"``: Mean squared error over observed post-reference frames.
 
     Raises:
         ValueError: If no trials found for target_class.
@@ -439,57 +599,39 @@ def extract_scalar_metrics(
         Label(target_class).name if target_class in [e.value for e in Label] else "Unknown",
     )
 
-    # ── Collect post-stimulus velocity arrays ─────────────────
+    # ── Collect post-reference velocity arrays ─────────────────
     peak_velocities: List[float] = []
     latencies: List[float] = []
     mse_values: List[float] = []
 
+    frames = _resolve_reference_frames(len(trial_labels), stim_onset_frame, reference_frames)
     for trial_idx in class_indices:
-        y_pred = y_preds[trial_idx]
-        y_true = y_trues[trial_idx]
-
-        if len(y_pred) == 0 or len(y_true) == 0:
+        eligible = _eligible_post_reference(y_preds[trial_idx], y_trues[trial_idx], frames[trial_idx])
+        if eligible is None:
             continue
-
-        stim_frame = min(stim_onset_frame, max(0, min(len(y_pred), len(y_true)) - 1))
-
-        # Extract post-stimulus portions
-        post_pred = y_pred[stim_frame:]
-        post_true = y_true[stim_frame:]
-
-        n_post = min(len(post_pred), len(post_true))
-        if n_post == 0:
-            continue
-        post_pred = post_pred[:n_post]
-        post_true = post_true[:n_post]
+        _, post_true, mse = eligible
 
         # ── Peak Velocity (V_max): maximum absolute velocity ──
-        abs_velocity = np.abs(post_true)
-        v_max = float(np.max(abs_velocity))
-
-        # ── Latency to Peak (T_max): time of V_max ───────────
-        peak_frame = int(np.argmax(abs_velocity))
-        t_max = float(peak_frame * dt_ms)  # Convert frames to ms
+        v_max, t_max = _observed_peak(post_true, dt_ms)
 
         # ── Mean MSE ──────────────────────────────────────────
-        mse = float(np.mean((post_pred - post_true) ** 2))
-
         peak_velocities.append(v_max)
-        latencies.append(t_max)
+        if t_max is not None:
+            latencies.append(t_max)
         mse_values.append(mse)
 
     if not peak_velocities:
-        raise ValueError(f"No valid post-stimulus data for class {target_class}")
+        raise ValueError(f"No valid post-reference data for class {target_class}")
 
     # ── Aggregate across trials ───────────────────────────────
     metrics = {
         "Peak_Velocity_cms": float(np.mean(peak_velocities)),
-        "Latency_to_Peak_ms": float(np.mean(latencies)),
+        "Latency_to_Peak_ms": float(np.mean(latencies)) if latencies else None,
         "Mean_MSE": float(np.mean(mse_values)),
     }
 
     logger.info(
-        "  Metrics: V_max=%.3f cm/s, T_max=%.1f ms, MSE=%.4f",
+        "  Metrics: V_max=%.3f cm/s, T_max=%s ms, MSE=%.4f",
         metrics["Peak_Velocity_cms"],
         metrics["Latency_to_Peak_ms"],
         metrics["Mean_MSE"],
@@ -498,18 +640,30 @@ def extract_scalar_metrics(
     return metrics
 
 
+class _NoValidLesionMeasurements(ValueError):
+    """The requested CSV has no eligible post-reference trial rows."""
+
+
 def export_lesion_statistics_csv(
     results: Dict[str, Tuple[List[np.ndarray], List[np.ndarray], List[int]]],
     output_path: Path,
     target_classes: List[int],
     dt_ms: float = 10.0,
     stim_onset_frame: int = 1200,
+    reference_frames: Optional[Sequence[Optional[int]]] = None,
 ) -> None:
     """
-    Export lesion statistics to a CSV file for ANOVA testing.
+    Export descriptive per-trial lesion measurements to the legacy CSV.
+
+    MSE uses restored, unclipped physical predictions against raw physical
+    targets. It is not the symmetrically clipped train.compute_metrics score.
+    Peak/latency columns describe the observed target relative to the trial
+    reference. Rows from shared recordings are not independent animal samples.
 
     Generates a CSV with columns:
-    ``Class, Condition, Peak_Velocity_cms, Latency_to_Peak_ms, Mean_MSE``
+    ``Class, Condition, Trial_ID, Peak_Velocity_cms, Latency_to_Peak_ms, MSE``
+    ``Trial_ID`` is the zero-based dataset row index, joining to the existing
+    sidecar ``trials[row_index]``; raw identity is (session_id, source_trial_id).
 
     Args:
         results: Dictionary from :func:`run_full_ablation` mapping
@@ -517,7 +671,8 @@ def export_lesion_statistics_csv(
         output_path: Path to save the CSV file.
         target_classes: List of label values to analyze.
         dt_ms: Frame interval in milliseconds.
-        stim_onset_frame: Frame index of stimulus onset.
+        stim_onset_frame: Legacy scalar reference index.
+        reference_frames: Optional per-trial cropped reference indices.
 
     Raises:
         ValueError: If no valid statistics could be computed.
@@ -526,10 +681,8 @@ def export_lesion_statistics_csv(
     logger.info("Exporting lesion statistics to CSV...")
     logger.info("=" * 60)
 
-    # ── Collect per-trial rows (CF3 fix) ───────────────────────
-    # ANOVA requires per-trial observations, not aggregated means.
-    # Each row is one trial: Class, Condition, Trial_ID, Peak_Velocity,
-    # Latency_to_Peak, MSE.
+    # Keep the six-column measurement interface. Group identities, observed
+    # support, and inferential limitations are recorded in the existing sidecar.
     csv_rows: List[Dict[str, str]] = []
 
     for target_class in target_classes:
@@ -539,39 +692,34 @@ def export_lesion_statistics_csv(
             class_name = f"Class_{target_class}"
 
         for condition_name, (y_preds, y_trues, trial_labels) in results.items():
+            frames = _resolve_reference_frames(len(trial_labels), stim_onset_frame, reference_frames)
             class_indices = [i for i, l in enumerate(trial_labels) if l == target_class]
             if not class_indices:
                 continue
 
             for trial_idx in class_indices:
-                pred = y_preds[trial_idx]
-                true = y_trues[trial_idx]
-                n = min(len(pred), len(true))
-
-                if n == 0:
+                eligible = _eligible_post_reference(y_preds[trial_idx], y_trues[trial_idx],
+                                                    frames[trial_idx])
+                if eligible is None:
                     continue
+                _, post_true, mse = eligible
+                v_max, t_max = _observed_peak(post_true, dt_ms)
 
-                stim_frame = min(stim_onset_frame, n - 1)
-
-                post_pred = pred[stim_frame:n]
-                post_true = true[stim_frame:n]
-
-                v_max = float(np.max(np.abs(post_true)))
-                peak_frame = int(np.argmax(np.abs(post_true)))
-                t_max = float(peak_frame * dt_ms)
-                mse = float(np.mean((post_pred - post_true) ** 2))
 
                 csv_rows.append({
                     "Class": class_name,
                     "Condition": CONDITION_NAMES[condition_name],
                     "Trial_ID": str(trial_idx),
                     "Peak_Velocity_cms": f"{v_max:.4f}",
-                    "Latency_to_Peak_ms": f"{t_max:.2f}",
+                    "Latency_to_Peak_ms": f"{t_max:.2f}" if t_max is not None else "",
                     "MSE": f"{mse:.6f}",
                 })
 
     if not csv_rows:
-        raise ValueError("No valid statistics could be computed for any class/condition.")
+        # The selected output belongs to this run. An older CSV must not pass
+        # an existence/size check after an all-ineligible run.
+        output_path.unlink(missing_ok=True)
+        raise _NoValidLesionMeasurements("No valid statistics could be computed for any class/condition.")
 
     # ── Write CSV ─────────────────────────────────────────────
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -648,6 +796,8 @@ def create_ablation_figure(
     output_path: Path,
     dt_ms: float = 10.0,
     stim_onset_frame: int = 1200,
+    reference_frames: Optional[Sequence[Optional[int]]] = None,
+    analysis_population: Optional[Dict[str, object]] = None,
 ) -> None:
     """
     Create the Lancet/Cell ablation comparison figure.
@@ -688,6 +838,7 @@ def create_ablation_figure(
                 target_class=target_class,
                 dt_ms=dt_ms,
                 stim_onset_frame=stim_onset_frame,
+                reference_frames=reference_frames,
             )
         except ValueError as e:
             logger.warning("Skipping condition %s: %s", condition_name, e)
@@ -717,7 +868,7 @@ def create_ablation_figure(
             label="Predicted",
         )
 
-        # ── Stimulus onset vertical line ──
+        # ── Trial reference vertical line ──
         ax.axvline(
             x=0.0,
             color=AXIS_COLOR,
@@ -728,7 +879,7 @@ def create_ablation_figure(
 
         # ── Axes styling ──
         ax.set_xlabel(
-            "Time relative to stimulus onset (ms)",
+            "Time relative to trial reference (ms)",
             fontsize=FONT_SIZE_AXIS_TITLE,
             color=AXIS_COLOR,
         )
@@ -770,7 +921,10 @@ def create_ablation_figure(
 
     # ── Suptitle ──
     fig.suptitle(
-        f"In-Silico Lesion Analysis — {class_name} Trials",
+        f"In-Silico Lesion Analysis — {class_name} Trials ("
+        + (analysis_population["selection"].replace("_", " ") + "; "
+           + analysis_population["evidence_scope"].replace("_", " ")
+           if analysis_population is not None else "descriptive population unavailable") + ")",
         fontsize=14,
         fontweight="bold",
         color=AXIS_COLOR,
@@ -801,8 +955,12 @@ def run_lesion_experiment(
     batch_size: int = 32,
     max_seq_len: Optional[int] = 2400,
     pre_anchor_frames: int = 1200,
-    dt_ms: float = 10.0,
-    stim_onset_frame: int = 1200,
+    dt_ms: Optional[float] = None,
+    stim_onset_frame: Optional[int] = None,
+    nested_prior_artifact: Optional[Path] = None,
+    qc_sealed_nested_prior_sha256: Optional[str] = None,
+    trusted_historical_checkpoint_sha256: Optional[str] = None,
+    trusted_historical_artifact_sha256: Optional[str] = None,
 ) -> None:
     """
     Run the full in-silico lesion experiment.
@@ -819,9 +977,11 @@ def run_lesion_experiment(
         batch_size: Batch size for data loading.
         max_seq_len: Maximum sequence length for cropping.
         pre_anchor_frames: Baseline frames before anchor.
-        dt_ms: Frame interval in milliseconds.
-        stim_onset_frame: Frame index of stimulus onset (default 1200
-            for anchor-aligned data).
+        dt_ms: None inherits saved model.dt_ms; an explicit interval must match.
+        stim_onset_frame: Optional scalar override in cropped coordinates.
+            None uses each recorded/derived dataset anchor as a reference;
+            loaders without metadata retain the legacy scalar fallback of 1200.
+            A dataset anchor need not represent physical stimulus onset.
     """
     logger.info("=" * 60)
     logger.info("NSMoR In-Silico Lesion Experiment (Phase 7)")
@@ -839,6 +999,7 @@ def run_lesion_experiment(
 
     # ── Load model ────────────────────────────────────────────
     model = load_model_from_checkpoint(checkpoint_path, device)
+    dt_ms = resolve_dt_ms(model, dt_ms)
 
     # ── Load dataset ──────────────────────────────────────────
     dataloader, labels, lengths_list = load_dataset(
@@ -846,177 +1007,160 @@ def run_lesion_experiment(
         batch_size=batch_size,
         max_seq_len=max_seq_len,
         pre_anchor_frames=pre_anchor_frames,
+        nested_prior_artifact=nested_prior_artifact,
+        qc_sealed_nested_prior_sha256=qc_sealed_nested_prior_sha256,
+        checkpoint_model=model,
+        trusted_historical_checkpoint_sha256=trusted_historical_checkpoint_sha256,
+        trusted_historical_artifact_sha256=trusted_historical_artifact_sha256,
     )
+
+    reference_override = stim_onset_frame is not None
+    analysis_dataset = getattr(dataloader, "dataset", None)
+    reference_frames = getattr(analysis_dataset, "cropped_reference_frames", None)
+    # Explicit scalar overrides remain supported; default CLI uses recorded references.
+    if stim_onset_frame is not None:
+        reference_frames = None
+    else:
+        stim_onset_frame = 1200  # Legacy loaders without reference metadata.
+
+    logger.info("Lesion MSE compares unclipped physical predictions and raw targets; "
+                "it differs from clipped training/evaluation scoring.")
 
     # ── Run ablation ──────────────────────────────────────────
     results = run_full_ablation(model, dataloader, device)
 
-    # ── Log comparative statistics with UQ ──────────────────────
-    from nsmor.analysis.uq import bootstrap_ci, cohens_d
+    # Recording prefixes collapse session blocks, but do not prove independent
+    # animal identity. Report descriptive group means/effects; no trial t-tests
+    # or acquisition-order bootstrap can supply that missing evidence.
+    from nsmor.analysis.uq import cohens_d
 
-    logger.info("-" * 60)
-    logger.info("Comparative Statistics (for plotting class):")
-    condition_mse_arrays: Dict[str, np.ndarray] = {}
-    # Round-3 (Reviewer B MINOR-3): block-size sensitivity records,
-    # persisted to JSON so the robustness claim is auditable evidence.
-    lesion_sensitivity: Dict[str, Dict[str, float]] = {}
-
-    for condition_name, (y_preds, y_trues, trial_labels) in results.items():
-        class_indices = [i for i, l in enumerate(trial_labels) if l == target_class]
-        if not class_indices:
-            continue
-
-        # Compute per-trial MSE for this class
-        per_trial_mse: List[float] = []
-        for idx in class_indices:
-            pred = y_preds[idx]
-            true = y_trues[idx]
-            n = min(len(pred), len(true))
-            mse_i = float(np.mean((pred[:n] - true[:n]) ** 2))
-            per_trial_mse.append(mse_i)
-
-        mse_arr = np.array(per_trial_mse)
-        condition_mse_arrays[condition_name] = mse_arr
-
-        # Round-1 fix (Reviewer A MAJOR-1): per-trial MSE sequences
-        # inherit session ordering (trials arrive in acquisition order),
-        # so an i.i.d. bootstrap would systematically narrow the CI when
-        # the sequence is autocorrelated.  Use the circular
-        # block-bootstrap already provided by uq.py.
-        #
-        # Round-2 note (Reviewer A MINOR-F) / Round-3 fix (Reviewer B
-        # MINOR-3): block_size=5 is a fixed a-priori choice, not fitted
-        # to the data.  It corresponds to ~50 s of acquisition at the
-        # typical inter-trial interval and sits safely below n/4 for
-        # every condition in this pipeline; Politis & White (2004)
-        # recommend data-driven selection, but with n ≈ 20-60 per
-        # condition their automatic selectors are themselves unstable,
-        # so the fixed conservative block is the more defensible choice.
-        # Round-3: the "<10% CI-width sensitivity" claim is now VERIFIED
-        # at runtime — the bootstrap is repeated with block_size 2 and
-        # 10 and the observed CI half-widths are logged next to the
-        # primary estimate, so the robustness statement is evidence,
-        # not assertion.
-        n_degenerate = int(np.sum(~np.isfinite(mse_arr)))
-        mse_arr_finite = mse_arr[np.isfinite(mse_arr)]
-        if mse_arr_finite.size == 0:
-            logger.warning(
-                "  %s: all %d per-trial MSE values non-finite — "
-                "CI skipped.", CONDITION_NAMES[condition_name], len(mse_arr),
-            )
-            continue
-        mse_mean, ci_lo, ci_hi = bootstrap_ci(
-            mse_arr_finite, np.mean, n_bootstrap=1000, block_size=5,
+    frames = _resolve_reference_frames(len(labels), stim_onset_frame, reference_frames)
+    recorded_trials = getattr(analysis_dataset, "analysis_reference_trials", None)
+    reference_trials = [dict(trial) for trial in recorded_trials] if recorded_trials is not None else [
+        {"trial_id": i, "row_index": i, "source_trial_id": None,
+          "label": int(label), "original_reference_frame": None,
+         "crop_start_frame": None, "crop_end_frame": None,
+         "cropped_length": int(lengths_list[i]), "cropped_reference_frame": None,
+         "reference_source": "unavailable", "anchor_rule": None,
+         "reference_status": "unavailable_loader_metadata",
+         "session_id": None, "recording_prefix": None}
+        for i, label in enumerate(labels)
+    ]
+    if len(reference_trials) != len(labels):
+        raise ValueError("analysis reference metadata must align with all trials")
+    for i, trial in enumerate(reference_trials):
+        trial["analysis_reference_frame"] = frames[i]
+        trial["analysis_reference_source"] = (
+            "explicit_scalar_override" if reference_override else
+            trial["reference_source"] if reference_frames is not None else "legacy_scalar_fallback"
         )
-        # Round-3 (Reviewer B MINOR-3): runtime sensitivity check —
-        # repeat the block bootstrap at half/double the block length
-        # and report the CI half-width variation.  Only meaningful when
-        # n supports block sizes 2 and 10.  Results are ALSO persisted
-        # to JSON next to the stats CSV so the robustness statement is
-        # auditable evidence, not just a log line.
-        n_finite = int(mse_arr_finite.size)
-        if n_finite >= 4 * 10:
-            sens_lines = []
-            sens_record: Dict[str, float] = {
-                "primary_halfwidth": 0.5 * (ci_hi - ci_lo),
-                "n": n_finite,
-            }
-            for alt_block in (2, 10):
-                _, lo_a, hi_a = bootstrap_ci(
-                    mse_arr_finite, np.mean,
-                    n_bootstrap=500, block_size=alt_block, seed=1,
-                )
-                hw = 0.5 * (hi_a - lo_a)
-                sens_lines.append(
-                    f"b={alt_block}: halfwidth={hw:.4f}"
-                )
-                sens_record[f"halfwidth_b{alt_block}"] = float(hw)
-            logger.info(
-                "  Block-size sensitivity for %s: primary b=5 "
-                "halfwidth=%.4f | %s",
-                CONDITION_NAMES[condition_name],
-                0.5 * (ci_hi - ci_lo), "; ".join(sens_lines),
+        trial["post_reference_frames"] = {}
+        trial["post_reference_status"] = {}
+
+    population = population_for_output(dataloader, len(labels))
+    unavailable_p = "unavailable_unverified_animal_identity_and_independence"
+    summary = {
+        "schema_version": 2, "analysis_status": "descriptive_only",
+        "analysis_population": population,
+        "csv_trial_id_semantics": "zero_based_dataset_row_index",
+        "summary_class": int(target_class), "dt_ms": float(dt_ms),
+        "mse_units": "(cm/s)^2", "mse_window": "observed_post_reference",
+        "reference_semantics": "trial_reference_not_verified_stimulus_onset",
+        "ci_status": unavailable_p, "p_status": unavailable_p,
+        "trials": reference_trials, "conditions": {}, "comparisons": {},
+    }
+    condition_scores = {}
+    for name, (y_preds, y_trues, trial_labels) in results.items():
+        assert len(y_preds) == len(y_trues) == len(trial_labels) == len(reference_trials)
+        if any(int(label) != int(reference_trials[i]["label"])
+               for i, label in enumerate(trial_labels)):
+            raise ValueError("lesion labels do not align with trial reference metadata")
+        scores = {}
+        for i, (pred, true) in enumerate(zip(y_preds, y_trues)):
+            frame = frames[i]
+            n_post = max(0, min(len(pred), len(true)) - frame) if frame is not None else 0
+            trial = reference_trials[i]
+            trial["post_reference_frames"][name] = n_post
+            trial["post_reference_status"][name] = (
+                "missing_reference" if frame is None else
+                "observed" if n_post else "no_observed_post_reference"
             )
-            lesion_sensitivity[condition_name] = sens_record
-        if n_degenerate:
-            logger.warning(
-                "  %s: %d/%d degenerate (non-finite) MSE samples "
-                "excluded from CI.",
-                CONDITION_NAMES[condition_name], n_degenerate, len(mse_arr),
-            )
-        logger.info(
-            "  %s: MSE = %.4f [95%% CI: %.4f, %.4f] (n=%d)",
-            CONDITION_NAMES[condition_name], mse_mean, ci_lo, ci_hi, len(mse_arr_finite),
-        )
-
-    # CF3 fix: Paired Cohen's d between intact and each lesioned condition.
-    # Paired because the same trials are measured under different conditions.
-    # CF4 fix: Holm-Bonferroni correction for multiple comparisons.
-    if "intact" in condition_mse_arrays:
-        intact_mse = condition_mse_arrays["intact"]
-        logger.info("-" * 60)
-        logger.info("Effect Size (Paired Cohen's d vs Intact):")
-
-        # Collect p-values for Holm-Bonferroni correction
-        from nsmor.analysis.uq import holm_bonferroni
-        from scipy import stats as sp_stats
-        p_values: Dict[str, float] = {}
-        n_degenerate_tests = 0
-        effect_sizes: Dict[str, Tuple[float, str]] = {}
-
-        for cond_name, cond_mse in condition_mse_arrays.items():
-            if cond_name == "intact":
+            if not n_post:
                 continue
-            n = min(len(cond_mse), len(intact_mse))
-            d = cohens_d(cond_mse[:n], intact_mse[:n], paired=True)
-            magnitude = "negligible"
-            if abs(d) >= 0.8:
-                magnitude = "large"
-            elif abs(d) >= 0.5:
-                magnitude = "medium"
-            elif abs(d) >= 0.2:
-                magnitude = "small"
-            effect_sizes[cond_name] = (d, magnitude)
-
-            # Paired t-test for p-value
-            try:
-                _, p_val = sp_stats.ttest_rel(cond_mse[:n], intact_mse[:n])
-                # Round-1 fix (Reviewer A MAJOR-1): a NaN p-value
-                # (e.g. zero variance in both conditions) is a numerical
-                # pathology, not evidence of "no effect".  Count it as a
-                # degenerate sample and exclude from the Holm family so
-                # it cannot silently dilute the correction.
-                if math.isnan(float(p_val)):
-                    n_degenerate_tests += 1
-                    logger.warning(
-                        "  %s: paired t-test returned NaN p (zero-variance "
-                        "condition?) — excluded from Holm family.",
-                        CONDITION_NAMES[cond_name],
-                    )
-                    continue
-                p_values[cond_name] = float(p_val)
-            except ValueError:
-                n_degenerate_tests += 1
+            eligible = _eligible_post_reference(pred, true, frame)
+            if eligible is None:
+                trial["post_reference_status"][name] = "nonfinite_observations"
                 continue
+            _, _, mse = eligible
+            scores[i] = mse
+        condition_scores[name] = scores
+        target_scores = {i: mse for i, mse in scores.items() if int(trial_labels[i]) == target_class}
+        grouped = {}
+        for i, mse in target_scores.items():
+            grouped.setdefault(reference_trials[i]["recording_prefix"], []).append(mse)
+        group_means = [float(np.mean(values)) for values in grouped.values()] if None not in grouped else []
+        summary["conditions"][name] = {
+            "n_finite_trials": len(target_scores), "n_recording_prefixes": len(group_means),
+            "mean_trial_mse": float(np.mean(list(target_scores.values()))) if target_scores else None,
+            "mean_recording_prefix_mse": float(np.mean(group_means)) if group_means else None,
+            "status": "descriptive_only" if target_scores else "unavailable_no_valid_post_reference",
+        }
 
-        # Apply Holm-Bonferroni correction
-        corrected = holm_bonferroni(p_values)
-        if n_degenerate_tests:
-            logger.warning(
-                "Degenerate tests excluded from Holm family: %d",
-                n_degenerate_tests,
-            )
+    # Exact, finite scores from the full observed window; the six-column CSV
+    # rounds the same measurement to six decimal places.
+    for i, trial in enumerate(reference_trials):
+        trial["mse_by_condition"] = {name: scores.get(i) for name, scores in condition_scores.items()}
 
-        for cond_name in effect_sizes:
-            d, magnitude = effect_sizes[cond_name]
-            adj_p, sig = corrected.get(cond_name, (1.0, False))
-            sig_marker = "*" if sig else "n.s."
-            logger.info(
-                "  %s vs Intact: d = %.3f (%s), p = %.4f (corrected), %s",
-                CONDITION_NAMES[cond_name], d, magnitude, adj_p, sig_marker,
+    intact = {i: mse for i, mse in condition_scores.get("intact", {}).items()
+              if int(reference_trials[i]["label"]) == target_class}
+    for name, all_scores in condition_scores.items():
+        if name == "intact":
+            continue
+        scores = {i: mse for i, mse in all_scores.items()
+                  if int(reference_trials[i]["label"]) == target_class}
+        paired_ids = sorted(scores.keys() & intact.keys())
+        grouped = {}
+        for i in paired_ids:
+            grouped.setdefault(reference_trials[i]["recording_prefix"], []).append(i)
+        if None in grouped:
+            grouped = {}  # Incomplete identities cannot be silently dropped.
+        paired_groups = [
+            {"recording_prefix": key, "n_paired_trials": len(ids),
+             "intact_mean_mse": float(np.mean([intact[i] for i in ids])),
+             "lesioned_mean_mse": float(np.mean([scores[i] for i in ids]))}
+            for key, ids in sorted(grouped.items())
+        ]
+        intact_means = np.array([group["intact_mean_mse"] for group in paired_groups])
+        lesion_means = np.array([group["lesioned_mean_mse"] for group in paired_groups])
+        assert intact_means.shape == lesion_means.shape == (len(paired_groups),)
+        effect = None
+        if not paired_ids:
+            effect_status = "unavailable_no_paired_post_reference"
+        elif not paired_groups:
+            effect_status = "unavailable_recording_group_metadata"
+        elif len(paired_groups) < 2:
+            effect_status = "unavailable_fewer_than_two_recording_prefixes"
+        else:
+            d = cohens_d(lesion_means, intact_means, paired=True)
+            effect = d if np.isfinite(d) else None
+            effect_status = "estimable_descriptive_only" if effect is not None else (
+                "undefined_zero_variance_paired_differences"
+                if np.std(lesion_means - intact_means, ddof=1) == 0 else "undefined_nonfinite_paired_variance"
             )
+        comparison = {
+            "n_paired_trials": len(paired_ids), "n_paired_recording_prefixes": len(paired_groups),
+            "paired_groups": paired_groups,
+            "delta_mse": float(np.mean(lesion_means - intact_means)) if paired_groups else None,
+            "effect_size": effect, "effect_size_measure": "paired_cohens_dz",
+            "effect_size_unit": "paired_recording_prefix_means", "effect_size_status": effect_status,
+            "p_value": None, "p_adjusted": None, "significant": None, "p_status": unavailable_p,
+        }
+        summary["comparisons"][name] = comparison
+        logger.info("%s vs Intact: recording-prefix descriptive d=%s (%s); p/adjusted p unavailable: %s",
+                    CONDITION_NAMES[name], effect, effect_status, unavailable_p)
 
     # ── Export statistics CSV ──────────────────────────────────
+    export_error = None
     try:
         export_lesion_statistics_csv(
             results=results,
@@ -1024,16 +1168,22 @@ def run_lesion_experiment(
             target_classes=target_classes,
             dt_ms=dt_ms,
             stim_onset_frame=stim_onset_frame,
+            reference_frames=reference_frames,
         )
-    except ValueError as e:
-        logger.warning("Could not export statistics CSV: %s", e)
+    except _NoValidLesionMeasurements as exc:
+        export_error = exc
+        summary["analysis_status"] = "unavailable_no_valid_measurements"
+        logger.error("Could not export statistics CSV: %s", exc)
 
-    # ── Persist block-size sensitivity records (Round-3 B-MIN-3) ──
-    if lesion_sensitivity:
-        sens_path = stats_output_path.with_suffix(".block_sensitivity.json")
-        with open(sens_path, "w", encoding="utf-8") as f:
-            json.dump(lesion_sensitivity, f, indent=2)
-        logger.info("Block-size sensitivity records saved to %s", sens_path)
+    # Reuse the existing sidecar path; schema 2 describes groups/support rather
+    # than asserting that acquisition-order block CIs establish independence.
+    sens_path = stats_output_path.with_suffix(".block_sensitivity.json")
+    sens_path.parent.mkdir(parents=True, exist_ok=True)
+    with sens_path.open("w", encoding="utf-8") as stream:
+        json.dump(summary, stream, indent=2, allow_nan=False)
+    logger.info("Descriptive statistics and trial references saved to %s", sens_path)
+    if export_error is not None:
+        raise export_error
 
     # ── Create figure ─────────────────────────────────────────
     create_ablation_figure(
@@ -1042,6 +1192,8 @@ def run_lesion_experiment(
         output_path=output_path,
         dt_ms=dt_ms,
         stim_onset_frame=stim_onset_frame,
+        reference_frames=reference_frames,
+        analysis_population=population,
     )
 
     logger.info("=" * 60)
@@ -1070,6 +1222,24 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default="data/processed/nsmor_dataset.pt",
         help="Path to preprocessed dataset.",
+    )
+    parser.add_argument(
+        "--nested_prior_artifact",
+        type=str,
+        default=None,
+        help="Optional validated nested prior artifact used by the checkpoint.",
+    )
+    parser.add_argument(
+        "--qc_sealed_nested_prior_sha256", type=str, default=None,
+        help="Optional external QC-sealed SHA-256 to check the nested checkpoint's embedded artifact digest; cannot authenticate a checkpoint missing that digest.",
+    )
+    parser.add_argument(
+        "--trusted_historical_checkpoint_sha256", type=str, default=None,
+        help="Independently pinned SHA-256 of historical checkpoint bytes (required for historical analysis).",
+    )
+    parser.add_argument(
+        "--trusted_historical_artifact_sha256", type=str, default=None,
+        help="Independently pinned SHA-256 of historical nested artifact bytes.",
     )
     parser.add_argument(
         "--output",
@@ -1117,14 +1287,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dt_ms",
         type=float,
-        default=10.0,
-        help="Frame interval in milliseconds.",
+        default=None,
+        help="Frame interval in ms (default: saved model.dt_ms; explicit value must match).",
     )
     parser.add_argument(
         "--stim_onset_frame",
         type=int,
-        default=1200,
-        help="Frame index of stimulus onset (default 1200 for anchor-aligned data).",
+        default=None,
+        help="Override all cropped trial reference indices with one scalar (legacy fallback: 1200). "
+             "By default use each recorded/derived dataset anchor, which need not be stimulus onset.",
     )
     return parser
 
@@ -1139,6 +1310,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     run_lesion_experiment(
         checkpoint_path=Path(args.checkpoint),
         dataset_path=Path(args.dataset),
+        nested_prior_artifact=Path(args.nested_prior_artifact) if args.nested_prior_artifact else None,
+        qc_sealed_nested_prior_sha256=args.qc_sealed_nested_prior_sha256,
+        trusted_historical_checkpoint_sha256=args.trusted_historical_checkpoint_sha256,
+        trusted_historical_artifact_sha256=args.trusted_historical_artifact_sha256,
         output_path=Path(args.output),
         stats_output_path=Path(args.stats_output),
         target_class=args.target_class,

@@ -8,8 +8,8 @@ Features:
   - Gradient accumulation support via optax.MultiSteps.
   - Full BioJointLoss parity (Masked MSE, MoR gate regularization,
     ATP metabolic cost, Population sparsity L1, Temporal coherence jerk).
-  - Checkpointing: saves native JAX checkpoints and PyTorch-compatible .pth
-    artifacts for seamless evaluation by downstream PyTorch tools.
+  - Checkpointing: writes JAX development checkpoints in a restricted-readable
+    PyTorch container; they are not canonical analysis checkpoints.
 """
 
 from __future__ import annotations
@@ -28,12 +28,14 @@ import optax
 import torch
 
 from nsmor.config_parser import ExperimentConfig
+from nsmor.pipeline.grouping import animal_keys_of
+from nsmor.pipeline.nested_prior import load_artifact_bytes
 from nsmor.jax.dataloader import (
     JAXDataLoader,
     JAXDataset,
     compute_target_stats,
     load_nsmor_dataset,
-    session_grouped_train_val_split,
+    recording_prefix_train_val_split,
 )
 from nsmor.jax.model import (
     NSMoRModel,
@@ -221,10 +223,11 @@ def train_jax(
         learning_rate: Override base learning rate.
         grad_accum_steps: Microbatch accumulation count.
         val_split: Validation split fraction.
-        resume_from: Optional path to checkpoint to resume from.
+        resume_from: Optional lineage-bound JAX development checkpoint.
 
     Returns:
-        Summary dict containing training logs and execution benchmarks.
+        Summary with validation_scope="diagnostic_global_oof". Validation
+        scores use globally cross-fitted priors and are development diagnostics.
     """
     # Disable preallocation by default to avoid GPU OOM on shared cards
     os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
@@ -250,10 +253,48 @@ def train_jax(
     lengths = raw_data["lengths"]
     n_total = len(X_seqs)
 
-    train_idx, val_idx = session_grouped_train_val_split(
+    train_idx, val_idx = recording_prefix_train_val_split(
         session_ids, n_total, val_split=val_split, random_seed=config.training.random_seed
     )
-    logger.info("Split: %d train, %d val (session-grouped)", len(train_idx), len(val_idx))
+    if not len(train_idx) or not len(val_idx):
+        raise ValueError("JAX training requires nonempty train and validation recording-prefix groups")
+    prefixes = animal_keys_of(session_ids)
+    validation_scope = "diagnostic_global_oof"
+    checkpoint_lineage = {
+        "checkpoint_type": "jax_development_only",
+        "validation_scope": validation_scope,
+        "is_nested_cv": False,
+        "dataset_source_sha256": raw_data["dataset_sha256"],
+        "mcmc_prior_provenance": raw_data["mcmc_prior_provenance"],
+        "animal_identity_status": raw_data.get("animal_identity_status", "historical_unknown"),
+        "split_seed": config.training.random_seed,
+        "val_split": val_split,
+        "n_train_recording_prefixes": len(set(prefixes[train_idx])),
+        "n_val_recording_prefixes": len(set(prefixes[val_idx])),
+    }
+    logger.warning(
+        "JAX validation is a contaminated development diagnostic: global OOF "
+        "prior models may have used outer-validation labels. Checkpoint selection "
+        "and early stopping cannot establish holdout/generalization performance; "
+        "scores are ineligible for strict QC/release gates. "
+        "Split: %d train, %d val recording-prefix trials; animal identity %s.",
+        len(train_idx), len(val_idx), checkpoint_lineage["animal_identity_status"],
+    )
+
+    resume_path = resume_from or config.checkpoint.resume_from
+    resume_weights = None
+    if resume_path:
+        path = Path(resume_path)
+        ckpt_th = load_artifact_bytes(path.read_bytes(), map_location="cpu")
+        if (not isinstance(ckpt_th, dict)
+                or any(ckpt_th.get(key) != value for key, value in checkpoint_lineage.items())
+                or not isinstance(ckpt_th.get("model_state_dict"), dict)):
+            raise ValueError("JAX development checkpoint lacks matching dataset, split, or lineage")
+        resume_weights = ckpt_th["model_state_dict"]
+        if not resume_weights or any(not isinstance(key, str) or not isinstance(value, torch.Tensor)
+                                     or not torch.isfinite(value).all()
+                                     for key, value in resume_weights.items()):
+            raise ValueError("JAX development checkpoint has invalid model weights")
 
     # Target statistics
     target_mean, target_std = 0.0, 1.0
@@ -328,13 +369,9 @@ def train_jax(
     dummy_l = jnp.full((micro_bs,), max_len, dtype=jnp.int32)
     params = model.init(init_rng, dummy_x, dummy_l)
 
-    # Resume from checkpoint if requested
-    resume_path = resume_from or config.checkpoint.resume_from
-    if resume_path and Path(resume_path).exists():
-        logger.info("Loading weights from checkpoint: %s", resume_path)
-        ckpt_th = torch.load(resume_path, weights_only=False)
-        sd = ckpt_th.get("model_state_dict", ckpt_th)
-        params = load_from_torch_state_dict(model, sd)
+    if resume_weights is not None:
+        logger.info("Loading JAX development weights from %s", resume_path)
+        params = load_from_torch_state_dict(model, resume_weights)
 
     param_count = sum(p.size for p in jax.tree_util.tree_leaves(params))
     logger.info("Model initialized: %d parameters", param_count)
@@ -464,11 +501,12 @@ def train_jax(
         state = state.replace(epoch=ep)
 
         logger.info(
-            "Epoch %3d/%3d | train_loss: %.4f (mse: %.4f) | val_loss: %.4f (mse: %.4f) | spk: %.4f | time: %.2fs",
+            "Epoch %3d/%3d | train_loss: %.4f (mse: %.4f) | development diagnostic val_loss: %.4f (mse: %.4f) | spk: %.4f | time: %.2fs",
             ep, epochs, train_loss, train_mse, val_loss, val_mse, val_spk, ep_duration,
         )
 
         ep_stats = {
+            "validation_scope": validation_scope,
             "epoch": ep,
             "train_loss": train_loss,
             "train_mse": train_mse,
@@ -489,6 +527,7 @@ def train_jax(
             best_tmp = out_path / "best_model.pth.tmp"
             torch_sd = to_torch_state_dict(state.params)
             torch.save({
+                **checkpoint_lineage,
                 "model_state_dict": torch_sd,
                 "epoch": ep,
                 "val_loss": val_loss,
@@ -497,13 +536,14 @@ def train_jax(
                 "target_std": target_std,
             }, best_tmp)
             os.replace(best_tmp, best_pth)
-            logger.info("Saved new best model checkpoint to %s (val_loss=%.4f)", best_pth, val_loss)
+            logger.info("Saved development checkpoint to %s (contaminated diagnostic val_loss=%.4f)", best_pth, val_loss)
 
         if ep % config.training.checkpoint_interval == 0 or ep == epochs:
             ep_pth = out_path / f"epoch_{ep}.pth"
             ep_tmp = out_path / f"epoch_{ep}.pth.tmp"
             torch_sd = to_torch_state_dict(state.params)
             torch.save({
+                **checkpoint_lineage,
                 "model_state_dict": torch_sd,
                 "epoch": ep,
                 "val_loss": val_loss,
@@ -531,6 +571,7 @@ def train_jax(
     logger.info("=" * 60)
 
     return {
+        **checkpoint_lineage,
         "best_val_loss": state.best_val_loss,
         "avg_epoch_time_s": avg_ep_time,
         "first_epoch_time_s": epoch_times[0],

@@ -6,7 +6,8 @@ Window-free by design. NSMoR is Trial-Start anchored. TTC-50ms is only
 for MCMC prior 5-D snapshot. Baseline 5700ms is variant for pure-wind
 via TimeWindowConfig, not universal. Manual windows like [-5700:-500]
 inject human bias and break unsupervised claim. Clustering is unsupervised
-(silhouette selects k without labels); k=4 matches labeling.py cardinality;
+(silhouette selects among bootstrap-stable k, with a documented fallback);
+k=4 matches labeling.py cardinality;
 k=3 merged is for biological interpretation only and defined as:
     Startle->Escape, Walk+Pre_Active->PreWalk, NoResponse->NoResponse.
 Pearson NaN guarded to 0.0 when std==0.
@@ -31,11 +32,15 @@ CLI::
 from __future__ import annotations
 
 import argparse
+import sys
 import json
 import logging
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+# Direct CLI execution must use this checkout, including its prior/lineage helpers.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 # Prevent thread contention in scikit-learn / OpenMP / MKL on high-core CPUs
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -54,13 +59,16 @@ import torch
 
 from nsmor.analysis.gating_cluster import (
     ClusterGatingConfig,
-    GatingClusterAdapter,
     extract_and_cluster_gates,
 )
 from nsmor.config import Label
 from nsmor.config_parser import ExperimentConfig
 from nsmor.dataloader_factory import create_optimized_dataloader
-from nsmor.model_utils import load_model_from_checkpoint as _shared_load_model
+from nsmor.analysis.analysis_priors import (
+    describe_analysis_population, load_analysis_priors, population_for_output,
+)
+from nsmor.pipeline.nested_prior import load_dataset_with_fingerprint
+from nsmor.analysis.prediction_units import load_model_from_checkpoint as _shared_load_model
 from nsmor.model_utils import validate_dataset_provenance
 from nsmor.nsmor_dataloader import NSMoRDataset
 from nsmor.pipeline.conditions import derive_stimulus_metadata
@@ -114,6 +122,10 @@ def load_model_and_dataset(
     batch_size: int = 32,
     max_seq_len: Optional[int] = 2400,
     pre_anchor_frames: int = 1200,
+    nested_prior_artifact: Optional[Path] = None,
+    qc_sealed_nested_prior_sha256: Optional[str] = None,
+    trusted_historical_checkpoint_sha256: Optional[str] = None,
+    trusted_historical_artifact_sha256: Optional[str] = None,
 ) -> Tuple[torch.nn.Module, torch.utils.data.DataLoader, np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
     """
     Load model and dataset for gating extraction.
@@ -134,14 +146,19 @@ def load_model_and_dataset(
         raise FileNotFoundError(f"Dataset not found: {dataset_path}")
 
     logger.info("Loading dataset from %s", dataset_path)
-    dataset = torch.load(dataset_path, weights_only=False)
+    dataset, loaded_source_fingerprint = load_dataset_with_fingerprint(dataset_path)
 
     # Round-2 CRITICAL-A: refuse pre-2.0 datasets (leaked priors, np.max labels)
     validate_dataset_provenance(dataset, Path(dataset_path))
 
     X_seqs = dataset["X_seqs"]
     Y_seqs = dataset["Y_seqs"]
-    mcmc_priors = dataset["mcmc_priors"]
+    mcmc_priors, val_indices = load_analysis_priors(
+        dataset, dataset_path, nested_prior_artifact, model, qc_sealed_nested_prior_sha256,
+        loaded_source_fingerprint=loaded_source_fingerprint,
+        trusted_historical_checkpoint_sha256=trusted_historical_checkpoint_sha256,
+        trusted_historical_artifact_sha256=trusted_historical_artifact_sha256,
+    )
     labels = dataset["labels"]
 
     # Ticket #17: Load stimulus condition metadata if available
@@ -204,6 +221,10 @@ def load_model_and_dataset(
         is_pure_wind=is_pure_wind,  # Ticket #17
     )
 
+    bio_dataset.analysis_population = describe_analysis_population(
+        n_total, val_indices, bio_dataset.source_indices,
+        getattr(model, "analysis_validation_scope", None),
+    )
     dataloader = create_optimized_dataloader(
         bio_dataset,
         batch_size=batch_size,
@@ -335,6 +356,7 @@ def plot_trajectories_by_cluster(
         ax.grid(True, alpha=0.15, linestyle="--")
 
     axes[-1].set_xlabel("Normalized Time (0-1)", fontsize=10)
+    fig.suptitle("Whole corpus — in-sample descriptive gate trajectories", fontsize=12)
     plt.tight_layout()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(output_path, dpi=DPI, bbox_inches="tight")
@@ -385,6 +407,11 @@ def build_summary_json(
             str(k): float(v)
             for k, v in result["silhouette_scores"].items()
         },
+        "stability_scores": {
+            str(k): None if v is None else float(v)
+            for k, v in result["stability_scores"].items()
+        },
+        "k_selection_basis": result["k_selection_basis"],
         "ARI_4way_k4": float(ari_4way_k4) if not np.isnan(ari_4way_k4) else None,
         "NMI_4way_k4": float(nmi_4way_k4) if not np.isnan(nmi_4way_k4) else None,
         "ARI_3way_k3": float(ari_3way_k3) if not np.isnan(ari_3way_k3) else None,
@@ -533,6 +560,10 @@ def run_analysis(
     max_seq_len: Optional[int] = 2400,
     pre_anchor_frames: int = 1200,
     config_path: Optional[Path] = None,
+    nested_prior_artifact: Optional[Path] = None,
+    qc_sealed_nested_prior_sha256: Optional[str] = None,
+    trusted_historical_checkpoint_sha256: Optional[str] = None,
+    trusted_historical_artifact_sha256: Optional[str] = None,
 ) -> None:
     """Run the full gating cluster analysis pipeline."""
     logger.info("=" * 60)
@@ -556,6 +587,10 @@ def run_analysis(
         batch_size=batch_size,
         max_seq_len=max_seq_len,
         pre_anchor_frames=pre_anchor_frames,
+        nested_prior_artifact=nested_prior_artifact,
+        qc_sealed_nested_prior_sha256=qc_sealed_nested_prior_sha256,
+        trusted_historical_checkpoint_sha256=trusted_historical_checkpoint_sha256,
+        trusted_historical_artifact_sha256=trusted_historical_artifact_sha256,
     )
 
     # Extract and cluster
@@ -576,7 +611,7 @@ def run_analysis(
         labels_4way = np.array([s["true_4way"] for s in result["sequences"]])
         plot_umap(
             umap_emb, labels_4way,
-            "UMAP: True 4-Way Labels",
+            "UMAP: True 4-Way Labels (whole corpus; in-sample descriptive)",
             LABEL_NAMES_4WAY, CMAP_4WAY,
             output_dir / OUTPUT_FILES["umap_true_4way"],
         )
@@ -585,7 +620,7 @@ def run_analysis(
         labels_3way = np.array([s["true_3way_merged"] for s in result["sequences"]])
         plot_umap(
             umap_emb, labels_3way,
-            "UMAP: True 3-Way Merged Labels",
+            "UMAP: True 3-Way Merged Labels (whole corpus; in-sample descriptive)",
             LABEL_NAMES_3WAY, CMAP_3WAY,
             output_dir / OUTPUT_FILES["umap_true_3way"],
         )
@@ -605,7 +640,7 @@ def run_analysis(
         pred_colors = {i: CMAP_PRED(i) for i in range(k_opt)}
         plot_umap(
             umap_emb, result["labels_kopt"],
-            f"UMAP: Predicted Clusters (k_opt={k_opt})",
+            f"UMAP: Predicted Clusters (k_opt={k_opt}; whole corpus, in-sample descriptive)",
             pred_names, pred_colors,
             output_dir / OUTPUT_FILES["umap_pred_kopt"],
         )
@@ -622,6 +657,7 @@ def run_analysis(
 
     # -- Save summary JSON --
     summary = build_summary_json(result, cluster_config)
+    summary["analysis_population"] = population_for_output(dataloader, len(labels))
     summary_path = output_dir / OUTPUT_FILES["summary"]
     summary_path.parent.mkdir(parents=True, exist_ok=True)
     with open(summary_path, "w", encoding="utf-8") as f:
@@ -642,7 +678,7 @@ def run_analysis(
     cond_stats = _compute_condition_gate_stats(result["sequences"])
     if cond_stats is not None:
         logger.info("=" * 60)
-        logger.info("Per-Condition Gate Statistics (Validation Set):")
+        logger.info("Per-Condition Gate Statistics (whole corpus; in-sample descriptive):")
         logger.info(
             f"  Pure-wind trials (N={cond_stats['n_wind_trials']}):  "
             f"mean g_lif = {cond_stats['mean_g_lif_wind']:.3f} ± {cond_stats['std_g_lif_wind']:.3f}"
@@ -678,6 +714,24 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default="data/processed/nsmor_dataset.pt",
         help="Path to preprocessed dataset.",
+    )
+    parser.add_argument(
+        "--nested_prior_artifact",
+        type=str,
+        default=None,
+        help="Optional validated nested prior artifact used by the checkpoint.",
+    )
+    parser.add_argument(
+        "--qc_sealed_nested_prior_sha256", type=str, default=None,
+        help="Optional external QC-sealed SHA-256 to check the nested checkpoint's embedded artifact digest; cannot authenticate a checkpoint missing that digest.",
+    )
+    parser.add_argument(
+        "--trusted_historical_checkpoint_sha256", type=str, default=None,
+        help="Independently pinned SHA-256 of historical checkpoint bytes (required for historical analysis).",
+    )
+    parser.add_argument(
+        "--trusted_historical_artifact_sha256", type=str, default=None,
+        help="Independently pinned SHA-256 of historical nested artifact bytes.",
     )
     parser.add_argument(
         "--config",
@@ -723,6 +777,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     run_analysis(
         checkpoint_path=Path(args.checkpoint),
         dataset_path=Path(args.dataset),
+        nested_prior_artifact=Path(args.nested_prior_artifact) if args.nested_prior_artifact else None,
+        qc_sealed_nested_prior_sha256=args.qc_sealed_nested_prior_sha256,
+        trusted_historical_checkpoint_sha256=args.trusted_historical_checkpoint_sha256,
+        trusted_historical_artifact_sha256=args.trusted_historical_artifact_sha256,
         output_dir=Path(args.output_dir),
         batch_size=args.batch_size,
         max_seq_len=max_seq_len,

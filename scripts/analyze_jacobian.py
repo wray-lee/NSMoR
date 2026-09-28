@@ -50,11 +50,15 @@ CLI::
 from __future__ import annotations
 
 import argparse
+import sys
 import json
 import logging
 import math
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
+
+# Direct CLI execution must use this checkout, including its prior/lineage helpers.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
@@ -68,7 +72,12 @@ from nsmor.dataloader_factory import create_optimized_dataloader
 from nsmor.checkpoint import load_checkpoint
 from nsmor.config import DEFAULT_FEATURE, Label
 from nsmor.model_nsmor_core import NSMoRCore
-from nsmor.model_utils import load_model_from_checkpoint as _shared_load_model
+from nsmor.analysis.analysis_priors import (
+    describe_analysis_population, load_analysis_priors, population_for_output,
+)
+from nsmor.pipeline.nested_prior import load_dataset_with_fingerprint
+from nsmor.analysis.prediction_units import resolve_dt_ms
+from nsmor.analysis.prediction_units import load_model_from_checkpoint as _shared_load_model
 from nsmor.model_utils import validate_dataset_provenance
 
 # ── Logging ────────────────────────────────────────────────────
@@ -290,7 +299,7 @@ def load_model_from_checkpoint(
 ) -> NSMoRCore:
     """Load trained NSMoRCore from checkpoint.
 
-    Delegates to the shared :func:`nsmor.model_utils.load_model_from_checkpoint`
+    Delegates to the shared :func:`nsmor.analysis.prediction_units.load_model_from_checkpoint`
     which guarantees all biophysical parameters are restored.
     """
     return _shared_load_model(checkpoint_path, device)
@@ -305,6 +314,11 @@ def load_dataset(
     batch_size: int = 32,
     max_seq_len: Optional[int] = 2400,
     pre_anchor_frames: int = 1200,
+    nested_prior_artifact: Optional[Path] = None,
+    qc_sealed_nested_prior_sha256: Optional[str] = None,
+    checkpoint_model: Optional[NSMoRCore] = None,
+    trusted_historical_checkpoint_sha256: Optional[str] = None,
+    trusted_historical_artifact_sha256: Optional[str] = None,
 ) -> Tuple[torch.utils.data.DataLoader, np.ndarray, List[int], List[np.ndarray]]:
     """
     Load the preprocessed dataset and create a DataLoader.
@@ -328,14 +342,19 @@ def load_dataset(
         raise FileNotFoundError(f"Dataset not found: {dataset_path}")
 
     logger.info("Loading dataset from %s", dataset_path)
-    dataset = torch.load(dataset_path, weights_only=False)
+    dataset, loaded_source_fingerprint = load_dataset_with_fingerprint(dataset_path)
 
     # Round-2 CRITICAL-A: refuse pre-2.0 datasets (leaked priors, np.max labels)
     validate_dataset_provenance(dataset, Path(dataset_path))
 
     X_seqs = dataset["X_seqs"]
     Y_seqs = dataset["Y_seqs"]
-    mcmc_priors = dataset["mcmc_priors"]
+    mcmc_priors, val_indices = load_analysis_priors(
+        dataset, dataset_path, nested_prior_artifact, checkpoint_model, qc_sealed_nested_prior_sha256,
+        loaded_source_fingerprint=loaded_source_fingerprint,
+        trusted_historical_checkpoint_sha256=trusted_historical_checkpoint_sha256,
+        trusted_historical_artifact_sha256=trusted_historical_artifact_sha256,
+    )
     labels = dataset["labels"]
     lengths = dataset["lengths"]
 
@@ -368,6 +387,10 @@ def load_dataset(
         anchor_frames=anchor_frames,
     )
 
+    bio_dataset.analysis_population = describe_analysis_population(
+        n_total, val_indices, bio_dataset.source_indices,
+        getattr(checkpoint_model, "analysis_validation_scope", None),
+    )
     dataloader = create_optimized_dataloader(
         bio_dataset,
         batch_size=batch_size,
@@ -523,7 +546,7 @@ def extract_gru_states_at_epochs(
     device: torch.device,
     onset_frames: List[int],
     target_class: int = Label.PREWALK.value,
-    dt_ms: float = 10.0,
+    dt_ms: Optional[float] = None,
     adapter: Optional[FixedPointAdapter] = None,
 ) -> Dict[str, Tuple[torch.Tensor, torch.Tensor]]:
     """
@@ -566,7 +589,7 @@ def extract_gru_states_at_epochs(
             (from :func:`detect_stimulus_onset_frames`).
         target_class: Label value to filter by
             (default: PREWALK — sustained locomotion).
-        dt_ms: Frame interval in milliseconds.
+        dt_ms: None inherits saved model.dt_ms; an explicit interval must match.
         adapter: FixedPointAdapter providing the GRU cell for the
             residual check.  Created from *model* if omitted.
 
@@ -583,6 +606,8 @@ def extract_gru_states_at_epochs(
     """
     logger.info("Extracting GRU states for class %d (%s) at target epochs...",
                 target_class, Label(target_class).name)
+
+    dt_ms = resolve_dt_ms(model, dt_ms)
 
     if adapter is None:
         adapter = FixedPointAdapter(model, device=device)
@@ -1097,7 +1122,7 @@ def compute_full_system_eigenvalues(
     device: torch.device,
     onset_frames: List[int],
     target_class: int = Label.PREWALK.value,
-    dt_ms: float = 10.0,
+    dt_ms: Optional[float] = None,
     max_states_per_epoch: int = 100,
 ) -> Dict[str, np.ndarray]:
     """
@@ -1120,13 +1145,15 @@ def compute_full_system_eigenvalues(
         device: Computation device.
         onset_frames: Per-trial stimulus onset frame indices.
         target_class: Label value to filter by.
-        dt_ms: Frame interval in milliseconds.
+        dt_ms: None inherits saved model.dt_ms; an explicit interval must match.
         max_states_per_epoch: Maximum states to process per epoch.
 
     Returns:
         Dictionary mapping epoch name to singular value array (N, min(H,F)).
     """
     logger.info("Computing FULL SYSTEM Jacobian (LIF + GRU + Router)...")
+
+    dt_ms = resolve_dt_ms(model, dt_ms)
 
     epoch_results: Dict[str, np.ndarray] = {}
     model.eval()
@@ -1242,6 +1269,7 @@ def setup_lancet_style() -> None:
 def plot_eigenvalue_spectrum(
     eigenvalue_results: Dict[str, np.ndarray],
     output_path: Path,
+    analysis_population: Optional[Dict[str, object]] = None,
 ) -> None:
     """
     Plot the Jacobian eigenvalue spectrum on the complex plane.
@@ -1442,7 +1470,10 @@ def plot_eigenvalue_spectrum(
     # separate figure and carry no stability interpretation.
     fig.suptitle(
         "Jacobian Eigenvalue Spectrum — GRU Pathway (exact, "
-        "autograd ∂h$_{t+1}$/∂h$_t$)",
+        "autograd ∂h$_{t+1}$/∂h$_t$); "
+        + (analysis_population["selection"].replace("_", " ") + ", "
+           + analysis_population["evidence_scope"].replace("_", " ")
+           if analysis_population is not None else "descriptive population unavailable"),
         fontsize=14,
         fontweight="bold",
         color=AXIS_COLOR,
@@ -1453,7 +1484,11 @@ def plot_eigenvalue_spectrum(
 
     # ── Save ──────────────────────────────────────────────────
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(output_path, dpi=DPI, bbox_inches="tight", pad_inches=0.1)
+    plt.savefig(
+        output_path, dpi=DPI, bbox_inches="tight", pad_inches=0.1,
+        metadata={"Description": json.dumps({"analysis_population": analysis_population})}
+        if analysis_population is not None else None,
+    )
     logger.info("Saved Jacobian spectrum figure to %s (%d DPI)", output_path, DPI)
 
     plt.close(fig)
@@ -1471,10 +1506,14 @@ def run_jacobian_analysis(
     batch_size: int = 32,
     max_seq_len: Optional[int] = 2400,
     pre_anchor_frames: int = 1200,
-    dt_ms: float = 10.0,
+    dt_ms: Optional[float] = None,
     max_states_per_epoch: int = 100,
     full_system: bool = False,
     backend: str = "jax",
+    nested_prior_artifact: Optional[Path] = None,
+    qc_sealed_nested_prior_sha256: Optional[str] = None,
+    trusted_historical_checkpoint_sha256: Optional[str] = None,
+    trusted_historical_artifact_sha256: Optional[str] = None,
 ) -> None:
     """
     Run the full Jacobian eigenvalue spectrum analysis.
@@ -1489,7 +1528,7 @@ def run_jacobian_analysis(
         batch_size: Batch size for data loading.
         max_seq_len: Maximum sequence length for cropping.
         pre_anchor_frames: Baseline frames before anchor.
-        dt_ms: Frame interval in milliseconds.
+        dt_ms: None inherits saved model.dt_ms; an explicit interval must match.
         max_states_per_epoch: Maximum states to process per epoch.
         backend: ``"jax"`` uses the measured-faster GRU Jacobian kernel
             (falls back to PyTorch if JAX is missing). ``"torch"``
@@ -1506,6 +1545,7 @@ def run_jacobian_analysis(
 
     # ── Load model ────────────────────────────────────────────
     model = load_model_from_checkpoint(checkpoint_path, device)
+    dt_ms = resolve_dt_ms(model, dt_ms)
 
     # ── Load dataset (returns raw X_seqs for onset detection) ─
     dataloader, labels, lengths_list, X_seqs = load_dataset(
@@ -1513,6 +1553,11 @@ def run_jacobian_analysis(
         batch_size=batch_size,
         max_seq_len=max_seq_len,
         pre_anchor_frames=pre_anchor_frames,
+        nested_prior_artifact=nested_prior_artifact,
+        qc_sealed_nested_prior_sha256=qc_sealed_nested_prior_sha256,
+        checkpoint_model=model,
+        trusted_historical_checkpoint_sha256=trusted_historical_checkpoint_sha256,
+        trusted_historical_artifact_sha256=trusted_historical_artifact_sha256,
     )
 
     # ── Task 1: Dynamic stimulus onset detection ──────────────
@@ -1610,6 +1655,7 @@ def run_jacobian_analysis(
     plot_eigenvalue_spectrum(
         eigenvalue_results=eigenvalue_results,
         output_path=output_path,
+        analysis_population=population_for_output(dataloader, len(labels)),
     )
 
     # ── Export JSON summary (Round-2 M-2c) ───────────────────
@@ -1636,6 +1682,7 @@ def run_jacobian_analysis(
                 "n_tested_attractors": attractor_stats.get(epoch_name, {}).get("n_tested", 0),
             }
         summary = {
+            "analysis_population": population_for_output(dataloader, len(labels)),
             "target_class": int(target_class),
             "dt_ms": dt_ms,
             "epochs": EPOCH_DEFINITIONS,
@@ -1680,6 +1727,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to preprocessed dataset.",
     )
     parser.add_argument(
+        "--nested_prior_artifact",
+        type=str,
+        default=None,
+        help="Optional validated nested prior artifact used by the checkpoint.",
+    )
+    parser.add_argument(
+        "--qc_sealed_nested_prior_sha256", type=str, default=None,
+        help="Optional external QC-sealed SHA-256 to check the nested checkpoint's embedded artifact digest; cannot authenticate a checkpoint missing that digest.",
+    )
+    parser.add_argument(
+        "--trusted_historical_checkpoint_sha256", type=str, default=None,
+        help="Independently pinned SHA-256 of historical checkpoint bytes (required for historical analysis).",
+    )
+    parser.add_argument(
+        "--trusted_historical_artifact_sha256", type=str, default=None,
+        help="Independently pinned SHA-256 of historical nested artifact bytes.",
+    )
+    parser.add_argument(
         "--output",
         type=str,
         default="results/jacobian_spectrum.png",
@@ -1721,8 +1786,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dt_ms",
         type=float,
-        default=10.0,
-        help="Frame interval in milliseconds.",
+        default=None,
+        help="Frame interval in ms (default: saved model.dt_ms; explicit value must match).",
     )
     parser.add_argument(
         "--max_states",
@@ -1765,6 +1830,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     run_jacobian_analysis(
         checkpoint_path=Path(args.checkpoint),
         dataset_path=Path(args.dataset),
+        nested_prior_artifact=Path(args.nested_prior_artifact) if args.nested_prior_artifact else None,
+        qc_sealed_nested_prior_sha256=args.qc_sealed_nested_prior_sha256,
+        trusted_historical_checkpoint_sha256=args.trusted_historical_checkpoint_sha256,
+        trusted_historical_artifact_sha256=args.trusted_historical_artifact_sha256,
         output_path=output_path,
         target_class=args.target_class,
         batch_size=args.batch_size,

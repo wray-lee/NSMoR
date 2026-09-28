@@ -102,43 +102,73 @@ contents. A length mismatch raises `ValueError`.
 
 ---
 
-### `data_extractor.py` — Snapshot anchor (added 2026-09-02 under user override)
+### `data_extractor.py` — Snapshot anchor (reconciled 2026-09-28 under user override)
 
 ```
 resolve_snapshot_anchor(trial_data, stimulus_onset_ms)
     -> (anchor_ms: float, anchor_rule: str)
 
 anchor_rule is one of:
-  "stimulus_onset"     — any trial carrying wind.  UNCHANGED behaviour:
-                         anchor = stimulus_onset_ms.
-  "looming_collision"  — visual-only trials.  anchor = time of the
-                         visual-angle peak, which locates the collision.
+  "stimulus_onset"     — any trial carrying wind (and no-stimulus fallback).
+                         anchor = stimulus_onset_ms, unchanged.
+  "looming_collision"  — visual-only trials. Physical collision in trial ms:
+                         looming_onset_ms + lv_ratio_ms / tan(radians(init_deg/2)).
 
-extract_mcmc_snapshot(...)    — offsets from the resolved anchor, not from
-                                stimulus_onset_ms directly.  snapshot_dim
-                                stays 5; feature layout unchanged.
+extract_mcmc_snapshot(...)    — samples resolved anchor + ttc_offset_ms
+                                (default -50 ms). snapshot_dim stays 5:
+                                visual_angle, looming_velocity, wind_state,
+                                avg_velocity_bg, max_acceleration_bg.
 
 build_snapshot_dataset(..., return_anchor_rules=False,
                        on_unanchorable="raise")
     -> (snapshots, labels[, kept_indices][, anchor_rules])
 ```
 
-Why this required touching a frozen module: the anchor was
-`stimulus_onset_ms − 50 ms` for every condition, but visual-only trials begin
-looming at the `TrialStart -> Looming` transition — the same instant as
-`trial_start` — so their anchor fell before the first frame and
-`extract_mcmc_snapshot` raised. `build_snapshot_dataset` swallowed that with a
-bare `except ValueError: continue`, so **every visual-only trial in the corpus
-was deleted in silence**: 36 of 396 on the reference data, all `NO_RESPONSE`,
-none surviving. Because the retention identity carries a snapshot drop
-forward, those trials also disappeared from the regression sequence set.
+Geometry comes from each trial, with no visual-angle peak selection:
 
-The edit is deliberately confined. On the reference corpus 360 trials resolve
-via `"stimulus_onset"` and are bit-identical to before; only the 36
-visual-only trials take the new rule. `on_unanchorable` now defaults to
-`"raise"`, so a caller that tolerates drops must opt in and report what it
-lost. `PIPELINE_SEMANTICS_VERSION` moved to `2.2` because the retained trial
-population changed.
+- Canonical `trial_start` event details supply `lv_ratio_ms` and, when declared,
+  `init_deg`. Legacy canonical fixtures without declared l/v use their constant
+  positive `l_v_ratio` trace. A visual trial must have a positive l/v trace;
+  declared l/v must agree with its nonzero values.
+- The production raw schema stores `lv_ratio_ms` in `trial_start.details` and
+  does not declare the initial angle. The current conversion layer reconstructs
+  that angle with `init_deg=2.0`; its converted trace retains the initial geometry.
+  Each positive, unclipped angle gives the onset-to-collision duration as
+  `max(0, sample_time - looming_onset) + lv_ratio_ms / tan(angle/2)`.
+  At least three such samples are required. Without a declaration, use their
+  median duration; with `init_deg`, use the declared duration. In both cases a
+  strict majority must agree within `max(1 ms, 0.1% of that duration)` or the
+  visual trial fails. This tolerates one early 35-degree artifact while rejecting
+  a coherent 4-degree trace against a 2-degree declaration. Pre-onset samples
+  hold the initial angle; delayed or negative looming onsets use the same clock.
+- Looming onset is the earliest `phase_transition` to `Looming` or explicit
+  `looming_onset` event, on the shared trial clock. `stimulus_onset_ms` is the
+  canonical fallback. Looming onset need not equal `trial_start`.
+- l/v must be finite and positive, the initial angle finite and strictly between
+  0 and 180 degrees, and collision finite and after onset. Invalid declared
+  metadata (including null/boolean values), nonfinite geometry, and an
+  unverifiable clipped visual trace raise `ValueError`. The collision itself
+  and its visual snapshot must fall inside the recorded time range; nearest-
+  frame sampling cannot substitute the last frame for an unrecorded instant.
+
+The original onset-minus-50-ms rule could precede frame one for visual-only
+trials and silently remove them. `on_unanchorable="raise"` remains the default;
+explicit `"skip"` retains the existing kept-index contract for reporting drops.
+The anchor rule remains a sidecar; sequence and feature layouts are unchanged.
+
+**Reconciliation with the approved spec:** the rejected SOURCE4 visual-angle
+peak proxy is superseded by the physical geometry above. The approved preserved
+wind decision still applies; wind geometry is not parsed and its five snapshot
+features retain the onset rule. Earlier reference counts (36 visual-only and
+360 wind-bearing trials) are historical audit evidence, not a new corpus run.
+`PIPELINE_SEMANTICS_VERSION` remains `2.2`, the already approved 2.1-to-2.2
+retention change. This correction belongs to the unapproved v6 candidate and
+requires a fresh source seal and independent source review. `CONTEXT.md`'s
+"looming begins at trial start" describes the original reference condition;
+the clock contract above also covers delayed and negative looming onsets. The
+root `BOUNDARY.md` freeze remains in force, with the user's explicit override
+limited here to this extractor correction; `model_nsmor_core.py` and `loss.py`
+remain frozen.
 
 ---
 

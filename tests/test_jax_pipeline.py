@@ -238,3 +238,142 @@ class TestJAXPipeline:
         assert abs(float(jax_loss) - float(pt_loss.item())) < 0.05, (
             f"JAX loss {float(jax_loss):.6f} vs PyTorch loss {float(pt_loss.item()):.6f}"
         )
+
+
+def _synthetic_jax_artifact(path: Path) -> dict:
+    """Four recording prefixes; no biological identity is asserted."""
+    from nsmor.config import PIPELINE_SEMANTICS_VERSION
+
+    data = {
+        "X_seqs": [torch.zeros(3, 8) for _ in range(4)],
+        "Y_seqs": [torch.zeros(3) for _ in range(4)],
+        "lengths": torch.tensor([3, 3, 3, 3]),
+        "labels": torch.tensor([0, 1, 0, 1]),
+        "session_ids": [f"prefix{i}_session_1" for i in range(4)],
+        "mcmc_priors": torch.full((4, 4), 0.25),
+        "pipeline_semantics_version": PIPELINE_SEMANTICS_VERSION,
+        "mcmc_prior_provenance": "oof_2fold_recording_prefix_grouped_cv",
+        "animal_identity_status": "unverified",
+    }
+    torch.save(data, path)
+    return data
+
+
+@pytest.mark.skipif(not JAX_AVAILABLE, reason="JAX is not installed")
+def test_jax_dataset_loader_rejects_reducer_and_false_lineage(tmp_path):
+    import os
+    from nsmor.jax.dataloader import load_nsmor_dataset
+
+    marker = tmp_path / "executed"
+
+    class Reducer:
+        def __reduce__(self):
+            return os.system, (f"touch {marker}",)
+
+    path = tmp_path / "synthetic.pt"
+    torch.save({"payload": Reducer()}, path)
+    with pytest.raises(ValueError, match="Unexpected serialized global"):
+        load_nsmor_dataset(path)
+    assert not marker.exists()
+
+    data = _synthetic_jax_artifact(path)
+    loaded = load_nsmor_dataset(path)
+    assert loaded["dataset_sha256"] == __import__("hashlib").sha256(path.read_bytes()).hexdigest()
+    invalid_priors = data["mcmc_priors"].clone()
+    invalid_priors[0] = torch.tensor([1.1, -0.1, 0.0, 0.0])
+    for mutation in (
+        {"animal_identity_status": "verified"},
+        {"mcmc_prior_provenance": "session_grouped_5fold"},
+        {"pipeline_semantics_version": "incompatible"},
+        {"mcmc_priors": invalid_priors},
+    ):
+        torch.save(dict(data, **mutation), path)
+        with pytest.raises((ValueError, RuntimeError)):
+            load_nsmor_dataset(path)
+
+
+@pytest.mark.skipif(not JAX_AVAILABLE, reason="JAX is not installed")
+def test_jax_resume_rejects_unbound_checkpoint_before_training(tmp_path, caplog):
+    from nsmor.config_parser import ExperimentConfig
+    from nsmor.jax.train import train_jax
+
+    dataset_path = tmp_path / "synthetic.pt"
+    _synthetic_jax_artifact(dataset_path)
+    resume_path = tmp_path / "unbound.pth"
+    torch.save({"model_state_dict": {}}, resume_path)
+    with pytest.raises(ValueError, match="JAX development checkpoint"):
+        train_jax(ExperimentConfig(), dataset_path=str(dataset_path),
+                  output_dir=str(tmp_path / "out"), resume_from=str(resume_path))
+    assert "contaminated development diagnostic" in caplog.text.lower()
+
+
+@pytest.mark.skipif(not JAX_AVAILABLE, reason="JAX is not installed")
+def test_jax_resume_rejects_forged_holdout_scope_and_reducer(tmp_path):
+    import hashlib
+    import os
+    from nsmor.config_parser import ExperimentConfig
+    from nsmor.jax.train import train_jax
+
+    dataset_path = tmp_path / "synthetic.pt"
+    _synthetic_jax_artifact(dataset_path)
+    resume_path = tmp_path / "resume.pth"
+    lineage = {
+        "checkpoint_type": "jax_development_only",
+        "validation_scope": "independent_holdout",
+        "is_nested_cv": False,
+        "dataset_source_sha256": hashlib.sha256(dataset_path.read_bytes()).hexdigest(),
+        "mcmc_prior_provenance": "oof_2fold_recording_prefix_grouped_cv",
+        "animal_identity_status": "unverified",
+        "split_seed": 42,
+        "val_split": 0.2,
+        "n_train_recording_prefixes": 3,
+        "n_val_recording_prefixes": 1,
+        "model_state_dict": {"dummy": torch.zeros(1)},
+    }
+    torch.save(lineage, resume_path)
+    with pytest.raises(ValueError, match="JAX development checkpoint lacks matching"):
+        train_jax(ExperimentConfig(), dataset_path=str(dataset_path),
+                  output_dir=str(tmp_path / "out"), resume_from=str(resume_path))
+
+    marker = tmp_path / "executed"
+
+    class Reducer:
+        def __reduce__(self):
+            return os.system, (f"touch {marker}",)
+
+    torch.save(dict(lineage, model_state_dict={"dummy": Reducer()}), resume_path)
+    with pytest.raises(ValueError, match="Unexpected serialized global"):
+        train_jax(ExperimentConfig(), dataset_path=str(dataset_path),
+                  output_dir=str(tmp_path / "out"), resume_from=str(resume_path))
+    assert not marker.exists()
+@pytest.mark.skipif(not JAX_AVAILABLE, reason="JAX is not installed")
+def test_jax_split_is_prefix_disjoint_without_animal_claim():
+    from nsmor.jax.dataloader import (
+        recording_prefix_train_val_split, session_grouped_train_val_split,
+    )
+    sessions = ["subjectA_day1_session_1", "subjectA_day1_session_2",
+                "subjectA_day2_session_1", "subjectA_day2_session_2"]
+    train, val = recording_prefix_train_val_split(sessions, 4, val_split=0.5, random_seed=42)
+    assert sorted(map(len, (train, val))) == [2, 2]
+    assert {sessions[int(i)].rsplit("_session_", 1)[0] for i in train}.isdisjoint(
+        {sessions[int(i)].rsplit("_session_", 1)[0] for i in val}
+    )
+    assert session_grouped_train_val_split is recording_prefix_train_val_split
+
+
+@pytest.mark.skipif(not JAX_AVAILABLE, reason="JAX is not installed")
+def test_jax_loader_requires_modern_group_metadata_or_trial_specs(tmp_path):
+    from nsmor.jax.dataloader import load_nsmor_dataset
+
+    path = tmp_path / "synthetic.pt"
+    data = _synthetic_jax_artifact(path)
+    sessions = data.pop("session_ids")
+    for missing in (data, dict(data, session_ids=[]),
+                    dict(data, session_ids=["prefix0_session_1"]),
+                    dict(data, session_ids=["  "] * 4)):
+        torch.save(missing, path)
+        with pytest.raises((RuntimeError, ValueError), match="session_ids"):
+            load_nsmor_dataset(path)
+    data["trial_specs"] = [{"session_id": value} for value in sessions]
+    torch.save(data, path)
+    assert load_nsmor_dataset(path)["session_ids"] == sessions

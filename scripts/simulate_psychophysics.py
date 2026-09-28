@@ -33,12 +33,16 @@ Hypothesis (scoped):
 Respects all BOUNDARY.md constraints — never modifies frozen core.
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import logging
+import math
 import os
 import sys
-from typing import Optional
+from dataclasses import dataclass
+from typing import List, NamedTuple, Optional, Sequence
 from pathlib import Path
 
 import numpy as np
@@ -52,7 +56,11 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(_SCRIPT_DIR)
 sys.path.insert(0, _PROJECT_ROOT)
 
-from nsmor.model_utils import load_model_from_checkpoint  # noqa: E402
+from nsmor.analysis.analysis_priors import load_analysis_priors
+from nsmor.pipeline.nested_prior import load_dataset_with_fingerprint
+from nsmor.analysis.prediction_units import resolve_dt_ms
+from nsmor.analysis.prediction_units import load_model_from_checkpoint  # noqa: E402
+from nsmor.pipeline.events import load_declared_events_index  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s")
 logger = logging.getLogger(__name__)
@@ -82,7 +90,8 @@ DPI = 300
 def load_checkpoint(ckpt_path: str, device: torch.device):
     """Load model checkpoint with ALL biophysical parameters.
 
-    Delegates to the shared :func:`nsmor.model_utils.load_model_from_checkpoint`
+    Delegates to the shared :func:
+smor.analysis.prediction_units.load_model_from_checkpoint`
     which guarantees every biophysical parameter is reconstructed from
     the saved config (refractory periods, synaptic delay, STP, lateral
     inhibition, dendritic compartmentalization, neuromodulatory gain,
@@ -92,6 +101,74 @@ def load_checkpoint(ckpt_path: str, device: torch.device):
     return load_model_from_checkpoint(Path(ckpt_path), device)
 
 
+STIM_ONSET_FRAME = 1200
+NOISE_LEVELS = [0.0, 5.0, 15.0, 30.0]  # σ in degrees
+LATENCY_SCOPE = (
+    "Signed latency to the largest absolute peak in [-2s, +4s) relative to onset; "
+    "negative latencies include pre-collision escapes. Flat, nonfinite, and "
+    "empty windows are excluded as NaN. Peak velocity uses the same window."
+)
+
+
+@dataclass
+class TrialMeta:
+    """Explicit per-trial metadata that travels beside tensors.
+
+    Survives slicing/filtering via :meth:`subset`, unlike ad-hoc tensor
+    attributes which PyTorch strips on ``X[mask]``.
+    """
+
+    val_indices: Optional[List[int]] = None
+    session_ids: Optional[List[str]] = None
+    trial_ids: Optional[List[int]] = None
+    target_ttc_ms: Optional[List[Optional[float]]] = None
+    stimulus_conditions: Optional[List[str]] = None
+    anchor_frames: Optional[List[int]] = None
+    stim_onset_frame: int = STIM_ONSET_FRAME
+    pre_anchor_frames: int = 1200
+
+    def subset(self, indices: Sequence[int]) -> "TrialMeta":
+        """Return a new TrialMeta containing only the given row indices."""
+        def _pick(seq):
+            return [seq[i] for i in indices] if seq is not None else None
+        return TrialMeta(
+            val_indices=_pick(self.val_indices),
+            session_ids=_pick(self.session_ids),
+            trial_ids=_pick(self.trial_ids),
+            target_ttc_ms=_pick(self.target_ttc_ms),
+            stimulus_conditions=_pick(self.stimulus_conditions),
+            anchor_frames=_pick(self.anchor_frames),
+            stim_onset_frame=self.stim_onset_frame,
+            pre_anchor_frames=self.pre_anchor_frames,
+        )
+
+
+class ValidationData:
+    """Tensor bundle with explicit side-by-side metadata.
+
+    Unpacks as ``(X, Y, lengths)`` for backward compatibility with
+    callers that expect a 3-tuple; access ``.meta`` for TrialMeta.
+    """
+
+    def __init__(
+        self,
+        X: torch.Tensor,
+        Y: torch.Tensor,
+        lengths: torch.Tensor,
+        meta: TrialMeta,
+    ):
+        self.X = X
+        self.Y = Y
+        self.lengths = lengths
+        self.meta = meta
+
+    def __iter__(self):
+        return iter((self.X, self.Y, self.lengths))
+
+    def __len__(self):
+        return 3
+
+
 def load_validation_data(
     device: torch.device,
     max_seq_len: Optional[int] = 2400,
@@ -99,21 +176,26 @@ def load_validation_data(
     dataset_path: Optional[str] = None,
     val_split: float = 0.2,
     random_seed: int = 42,
+    nested_prior_artifact: Optional[Path] = None,
+    qc_sealed_nested_prior_sha256: Optional[str] = None,
+    checkpoint_model=None,
+    trusted_historical_checkpoint_sha256: Optional[str] = None,
+    trusted_historical_artifact_sha256: Optional[str] = None,
 ):
     """
-    Load ``nsmor_dataset.pt`` and return the validation split.
+    Load `
+smor_dataset.pt`` and return the validation split.
 
     ``dataset_path`` defaults to the in-repo processed dataset so existing
     callers keep working, but the pipeline passes the dataset the current
     run produced — otherwise this stage silently scores whatever file is
     left over in ``data/processed`` from an earlier run.
 
-    Uses animal-grouped train/val split (nsmor.pipeline.grouping.grouped_train_val_split)
-    matching train.py to eliminate animal leakage across splits.
+    Uses the recording-prefix grouped train/val split shared with train.py.
+    Distinct prefixes do not establish independent animal identities.
 
-    Returns validation tensors with metadata attributes:
-        - X_val.val_indices: original dataset indices
-        - X_val.stim_onset_frame: anchor-aligned stimulus frame
+    Returns a :class:`ValidationData` that unpacks as ``(X, Y, lengths)``
+    and carries explicit :class:`TrialMeta` via ``.meta``.
     """
     if dataset_path is None:
         dataset_path = os.path.join(
@@ -123,24 +205,33 @@ def load_validation_data(
         logger.error("Dataset not found: %s", dataset_path)
         sys.exit(1)
 
-    data = torch.load(dataset_path, map_location="cpu", weights_only=False)
+    data, loaded_source_fingerprint = load_dataset_with_fingerprint(dataset_path, map_location="cpu")
     # Round-2 CRITICAL-A: refuse pre-2.0 datasets (leaked priors)
-    from nsmor.model_utils import validate_dataset_provenance
+    from nsmor.model_utils import resolve_dataset_session_ids, validate_dataset_provenance
     validate_dataset_provenance(data, Path(dataset_path))
+    session_ids = resolve_dataset_session_ids(data)
     X_seqs = data["X_seqs"]
     Y_seqs = data["Y_seqs"]
     lengths = data["lengths"]
-    mcmc_priors = data.get("mcmc_priors", None)
+    mcmc_priors, persisted_val_indices = load_analysis_priors(
+        data, Path(dataset_path), nested_prior_artifact, checkpoint_model, qc_sealed_nested_prior_sha256,
+        loaded_source_fingerprint=loaded_source_fingerprint,
+        trusted_historical_checkpoint_sha256=trusted_historical_checkpoint_sha256,
+        trusted_historical_artifact_sha256=trusted_historical_artifact_sha256,
+    )
 
     n_total = len(X_seqs)
     from nsmor.pipeline.grouping import grouped_train_val_split
 
-    _, val_indices = grouped_train_val_split(
-        data.get("session_ids"),
-        n_total,
-        val_split=val_split,
-        random_seed=random_seed,
-    )
+    if persisted_val_indices is None:
+        _, val_indices = grouped_train_val_split(
+            session_ids,
+            n_total,
+            val_split=val_split,
+            random_seed=random_seed,
+        )
+    else:
+        val_indices = persisted_val_indices  # Exact checkpoint outer hold-out.
 
     anchor_frames = data.get("anchor_frames")
     if anchor_frames is None:
@@ -151,7 +242,11 @@ def load_validation_data(
             len(anchor_frames),
         )
 
-    val_anchor_frames = [anchor_frames[i] for i in val_indices]
+    val_anchor_frames_pre_crop = [int(anchor_frames[i]) for i in val_indices]
+    val_raw_lengths = [
+        int(lengths[i].item()) if torch.is_tensor(lengths) else int(lengths[i])
+        for i in val_indices
+    ]
 
     # Use DataLoader with collate_variable_length for proper padding
     from nsmor.nsmor_dataloader import NSMoRDataset
@@ -172,7 +267,7 @@ def load_validation_data(
         feature_config=feature_config,
         max_seq_len=max_seq_len,
         pre_anchor_frames=pre_anchor_frames,
-        anchor_frames=val_anchor_frames,
+        anchor_frames=val_anchor_frames_pre_crop,
     )
 
     # Create a single batch with all validation data
@@ -189,20 +284,59 @@ def load_validation_data(
     Y_val = Y_val.to(device).contiguous()
     lengths_val = lengths_val.to(device).contiguous()
 
-    X_val.stim_onset_frame = pre_anchor_frames
-    X_val.pre_anchor_frames = pre_anchor_frames
-    X_val.val_indices = val_indices
+    # Map pre-crop metadata anchors into the coordinate frame of the
+    # SAVED (post-crop) tensors using the exact same crop window that
+    # NSMoRDataset.__getitem__ applied.  Without this, extract_gate_trajectory
+    # shifts by a pre-crop anchor against a post-crop sequence and the
+    # aligned peak lands at the wrong index (or is dropped entirely).
+    from nsmor.pipeline.conditions import resolve_anchor_crop
+
+    val_anchor_frames: List[int] = []
+    for i, (raw_len, anchor_pre) in enumerate(
+        zip(val_raw_lengths, val_anchor_frames_pre_crop)
+    ):
+        start, _end = resolve_anchor_crop(
+            n_frames=raw_len,
+            anchor_frame=anchor_pre,
+            max_seq_len=max_seq_len,
+            pre_anchor_frames=pre_anchor_frames,
+        )
+        cropped_anchor = anchor_pre - start
+        # Keep anchors inside the saved sequence; fall back to the
+        # in-window stimulus position rather than leaking an OOB index.
+        saved_len = int(
+            lengths_val[i].item() if torch.is_tensor(lengths_val) else lengths_val[i]
+        )
+        if not (0 <= cropped_anchor < max(saved_len, 1)):
+            cropped_anchor = min(max(0, cropped_anchor), max(saved_len - 1, 0))
+        val_anchor_frames.append(int(cropped_anchor))
+
+    # Explicit metadata travels beside tensors (survives X_val[mask] slicing,
+    # unlike ad-hoc tensor attributes which PyTorch strips).
+    trial_ids = data.get("trial_ids")
+    target_ttc_ms = data.get("target_ttc_ms")
+    stimulus_conditions = data.get("stimulus_conditions")
+    meta = TrialMeta(
+        val_indices=list(val_indices),
+        session_ids=[session_ids[i] for i in val_indices] if session_ids is not None else None,
+        trial_ids=[trial_ids[i] for i in val_indices] if trial_ids is not None else None,
+        target_ttc_ms=[target_ttc_ms[i] for i in val_indices] if target_ttc_ms is not None else None,
+        stimulus_conditions=(
+            [stimulus_conditions[i] for i in val_indices]
+            if stimulus_conditions is not None else None
+        ),
+        anchor_frames=list(val_anchor_frames),
+        stim_onset_frame=pre_anchor_frames,
+        pre_anchor_frames=pre_anchor_frames,
+    )
 
     logger.info("Validation data loaded: %d trials", X_val.shape[0])
-    return X_val, Y_val, lengths_val
+    return ValidationData(X_val, Y_val, lengths_val, meta)
 
 
 # ===================================================================
 # Condition Filtering & Noise Injection
 # ===================================================================
-
-STIM_ONSET_FRAME = 1200
-NOISE_LEVELS = [0.0, 5.0, 15.0, 30.0]  # σ in degrees
 
 
 def detect_wind_onset_frame(x_seq: torch.Tensor) -> int | None:
@@ -214,94 +348,217 @@ def detect_wind_onset_frame(x_seq: torch.Tensor) -> int | None:
     return int(indices[0].item())
 
 
+class TTC0Selection(NamedTuple):
+    """Result of declared multisensory TTC=0 selection.
+
+    Attributes:
+        mask: Boolean mask over trials (empty when status is not_applicable).
+        n_candidates: Multisensory trials with resolvable declared TTC.
+        n_ttc0: Count of declared TTC=0 trials.
+        status: ``"ok"`` when n_ttc0 > 0, else ``"not_applicable"``.
+    """
+
+    mask: torch.Tensor
+    n_candidates: int
+    n_ttc0: int
+    status: str
+
+
+def psychophysics_gate_verdict(output_dir: str | Path) -> str:
+    """Return the Phase-G artefact gate verdict for ``output_dir``.
+
+    Reads the FRESH ``bayesian_reliability.json`` status written by the
+    current run. Stale PNG/summary files alone can never satisfy the gate
+    because the status artefact is required first.
+
+    Returns:
+        ``"not_applicable"`` — legitimate empty TTC=0 subset, no figure required.
+        ``"unavailable_latency"`` — TTC=0 present, no measurable latency; PNG + summary required.
+        ``"ok"``            — measured path, PNG + summary required.
+
+    Raises:
+        FileNotFoundError / ValueError: missing or unparsable status artefact.
+    """
+    status_json = Path(output_dir) / "bayesian_reliability.json"
+    if not status_json.is_file() or status_json.stat().st_size == 0:
+        raise FileNotFoundError(
+            f"missing fresh status artefact: {status_json}"
+        )
+    with open(status_json, "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+    status = data.get("status", "unknown")
+    if status not in ("ok", "not_applicable", "unavailable_latency"):
+        raise ValueError(f"Unknown psychophysics status: {status!r}")
+    if status == "unavailable_latency":
+        # ponytail: preserve the measured-absence result, not an estimated latency.
+        if (type(data.get("n_ttc0")) is not int or data["n_ttc0"] <= 0 or
+                not isinstance(data.get("reason"), str) or not data["reason"].strip()):
+            raise ValueError("unavailable_latency requires TTC=0 trials and a reason")
+    return status
+
+
 def find_multisensory_ttc0(
     X_seqs: torch.Tensor,
     lengths: torch.Tensor,
-    raw_dir: str = "data/raw",
+    raw_dir: Optional[str] = "data/raw",
     val_indices: Optional[Sequence[int]] = None,
     stim_onset_frame: Optional[int] = None,
-    dt_ms: float = 10.0,
-) -> torch.Tensor:
-    """Return boolean mask for trials matching multisensory_ttc_0ms condition.
+    dt_ms: float = 4.0,
+    session_ids: Optional[Sequence[str]] = None,
+    trial_ids: Optional[Sequence[int]] = None,
+    target_ttc_ms: Optional[Sequence[Optional[float]]] = None,
+    stimulus_conditions: Optional[Sequence[str]] = None,
+) -> TTC0Selection:
+    """Select trials matching declared multisensory_ttc_0ms.
 
-    Uses events files to determine trial type and target_ttc_ms, aligned with
-    the validation indices from animal-grouped split. Falls back to kinematics
-    analysis of physical channels if raw events files are missing or empty.
+    Uses declared target_ttc_ms and declared multisensory condition joined by
+    stable (session_id, trial_id) or persisted dataset metadata.
+
+    A complete valid declared subset with ZERO TTC=0 trials returns an empty
+    mask with ``status="not_applicable"`` (legitimate absence, not an error).
+    Raises ValueError on missing/unresolved identity, missing raw_dir for
+    required keyed lookup, unresolved required multisensory TTC, or corrupt
+    numeric TTC strings. Unimodal null TTC stays null.
     """
-    import json
-    from pathlib import Path
-
     B, T, _ = X_seqs.shape
+    assert X_seqs.dim() == 3, f"Expected X_seqs (B, T, F), got {X_seqs.shape}"
     mask = torch.zeros(B, dtype=torch.bool, device=X_seqs.device)
+    n_candidates = 0
 
     if val_indices is None:
         val_indices = getattr(X_seqs, "val_indices", None)
     if stim_onset_frame is None:
-        stim_onset_frame = getattr(X_seqs, "stim_onset_frame", STIM_ONSET_FRAME)
+        stim_onset_frame = STIM_ONSET_FRAME
+    if session_ids is None:
+        session_ids = getattr(X_seqs, "session_ids", None)
+    if trial_ids is None:
+        trial_ids = getattr(X_seqs, "trial_ids", None)
+    if target_ttc_ms is None:
+        target_ttc_ms = getattr(X_seqs, "target_ttc_ms", None)
+    if stimulus_conditions is None:
+        stimulus_conditions = getattr(X_seqs, "stimulus_conditions", None)
 
-    # Load trial info from events files
-    trial_info = []
-    events_files = sorted(Path(raw_dir).rglob("*_events.csv")) if os.path.exists(raw_dir) else []
-    for evt_path in events_files:
-        df = pd.read_csv(evt_path)
-        for _, row in df.iterrows():
-            event_type = str(row.get('event_type', row.get('event_name', '')))
-            if event_type == 'trial_start':
-                details_str = str(row.get('event_value', row.get('details', '{}')))
-                try:
-                    details = json.loads(details_str)
-                except (json.JSONDecodeError, KeyError, ValueError):
-                    details = {}
-                trial_info.append({
-                    'type': details.get('type', 'unknown'),
-                    'target_ttc_ms': details.get('target_ttc_ms'),
-                })
+    declared_index: Optional[dict] = None
 
-    # Align with val_indices from grouped_train_val_split
-    if trial_info and val_indices is not None and len(val_indices) == B:
-        for i, idx in enumerate(val_indices):
-            if idx < len(trial_info):
-                info = trial_info[idx]
-                if info.get('type') in ('looming_wind', 'multisensory') and info.get('target_ttc_ms') is not None:
-                    if abs(info['target_ttc_ms']) < 50:
-                        mask[i] = True
-    elif trial_info and val_indices is None:
-        n_total = len(trial_info)
-        n_val = min(B, int(n_total * 0.2))
-        split = n_total - n_val
-        val_info = trial_info[split:split + B]
-        for i, info in enumerate(val_info):
-            if i >= B:
-                break
-            if info.get('type') in ('looming_wind', 'multisensory') and info.get('target_ttc_ms') is not None:
-                if abs(info['target_ttc_ms']) < 50:
-                    mask[i] = True
+    def _load_raw_index() -> dict:
+        nonlocal declared_index
+        if declared_index is None:
+            if raw_dir is None or not os.path.exists(raw_dir):
+                raise ValueError(
+                    f"raw_dir {raw_dir!r} does not exist for declared events lookup. "
+                    "Failing closed without inferred TTC0."
+                )
+            declared_index = load_declared_events_index(raw_dir)
+        return declared_index
 
-    # Kinematics-based fallback from physical channels (TTC ~ 0ms)
-    if mask.sum() == 0:
-        logger.info("Aligning multisensory ttc0 from physical channels.")
+    def _raw_lookup(i: int) -> dict:
+        if session_ids is None or trial_ids is None or i >= len(session_ids) or i >= len(trial_ids):
+            raise ValueError(
+                f"missing session_ids/trial_ids for keyed raw lookup at index {i}; "
+                "failing closed without inferred TTC0."
+            )
+        key = (str(session_ids[i]), int(trial_ids[i]))
+        index = _load_raw_index()
+        if key not in index:
+            raise ValueError(
+                f"Unresolved declared events key {key}; failing closed without inferred TTC0."
+            )
+        return index[key]
+
+    def _is_multisensory(i: int, cond: Optional[str]) -> bool:
+        if cond is not None:
+            return cond in ("multisensory", "looming_wind")
+        L = int(lengths[i].item())
+        vis = X_seqs[i, :L, VISUAL_ANGLE_IDX].abs()
+        wind = X_seqs[i, :L, 1]
+        return bool((vis > 1e-4).any().item()) and bool((wind > 0.5).any().item())
+
+    def _parse_ttc(raw_ttc: object, context: str) -> Optional[float]:
+        if raw_ttc is None or (isinstance(raw_ttc, float) and math.isnan(raw_ttc)):
+            return None
+        try:
+            val = float(raw_ttc)
+        except (ValueError, TypeError) as e:
+            raise ValueError(
+                f"Corrupt target_ttc_ms {raw_ttc!r} in {context}: {e}"
+            ) from e
+        if not math.isfinite(val):
+            raise ValueError(
+                f"Non-finite target_ttc_ms {raw_ttc!r} in {context}"
+            )
+        return val
+
+    if target_ttc_ms is not None and len(target_ttc_ms) == B:
+        # Path 1: Persisted declared metadata in dataset
         for i in range(B):
-            L = int(lengths[i].item())
-            vis = X_seqs[i, :L, VISUAL_ANGLE_IDX].abs()
-            wind = X_seqs[i, :L, 1]
-            has_vis = bool((vis > 1e-4).any().item())
-            has_wind = bool((wind > 0.5).any().item())
-            if has_vis and has_wind:
-                wind_indices = (wind > 0.5).nonzero(as_tuple=False)
-                wind_onset = int(wind_indices[0].item()) if wind_indices.numel() > 0 else 0
-                ref_frame = stim_onset_frame if (stim_onset_frame is not None and stim_onset_frame < L) else int(torch.argmax(vis).item())
-                if abs(wind_onset - ref_frame) * dt_ms < 50.0:
+            cond = (
+                stimulus_conditions[i]
+                if stimulus_conditions is not None and i < len(stimulus_conditions)
+                else None
+            )
+            is_multi = _is_multisensory(i, cond)
+            raw_ttc = target_ttc_ms[i]
+            ttc_val = _parse_ttc(raw_ttc, context=f"dataset target_ttc_ms[{i}]")
+            if is_multi:
+                if ttc_val is None:
+                    # Present-but-null/partial: keyed raw lookup when raw_dir provided
+                    info = _raw_lookup(i)
+                    ttc_val = _parse_ttc(
+                        info.get("target_ttc_ms"),
+                        context=f"raw events for index {i}",
+                    )
+                    if ttc_val is None:
+                        raise ValueError(
+                            f"Unresolved required target_ttc_ms for multisensory "
+                            f"trial index {i} after raw lookup; failing closed."
+                        )
+                n_candidates += 1
+                if abs(ttc_val - 0.0) < 1e-3:
                     mask[i] = True
+            # Unimodal: legitimate null stays null — not a candidate.
 
-    # Strict condition semantics: no TTC=0 found → raise error
-    if mask.sum() == 0:
+    elif session_ids is not None and trial_ids is not None and len(session_ids) == B and len(trial_ids) == B:
+        # Path 2: Exact keyed lookup by stable (session_id, trial_id) in declared events
+        index = _load_raw_index()
+        for i in range(B):
+            cond = (
+                stimulus_conditions[i]
+                if stimulus_conditions is not None and i < len(stimulus_conditions)
+                else None
+            )
+            if not _is_multisensory(i, cond):
+                continue
+            key = (str(session_ids[i]), int(trial_ids[i]))
+            if key not in index:
+                raise ValueError(
+                    f"Unresolved declared events key {key}; failing closed without inferred TTC0."
+                )
+            info = index[key]
+            is_multi = info["type"] in ("looming_wind", "multisensory")
+            if not is_multi:
+                continue
+            ttc_val = _parse_ttc(info.get("target_ttc_ms"), context=f"raw events {key}")
+            if ttc_val is None:
+                raise ValueError(
+                    f"Unresolved required target_ttc_ms for multisensory trial {key}; "
+                    "failing closed."
+                )
+            n_candidates += 1
+            if abs(ttc_val - 0.0) < 1e-3:
+                mask[i] = True
+    else:
+        # Legacy dataset lacking trial_ids and target_ttc_ms: fail closed
         raise ValueError(
-            "No multisensory TTC=0ms trials found in validation set. "
-            "This analysis requires exact TTC=0 trials for Bayesian reliability inference. "
-            "Check raw events files and animal-grouped validation split."
+            "No multisensory TTC=0ms trials found: dataset lacks trial_ids and target_ttc_ms "
+            "metadata required for exact TTC=0 selection. Cannot safely infer condition from kinematics. "
+            "Regenerate dataset with trial_ids or provide raw_dir."
         )
 
-    return mask
+    n_ttc0 = int(mask.sum().item())
+    status = "ok" if n_ttc0 > 0 else "not_applicable"
+    return TTC0Selection(
+        mask=mask, n_candidates=n_candidates, n_ttc0=n_ttc0, status=status
+    )
 
 
 # Visual-angle channel index in the feature dimension (X[:, :, 0]).
@@ -364,40 +621,83 @@ def inject_visual_noise(
 # Metric Extraction
 # ===================================================================
 
-def extract_gate_trajectory(internals: dict, lengths: torch.Tensor) -> np.ndarray:
+def extract_gate_trajectory(
+    internals: dict,
+    lengths: torch.Tensor,
+    anchor_frames: Optional[Sequence[int]] = None,
+    target_anchor: int = STIM_ONSET_FRAME,
+) -> np.ndarray:
     """
-    Extract mean g_gru(t) across trials at each time-step.
+    Extract mean g_gru(t) across trials at each time-step, aligned by anchor_frames.
 
     Returns: (T,) numpy array of mean gate probabilities.
     """
     g_gru = internals["routing_gates"][:, :, 1]  # (B, T)
     B, T = g_gru.shape
-    mask = torch.arange(T, device=g_gru.device).unsqueeze(0) < lengths.unsqueeze(1)
-    g_gru_masked = g_gru * mask.float()
-    count = mask.float().sum(dim=0).clamp(min=1)
-    return (g_gru_masked.sum(dim=0) / count).cpu().numpy()
+    if anchor_frames is not None and len(anchor_frames) == B:
+        aligned = torch.zeros((B, T), device=g_gru.device, dtype=g_gru.dtype)
+        mask = torch.zeros((B, T), device=g_gru.device, dtype=torch.bool)
+        for i in range(B):
+            L = int(lengths[i].item())
+            anchor_i = int(anchor_frames[i])
+            shift = target_anchor - anchor_i
+            src_start = max(0, -shift)
+            src_end = min(L, T - shift)
+            dst_start = max(0, shift)
+            dst_end = min(T, shift + L)
+            if dst_end > dst_start and src_end > src_start:
+                copy_len = min(dst_end - dst_start, src_end - src_start)
+                aligned[i, dst_start : dst_start + copy_len] = g_gru[
+                    i, src_start : src_start + copy_len
+                ]
+                mask[i, dst_start : dst_start + copy_len] = True
+        # Unobserved positions (count == 0) must be NaN, not 0 — short
+        # T < target_anchor sequences leave shifted windows empty.
+        count = mask.float().sum(dim=0)
+        safe_count = count.clamp(min=1)
+        result = aligned.sum(dim=0) / safe_count
+        result[count == 0] = float("nan")
+        return result.cpu().numpy()
+    else:
+        mask = torch.arange(T, device=g_gru.device).unsqueeze(0) < lengths.unsqueeze(1)
+        g_gru_masked = g_gru * mask.float()
+        count = mask.float().sum(dim=0)
+        safe_count = count.clamp(min=1)
+        result = g_gru_masked.sum(dim=0) / safe_count
+        result[count == 0] = float("nan")
+        return result.cpu().numpy()
 
 
 def extract_latency_to_peak(
     Y_pred: torch.Tensor,
     lengths: torch.Tensor,
-    dt_ms: float = 10.0,
+    dt_ms: float = 4.0,
     stim_onset_frame: Optional[int] = None,
-    search_window_frames: int = 1000,
-    pre_stim_window_frames: int = 500,
+    search_window_frames: Optional[int] = None,
+    pre_stim_window_frames: Optional[int] = None,
+    anchor_frames: Optional[Sequence[int]] = None,
 ) -> list[float]:
     """
-    Per-trial latency to peak velocity (ms) relative to stimulus onset.
+    Per-trial latency to peak velocity (ms) relative to stimulus onset / anchor.
 
     Searches in physiologically relevant window around stimulus onset:
-    [onset - pre_stim_window : onset + search_window] to capture both
+    [anchor - pre_stim_window : anchor + search_window] to capture both
     pre-collision escapes (biologically valid) and post-stimulus responses,
     while avoiding spurious peaks from distant baseline drift.
 
+    Returns NaN for zero/flat/nonfinite windows or zero-length trials.
+
     Args:
-        search_window_frames: Post-stimulus search window (default 1000 = 4s at 250Hz).
-        pre_stim_window_frames: Pre-stimulus search window (default 500 = 2s at 250Hz).
+        search_window_frames: Post-stimulus frames (default +4s from dt_ms).
+        pre_stim_window_frames: Pre-stimulus frames (default -2s from dt_ms).
+        anchor_frames: Optional per-trial anchor frame indices.
     """
+    if not math.isfinite(dt_ms) or dt_ms <= 0:
+        raise ValueError("dt_ms must be finite and positive")
+    if search_window_frames is None:
+        search_window_frames = math.ceil(4000.0 / dt_ms)
+    if pre_stim_window_frames is None:
+        pre_stim_window_frames = math.floor(2000.0 / dt_ms)
     if stim_onset_frame is None:
         stim_onset_frame = STIM_ONSET_FRAME
     latencies = []
@@ -408,36 +708,72 @@ def extract_latency_to_peak(
             latencies.append(float("nan"))
             continue
 
-        # Search in window around stimulus: [onset - pre_window : onset + post_window]
-        search_start = max(0, stim_onset_frame - pre_stim_window_frames)
-        search_end = min(L, stim_onset_frame + search_window_frames)
+        anchor = (
+            int(anchor_frames[i])
+            if anchor_frames is not None and i < len(anchor_frames)
+            else stim_onset_frame
+        )
+
+        # Search in window around stimulus: [anchor - pre_window : anchor + post_window]
+        search_start = max(0, anchor - pre_stim_window_frames)
+        search_end = min(L, anchor + search_window_frames)
 
         if search_start >= L or search_end <= search_start:
             latencies.append(float("nan"))
             continue
 
         vel_window = Y_pred[i, search_start:search_end]
-        peak_in_window = torch.argmax(vel_window.abs()).item()
+        if not torch.isfinite(vel_window).all():
+            latencies.append(float("nan"))
+            continue
+
+        abs_vel = vel_window.abs()
+        assert abs_vel.shape == vel_window.shape
+        if abs_vel.max().item() - abs_vel.min().item() < 1e-6:
+            # ponytail: range rejects tonic output; calibrate prominence if drift yields false peaks.
+            latencies.append(float("nan"))
+            continue
+
+        peak_in_window = torch.argmax(abs_vel).item()
         peak_frame = search_start + peak_in_window
 
-        latency_ms = (peak_frame - stim_onset_frame) * dt_ms
+        latency_ms = float((peak_frame - anchor) * dt_ms)
         latencies.append(latency_ms)
     return latencies
 
 
-def extract_peak_velocity(Y_pred: torch.Tensor, lengths: torch.Tensor) -> list[float]:
-    """Per-trial peak absolute velocity."""
+def extract_peak_velocity(
+    Y_pred: torch.Tensor,
+    lengths: torch.Tensor,
+    dt_ms: Optional[float] = None,
+    stim_onset_frame: Optional[int] = None,
+    anchor_frames: Optional[Sequence[int]] = None,
+) -> list[float]:
+    """Peak magnitude in the latency window when dt_ms is supplied; legacy full-trial otherwise."""
+    if dt_ms is not None and (not math.isfinite(dt_ms) or dt_ms <= 0):
+        raise ValueError("dt_ms must be finite and positive")
+    if stim_onset_frame is None:
+        stim_onset_frame = STIM_ONSET_FRAME
     peaks = []
     B, T = Y_pred.shape
     for i in range(B):
         L = int(lengths[i].item())
-        if L == 0:
-            peaks.append(0.0)
+        if dt_ms is None:
+            start, end = 0, L
+        else:
+            anchor = int(anchor_frames[i]) if anchor_frames is not None and i < len(anchor_frames) else stim_onset_frame
+            start = max(0, anchor - math.floor(2000.0 / dt_ms))
+            end = min(L, anchor + math.ceil(4000.0 / dt_ms))
+        if start >= end:
+            peaks.append(float("nan") if dt_ms is not None else 0.0)
             continue
-        vel = Y_pred[i, :L]
-        peaks.append(vel.abs().max().item())
+        vel = Y_pred[i, start:end]
+        if not torch.isfinite(vel).all():
+            peaks.append(float("nan"))
+            continue
+        peak = vel.abs().max().item()
+        peaks.append(peak if dt_ms is None or peak >= 1e-6 else float("nan"))
     return peaks
-
 
 # ===================================================================
 # Figure Creation
@@ -449,6 +785,7 @@ def create_figure(
     T: int,
     dt_ms: float,
     output_path: str,
+    stim_onset_frame: int = STIM_ONSET_FRAME,
 ) -> None:
     """
     Dual-panel Lancet/Cell figure.
@@ -474,9 +811,9 @@ def create_figure(
 
     # ---- Panel A: Gate trajectories ----
     ax_a = axes[0]
-    time_ms = (np.arange(T) - STIM_ONSET_FRAME) * dt_ms
+    time_ms = (np.arange(T) - stim_onset_frame) * dt_ms
 
-    for idx, sigma in enumerate(NOISE_LEVELS):
+    for idx, sigma in enumerate(gate_trajectories):
         colour = GATE_COLOURS[idx % len(GATE_COLOURS)]
         style = "-" if sigma == 0.0 else "--"
         lw = LINEWIDTH + 0.3 if sigma == 0.0 else LINEWIDTH
@@ -500,11 +837,12 @@ def create_figure(
     # ---- Panel B: Psychometric curve ----
     ax_b = axes[1]
     sigmas = sorted(latency_stats.keys())
-    means = [latency_stats[s]["mean"] for s in sigmas]
-    sems = [latency_stats[s]["sem"] for s in sigmas]
+    measured = [s for s in sigmas if latency_stats[s]["n"] > 0]
+    means = [latency_stats[s]["mean"] for s in measured]
+    sems = [latency_stats[s]["sem"] for s in measured]
 
     ax_b.errorbar(
-        sigmas,
+        measured,
         means,
         yerr=sems,
         color=LATENCY_COLOUR,
@@ -519,12 +857,12 @@ def create_figure(
     )
 
     ax_b.set_xlabel("Visual Noise Level σ (degrees)", fontsize=11)
-    ax_b.set_ylabel("Mean Latency to Peak Velocity (ms)", fontsize=11)
-    ax_b.set_title("B. Psychometric Curve", fontsize=12, fontweight="bold")
+    ax_b.set_ylabel("Mean signed latency ± trial SEM (ms; descriptive)", fontsize=11)
+    ax_b.set_title("B. Fixed recorded trials (descriptive)", fontsize=12, fontweight="bold")
     ax_b.set_xlim(-2, max(sigmas) + 5)
 
     # Annotate N per point
-    for s in sigmas:
+    for s in measured:
         n = latency_stats[s]["n"]
         ax_b.annotate(
             f"n={n}",
@@ -573,6 +911,24 @@ def main() -> None:
              "<repo>/data/processed/nsmor_dataset.pt).",
     )
     parser.add_argument(
+        "--nested_prior_artifact",
+        type=str,
+        default=None,
+        help="Optional validated nested artifact with the saved outer-validation split.",
+    )
+    parser.add_argument(
+        "--qc_sealed_nested_prior_sha256", type=str, default=None,
+        help="Optional external QC-sealed SHA-256 to check the nested checkpoint's embedded artifact digest; cannot authenticate a checkpoint missing that digest.",
+    )
+    parser.add_argument(
+        "--trusted_historical_checkpoint_sha256", type=str, default=None,
+        help="Independently pinned SHA-256 of historical checkpoint bytes (required for historical analysis).",
+    )
+    parser.add_argument(
+        "--trusted_historical_artifact_sha256", type=str, default=None,
+        help="Independently pinned SHA-256 of historical nested artifact bytes.",
+    )
+    parser.add_argument(
         "--raw_dir",
         type=str,
         default=os.path.join(_PROJECT_ROOT, "data", "raw"),
@@ -607,10 +963,12 @@ def main() -> None:
     parser.add_argument(
         "--dt_ms",
         type=float,
-        default=4.0,
-        help="Frame interval in milliseconds (250 Hz = 4.0 ms).",
+        default=None,
+        help="Frame interval in ms (default: saved model.dt_ms; explicit value must match).",
     )
     args = parser.parse_args()
+    if any(not math.isfinite(sigma) or sigma < 0 for sigma in args.noise_levels):
+        parser.error("--noise_levels requires finite nonnegative sigma values")
 
     os.makedirs(args.output_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -618,39 +976,96 @@ def main() -> None:
 
     # --- Load model & data ---
     model = load_checkpoint(args.checkpoint, device)
+    args.dt_ms = resolve_dt_ms(model, args.dt_ms)
     max_seq_len = args.max_seq_len if args.max_seq_len > 0 else None
     pre_anchor_frames = getattr(args, "pre_anchor_frames", 1200)
-    X_val, Y_val, lengths_val = load_validation_data(
+    val_data = load_validation_data(
         device,
         max_seq_len=max_seq_len,
         pre_anchor_frames=pre_anchor_frames,
         dataset_path=args.dataset,
+        nested_prior_artifact=Path(args.nested_prior_artifact) if args.nested_prior_artifact else None,
+        qc_sealed_nested_prior_sha256=args.qc_sealed_nested_prior_sha256,
+        checkpoint_model=model,
+        trusted_historical_checkpoint_sha256=args.trusted_historical_checkpoint_sha256,
+        trusted_historical_artifact_sha256=args.trusted_historical_artifact_sha256,
     )
+    X_val, Y_val, lengths_val = val_data
+    meta: TrialMeta = val_data.meta
+    validation_scope = getattr(model, "analysis_validation_scope", "historical_unscoped")
+    analysis_evidence = {
+        "validation_scope": validation_scope,
+        "sample_scope": ("outer_validation" if validation_scope == "nested_outer_validation"
+                         else "diagnostic_validation"),
+        "n_validation_rows": len(meta.val_indices),
+        "dataset_binding": getattr(model, "analysis_dataset_binding", "unverified"),
+        "holdout_eligible": False,
+        "validation_note": ("Checkpoint-selected outer validation; descriptive only, "
+                            "ineligible as independent holdout evidence"
+                            if validation_scope == "nested_outer_validation"
+                            else "Contaminated/unscoped diagnostic; ineligible for holdout or QC claims"),
+    }
 
     # --- Filter to multisensory_ttc_0ms ---
-    ttc0_mask = find_multisensory_ttc0(
+    selection = find_multisensory_ttc0(
         X_val,
         lengths_val,
         raw_dir=args.raw_dir,
-        val_indices=getattr(X_val, "val_indices", None),
-        stim_onset_frame=getattr(X_val, "stim_onset_frame", STIM_ONSET_FRAME),
+        val_indices=meta.val_indices,
+        stim_onset_frame=meta.stim_onset_frame,
         dt_ms=args.dt_ms,
+        session_ids=meta.session_ids,
+        trial_ids=meta.trial_ids,
+        target_ttc_ms=meta.target_ttc_ms,
+        stimulus_conditions=meta.stimulus_conditions,
     )
-    n_ttc0 = ttc0_mask.sum().item()
-    logger.info("multisensory_ttc_0ms trials found: %d / %d", n_ttc0, X_val.shape[0])
-    if n_ttc0 == 0:
-        logger.error("No multisensory_ttc_0ms trials found. Aborting.")
-        sys.exit(1)
+    ttc0_mask = selection.mask
+    n_ttc0 = selection.n_ttc0
+    logger.info(
+        "multisensory_ttc_0ms trials found: %d / %d (candidates=%d, status=%s)",
+        n_ttc0, X_val.shape[0], selection.n_candidates, selection.status,
+    )
+    if selection.status == "not_applicable":
+        # Structured not_applicable: missing experimental condition is
+        # legitimate (real corpus has 0 declared TTC=0). No dummy figure.
+        os.makedirs(args.output_dir, exist_ok=True)
+        summary_path = os.path.join(args.output_dir, "bayesian_reliability.json")
+        not_applicable = {
+            **analysis_evidence,
+            "status": "not_applicable",
+            "reason": (
+                "No multisensory_ttc_0ms trials found. "
+                "Declared TTC=0 subset is empty; this is a legitimate "
+                "missing experimental condition, not a data error."
+            ),
+            "requested_condition": "multisensory_ttc_0ms",
+            "n_trials_total": int(X_val.shape[0]),
+            "n_candidates": selection.n_candidates,
+            "n_ttc0": selection.n_ttc0,
+            "n_trials_matched": 0,
+            "dt_ms": args.dt_ms,
+            "raw_dir": args.raw_dir,
+        }
+        with open(summary_path, "w") as f:
+            json.dump(not_applicable, f, indent=2, allow_nan=False)
+        logger.warning(
+            "not_applicable: no multisensory_ttc_0ms trials. Summary: %s",
+            summary_path,
+        )
+        return
 
     X_ttc0 = X_val[ttc0_mask]
     Y_ttc0 = Y_val[ttc0_mask]
     L_ttc0 = lengths_val[ttc0_mask]
+    ttc0_indices = ttc0_mask.nonzero(as_tuple=False).squeeze(-1).tolist()
+    meta_ttc0 = meta.subset(ttc0_indices)
+    ttc0_anchor_frames = meta_ttc0.anchor_frames
 
     # --- Run noise sweep ---
     gate_trajectories: dict[float, np.ndarray] = {}
     latency_stats: dict = {}
     latency_arrays: dict[float, np.ndarray] = {}  # per-trial latencies (NaN=excluded)
-    snr_by_sigma: dict[float, float] = {}
+    snr_by_sigma: dict[float, Optional[float]] = {}
     derived_seeds: dict[float, Optional[int]] = {}  # Round-3 m-3a
     T = X_ttc0.shape[1]
 
@@ -668,12 +1083,13 @@ def main() -> None:
                 peak_excursions.append(float(np.abs(angle).max()))
         sig_scale = float(np.median(peak_excursions)) if peak_excursions else 0.0
         snr_db = (
-            20.0 * np.log10(sig_scale / sigma)
-            if sigma > 0.0 and sig_scale > 0.0
-            else float("inf")
+            float(20.0 * np.log10(sig_scale / sigma))
+            if sigma > 0.0 and np.isfinite(sig_scale) and sig_scale > 0.0
+            else None  # Clean σ=0 or undefined signal scale has no finite dB SNR.
         )
-        snr_by_sigma[sigma] = float(snr_db)
-        logger.info("--- Noise level σ = %.1f° (median SNR %.1f dB) ---", sigma, snr_db)
+        snr_by_sigma[sigma] = snr_db if snr_db is None or math.isfinite(snr_db) else None
+        logger.info("--- Noise level σ = %.1f° (median SNR %s dB) ---",
+                    sigma, f"{snr_db:.1f}" if snr_db is not None else "undefined")
 
         X_noisy = inject_visual_noise(
             X_ttc0, L_ttc0, sigma, seed=args.seed,
@@ -691,185 +1107,122 @@ def main() -> None:
                 X_noisy, L_ttc0, return_internals=True
             )
 
-        # Gate trajectory
-        gate_traj = extract_gate_trajectory(internals, L_ttc0)
+        # Gate trajectory — align to the per-run stim onset so the
+        # trajectory origin, figure time axis, and post-stim split all
+        # share one coordinate frame (F1: nondefault --pre_anchor_frames).
+        gate_traj = extract_gate_trajectory(
+            internals, L_ttc0, anchor_frames=ttc0_anchor_frames,
+            target_anchor=meta.stim_onset_frame,
+        )
         gate_trajectories[sigma] = gate_traj
+        post_stim_gate = gate_traj[meta.stim_onset_frame:]
+        valid_gate = post_stim_gate[np.isfinite(post_stim_gate)]
+        mean_post_gate = float(np.mean(valid_gate)) if valid_gate.size > 0 else float("nan")
         logger.info(
             "  g_gru mean (post-stim): %.4f",
-            gate_traj[STIM_ONSET_FRAME:].mean(),
+            mean_post_gate,
         )
 
         # Latency
         latencies = extract_latency_to_peak(
             Y_pred, L_ttc0, dt_ms=args.dt_ms,
-            stim_onset_frame=getattr(X_val, "stim_onset_frame", STIM_ONSET_FRAME),
+            stim_onset_frame=meta.stim_onset_frame,
+            anchor_frames=ttc0_anchor_frames,
         )
         latency_arrays[sigma] = np.asarray(latencies, dtype=np.float64)
-        valid = latency_arrays[sigma][~np.isnan(latency_arrays[sigma])]
-        mean_lat = float(np.mean(valid)) if valid.size else float("nan")
+        valid = latency_arrays[sigma][np.isfinite(latency_arrays[sigma])]
+        mean_lat = float(np.mean(valid)) if valid.size else None
         sem_lat = (
             float(np.std(valid, ddof=1) / np.sqrt(valid.size))
-            if valid.size > 1 else 0.0
+            if valid.size > 1 else 0.0 if valid.size else None
         )
         latency_stats[sigma] = {
             "mean": mean_lat,
             "sem": sem_lat,
             "n": int(valid.size),
-            "n_excluded_prestim_peak": int(np.isnan(latency_arrays[sigma]).sum()),
-            "std": float(np.std(valid, ddof=1)) if valid.size > 1 else 0.0,
+            # Honest label: NaN exclusions cover flat/zero/nonfinite windows
+            # and zero-length trials, not only prestim peaks.
+            "n_excluded": int((~np.isfinite(latency_arrays[sigma])).sum()),
+            "std": float(np.std(valid, ddof=1)) if valid.size > 1 else 0.0 if valid.size else None,
         }
         # Round-2 fix (Reviewer B M-1c): report the VALID count, not the
         # raw array length (which includes NaN-excluded trials).
-        logger.info("  Latency: %.1f ± %.1f ms (n=%d)", mean_lat, sem_lat, int(valid.size))
+        logger.info("  Latency: %s ± %s ms (n=%d)",
+                    f"{mean_lat:.1f}" if mean_lat is not None else "unavailable",
+                    f"{sem_lat:.1f}" if sem_lat is not None else "unavailable", int(valid.size))
 
         # Peak velocity
-        peaks = extract_peak_velocity(Y_pred, L_ttc0)
-        logger.info("  Peak Vel: %.2f cm/s", float(np.mean(peaks)))
+        peaks = extract_peak_velocity(
+            Y_pred, L_ttc0, dt_ms=args.dt_ms,
+            stim_onset_frame=meta.stim_onset_frame,
+            anchor_frames=ttc0_anchor_frames,
+        )
+        finite_peaks = np.asarray(peaks)[np.isfinite(peaks)]
+        logger.info("  Peak Vel (signed-latency window -2/+4s): %.2f cm/s (n=%d)",
+                    float(np.mean(finite_peaks)) if finite_peaks.size else float("nan"),
+                    int(finite_peaks.size))
 
-    # --- Inferential statistics (Reviewer Round-1 BLOCKER-3) ---
-    # Paired comparisons of per-trial latency against the clean
-    # condition (σ=0).  Trials are PAIRED (identical stimulus set at
-    # every noise level); noise realisations are independent across σ.
-    # Holm-Bonferroni controls the family-wise error rate across the
-    # multiple σ levels; the Hodges-Lehmann location shift quantifies
-    # effect size, matched to the Wilcoxon signed-rank test (Round-3
-    # CRITICAL-4B: single fixed test — no Shapiro pre-test gate).
-    #
-    # Round-2 fixes:
-    # * Reviewer B M-1a: p_values / effect_sizes / corrected are bound
-    #   unconditionally so the JSON construction below cannot hit a
-    #   NameError when σ=0 is absent from --noise_levels.
-    # * Reviewer B M-1b: exclusion is ANCHORED ON THE CLEAN CONDITION —
-    #   a trial excluded at σ=0 is excluded from every condition, so all
-    #   conditions are tested on the identical stimulus set.  Per-
-    #   condition exclusion counts are reported.
-    # * Reviewer A MAJOR-D-1/2: NaN p-values and zero-variance paired
-    #   differences are REMOVED from the Holm family (and counted),
-    #   never imputed as "no effect" — matching the lesion-script
-    #   standard adopted in this same PR.
-    from nsmor.analysis.uq import holm_bonferroni
-    from scipy import stats as sp_stats
-
-    p_values: dict[float, float] = {}
+    # Paired descriptive contrasts on the fixed recorded TTC=0 trial set.
+    # A session/recording prefix is not a verified animal identity. Trials
+    # can share an animal, so their contrasts cannot supply animal-level p
+    # values, multiplicity corrections, or confidence intervals. Keep the
+    # observed model shift, including constant positive shifts for which a
+    # trial-level significance test would be degenerate.
     effect_sizes: dict[float, float] = {}
-    corrected: dict = {}
-
     if 0.0 in latency_arrays:
         baseline = latency_arrays[0.0]
-        clean_valid = ~np.isnan(baseline)
-
+        clean_valid = np.isfinite(baseline)
         for sigma in args.noise_levels:
             if sigma == 0.0:
                 continue
             noisy = latency_arrays[sigma]
-            # Identical stimulus set across conditions: anchor on the
-            # clean-condition exclusions.
-            valid = clean_valid & ~np.isnan(noisy)
+            # Each contrast uses trials measured in both this condition
+            # and the clean condition; missing responses stay excluded.
+            valid = clean_valid & np.isfinite(noisy)
             n_pairs = int(valid.sum())
             latency_stats[sigma]["n_pairs_vs_clean"] = n_pairs
-            if n_pairs < 3:
-                logger.warning(
-                    "σ=%.1f°: only %d complete pairs — test skipped.",
-                    sigma, n_pairs,
-                )
+            if not n_pairs:
                 continue
-            b, q = baseline[valid], noisy[valid]
-
-            diffs = q - b
-
-            # Zero-variance paired differences are degenerate samples:
-            # exclude from the family and count (Reviewer A MAJOR-D-2).
-            sd_diff = float(np.std(diffs, ddof=1))
-            if sd_diff <= 1e-12:
-                logger.warning(
-                    "σ=%.1f°: zero-variance paired differences "
-                    "(n=%d) — excluded from test family.",
-                    sigma, n_pairs,
-                )
+            diffs = noisy[valid] - baseline[valid]
+            if n_pairs > 1 and float(np.std(diffs, ddof=1)) <= 1e-12:
                 latency_stats[sigma]["n_degenerate_zero_variance"] = n_pairs
-                latency_stats[sigma]["test"] = "excluded_zero_variance"
-                continue
 
-            # Round-3 fix (Reviewer B CRITICAL-4B): the Shapiro-Wilk
-            # pre-test gate inflates type-I error (pre-test dilemma) and
-            # mixing Wilcoxon p-values with Cohen's d_z is a paradigm
-            # mismatch.  The paired design now uses a SINGLE test:
-            # Wilcoxon signed-rank with the Hodges-Lehmann estimate as
-            # effect size (median of pairwise averages of the diffs) —
-            # distribution-free, no pre-test, effect and test measure
-            # the same quantity.  Normality is still REPORTED
-            # descriptively (Shapiro-Wilk W logged per condition) so
-            # readers can judge approximate symmetry, but it no longer
-            # selects the procedure.
-            stat, p_raw = sp_stats.wilcoxon(q, b)
-            test_name = "Wilcoxon_signed_rank"
-
-            # NaN p-values are numerical pathologies, not null results:
-            # exclude from the family and count (Reviewer A MAJOR-D-1).
-            if np.isnan(p_raw):
-                logger.warning(
-                    "σ=%.1f°: %s returned NaN p-value — excluded "
-                    "from Holm family.", sigma, test_name,
-                )
-                latency_stats[sigma]["n_nan_pvalue_excluded"] = 1
-                latency_stats[sigma]["test"] = f"{test_name}_nan_pvalue"
-                continue
-
-            # Hodges-Lehmann location shift: median over all pairwise
-            # averages of the differences — the effect measure matched
-            # to the Wilcoxon signed-rank test (Round-3 CRITICAL-4B).
+            # Descriptive Hodges-Lehmann location of paired trial shifts;
+            # no population test is attached to this fixed-set estimate.
             pairwise_avg = (
                 diffs[:, None] + diffs[None, :]
             )[np.triu_indices(n_pairs, k=1)]
-            hl = float(np.median(
-                np.concatenate([pairwise_avg, diffs])
-            )) if n_pairs > 1 else float(np.median(diffs))
-            p_values[sigma] = float(p_raw)
+            hl = float(np.median(np.concatenate([pairwise_avg, diffs])))
             effect_sizes[sigma] = hl
-            latency_stats[sigma]["test"] = test_name
             latency_stats[sigma]["hodges_lehmann_ms"] = hl
-            # Descriptive normality diagnostic (does NOT gate the test).
-            if n_pairs >= 3 and n_pairs <= 5000:
-                W_stat, W_p = sp_stats.shapiro(diffs)
-                latency_stats[sigma]["shapiro_W"] = float(W_stat)
-                latency_stats[sigma]["shapiro_p"] = float(W_p)
-
-        corrected = holm_bonferroni(p_values) if p_values else {}
-        logger.info("-" * 60)
-        logger.info(
-            "Inference: post-stimulus latency vs clean condition "
-            "(identical stimulus set anchored on σ=0 exclusions, "
-            "Holm-Bonferroni corrected):"
-        )
-        for sigma in sorted(p_values):
-            adj_p, sig = corrected.get(sigma, (1.0, False))
             logger.info(
-                "  σ=%.1f° vs σ=0°: HL=%+.3f ms, %s p=%.4f (corrected), %s",
-                sigma, effect_sizes[sigma],
-                latency_stats[sigma].get("test", "Wilcoxon"),
-                adj_p, "*" if sig else "n.s.",
+                "  σ=%.1f° vs σ=0°: descriptive paired HL shift=%+.3f ms (n=%d)",
+                sigma, hl, n_pairs,
             )
     else:
-        logger.warning(
-            "σ=0 not among --noise_levels; no paired inference possible."
-        )
+        logger.warning("σ=0 absent; no clean-condition paired contrasts available.")
 
     # --- Create figure ---
     fig_path = os.path.join(args.output_dir, "bayesian_reliability.png")
-    create_figure(gate_trajectories, latency_stats, T, 10.0, fig_path)
+    create_figure(
+        gate_trajectories, latency_stats, T, args.dt_ms, fig_path,
+        stim_onset_frame=meta.stim_onset_frame,
+    )
 
     # --- Export JSON summary ---
     summary = {
+        **analysis_evidence,
         "noise_levels": args.noise_levels,
         "n_ttc0_trials": n_ttc0,
-        "stim_onset_frame": STIM_ONSET_FRAME,
+        "n_candidates": selection.n_candidates,
+        "stim_onset_frame": meta.stim_onset_frame,
+        "dt_ms": args.dt_ms,
         # Round-1 (Reviewer A MAJOR-2): explicit scope + SNR semantics
         "scope": (
             "Routing-gate sensitivity to VISUAL-channel noise. "
             "MCMC prior columns held fixed across conditions; this is "
-            "NOT a Bayesian cue-combination test. Latencies are "
-            "post-stimulus-peak only (pre-stimulus peaks reported as "
-            "NaN and excluded)."
+            "NOT a Bayesian cue-combination test. Descriptive model perturbations "
+            "on fixed recorded trials; animal population inference unavailable. " + LATENCY_SCOPE
         ),
         "snr_definition": (
             "SNR_dB = 20*log10(median peak |visual_angle| / sigma); "
@@ -879,6 +1232,7 @@ def main() -> None:
         # Round-2 fix (Reviewer A MAJOR-D-4): per-sigma SNR values are
         # persisted so the summary is statistically self-contained.
         "snr_db_by_sigma": {str(k): v for k, v in snr_by_sigma.items()},
+        "snr_clean_condition": "null: σ=0 has no finite dB SNR; null for undefined signal scale",
         "noise_seed": args.seed,
         # Round-3 (Reviewer A m-3a): per-σ derived seeds for exact
         # per-condition reproduction.
@@ -887,36 +1241,62 @@ def main() -> None:
         },
         "noise_realisations": (
             "independent per sigma level (seed + 1000003*sigma_index); "
-            "pairing unit is the stimulus trial"
+            "paired contrasts use the recorded stimulus trial; "
+            "independent animal identities are unverified"
         ),
+        "latency_dispersion": "SD and SEM describe variation across recorded trials; SEM is not an animal-level confidence interval",
         "latency_stats": {
             str(k): v for k, v in latency_stats.items()
         },
         "gate_post_stim_mean": {
-            str(sigma): float(gate_trajectories[sigma][STIM_ONSET_FRAME:].mean())
+            str(sigma): (
+                float(np.mean(gate_trajectories[sigma][meta.stim_onset_frame:][np.isfinite(gate_trajectories[sigma][meta.stim_onset_frame:])]))
+                if np.any(np.isfinite(gate_trajectories[sigma][meta.stim_onset_frame:]))
+                else None
+            )
             for sigma in args.noise_levels
         },
         "inference": {
-            "design": "paired per trial (identical stimulus set anchored "
-                      "on σ=0 exclusions), independent noise "
-                      "realisations across σ levels",
-            "correction": "Holm-Bonferroni step-down (FWER α=0.05)",
-            # Round-3 (CRITICAL-4B): single fixed test, no pre-test gate.
-            "test": "Wilcoxon signed-rank (paired)",
-            "effect_size": "Hodges-Lehmann location shift (ms)",
-            "p_values_uncorrected": {str(k): v for k, v in p_values.items()},
-            "p_values_holm_corrected": (
-                {str(k): v[0] for k, v in corrected.items()} if corrected else {}
+            "status": "descriptive_only",
+            "design": (
+                "paired contrasts on the fixed recorded trial set; clean-condition "
+                "exclusions plus complete pairs per noise level; noise realisations "
+                "separate across σ levels" if 0.0 in latency_arrays
+                else "σ=0 absent; no paired contrasts on fixed recorded trial set"
             ),
+            "independent_animal_count": None,
+            "population_inference_status": "unavailable_unverified_animal_identity_and_independence",
+            "correction": None,
+            "test": None,
+            "effect_size": "descriptive paired-trial Hodges-Lehmann shift (ms); fixed recorded trials only",
+            "p_values_uncorrected": None,
+            "p_values_holm_corrected": None,
             "effect_sizes_hodges_lehmann_ms": {
                 str(k): v for k, v in effect_sizes.items()
             },
-        } if 0.0 in latency_arrays else {"design": "σ=0 absent — no paired inference"},
+        },
     }
     json_path = os.path.join(args.output_dir, "psychophysics_summary.json")
     with open(json_path, "w") as f:
-        json.dump(summary, f, indent=2)
+        json.dump(summary, f, indent=2, allow_nan=False)
     logger.info("JSON summary saved → %s", json_path)
+
+    # Status artefact for Phase G runner gate
+    status_path = os.path.join(args.output_dir, "bayesian_reliability.json")
+    latency_available = any(stats["n"] > 0 for stats in latency_stats.values())
+    status_data = {
+        **analysis_evidence,
+        "status": "ok" if latency_available else "unavailable_latency",
+        "n_ttc0": n_ttc0,
+        "n_candidates": selection.n_candidates,
+        "n_trials_total": int(X_val.shape[0]),
+        "dt_ms": args.dt_ms,
+    }
+    if not latency_available:
+        status_data["reason"] = "No finite latency at any measured visual-noise level."
+    with open(status_path, "w") as f:
+        json.dump(status_data, f, indent=2, allow_nan=False)
+    logger.info("Status artefact saved → %s", status_path)
 
     logger.info("Done. All outputs in %s", args.output_dir)
 

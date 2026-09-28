@@ -1012,6 +1012,8 @@ def extract_and_cluster_gates(
         "fingerprints_scaled": cluster_result["fingerprints_scaled"],
         "k_opt": cluster_result["k_opt"],
         "silhouette_scores": cluster_result["silhouette_scores"],
+        "stability_scores": cluster_result["stability_scores"],
+        "k_selection_basis": cluster_result["k_selection_basis"],
         "labels_k4": cluster_result["labels_k4"],
         "labels_k3": cluster_result["labels_k3"],
         "labels_kopt": cluster_result["labels_kopt"],

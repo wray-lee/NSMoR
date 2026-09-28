@@ -26,6 +26,7 @@ from typing import Any, Dict, Optional, Tuple
 import torch
 
 from nsmor.model_nsmor_core import NSMoRCore
+from nsmor.pipeline.nested_prior import load_artifact_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -132,6 +133,7 @@ def _extract_model_params(
 def load_model_from_checkpoint(
     checkpoint_path: Path,
     device: torch.device,
+    checkpoint_payload: Optional[Dict[str, Any]] = None,
 ) -> NSMoRCore:
     """
     Load a trained NSMoRCore model from a checkpoint file.
@@ -145,20 +147,23 @@ def load_model_from_checkpoint(
     Args:
         checkpoint_path: Path to the ``.pth`` checkpoint file.
         device: Device to load the model onto.
+        checkpoint_payload: Optional already-deserialized checkpoint. When supplied,
+            reconstruct from this object without reopening checkpoint_path.
 
     Returns:
         Loaded model in eval mode.
 
     Raises:
-        FileNotFoundError: If the checkpoint file does not exist.
+        FileNotFoundError: If the checkpoint file does not exist and no payload is supplied.
     """
-    if not checkpoint_path.exists():
-        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-
-    logger.info("Loading checkpoint from %s", checkpoint_path)
-    checkpoint = torch.load(
-        checkpoint_path, map_location=device, weights_only=False,
-    )
+    if checkpoint_payload is None:
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+        logger.info("Loading checkpoint from %s", checkpoint_path)
+        checkpoint = load_artifact_bytes(checkpoint_path.read_bytes(), map_location=device)
+    else:
+        logger.info("Restoring model from preloaded checkpoint %s", checkpoint_path)
+        checkpoint = checkpoint_payload
 
     # ── Provenance check (Round-2 CRITICAL-A / m-2) ──
     # Old checkpoints interpret time constants in FRAME units; loading
@@ -219,60 +224,83 @@ def load_model_from_checkpoint(
 # 2b. Dataset provenance guard (Round-2 CRITICAL-A)
 # ═══════════════════════════════════════════════════════════════
 
+def resolve_dataset_session_ids(dataset: Dict[str, Any]):
+    """Resolve the row identities accepted by the provenance gate for every split caller."""
+    sessions = dataset.get("session_ids")
+    specs = dataset.get("trial_specs")
+    if sessions is None and isinstance(specs, (list, tuple)):
+        sessions = [spec.get("session_id") if isinstance(spec, dict) else None
+                    for spec in specs]
+    return sessions
+
+
 def validate_dataset_provenance(
     dataset: Dict[str, Any],
     path: Path,
-    require_animal_grouped_priors: bool = True,
-) -> None:
+    require_recording_prefix_grouped_priors: bool = True,
+    *,
+    require_animal_grouped_priors: Optional[bool] = None,
+) -> Optional[str]:
+    """Check pipeline version and recording-prefix OOF lineage.
+
+    Distinct prefixes are not verified animals. Historical animal-named
+    artifacts remain loadable with explicit historical_unknown status.
     """
-    Assert that a loaded ``nsmor_dataset.pt`` was produced by the
-    current pipeline semantics and animal-grouped MCMC cross-fitting.
-
-    Pre-2.0 datasets contain same-sample-leaked MCMC priors and
-    ``np.max``-based labels; every downstream analysis run on them is
-    scientifically invalid, so loading must fail loudly.
-
-    Also asserts that ``mcmc_prior_provenance`` indicates animal-grouped
-    cross-fitting ('oof_<N>fold_animal_grouped_cv') to prevent training
-    or evaluation on session-grouped leaked priors.
-
-    Checks the version string and prior provenance. The condition stamp
-    (stimulus_conditions, is_pure_wind) was added in v2.1 but is not gated
-    here: its absence is a valid state for corpora that predate the ETL
-    change, and consumers that need it must check explicitly and derive
-    on the fly when missing.
-
-    Args:
-        dataset: The dict returned by ``torch.load`` on a dataset file.
-        path: File path (for error text only).
-        require_animal_grouped_priors: If True, raises RuntimeError if
-            ``mcmc_prior_provenance`` is missing or not animal-grouped.
-
-    Raises:
-        RuntimeError: If the provenance stamp is missing or mismatched.
-    """
-    import re
     from nsmor.checkpoint import _require_pipeline_version
-    _require_pipeline_version(
-        dataset.get("pipeline_semantics_version"),
-        f"dataset {path}",
-    )
+    from nsmor.pipeline.grouping import animal_of, prior_identity_status
 
-    prior_prov = dataset.get("mcmc_prior_provenance")
-    is_valid_prov = bool(
-        prior_prov is not None
-        and re.match(r"^oof_\d+fold_animal_grouped_cv$", str(prior_prov))
-    )
-    if not is_valid_prov:
-        msg = (
-            f"dataset {path} has missing or invalid 'mcmc_prior_provenance': "
-            f"{prior_prov!r}. Expected format 'oof_<N>fold_animal_grouped_cv'. "
-            "Corpora without animal-grouped cross-fitting contain session-grouped "
-            "leaked MCMC priors and are scientifically invalid."
+    # Historical keyword controls the same prefix-lineage gate, never animal proof.
+    if require_animal_grouped_priors is not None:
+        require_recording_prefix_grouped_priors = require_animal_grouped_priors
+    _require_pipeline_version(dataset.get("pipeline_semantics_version"), f"dataset {path}")
+    try:
+        status = prior_identity_status(
+            dataset.get("mcmc_prior_provenance"), dataset.get("animal_identity_status")
         )
-        if require_animal_grouped_priors:
-            raise RuntimeError(msg)
+    except ValueError as exc:
+        msg = f"dataset {path}: {exc}"
+        if require_recording_prefix_grouped_priors:
+            raise RuntimeError(msg) from exc
         logger.warning(msg)
+        return None
+    if status == "unverified":
+        # The current prefix claim requires usable identities for every stored trial.
+        specs = dataset.get("trial_specs")
+        sessions = resolve_dataset_session_ids(dataset)
+        rows = dataset.get("X_seqs", specs)
+        try:
+            n_rows = len(rows) if rows is not None else len(sessions)
+            usable = (
+                n_rows > 0
+                and sessions is not None
+                and not isinstance(sessions, (str, bytes, dict))
+                and len(sessions) == n_rows
+                and all(isinstance(value, str) and value.strip()
+                        and animal_of(value).strip()
+                        and value.strip().lower() not in ("nan", "none") for value in sessions)
+                and (specs is None or len(specs) == n_rows
+                     and all(spec.get("session_id") == session
+                             for spec, session in zip(specs, sessions)))
+            )
+        except (TypeError, AttributeError):
+            usable = False
+        if not usable:
+            raise RuntimeError(
+                f"dataset {path}: recording-prefix lineage requires aligned usable session_ids"
+            )
+    if status == "historical_unknown":
+        logger.warning("dataset %s: historical prefix grouping; animal identity unknown", path)
+    return status
+
+
+def require_trusted_historical_checkpoint_sha256(actual_digest: str, trusted_digest: Any) -> None:
+    """Authorize historical checkpoint bytes using an independently supplied SHA-256."""
+    pins = (trusted_digest,) if isinstance(trusted_digest, str) else trusted_digest
+    if (not isinstance(pins, (tuple, list, set)) or not pins
+            or any(not isinstance(pin, str) or len(pin) != 64
+                   or any(c not in "0123456789abcdef" for c in pin) for pin in pins)
+            or actual_digest not in pins):
+        raise ValueError("Historical checkpoint requires explicit trusted_historical_checkpoint_sha256 matching captured checkpoint bytes")
 
 
 # ═══════════════════════════════════════════════════════════════

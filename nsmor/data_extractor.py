@@ -33,6 +33,7 @@ from nsmor.config import (
     FeatureConfig,
     TimeWindowConfig,
 )
+from nsmor.pipeline.events import parse_event_details
 from nsmor.pipeline.kinematics import mirror_to_right
 
 
@@ -60,54 +61,98 @@ def resolve_snapshot_anchor(
     trial_data: Dict[str, np.ndarray],
     stimulus_onset_ms: float,
 ) -> Tuple[float, str]:
-    """
-    Locate the reference instant the MCMC Snapshot is offset from.
+    """Return wind onset or the trial's geometric looming collision, in ms.
 
-    Two rules, because the two stimulus conditions put their decisive
-    moment in different places:
-
-    ``"stimulus_onset"``
-        Any trial carrying wind.  ``stimulus_onset_ms`` is the first
-        wind-on frame, which for the real corpus already sits close to the
-        looming collision (measured median 6714 ms against a collision at
-        6873 ms).  Wind is the potent escape trigger, so its arrival is
-        the decision-relevant instant, and this rule is left exactly as it
-        was — the 288 multisensory and 72 pure-wind Snapshots of the real
-        corpus are unchanged by this function's introduction.
-
-    ``"looming_collision"``
-        Visual-only trials.  Their looming begins at the ``TrialStart ->
-        Looming`` transition, i.e. the same instant as ``trial_start``, so
-        ``stimulus_onset_ms`` is 0 and offsetting backwards from it lands
-        before the first frame.  Every visual-only trial in the corpus was
-        therefore dropped: 36 of 396, all No_Response, none surviving —
-        and because the drop happens before sequence extraction, those
-        trials disappear from the regression training set as well.  The
-        collision is located by the visual-angle peak, which measured
-        6873.0 ms (median) against a geometric collision time of 6874.8 ms
-        for l/v = 120 ms at a 2 deg initial angle — inside one 250 Hz
-        frame — so no stimulus-geometry constant is assumed here.
-
-    Args:
-        trial_data: From :func:`pipeline.io.extract_trial_data`.
-        stimulus_onset_ms: Absolute time of stimulus onset.
-
-    Returns:
-        ``(anchor_ms, anchor_rule)``.  The rule is returned rather than
-        inferred so a mixed-anchor dataset stays auditable.
+    Visual-only collision = looming onset + l/v / tan(initial angle / 2).
+    trial_start details supply lv_ratio_ms and, when declared, init_deg.
+    Legacy events omit init_deg: recover it from the unclipped converted
+    trace and elapsed times. Declared angles must agree with its majority.
+    Phase-transition / explicit looming-onset times share the trial clock;
+    stimulus_onset_ms is the fallback for canonical trials without those rows.
+    Wind-bearing trials retain their original anchor without geometry parsing.
     """
     visual_angle = np.asarray(trial_data["visual_angle"], dtype=np.float64)
     wind_state = np.asarray(trial_data["wind_state"], dtype=np.float64)
-
-    has_looming = bool(np.any(np.abs(visual_angle) > 0.0))
     has_wind = bool(np.any(np.abs(wind_state) > 0.0))
+    if has_wind:
+        return float(stimulus_onset_ms), "stimulus_onset"
+    if not np.isfinite(visual_angle).all():
+        raise ValueError("Visual geometry must be finite.")
+    has_looming = bool(np.any(np.abs(visual_angle) > 0.0))
+    if not has_looming:
+        return float(stimulus_onset_ms), "stimulus_onset"
 
-    if has_looming and not has_wind:
-        time_ms = np.asarray(trial_data["time_ms"], dtype=np.float64)
-        collision_idx = int(np.argmax(visual_angle))
-        return float(time_ms[collision_idx]), "looming_collision"
+    time_ms = np.asarray(trial_data["time_ms"], dtype=np.float64)
+    lv_trace = np.asarray(trial_data["l_v_ratio"], dtype=np.float64)
+    assert time_ms.ndim == 1
+    assert visual_angle.shape == wind_state.shape == lv_trace.shape == time_ms.shape
+    if not time_ms.size or not all(np.isfinite(a).all() for a in (time_ms, visual_angle, lv_trace)):
+        raise ValueError("Visual collision requires nonempty finite trial geometry and times.")
+    if np.any(np.diff(time_ms) < 0.0):
+        raise ValueError("Visual collision requires ordered trial times.")
 
-    return float(stimulus_onset_ms), "stimulus_onset"
+    event_times = np.asarray(trial_data.get("event_times", []), dtype=np.float64)
+    event_types = np.asarray(trial_data.get("event_types", []))
+    event_values = np.asarray(trial_data.get("event_values", [None] * len(event_times)), dtype=object)
+    assert event_times.shape == event_types.shape == event_values.shape
+    details = {}
+    onsets = []
+    for kind, stamp, value in zip(event_types, event_times, event_values):
+        if kind == "trial_start" and not details:
+            details = parse_event_details(value)
+        elif kind == "looming_onset" or (
+            kind == "phase_transition" and parse_event_details(value).get("to_phase") == "Looming"
+        ):
+            onsets.append(float(stamp))
+    onset_ms = min(onsets) if onsets else float(stimulus_onset_ms)
+    positive_lv = lv_trace[lv_trace > 0.0]
+    raw_lv = details.get("lv_ratio_ms", positive_lv[0] if positive_lv.size else 0.0)
+    raw_init = details.get("init_deg")
+    try:
+        if isinstance(raw_lv, (bool, np.bool_)) or isinstance(raw_init, (bool, np.bool_)):
+            raise ValueError("boolean geometry")
+        lv_ms = float(raw_lv)
+        init_deg = float(raw_init) if "init_deg" in details else None
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Visual collision has invalid lv_ratio_ms / init_deg metadata.") from exc
+    if not np.isfinite(onset_ms) or not np.isfinite(lv_ms) or lv_ms <= 0.0:
+        raise ValueError("Visual collision requires finite onset and positive finite l/v in ms.")
+    # Half a float32 epsilon covers round-to-nearest storage of a positive l/v;
+    # no absolute floor can turn zero or a materially different ratio into agreement.
+    if not positive_lv.size or not np.all(np.isclose(
+        lv_trace[lv_trace != 0.0], lv_ms,
+        rtol=np.finfo(np.float32).eps / 2, atol=0.0,
+    )):
+        raise ValueError("Visual collision l/v trace disagrees with trial geometry.")
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+        if init_deg is not None and (not np.isfinite(init_deg) or not 0.0 < init_deg < 180.0):
+            raise ValueError("Visual collision requires a finite initial angle strictly between 0 and 180 degrees.")
+        samples = np.flatnonzero((visual_angle > 0.0) & (visual_angle < 179.0))
+        if samples.size < 3:
+            raise ValueError("Visual collision needs at least three unclipped angle samples.")
+        durations = (np.maximum(0.0, time_ms[samples] - onset_ms) +
+                     lv_ms / np.tan(np.deg2rad(visual_angle[samples] / 2.0)))
+        duration_ms = (float(np.median(durations)) if init_deg is None else
+                       float(lv_ms / np.tan(np.deg2rad(init_deg / 2.0))))
+        # One frame may be wrong; the majority must agree within 1 ms or
+        # 0.1% of the physical time to collision, whichever is larger.
+        if (not np.isfinite(duration_ms) or duration_ms <= 0.0 or
+                np.count_nonzero(np.abs(durations - duration_ms) <=
+                                 max(1.0, duration_ms * 0.001)) <= samples.size // 2):
+            if init_deg is not None:
+                raise ValueError("Visual collision declared initial angle disagrees with unclipped angle trace.")
+            raise ValueError("Visual collision trace disagrees with a single trial geometry.")
+        if init_deg is None:
+            init_deg = float(np.rad2deg(2.0 * np.arctan2(lv_ms, duration_ms)))
+        collision_ms = onset_ms + lv_ms / np.tan(np.deg2rad(init_deg / 2.0))
+    if not np.isfinite(collision_ms) or collision_ms <= onset_ms:
+        raise ValueError("Visual collision is not a finite time after looming onset.")
+    if collision_ms < time_ms[0] or collision_ms > time_ms[-1]:
+        raise ValueError(
+            f"Visual collision {collision_ms:.1f} ms is outside recorded trial "
+            f"[{time_ms[0]:.1f}, {time_ms[-1]:.1f}] ms."
+        )
+    return float(collision_ms), "looming_collision"
 
 
 def _extract_background_features(
@@ -189,7 +234,8 @@ def extract_mcmc_snapshot(
         1-D array, shape ``(5,)``.
 
     Raises:
-        ValueError: If the snapshot time precedes the first frame.
+        ValueError: If geometry is invalid, the snapshot precedes the first
+            frame, or a visual-only snapshot is nonfinite / after the last frame.
     """
     anchor_ms, anchor_rule = resolve_snapshot_anchor(
         trial_data, stimulus_onset_ms,
@@ -197,6 +243,14 @@ def extract_mcmc_snapshot(
     snapshot_time_ms = anchor_ms + ttc_offset_ms
     time_ms = trial_data["time_ms"]
 
+    if anchor_rule == "looming_collision":
+        if not np.isfinite(snapshot_time_ms):
+            raise ValueError("Visual snapshot time must be finite.")
+        if snapshot_time_ms > time_ms[-1]:
+            raise ValueError(
+                f"Visual snapshot time {snapshot_time_ms:.1f} ms is after trial end "
+                f"{time_ms[-1]:.1f} ms (collision={anchor_ms:.1f} ms)."
+            )
     if snapshot_time_ms < time_ms[0]:
         raise ValueError(
             f"Snapshot time {snapshot_time_ms:.1f} ms is before trial "
@@ -305,7 +359,11 @@ def extract_trial_sequence(
             if n_frames > 1:
                 dt_ms_eff = float(np.median(np.diff(time_ms)))
             else:
-                dt_ms_eff = 10.0
+                raise ValueError(
+                    "Pure-wind trial with a single frame and unknown dt_ms: "
+                    "cannot compute 5.7 s baseline prepend frames. Provide an "
+                    "explicit dt_ms rather than fabricating a frame interval."
+                )
         else:
             dt_ms_eff = dt_ms
 
