@@ -22,13 +22,20 @@ Condition handling distinguishes `wind_only`, `visual_only`, `multisensory`, and
 - The skipped real-data alignment test requires unavailable `nsmor_subset_small.pt`.
 - Stage-1 descriptive corpus check: 256 files (128 kinematics and 128 events), 2,432 trial pairs, 166 declared prefix trials / 167 rows, 2,431 fitted trials plus one singleton, and no structural failures before residual rejection. The zero-tolerance diagnostic exits before the production helper's final mapped-axis check for positive-residual fits; this count does not certify every reconstructed axis. Maximum leave-one-out residual summary: median 24.283855 ms, P95 35.396806 ms, maximum 108.340565 ms.
 
-These residuals describe host-arrival association only. They do not establish scientific timing acceptance, biological response-window robustness, model convergence, independent-animal inference, or an untouched holdout.
+- Stage-2 descriptive axis and prefix sensitivity: 22 deterministic diagnostic tests passed. The pinned corpus run rechecked 256 input files and artifact hashes before/after, reconstructed 2,431 strictly increasing fitted suffix axes plus one host-only singleton, and covered all 166 declared prefixes / 167 rows. Both prefix alternatives were strictly increasing in these cases; this does not select either as physical truth.
+- Prefix origin difference (cadence estimate minus original-host prefix): minimum -4.912455 ms, median -1.432334 ms, maximum 0.932573 ms. Across the reported boundary rows, the maximum absolute differences were 2.528680 cm/s in velocity and 1,538.502596 cm/s² in acceleration. Of 1,254 trial-matched events, 31 changed recorded-window membership across 18 trials (13 `trial_start`, 18 `phase_transition`). These nonzero sensitivities must not be reported as evidence that prefix reconstruction is harmless.
+
+These diagnostics describe host-arrival association and model-dependent prefix sensitivity only. They do not establish scientific timing acceptance, biological response-window robustness, model convergence, independent-animal inference, or an untouched holdout.
 
 ## Pending release evidence
 
-Prefix sensitivity, an evidence-based operational tolerance, staged ETL, nested-prior evaluation, training, downstream analyses, and scientific acceptance remain pending. The historical failed Stage-02 QC evidence is preserved unchanged. Missing experimental conditions and verified animal identity remain explicit limitations. No claim is made that this revision is already delivered to `main`.
+Biological response-window sensitivity, an evidence-based operational tolerance, staged ETL, nested-prior evaluation, training, downstream analyses, and scientific acceptance remain pending. The historical failed Stage-02 QC evidence is preserved unchanged. Missing experimental conditions and verified animal identity remain explicit limitations. The engineering safeguards and descriptive diagnostics are not a completed scientific release.
 
 Evidence paths (external scratch, not release artifacts):
 
 - `.scratch/combined-validation-r4/verified-wsl-An7UkhYc/`
 - `.scratch/clock-corpus-r4/verified-run-H0kiCAI6/`
+- `.scratch/clock-corpus-r4/r3-checks-qZiIekrh/` — 22 deterministic tests; source SHA bindings.
+- `.scratch/clock-corpus-r4/r3-corpus-szalVZ5Y/` — Stage-2 corpus run; report SHA256 `c909b40458e3aeb3745e700d1fa70d8f8ed1583e9359c58dd871d7579ddb709e`.
+
+Stage-2 runner: `.scratch/clock-corpus-r4/stage2_reviewed_r3.py`; tests: `.scratch/clock-corpus-r4/test_stage2_reviewed_r3.py`. Stage-1 result SHA256 is `6187c988a2eef6202e752dcd83939a6e60b2785bc6bccf8cee3a7e34d932e51b`, distinct from the historical failed-QC report. The rejected R1 execution and incomplete R2 draft are preserved separately and are not validation evidence. The first R3 test run had one error-message-regex mismatch (21 passed, 1 failed); the source already rejected the input, and the corrected assertion passed in the cited 22-test run.
