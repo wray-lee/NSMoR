@@ -2,14 +2,57 @@
 
 from __future__ import annotations
 
+import json
+
 import numpy as np
 import pytest
 
-from scripts.analyze_gating import _compute_condition_gate_stats
+from scripts.analyze_gating import _compute_condition_gate_stats, build_summary_json
+from nsmor.analysis.gating_cluster import ClusterGatingConfig
 
 
-def test_compute_condition_stats_with_is_pure_wind():
-    """Compute stats when is_pure_wind metadata is present."""
+def test_summary_excludes_unclassified_trials_and_preserves_conditions() -> None:
+    """Only explicit visual-present trials enter the routing contrast."""
+    sequences = [
+        {"stimulus_condition": "wind_only", "is_pure_wind": True},
+        {"stimulus_condition": "visual_only", "is_pure_wind": False},
+        {"stimulus_condition": "multisensory", "is_pure_wind": False},
+        {"stimulus_condition": "no_stimulus", "is_pure_wind": False},
+        {"stimulus_condition": "unknown", "is_pure_wind": False},
+        {"is_pure_wind": False},
+        {"stimulus_condition": "wind_only", "is_pure_wind": False},
+    ]
+    for seq, value in zip(sequences, [0.8, 0.2, 0.4, 1.0, 1.0, 1.0, 1.0]):
+        seq.update(
+            gates=np.array([[value, 1.0 - value]]),
+            true_4way=0,
+            true_3way_merged=0,
+        )
+    result = {
+        "sequences": sequences,
+        "k_opt": 2,
+        "silhouette_scores": {},
+        "stability_scores": {},
+        "k_selection_basis": "test",
+    }
+    stats = build_summary_json(result, ClusterGatingConfig())[
+        "condition_specific_routing"
+    ]
+    assert stats["n_wind_trials"] == 1
+    assert stats["n_visual_trials"] == 2
+    assert stats["mean_g_lif_visual"] == pytest.approx(0.3)
+    assert stats["condition_counts"] == {
+        "wind_only": 1, "visual_only": 1, "multisensory": 1, "no_stimulus": 1,
+    }
+    assert stats["per_condition"]["multisensory"]["mean_g_lif"] == 0.4
+    assert stats["excluded_trial_counts"] == {
+        "unknown_condition": 1, "missing_condition": 1,
+        "conflicting_metadata": 1,
+    }
+
+
+def test_compute_condition_stats_with_is_pure_wind() -> None:
+    """A false legacy flag does not establish a visual-present trial."""
     sequences = [
         {"gate_seq": np.array([[0.8, 0.2], [0.9, 0.1]]), "is_pure_wind": True},
         {"gate_seq": np.array([[0.3, 0.7], [0.4, 0.6]]), "is_pure_wind": False},
@@ -24,13 +67,13 @@ def test_compute_condition_stats_with_is_pure_wind():
     assert "separation" in stats
     assert "cohens_d" in stats
 
-    # Wind trials: (0.8+0.9)/2=0.85, (0.7+0.8)/2=0.75 → mean=0.80
-    # Visual trials: (0.3+0.4)/2=0.35
-    assert abs(stats["mean_g_lif_wind"] - 0.80) < 0.01
-    assert abs(stats["mean_g_lif_visual"] - 0.35) < 0.01
-    assert abs(stats["separation"] - 0.45) < 0.01
+    assert stats["mean_g_lif_wind"] is None
+    assert stats["mean_g_lif_visual"] is None
+    assert stats["comparison_available"] is False
     assert stats["n_wind_trials"] == 2
-    assert stats["n_visual_trials"] == 1
+    assert stats["n_visual_trials"] == 0
+    assert stats["per_condition"]["wind_only"]["mean_g_lif"] == pytest.approx(0.8)
+    assert stats["excluded_trial_counts"] == {"missing_condition": 1}
 
 
 def test_compute_condition_stats_with_stimulus_condition():
@@ -48,6 +91,9 @@ def test_compute_condition_stats_with_stimulus_condition():
     assert abs(stats["mean_g_lif_visual"] - 0.30) < 0.01
     assert stats["n_wind_trials"] == 2
     assert stats["n_visual_trials"] == 1
+    assert stats["cohens_d"] is None
+    assert stats["cohens_d_unavailable_reason"] == "fewer_than_two_trials_per_group"
+    json.dumps(stats, allow_nan=False)
 
 
 def test_compute_condition_stats_no_metadata_returns_none():
@@ -62,8 +108,8 @@ def test_compute_condition_stats_no_metadata_returns_none():
     assert stats is None
 
 
-def test_compute_condition_stats_empty_group_returns_none():
-    """Return None when one group is empty."""
+def test_compute_condition_stats_empty_group_reports_unavailable() -> None:
+    """Keep counts when one contrast group is empty."""
     sequences = [
         {"gate_seq": np.array([[0.9, 0.1]]), "is_pure_wind": True},
         {"gate_seq": np.array([[0.8, 0.2]]), "is_pure_wind": True},
@@ -71,26 +117,75 @@ def test_compute_condition_stats_empty_group_returns_none():
 
     stats = _compute_condition_gate_stats(sequences)
 
-    assert stats is None  # No visual trials
-
-
-def test_compute_condition_stats_cohens_d_calculation():
-    """Cohen's d is computed correctly."""
-    # Create sequences with known statistics
-    sequences = [
-        {"gate_seq": np.array([[1.0, 0.0]]), "is_pure_wind": True},
-        {"gate_seq": np.array([[1.0, 0.0]]), "is_pure_wind": True},
-        {"gate_seq": np.array([[0.0, 1.0]]), "is_pure_wind": False},
-        {"gate_seq": np.array([[0.0, 1.0]]), "is_pure_wind": False},
-    ]
-
-    stats = _compute_condition_gate_stats(sequences)
-
-    # Wind: mean=1.0, std=0.0
-    # Visual: mean=0.0, std=0.0
-    # pooled_std=0.0 → Cohen's d should handle division by zero
     assert stats is not None
-    assert stats["cohens_d"] == 0.0  # Handled gracefully
+    assert not stats["comparison_available"]
+    assert stats["unavailable_reason"] == "missing_wind_or_visual_present_group"
+    assert stats["n_wind_trials"] == 2
+    assert stats["n_visual_trials"] == 0
+
+
+def test_compute_condition_stats_cohens_d_calculation() -> None:
+    """Separated constant groups have undefined d, not zero separation."""
+    sequences = [
+        {"gate_seq": np.array([[1.0, 0.0]]), "stimulus_condition": "wind_only"},
+        {"gate_seq": np.array([[1.0, 0.0]]), "stimulus_condition": "wind_only"},
+        {"gate_seq": np.array([[0.0, 1.0]]), "stimulus_condition": "visual_only"},
+        {"gate_seq": np.array([[0.0, 1.0]]), "stimulus_condition": "visual_only"},
+    ]
+    stats = _compute_condition_gate_stats(sequences)
+    assert stats is not None
+    assert stats["separation"] == 1.0
+    assert stats["cohens_d"] is None
+    assert stats["cohens_d_unavailable_reason"] == "zero_pooled_variance"
+
+
+def test_cohens_d_uses_sample_size_weighted_sample_variance() -> None:
+    """Unequal trial groups use pooled sample variance, not population SDs."""
+    sequences = [
+        {"gates": np.array([[v, 1 - v]]), "stimulus_condition": condition}
+        for condition, values in (
+            ("wind_only", [0.6, 1.0]),
+            ("visual_only", [0.0, 0.2, 0.4]),
+        )
+        for v in values
+    ]
+    stats = _compute_condition_gate_stats(sequences)
+    # Hand calculation: means .8/.2; pooled variance (.08 + 2*.04)/3.
+    assert stats["cohens_d"] == pytest.approx(2.598076211353316)
+    assert stats["cohens_d_unavailable_reason"] is None
+
+
+@pytest.mark.parametrize(
+    "condition, flag",
+    [("wind_only", False), ("visual_only", True), ("multisensory", True)],
+)
+def test_conflicting_conditions_are_reported_not_reassigned(
+    condition: str, flag: bool,
+) -> None:
+    """Neither inconsistent metadata field may silently win classification."""
+    stats = _compute_condition_gate_stats([
+        {"gates": np.array([[0.5, 0.5]]), "stimulus_condition": condition,
+         "is_pure_wind": flag},
+    ])
+    assert stats["excluded_trial_counts"] == {"conflicting_metadata": 1}
+    assert sum(stats["condition_counts"].values()) == 0
+    assert not stats["comparison_available"]
+    json.dumps(stats, allow_nan=False)
+
+
+def test_empty_nonfinite_gates_are_reported_without_nan_summary() -> None:
+    """Missing numeric support cannot produce a fabricated routing contrast."""
+    stats = _compute_condition_gate_stats([
+        {"gates": np.empty((0, 2)), "stimulus_condition": "wind_only"},
+        {"gates": np.array([[np.nan, 0.5]]),
+         "stimulus_condition": "visual_only"},
+        {"stimulus_condition": "multisensory"},
+    ])
+    assert stats["excluded_trial_counts"] == {
+        "empty_or_nonfinite_gates": 2, "missing_gates": 1,
+    }
+    assert not stats["comparison_available"]
+    json.dumps(stats, allow_nan=False)
 
 
 class TestPureWindFallbackDerivation:

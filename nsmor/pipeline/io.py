@@ -8,6 +8,7 @@ raw experimental data into pandas DataFrames and per-trial dictionaries.
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 from pathlib import Path
 from typing import Any, Dict, List, Union
@@ -166,7 +167,7 @@ def load_kinematics_csv(
     Raises:
         ValueError: If required columns are missing.
     """
-    df = pd.read_csv(path)
+    df = pd.read_csv(path, converters={"raw_sys_time": str, "raw_ard_time": str})
     missing = set(KINEMATICS_COLUMNS) - set(df.columns)
     if missing:
         raw_markers = {"sys_time", "stim_state"}
@@ -179,7 +180,49 @@ def load_kinematics_csv(
                 "wind-only trials to no_stimulus."
             )
         raise ValueError(f"Missing columns in {path}: {missing}")
-    df = df[KINEMATICS_COLUMNS].copy()
+    clock_columns = ["raw_sys_time", "raw_ard_time", "source_row_index", "time_source"]
+    has_clock = any(c in df for c in clock_columns)
+    if has_clock and not all(c in df for c in clock_columns):
+        raise ValueError(f"Incomplete clock provenance columns in {path}")
+    df = df[KINEMATICS_COLUMNS + (clock_columns if has_clock else [])].copy()
+    if has_clock:
+        source = Path(path)
+        audit_path = source.with_name(
+            source.name.removesuffix("_kinematics.csv") + "_timebase_audit.json"
+        )
+        audit_bytes = audit_path.read_bytes()
+        audit = json.loads(audit_bytes)
+        if audit.get("status") != "accepted_by_operational_tolerance":
+            raise ValueError(f"Clock audit is not accepted: {audit_path}")
+        for candidate, key in (
+            (source, "staged_kinematics_sha256"),
+            (source.with_name(source.name.replace("_kinematics.csv", "_events.csv")),
+             "staged_events_sha256"),
+        ):
+            digest = hashlib.sha256()
+            with candidate.open("rb") as stream:
+                for block in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(block)
+            if digest.hexdigest() != audit.get(key):
+                raise ValueError(f"Clock provenance hash mismatch: {candidate}")
+        if not df["time_source"].isin({
+            "experimental_affine_estimate", "experimental_prefix_cadence_estimate",
+            "single_row_host_only",
+        }).all():
+            raise ValueError(f"Unknown clock estimate source in {path}")
+        # A bound reference survives concat/slicing without confusing raw row
+        # indices with the later resampled/cropped tensor coordinates.
+        df["clock_audit_reference"] = json.dumps({
+            "audit_path": str(audit_path.resolve()),
+            "audit_sha256": hashlib.sha256(audit_bytes).hexdigest(),
+            "kinematics_sha256": audit["kinematics_sha256"],
+            "events_sha256": audit["events_sha256"],
+            "method": audit["method"],
+            "operational_tolerance_ms": audit["operational_tolerance_ms"],
+            "prefix_manifest_sha256": audit.get("prefix_manifest_sha256"),
+            "scientific_acceptance": audit.get("scientific_acceptance", "unresolved"),
+            "coordinate_scope": "source_CSV_rows_not_resampled_tensor_frames",
+        }, sort_keys=True)
     df["wind_state"] = pd.to_numeric(df["wind_state"], errors="coerce").fillna(0).eq(1).astype(np.int64)
 
     # ── Trial-boundary velocity/acceleration sanitization ──
@@ -371,6 +414,16 @@ def extract_trial_data(
         arr = kin_trial[_col].to_numpy(dtype=np.float64)
         assert arr.shape == (T,), f"{_col} shape {arr.shape} != ({T},)"
 
+    clock_provenance = []
+    if "clock_audit_reference" in kin_trial:
+        for reference, rows in kin_trial.groupby("clock_audit_reference", sort=False):
+            entry = json.loads(reference)
+            entry["source_row_indices"] = rows["source_row_index"].astype(int).tolist()
+            entry["raw_sys_time"] = rows["raw_sys_time"].astype(str).tolist()
+            entry["raw_ard_time"] = rows["raw_ard_time"].astype(str).tolist()
+            entry["time_source"] = rows["time_source"].tolist()
+            clock_provenance.append(entry)
+
     return {
         "time_ms": time_ms_arr,
         "x_pos": kin_trial["x_pos"].to_numpy(dtype=np.float64),
@@ -388,4 +441,5 @@ def extract_trial_data(
         "wind_side_unified": wind_side,
         "session_id": session_id,
         "trial_id": trial_id,
+        **({"clock_provenance": clock_provenance} if clock_provenance else {}),
     }

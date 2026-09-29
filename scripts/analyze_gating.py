@@ -61,6 +61,7 @@ from nsmor.analysis.gating_cluster import (
     ClusterGatingConfig,
     extract_and_cluster_gates,
 )
+from nsmor.analysis.uq import cohens_d
 from nsmor.config import Label
 from nsmor.config_parser import ExperimentConfig
 from nsmor.dataloader_factory import create_optimized_dataloader
@@ -447,7 +448,11 @@ def _compute_condition_gate_stats(
             Optional: 'is_pure_wind' (bool) or 'stimulus_condition' (str).
 
     Returns:
-        Dict with condition-specific stats if metadata available, else None.
+        Descriptive condition counts and contrast statistics, or None when
+        all metadata is absent. Unknown/conflicting conditions are excluded
+        explicitly; a false pure-wind flag alone never establishes vision.
+        Multisensory and visual-only counts remain separate within the
+        visual-present contrast. Undefined effect sizes are None with a reason.
     """
     # Check if any sequence has condition metadata
     has_wind_flag = any("is_pure_wind" in s for s in sequences)
@@ -456,37 +461,81 @@ def _compute_condition_gate_stats(
     if not (has_wind_flag or has_condition):
         return None  # No metadata, skip
 
-    # Extract gate sequences and conditions
-    wind_g_lif_trials = []
-    visual_g_lif_trials = []
-
+    # A false pure-wind flag does not establish visual presence: it also
+    # describes no-stimulus trials. Keep the four physical conditions distinct.
+    groups: Dict[str, List[float]] = {
+        key: [] for key in (
+            "wind_only", "visual_only", "multisensory", "no_stimulus"
+        )
+    }
+    excluded: Dict[str, int] = {}
     for seq in sequences:
+        condition = seq.get("stimulus_condition")
+        wind_flag = seq.get("is_pure_wind")
+        reason = None
+        if condition is None:
+            if isinstance(wind_flag, (bool, np.bool_)) and wind_flag:
+                condition = "wind_only"
+            else:
+                reason = "missing_condition"
+        elif condition not in groups:
+            reason = "unknown_condition"
+        if reason is None and wind_flag is not None:
+            if not isinstance(wind_flag, (bool, np.bool_)) or bool(wind_flag) != (
+                condition == "wind_only"
+            ):
+                reason = "conflicting_metadata"
         gate_seq = seq.get("gates")
         if gate_seq is None:
             gate_seq = seq.get("gate_seq")
-        if gate_seq is None:
+        if reason is None:
+            if gate_seq is None:
+                reason = "missing_gates"
+            else:
+                gates = np.asarray(gate_seq)
+                assert gates.ndim == 2 and gates.shape[1] == 2, (
+                    f"Expected gates (T, 2), got {gates.shape}"
+                )
+                if len(gates) == 0 or not np.isfinite(gates).all():
+                    reason = "empty_or_nonfinite_gates"
+        if reason is not None:
+            excluded[reason] = excluded.get(reason, 0) + 1
             continue
+        groups[condition].append(float(np.mean(gates[:, 0])))
 
-        g_lif_seq = gate_seq[:, 0]  # (T,)
+    wind_g_lif_trials = groups["wind_only"]
+    visual_g_lif_trials = groups["visual_only"] + groups["multisensory"]
+    audit = {
+        "condition_counts": {key: len(values) for key, values in groups.items()},
+        "per_condition": {
+            key: {
+                "n_trials": len(values),
+                "mean_g_lif": float(np.mean(values)) if values else None,
+                "std_g_lif": float(np.std(values)) if values else None,
+            }
+            for key, values in groups.items()
+        },
+        "excluded_trial_counts": excluded,
+        "visual_group_conditions": ["visual_only", "multisensory"],
+        "evidence_scope": "in_sample_descriptive_only",
+    }
 
-        # Determine condition
-        is_wind = False
-        if "is_pure_wind" in seq:
-            is_wind = bool(seq["is_pure_wind"])
-        elif "stimulus_condition" in seq:
-            is_wind = seq["stimulus_condition"] == "wind_only"
-
-        # Per-trial mean (already computed in sequence, but recalculate for clarity)
-        trial_mean_g_lif = float(np.mean(g_lif_seq))
-
-        if is_wind:
-            wind_g_lif_trials.append(trial_mean_g_lif)
-        else:
-            visual_g_lif_trials.append(trial_mean_g_lif)
-
-    # Compute statistics
-    if len(wind_g_lif_trials) == 0 or len(visual_g_lif_trials) == 0:
-        return None  # Need both groups for comparison
+    # Keep condition/exclusion counts even when a contrast cannot be computed.
+    if not wind_g_lif_trials or not visual_g_lif_trials:
+        return {
+            **audit,
+            "comparison_available": False,
+            "unavailable_reason": "missing_wind_or_visual_present_group",
+            "mean_g_lif_wind": None,
+            "mean_g_lif_visual": None,
+            "std_g_lif_wind": None,
+            "std_g_lif_visual": None,
+            "separation": None,
+            "cohens_d": None,
+            "cohens_d_unavailable_reason": "missing_wind_or_visual_present_group",
+            "n_wind_trials": len(wind_g_lif_trials),
+            "n_visual_trials": len(visual_g_lif_trials),
+        }
 
     mean_g_lif_wind = float(np.mean(wind_g_lif_trials))
     mean_g_lif_visual = float(np.mean(visual_g_lif_trials))
@@ -494,19 +543,26 @@ def _compute_condition_gate_stats(
     std_g_lif_visual = float(np.std(visual_g_lif_trials))
     separation = abs(mean_g_lif_wind - mean_g_lif_visual)
 
-    # Cohen's d effect size
-    pooled_std = np.sqrt(
-        (std_g_lif_wind**2 + std_g_lif_visual**2) / 2
+    # Trial-level descriptive effect, not animal-independent inference.
+    effect = cohens_d(
+        np.asarray(wind_g_lif_trials), np.asarray(visual_g_lif_trials)
     )
-    cohens_d = (mean_g_lif_wind - mean_g_lif_visual) / pooled_std if pooled_std > 0 else 0.0
+    effect_reason = None
+    if len(wind_g_lif_trials) < 2 or len(visual_g_lif_trials) < 2:
+        effect_reason = "fewer_than_two_trials_per_group"
+    elif not np.isfinite(effect):
+        effect_reason = "zero_pooled_variance"
 
     return {
+        **audit,
+        "comparison_available": True,
         "mean_g_lif_wind": mean_g_lif_wind,
         "mean_g_lif_visual": mean_g_lif_visual,
         "std_g_lif_wind": std_g_lif_wind,
         "std_g_lif_visual": std_g_lif_visual,
         "separation": float(separation),
-        "cohens_d": float(cohens_d),
+        "cohens_d": float(effect) if np.isfinite(effect) else None,
+        "cohens_d_unavailable_reason": effect_reason,
         "n_wind_trials": len(wind_g_lif_trials),
         "n_visual_trials": len(visual_g_lif_trials),
     }
@@ -676,7 +732,7 @@ def run_analysis(
 
     # -- Per-Condition Gate Statistics (Ticket #17) --
     cond_stats = _compute_condition_gate_stats(result["sequences"])
-    if cond_stats is not None:
+    if cond_stats is not None and cond_stats["comparison_available"]:
         logger.info("=" * 60)
         logger.info("Per-Condition Gate Statistics (whole corpus; in-sample descriptive):")
         logger.info(

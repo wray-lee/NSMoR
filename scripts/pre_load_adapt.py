@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import errno
+import hashlib
 import json
 import math
 import os
@@ -889,6 +890,238 @@ def find_session_pairs(
     return matched_pairs
 
 
+def _experimental_trial_clock(
+    grp: pd.DataFrame, tolerance_ms: float, diagnostic: Dict[str, Any],
+) -> np.ndarray:
+    """Estimate host-arrival association, not acquisition or stimulus latency.
+
+    Centered ordinary least squares uses every paired row, with no outlier
+    removal or repair. The caller's maximum residual tolerance is an operational
+    criterion, not a biological precision guarantee. Leave-one-out residuals
+    prevent a high-leverage endpoint from validating its own fitted location.
+    """
+    n = len(grp)
+    diagnostic.update(n_samples=n, status="rejected")
+    if n == 1:
+        host = pd.to_numeric(grp["sys_time"], errors="coerce").to_numpy(
+            dtype=np.float64,
+        ) * 1000.0
+        if not np.isfinite(host).all():
+            raise ValueError("Single-row host time must be finite.")
+        diagnostic.update(
+            status="host_only_convention", method="single_row_host_only",
+            derivative_interpretation="undefined; stored zero is a convention",
+            scientific_acceptance="unresolved",
+        )
+        return host
+    if n < 4:
+        raise ValueError("At least four paired rows are required for an affine fit.")
+    tokens = grp["ard_time"].astype(str)
+    lexical = tokens.str.fullmatch(r"[0-9]{1,10}")
+    ticks = pd.to_numeric(tokens, errors="coerce").to_numpy(dtype=np.float64)
+    valid = lexical.to_numpy() & np.isfinite(ticks) & (ticks <= 2**32 - 1)
+    if not valid.all():
+        diagnostic["invalid_source_rows"] = grp.index[~valid].tolist()
+        raise ValueError("Invalid uint32 tick token; no trimming or reconstruction.")
+    host = pd.to_numeric(grp["sys_time"], errors="coerce").to_numpy(
+        dtype=np.float64,
+    ) * 1000.0
+    if not np.isfinite(host).all() or np.any(np.diff(host) < 0):
+        raise ValueError("Host times must be finite and nondecreasing in file order.")
+    if np.any(np.diff(ticks) <= 0):
+        raise ValueError("Hardware ticks must increase; resets/wraps are unresolved.")
+    diagnostic["duplicate_host_intervals"] = int(np.sum(np.diff(host) == 0))
+    x = ticks - ticks.mean()
+    y_mean = float(host.mean())
+    ss = float(x @ x)
+    slope = float(x @ (host - y_mean) / ss)
+    fitted = y_mean + slope * x
+    residual = host - fitted
+    leverage = 1.0 / n + x * x / ss
+    if not np.isfinite(slope) or slope <= 0 or np.any(leverage >= 1):
+        raise ValueError("Nonpositive/nonfinite slope or unidentifiable mapping.")
+    loo = residual / (1.0 - leverage)
+    diagnostic.update(
+        slope=slope, intercept_ms=float(y_mean - slope * ticks.mean()),
+        reference_tick=float(ticks.mean()), reference_host_ms=y_mean,
+        rmse_ms=float(np.sqrt(np.mean(residual**2))),
+        max_abs_residual_ms=float(np.max(np.abs(residual))),
+        max_abs_leave_one_out_residual_ms=float(np.max(np.abs(loo))),
+        worst_source_row=int(grp.index[int(np.argmax(np.abs(loo)))]),
+    )
+    if not np.isfinite(loo).all() or np.max(np.abs(loo)) > tolerance_ms:
+        raise ValueError(
+            "Clock association exceeds explicit operational residual tolerance; "
+            "retain raw trial for timing review, not automatic reconstruction."
+        )
+    if not np.isfinite(fitted).all() or np.any(np.diff(fitted) <= 0):
+        raise ValueError("Mapped times are not finite and strictly increasing.")
+    diagnostic["status"] = "accepted_by_operational_tolerance"
+    assert fitted.shape == (n,)
+    return fitted
+
+
+def _suspect_prefixes(
+    path: Union[str, Path], audit: Dict[str, Any], frame: pd.DataFrame,
+) -> Dict[str, int]:
+    """Validate externally specified suspect rows, not a corruption diagnosis."""
+    content = Path(path).read_bytes()
+    manifest = json.loads(content)
+    assumption = "manually specified suspect prefix/model assumption"
+    if (not isinstance(manifest, dict)
+            or manifest.get("schema") != "experimental_suspect_prefix_v1"
+            or manifest.get("assumption") != assumption
+            or not isinstance(manifest.get("sessions"), list)):
+        raise ValueError("Invalid suspect-prefix manifest schema/assumption.")
+    audit["prefix_manifest_sha256"] = hashlib.sha256(content).hexdigest()
+    audit["prefix_manifest_path"] = str(Path(path).resolve())
+    sessions = manifest["sessions"]
+    if any(not isinstance(s, dict) for s in sessions):
+        raise ValueError("Invalid suspect-prefix session entry.")
+    names = [s.get("session_id") for s in sessions]
+    if any(not isinstance(s, str) for s in names) or len(set(names)) != len(names):
+        raise ValueError("Missing or duplicate suspect-prefix session identity.")
+    matches = [s for s in sessions if s["session_id"] == audit["session_id"]]
+    if not matches:
+        return {}  # Unlisted sessions still undergo all-row validation.
+    session = matches[0]
+    for key in ("kinematics_sha256", "events_sha256"):
+        if session.get(key) != audit[key]:
+            raise ValueError(f"Suspect-prefix manifest {key} mismatch.")
+    trials = session.get("trials")
+    if not isinstance(trials, list):
+        raise ValueError("Invalid suspect-prefix trials.")
+    groups = {str(t): g for t, g in frame.groupby("global_trial_id", sort=False)}
+    prefixes: Dict[str, int] = {}
+    for trial in trials:
+        if not isinstance(trial, dict):
+            raise ValueError("Invalid suspect-prefix trial entry.")
+        tid, rows = trial.get("trial_id"), trial.get("rows")
+        if not isinstance(tid, str) or tid not in groups or tid in prefixes:
+            raise ValueError("Unknown or duplicate suspect-prefix trial identity.")
+        if not isinstance(rows, list) or not rows or len(rows) >= len(groups[tid]):
+            raise ValueError("Suspect prefix must leave an independently fitted suffix.")
+        expected = [
+            {"source_row_index": int(i), "raw_sys_time": r["sys_time"],
+             "raw_ard_time": r["ard_time"]}
+            for i, r in groups[tid].iloc[:len(rows)].iterrows()
+        ]
+        if rows != expected or any(
+            type(r.get("source_row_index")) is not int for r in rows
+        ):
+            raise ValueError("Suspect-prefix row index or lexical token mismatch.")
+        prefixes[tid] = len(rows)
+    audit["suspect_prefix_assumption"] = assumption
+    audit["suspect_prefix_entries"] = trials
+    audit["method"] = (
+        "centered_OLS_suffix_leave_one_out_gate_with_declared_prefix_cadence"
+    )
+    return prefixes
+
+
+def _prefix_clock_candidate(
+    grp: pd.DataFrame, prefix: int, tolerance_ms: float,
+    diagnostic: Dict[str, Any], events: pd.DataFrame,
+) -> np.ndarray:
+    """Extrapolate a declared prefix; retain host-boundary sensitivity separately."""
+    diagnostic.update(
+        status="rejected", n_samples=len(grp), prefix_rows=prefix,
+        assumption="manually specified suspect prefix/model assumption",
+        model="constant cadence: median mapped suffix interval",
+        scientific_acceptance="unresolved",
+        derivative_interpretation=(
+            "Estimated prefix and boundary derivatives are model-dependent; "
+            "finite values do not establish first-interval reliability."
+        ),
+        suffix_fit={},
+    )
+    suffix = grp.iloc[prefix:]
+    if len(suffix) < 4:
+        raise ValueError("Suspect prefix requires at least four suffix pairs.")
+    fitted = _experimental_trial_clock(suffix, tolerance_ms, diagnostic["suffix_fit"])
+    cadence = float(np.median(np.diff(fitted)))
+    mapped = np.concatenate((fitted[0] - cadence * np.arange(prefix, 0, -1), fitted))
+    if not np.isfinite(mapped).all() or np.any(np.diff(mapped) <= 0):
+        raise ValueError("Prefix estimates must be finite and strictly increasing.")
+    host = pd.to_numeric(grp["sys_time"], errors="coerce").to_numpy(
+        dtype=np.float64,
+    ) * 1000.0
+    if not np.isfinite(host).all() or np.any(np.diff(host) < 0):
+        raise ValueError("Prefix host times must be finite and nondecreasing.")
+    alternative = np.concatenate((host[:prefix], fitted))
+    host_valid = bool(np.all(np.diff(alternative) > 0))
+    # Rotation does not change the dx/dy norm; use the adapter's cm conversion.
+    distance = np.hypot(grp["dx"].to_numpy(dtype=float),
+                        grp["dy"].to_numpy(dtype=float)) / 10.0
+    distance[0] = 0.0
+    if not np.isfinite(distance).all():
+        raise ValueError("Cannot describe derivatives for nonfinite displacements.")
+    count = min(prefix + 2, len(grp))  # Boundary derivative plus acceleration echo.
+
+    def describe(axis: np.ndarray, valid: bool) -> Dict[str, Any]:
+        result: Dict[str, Any] = {
+            "status": "strictly_increasing" if valid else "unresolved_nonpositive_interval",
+            "absolute_ms": axis[:count].tolist(),
+            "source_row_indices": grp.index[:count].tolist(),
+        }
+        if valid:
+            dt = np.r_[1.0, np.diff(axis) / 1000.0]
+            velocity = distance / dt
+            acceleration = np.r_[0.0, np.diff(velocity)] / dt
+            if not np.isfinite(velocity).all() or not np.isfinite(acceleration).all():
+                raise ValueError("Nonfinite candidate derivatives.")
+            result.update(
+                velocity_cm_s=velocity[:count].tolist(),
+                acceleration_cm_s2=acceleration[:count].tolist(),
+            )
+        return result
+
+    sensitivity: Dict[str, Any] = {
+        "scope": "descriptive only; no scientific acceptance limits established",
+        "cadence_ms": cadence,
+        "cadence": describe(mapped, True),
+        "host_boundary": describe(alternative, host_valid),
+        "events": [],
+    }
+    for source_index, event in events.iterrows():
+        time = float(event["timestamp"]) * 1000.0
+        if not math.isfinite(time):
+            raise ValueError("Cannot assess a nonfinite host event timestamp.")
+        sensitivity["events"].append({
+            "source_event_row_index": int(source_index),
+            "cadence_relative_ms": time - float(mapped[0]),
+            "host_boundary_relative_ms": time - float(alternative[0]),
+            "cadence_in_recorded_window": bool(mapped[0] <= time <= mapped[-1]),
+            "host_boundary_in_recorded_window": (
+                bool(alternative[0] <= time <= alternative[-1]) if host_valid else None
+            ),
+        })
+    diagnostic.update(sensitivity=sensitivity, status="accepted_by_operational_tolerance")
+    assert mapped.shape == (len(grp),)
+    return mapped
+
+
+def _clock_source_hash(path: Path) -> str:
+    """Bind diagnostics to exact input bytes without loading a whole CSV."""
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _write_clock_failure(path: Path, audit: Dict[str, Any]) -> None:
+    """Persist rejected mapping diagnostics without publishing canonical CSVs."""
+    _reject_symlink_components(path.parent, kind="clock diagnostic directory")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _reject_symlink_components(path.parent, kind="clock diagnostic directory")
+    # Exclusive creation also rejects existing files and symlink destinations.
+    with path.open("x", encoding="utf-8") as stream:
+        json.dump(audit, stream, indent=2, allow_nan=False)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
 def adapt_session_pair(
     kin_path: Union[str, Path],
     evt_path: Union[str, Path],
@@ -896,6 +1129,8 @@ def adapt_session_pair(
     session_id: Optional[str] = None,
     output_session_dir: Optional[Union[str, Path]] = None,
     in_place: bool = False,
+    experimental_clock_residual_ms: Optional[float] = None,
+    experimental_clock_prefix_manifest: Optional[Union[str, Path]] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Adapt a single paired session (kinematics + events) to canonical NSMoR schema.
 
@@ -910,6 +1145,13 @@ def adapt_session_pair(
         session_id: Optional explicit session identifier string.
         output_session_dir: Optional target directory to write adapted CSVs.
         in_place: If True and output_session_dir is None, rewrite source CSVs in place.
+        experimental_clock_residual_ms: Explicit opt-in to per-trial OLS clock
+            association. Positive finite maximum leave-one-out residual in ms;
+            an operational tolerance, NOT physical synchronization accuracy.
+            Requires non-destructive staging. No implicit repairs or frame deletion.
+        experimental_clock_prefix_manifest: Optional hash/token/index-bound JSON
+            declaring suspect leading rows. Uses constant median suffix cadence
+            with separate host-boundary sensitivity; scientific acceptance unresolved.
 
     Returns:
         Tuple of (df_kinematics_adapted, df_events_adapted).
@@ -919,6 +1161,15 @@ def adapt_session_pair(
         ValueError: If inputs are invalid, conflicting, or target aliases source.
         FileNotFoundError: If source kinematics or events CSV does not exist.
     """
+    if (experimental_clock_prefix_manifest is not None
+            and experimental_clock_residual_ms is None):
+        raise ValueError("Suspect-prefix manifest requires explicit clock tolerance.")
+    if experimental_clock_residual_ms is not None:
+        if output_session_dir is None or in_place:
+            raise ValueError("Experimental clock mapping requires staged output.")
+        if (not math.isfinite(experimental_clock_residual_ms)
+                or experimental_clock_residual_ms <= 0):
+            raise ValueError("Experimental clock residual tolerance must be positive.")
     if output_session_dir is not None and in_place:
         raise ValueError("Cannot specify both output_session_dir and in_place=True.")
 
@@ -1021,7 +1272,29 @@ def adapt_session_pair(
             )
 
     # ── 1. Process Kinematics ──
-    df_k = pd.read_csv(k_path)
+    clock_audit: Optional[Dict[str, Any]] = None
+    clock_target: Optional[Path] = None
+    if experimental_clock_residual_ms is not None:
+        assert target_kin is not None
+        clock_target = target_kin.parent / f"{session_id}_timebase_audit.json"
+        if clock_target.exists() or clock_target.is_symlink():
+            raise FileExistsError(f"Clock audit already exists: {clock_target}")
+        clock_audit = {
+            "schema": "experimental_clock_association_v1",
+            "status": "rejected", "session_id": session_id,
+            "method": "centered_OLS_all_pairs_leave_one_out_residual_gate",
+            "operational_tolerance_ms": experimental_clock_residual_ms,
+            "limitation": "Arrival-clock association; not physical latency bounds.",
+            "kinematics_sha256": _clock_source_hash(k_path),
+            "events_sha256": _clock_source_hash(e_path),
+            "kinematics_path": str(k_path.resolve()),
+            "events_path": str(e_path.resolve()), "trials": [],
+        }
+        # Preserve lexical tokens; do not normalize malformed device values.
+        df_k = pd.read_csv(k_path, dtype={"ard_time": str, "sys_time": str},
+                           keep_default_na=False)
+    else:
+        df_k = pd.read_csv(k_path)
     stim_starts: List[Dict[str, Any]] = []
 
     is_raw = "sys_time" in df_k.columns and "x_pos" not in df_k.columns
@@ -1031,11 +1304,67 @@ def adapt_session_pair(
             "and canonical 'x_pos'. Refusing to adapt unvalidated mixed format."
         )
 
+    if clock_audit is not None:
+        assert clock_target is not None
+        try:
+            if not is_raw or "ard_time" not in df_k:
+                raise ValueError("Experimental mapping requires raw paired clocks.")
+            event_schema = pd.read_csv(e_path, nrows=0).columns
+            if "timestamp" not in event_schema or "time_ms" in event_schema:
+                raise ValueError("Experimental mapping requires host timestamp events.")
+            ids = df_k["global_trial_id"]
+            if ids.isna().any() or (ids.astype(str).str.strip() == "").any():
+                raise ValueError("Missing trial identity in raw timing rows.")
+            runs = ids[ids.ne(ids.shift())]
+            if runs.duplicated().any():
+                raise ValueError("Repeated noncontiguous trial IDs need timing review.")
+            df_k["raw_sys_time"] = df_k["sys_time"]
+            df_k["raw_ard_time"] = df_k["ard_time"]
+            df_k["source_row_index"] = np.arange(len(df_k))
+            df_k["time_source"] = "experimental_affine_estimate"
+            prefixes = (
+                _suspect_prefixes(experimental_clock_prefix_manifest, clock_audit, df_k)
+                if experimental_clock_prefix_manifest is not None else {}
+            )
+            raw_events = pd.read_csv(e_path) if prefixes else None
+            mapped = np.empty(len(df_k), dtype=np.float64)
+            for tid, grp in df_k.groupby("global_trial_id", sort=False):
+                diag: Dict[str, Any] = {"trial_id": str(tid)}
+                clock_audit["trials"].append(diag)
+                prefix = prefixes.get(str(tid), 0)
+                if prefix:
+                    assert raw_events is not None
+                    event_id = ("global_trial_id" if "global_trial_id" in raw_events
+                                else "trial_id")
+                    trial_events = raw_events.loc[raw_events[event_id] == tid]
+                    mapped[grp.index] = _prefix_clock_candidate(
+                        grp, prefix, experimental_clock_residual_ms, diag, trial_events,
+                    )
+                    df_k.loc[grp.index[:prefix], "time_source"] = (
+                        "experimental_prefix_cadence_estimate"
+                    )
+                else:
+                    mapped[grp.index] = _experimental_trial_clock(
+                        grp, experimental_clock_residual_ms, diag,
+                    )
+                    if len(grp) == 1:
+                        df_k.loc[grp.index, "time_source"] = "single_row_host_only"
+            df_k["abs_time"] = mapped
+            clock_audit["scientific_acceptance"] = "unresolved"
+            clock_audit["status"] = "accepted_by_operational_tolerance"
+        except ValueError as exc:
+            clock_audit["error"] = str(exc)
+            _write_clock_failure(clock_target, clock_audit)
+            raise ValueError(
+                f"Experimental clock mapping rejected; diagnostic: {clock_target}: {exc}"
+            ) from exc
+
     if is_raw:
         df_k["session_id"] = session_id
         df_k["trial_id"] = df_k["global_trial_id"]
 
-        df_k["abs_time"] = df_k["sys_time"] * 1000.0
+        if clock_audit is None:
+            df_k["abs_time"] = df_k["sys_time"] * 1000.0
         # Fail closed on unsorted per-trial rows: heading/position cumsum and
         # velocity/acceleration diffs require chronological order. File-order
         # first() would silently move the shared origin (v4 review A1 / B F1).
@@ -1088,7 +1417,12 @@ def adapt_session_pair(
         dt_s = per_trial_group["abs_time"].transform(
             lambda x: x.diff().fillna(0) / 1000.0
         )
-        dt_s = dt_s.clip(lower=0.001)
+        if clock_audit is None:
+            dt_s = dt_s.clip(lower=0.001)
+        else:
+            # Only the first-row convention needs a denominator; later intervals
+            # use the estimated clock unchanged, including sub-millisecond gaps.
+            dt_s = dt_s.mask(per_trial_group.cumcount() == 0, 1.0)
         df_k["velocity"] = (step_dist_mm / dt_s.to_numpy()) / 10.0
 
         acc_out = np.zeros(len(df_k), dtype=np.float64)
@@ -1301,11 +1635,14 @@ def adapt_session_pair(
             df_e = df_e[~replace_mask]
         df_e = pd.concat([df_e, df_stim], ignore_index=True)
 
-    df_k_out = df_k[KIN_TARGET].copy()
+    kin_columns = KIN_TARGET + ([
+        "raw_sys_time", "raw_ard_time", "source_row_index", "time_source",
+    ] if clock_audit is not None else [])
+    df_k_out = df_k[kin_columns].copy()
     df_e_out = df_e[EVT_TARGET].copy()
 
     # Rigid shape and schema assertions
-    assert df_k_out.shape[1] == len(KIN_TARGET), (
+    assert df_k_out.shape[1] == len(kin_columns), (
         f"Kinematics column mismatch: {df_k_out.columns.tolist()}"
     )
     assert df_e_out.shape[1] == len(EVT_TARGET), (
@@ -1347,6 +1684,19 @@ def adapt_session_pair(
         try:
             tmp_k = _write_exclusive(df_k_out, target_kin)
             tmp_e = _write_exclusive(df_e_out, target_evt)
+            if clock_audit is not None:
+                assert clock_target is not None
+                clock_audit["staged_kinematics_sha256"] = _clock_source_hash(tmp_k)
+                clock_audit["staged_events_sha256"] = _clock_source_hash(tmp_e)
+                fd, name = tempfile.mkstemp(dir=str(target_kin.parent))
+                tmp_audit = Path(name)
+                st = os.fstat(fd)
+                owned_tmps.append((tmp_audit, st.st_dev, st.st_ino))
+                with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                    json.dump(clock_audit, stream, indent=2, allow_nan=False)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                _publish_no_replace(tmp_audit, clock_target, published)
             _publish_no_replace(tmp_k, target_kin, published)
             _publish_no_replace(tmp_e, target_evt, published)
         except Exception:
@@ -1370,6 +1720,8 @@ def adapt_cercus_to_nsmor(
     *,
     single_pair: Optional[Tuple[Union[str, Path], Union[str, Path]]] = None,
     session_id: Optional[str] = None,
+    experimental_clock_residual_ms: Optional[float] = None,
+    experimental_clock_prefix_manifest: Optional[Union[str, Path]] = None,
 ) -> Dict[str, Any]:
     """Convert archived or flat cercus session CSVs to canonical NSMoR schema.
 
@@ -1378,6 +1730,8 @@ def adapt_cercus_to_nsmor(
         output_dir: Optional absent or empty destination directory for staging.
         single_pair: Optional tuple of (kinematics_path, events_path) for bounded runs.
         session_id: Optional explicit session ID override for single_pair mode.
+        experimental_clock_residual_ms: Opt-in operational leave-one-out clock
+            residual tolerance in ms; requires staging. See adapt_session_pair.
 
     Returns:
         Dict with summary report: 'adapted_sessions', 'count_kinematics', 'count_events'.
@@ -1390,6 +1744,11 @@ def adapt_cercus_to_nsmor(
             any staged target already exists (preflight).
         FileNotFoundError: If raw_dir/pair sources are missing or unpaired.
     """
+    if (experimental_clock_prefix_manifest is not None
+            and experimental_clock_residual_ms is None):
+        raise ValueError("Suspect-prefix manifest requires explicit clock tolerance.")
+    if experimental_clock_residual_ms is not None and output_dir is None:
+        raise ValueError("Experimental clock mapping requires staged output.")
     # ── Safety gate BEFORE any filesystem scan or source read ──
     if output_dir is None:
         if is_protected_raw_path(raw_dir):
@@ -1481,6 +1840,8 @@ def adapt_cercus_to_nsmor(
                 session_id=sid,
                 output_session_dir=s_dir,
                 in_place=False,
+                experimental_clock_residual_ms=experimental_clock_residual_ms,
+                experimental_clock_prefix_manifest=experimental_clock_prefix_manifest,
             )
             count_k += 1
             count_e += 1
@@ -1575,6 +1936,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional explicit session ID override for single pair mode.",
     )
+    parser.add_argument(
+        "--experimental-clock-residual-ms", type=float, default=None,
+        help=("Opt-in per-trial affine arrival-clock association; requires output "
+              "staging and explicit max leave-one-out residual in ms. This is an "
+              "operational tolerance, not physical timing accuracy. No implicit repairs."),
+    )
+    parser.add_argument(
+        "--experimental-clock-prefix-manifest", default=None,
+        help=("Hash-bound manually specified suspect-prefix model assumptions. "
+              "Opt-in constant-cadence extrapolation with descriptive sensitivity; "
+              "requires explicit clock residual tolerance. Not scientific acceptance."),
+    )
     return parser
 
 
@@ -1601,6 +1974,12 @@ if __name__ == "__main__":
             output_dir=args.output_dir,
             single_pair=(args.kinematics, args.events),
             session_id=args.session_id,
+            experimental_clock_residual_ms=args.experimental_clock_residual_ms,
+            experimental_clock_prefix_manifest=args.experimental_clock_prefix_manifest,
         )
     else:
-        adapt_cercus_to_nsmor(raw_dir=args.raw_dir, output_dir=args.output_dir)
+        adapt_cercus_to_nsmor(
+            raw_dir=args.raw_dir, output_dir=args.output_dir,
+            experimental_clock_residual_ms=args.experimental_clock_residual_ms,
+            experimental_clock_prefix_manifest=args.experimental_clock_prefix_manifest,
+        )

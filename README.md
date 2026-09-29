@@ -12,6 +12,10 @@ encoding from bio-physical decision-making via gradient isolation.
 
 ---
 
+## Experimental Clock Recovery
+
+Clock recovery remains experimental: estimated prefix timestamps are not observed measurements, and host-arrival fit residuals are not physical synchronization bounds. See [method and validation status](docs/clock-recovery-r4.md). Full scientific QC remains pending.
+
 ## Project Structure
 
 ```

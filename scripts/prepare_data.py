@@ -1393,6 +1393,7 @@ def prepare_dataset(
     # sequence rather than be re-derived from the 8-D features later (the
     # pure-wind zero-prepend makes that ambiguous downstream).
     seq_conditions: List[str] = []
+    seq_clock_provenance: List[Any] = []
 
     # Step 4 fitted OOF priors on this cohort. Any Step 5 failure must abort
     # before save so sequences and trained prior rows stay aligned.
@@ -1514,6 +1515,7 @@ def prepare_dataset(
             seq_trial_ids.append(int(info["trial_id"]))
             seq_target_ttc_ms.append(target_ttc_ms_val)
             seq_conditions.append(classify_stimulus_condition(trial_data))
+            seq_clock_provenance.append(trial_data.get("clock_provenance"))
 
             logger.debug(
                 "Trial %s/%d: θ(t) range [%.2f°, %.2f°], "
@@ -1738,6 +1740,9 @@ def prepare_dataset(
 
     # Sequences are float32 at extraction, matching DataLoader precision and
     # bounding the ZIP pickle buffer while preserving every trial and frame.
+    if any(item is not None for item in seq_clock_provenance):
+        assert len(seq_clock_provenance) == len(X_seqs)
+        dataset["source_clock_provenance"] = seq_clock_provenance
     torch.save(dataset, output_path)
     logger.info("Saved dataset to %s", output_path)
 
