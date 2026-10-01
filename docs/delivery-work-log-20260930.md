@@ -437,11 +437,31 @@ row is marked complete.
 | 3 | GRU pathway is causally necessary for escape | Lesion `gru_lesioned` vs `intact` d=1.899, `estimable_descriptive_only` | Same substitution caveat; descriptive only, p/adjusted p `null`; animal IDs alone address population identity only | Verified animal identity/independence **and** biological pathway correspondence + pathway-specific perturbation + identification design (blocks population and causal inference) |
 | 4 | Router implements mechanistic causal inference | Gate is a coupled softmax mixture `[g_lif, g_gru]` (columns sum to 1) | The router causal claim is **not established from these artifacts** (not a mathematical-impossibility claim) | Interventional/mechanistic identification design (not available) |
 | 5 | Multisensory integration window is physiological | `integration_summary.json`, `in_sample_descriptive_only`, sorted wind axis `[-373,-308,-261,-225]` | Descriptive only; no grouped effect test; visual-only is a labelled baseline | Persisted multisensory cohort + animal IDs |
-| 6 | Bayesian cue combination / TTC=0 psychophysics | `status=not_applicable` (`n_ttc0=0`, `n_candidates=252`) | TTC=0 cohort absent; 432 rows are r6-metrics checkpoint-selected nested outer-validation rows, not an untouched holdout (`holdout_eligible=false`) | Persisted non-empty `multisensory_ttc_0ms` subset + untouched holdout |
-| 7 | Fixed-point / stability spectra | `jacobian_spectrum.json` `status=withheld`, empty stats (`early 0/63`, `transient 0/9`, `sustained 0/79`) | Withheld means no publishable spectra under existing control — **not** no fixed points; whether a fixed point is analytically recoverable under a passing solver/control is an open analysis question, and the status cannot be made green by cherry-picking candidates or lowering the residual cap | A passing frozen-input Jacobian control (an analytic recovery/control question, not an external acquisition record) |
+| 6 | Bayesian cue combination / TTC=0 psychophysics | `status=not_applicable` (`n_ttc0=0`, `n_candidates=252`) | TTC=0 cohort absent; 432 rows are r6-metrics checkpoint-selected nested outer-validation rows (`sample_scope=outer_validation`, `dataset_binding=unverified`), not an untouched holdout (`holdout_eligible=false`); no CLI batch option, so the stage inherited the whole validation subset | Persisted non-empty `multisensory_ttc_0ms` subset + untouched holdout |
+| 7 | Fixed-point / stability spectra | `jacobian_spectrum.json` `status=withheld`, empty stats (`early 0/63`, `transient 0/9`, `sustained 0/79`); gate failed on frozen-input residual sanity cap 0.3 (calibrated boundaries 2.560 / 2.617 / 1.321 for early / transient / sustained vs residual medians 0.397424 / 0.028625 / 0.125290; all-epoch n_pass=0 includes placeholder after calibration abort) | Withheld means no publishable spectra under existing control — **not** no fixed points; whether a fixed point is analytically recoverable under a passing solver/control is an open analysis question, and the status cannot be made green by cherry-picking candidates or lowering the residual cap | A passing frozen-input Jacobian control (an analytic recovery/control question, not an external acquisition record) |
 | 8 | Animal-level generalization | `animal_identity_status=unverified`; prefix-grouped split | Distinct prefixes do not establish distinct animals | Auditable animal-identity mapping + identity-based split |
 | 9 | Physical timing / clock synchronization | `clock_scientific_acceptance=experimental_unresolved`; ~4.006 ms is a host-arrival batching diagnostic | Source cadence ~5 ms unverified; no emission calibration | Verified firmware + raw unbatched timestamps + emission calibration |
 | 10 | Gating clusters are distinct strategies | ARI 4-way 0.198, NMI 4-way 0.227, Cohen's d 1.19 | In-sample descriptive; no p-values fabricated | Verified animal identity/independence |
+| 11 | Model beats a lag-one persistence comparator | Lag-one persistence, scope `checkpoint_selected_nested_outer_validation`, `descriptive_only=true`, `untouched_holdout=false`, `independent_animal_inference=false`; 432/432 scored trials, 1,036,316 eligible frames; pooled model MSE 10.419 vs baseline MSE 1.910 → `skill_vs_persistence=-4.456` | **Negative result**: the model does not beat the comparator on this frame scope. Original receipt's `spot_check.all_ok=false` (batch-1 vs batch-128 at 1e-9); exact-batch persistence verification covered only three sampled original batch groups at rel_tol=abs_tol=1e-12 (`model_mse_rel_diff=0`), with no 432-trial rescore. The original contradictory receipt is preserved verbatim (not overwritten). Original receipt warning count 432 vs actual 146 | Untouched holdout + verified animal IDs; persistence result not a generalization claim |
+
+**External primary evidence versus local analysis controls.**
+Verified animal identity, biological LIF/GRU pathway correspondence, selective
+biological perturbations, the TTC=0 cohort, and an untouched animal holdout are
+external primary records that cannot be established by local code. Descriptive
+and grouped statistical computation and the frozen-input Jacobian control are
+local analyses only: they do not establish those external biological claims.
+Rows resting on external primary records remain unsatisfied until those records
+are acquired; local code cannot create them.
+
+**Current r6 acceptance state.** `seven-analysis-sorted-20261001-r6/status.json`
+reports `state=complete`, `all_seven_executed=true`, `all_seven_successful=true`,
+and `scientific_acceptance=pending`. Acceptance is not claimed and the pending
+flag is not rewritten to invent it. The psychophysics stage records
+`ticket_batch_32_compliant=false` with `batch_32_where_exposed=32` and
+`psychophysics_batch_policy="inherited whole validation/TTC=0 subset; no CLI
+batch option"`: the batch-32 exposure is a policy limitation (the stage has no
+CLI batch selector and inherited the full subset), not a per-ticket batch
+choice.
 
 **Acquisition-rate facts.** The model grid is 4 ms (250 Hz); the source cadence
 is approximately 5 ms (inspected firmware nominal, about 200 Hz). Neither figure

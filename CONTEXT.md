@@ -97,7 +97,7 @@ _Avoid_: animal split, session split, grouped split
 ### Behavioral Classification
 
 **Escape**:
-Behavioral label for trials where post-stimulus sustained speed exceeds 50 mm/s for 250ms and pre-stimulus speed was below 10 mm/s, indicating a stimulus-locked giant-fiber-mediated wind escape response.
+Behavioral label for trials where post-stimulus sustained speed exceeds 50 mm/s for 250ms and pre-stimulus speed was below 10 mm/s. A speed-threshold rule only; it does not establish the mediating neural pathway.
 _Avoid_: startle, flight response
 
 **Prewalk**:
