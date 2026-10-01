@@ -19,8 +19,8 @@ Gated Recurrent Unit pathway for smooth, continuous temporal integration of sens
 _Avoid_: Path B, continuous path
 
 **MoR Router**:
-Per-timestep routing network that produces independent softmax weights blending LIF Pathway and GRU Pathway outputs, conditioned on sensory encoding and MCMC Prior.
-_Avoid_: gate, mixer, blender
+Per-timestep routing network that produces coupled softmax weights (the two columns sum to 1) blending LIF Pathway and GRU Pathway outputs, conditioned on sensory encoding and MCMC Prior. The gate vector is ``[g_lif, g_gru]`` (column 0 = LIF weight, column 1 = GRU weight); it is a learned representational-routing gate, not a causal-inference estimator.
+_Avoid_: gate, mixer, blender, causal inference gate
 
 **FrontendEncoder**:
 Stage 1 of the Hybrid Funnel architecture, encapsulating optional dendritic compartmentalization (IIR filtering on visual channels) and the SensoryEncoder, mapping raw 4-D sensory features to hidden representations.
@@ -79,15 +79,15 @@ A provenance stamp embedded in every checkpoint and dataset artifact, enforcing 
 _Avoid_: version, stamp, tag
 
 **Physical Cadence (dt_ms)**:
-The hardware sampling interval in milliseconds (nominal 250 Hz, dt_ms = 4.0 ms, ~4.006 ms median), superseding legacy 100 Hz (10.0 ms) assumptions. All biophysical time constants are specified in physical milliseconds and converted internally via exp(-dt_ms / tau_ms).
-_Avoid_: frame rate, step size
+The model-grid interval in milliseconds used for LIF discretization and all frame-to-millisecond conversions: dt_ms = 4.0 ms. This is a causal previous-source-hold grid containing estimates, not observations; it supersedes the legacy 10.0 ms grid assumption. The source cadence is approximately 5 ms (inspected firmware nominal, about 200 Hz); the 4.0 ms model grid corresponds to 250 Hz. Neither figure proves hardware emission calibration, and the historically flashed firmware is not verified. The nominal source cadence is not the host-arrival residual P95 and the two are not contradictory. The ~4.006 ms figure is a host-arrival batching diagnostic, not a measured acquisition rate, and changing the grid does not inflate trial duration by 25%. All biophysical time constants are specified in physical milliseconds and converted internally via exp(-dt_ms / tau_ms).
+_Avoid_: frame rate, step size, acquisition rate
 
 **Trial-Start Anchor**:
 The temporal reference point for all continuous sequences, defined as the moment of the 2-second absolute static baseline onset. Sequences are extracted from this anchor forward.
 _Avoid_: baseline onset, sequence origin
 
 **Pure-Wind Trial**:
-An experimental trial with no visual looming stimulus, receiving 1425 frames (5.7s at 250 Hz / 4ms cadence) of zero-padding prepended to align temporally with looming trials.
+An experimental trial with no visual looming stimulus, receiving 1425 frames (5.7 s at the 4.0 ms model grid) of zero-padding prepended to align temporally with looming trials. The prepend is synthetic alignment padding, not observed baseline data.
 _Avoid_: wind-only trial
 
 **Animal-Grouped Split**:

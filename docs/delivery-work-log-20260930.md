@@ -419,6 +419,38 @@ epochs. No deterministic uninterrupted-equivalence claim is made.
   `nsmor_subset_small.pt` absent), reported as skipped, not passed. The earlier
   1643- and 1607-passed figures are superseded.
 
+## Scientific claim-to-evidence / gap matrix — 2026-10-01
+
+Each row states a claim, the *existing* evidence for it, and what must exist
+before the claim can be asserted. That prerequisite is either a *required
+analysis/control* that is analytically recoverable (e.g. a passing solver or
+frozen-input control) or an *external primary record* that must be acquired
+(verified firmware, verified animal identity, an untouched holdout). Existing
+engineering acceptance is not biological completeness, and recoverable control
+work is **in progress**; no test or empirical result is invented here, and no
+row is marked complete.
+
+| # | Claim | Existing evidence (r6/checkout) | Gap / status | Required analysis/control or external primary record (blocks) |
+| - | ----- | ------------------------------- | ------------ | ----------------------------------------- |
+| 1 | Model reproduces observed escape kinematics | Formal metrics (MSE 10.42, RMSE 3.23 cm/s, R² 0.601, escape-band RMSE 19.82 cm/s over 25,075 frames) on `best_model.pth` | Checkpoint-selected nested outer-validation; descriptive; not an untouched holdout; escape-band error an order of magnitude above resting | Untouched holdout + verified animal IDs (blocks unbiased generalization) |
+| 2 | LIF pathway is causally necessary for escape | Lesion `lif_lesioned` vs `intact` d=-0.456, `estimable_descriptive_only` | Readout substitution (`g_lif`,`g_gru` both pinned); both branches still run; no p-value; animal IDs alone address population identity only | Verified animal identity/independence **and** biological pathway correspondence + pathway-specific perturbation + identification design (blocks population and causal inference) |
+| 3 | GRU pathway is causally necessary for escape | Lesion `gru_lesioned` vs `intact` d=1.899, `estimable_descriptive_only` | Same substitution caveat; descriptive only, p/adjusted p `null`; animal IDs alone address population identity only | Verified animal identity/independence **and** biological pathway correspondence + pathway-specific perturbation + identification design (blocks population and causal inference) |
+| 4 | Router implements mechanistic causal inference | Gate is a coupled softmax mixture `[g_lif, g_gru]` (columns sum to 1) | The router causal claim is **not established from these artifacts** (not a mathematical-impossibility claim) | Interventional/mechanistic identification design (not available) |
+| 5 | Multisensory integration window is physiological | `integration_summary.json`, `in_sample_descriptive_only`, sorted wind axis `[-373,-308,-261,-225]` | Descriptive only; no grouped effect test; visual-only is a labelled baseline | Persisted multisensory cohort + animal IDs |
+| 6 | Bayesian cue combination / TTC=0 psychophysics | `status=not_applicable` (`n_ttc0=0`, `n_candidates=252`) | TTC=0 cohort absent; 432 rows are r6-metrics checkpoint-selected nested outer-validation rows, not an untouched holdout (`holdout_eligible=false`) | Persisted non-empty `multisensory_ttc_0ms` subset + untouched holdout |
+| 7 | Fixed-point / stability spectra | `jacobian_spectrum.json` `status=withheld`, empty stats (`early 0/63`, `transient 0/9`, `sustained 0/79`) | Withheld means no publishable spectra under existing control — **not** no fixed points; whether a fixed point is analytically recoverable under a passing solver/control is an open analysis question, and the status cannot be made green by cherry-picking candidates or lowering the residual cap | A passing frozen-input Jacobian control (an analytic recovery/control question, not an external acquisition record) |
+| 8 | Animal-level generalization | `animal_identity_status=unverified`; prefix-grouped split | Distinct prefixes do not establish distinct animals | Auditable animal-identity mapping + identity-based split |
+| 9 | Physical timing / clock synchronization | `clock_scientific_acceptance=experimental_unresolved`; ~4.006 ms is a host-arrival batching diagnostic | Source cadence ~5 ms unverified; no emission calibration | Verified firmware + raw unbatched timestamps + emission calibration |
+| 10 | Gating clusters are distinct strategies | ARI 4-way 0.198, NMI 4-way 0.227, Cohen's d 1.19 | In-sample descriptive; no p-values fabricated | Verified animal identity/independence |
+
+**Acquisition-rate facts.** The model grid is 4 ms (250 Hz); the source cadence
+is approximately 5 ms (inspected firmware nominal, about 200 Hz). Neither figure
+proves hardware emission calibration. The nominal source cadence is not the
+host-arrival residual P95, and the two are not contradictory. The host-arrival
+4.006 ms batching figure is a diagnostic, not a measured acquisition rate.
+Timing/emission calibration is unverified, and the 10.0 ms → 4.0 ms grid change
+does not inflate trial duration by 25%.
+
 ## Remaining delivery gates
 
 1. Coordinator release review and approval (all seven analyses and final

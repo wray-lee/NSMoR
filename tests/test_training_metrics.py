@@ -16,8 +16,9 @@ directly, with a lightweight stand-in model and a tiny DataLoader, so that:
 from __future__ import annotations
 
 import importlib.util
+import math
 from pathlib import Path
-from typing import Dict
+from typing import Any, Callable, Dict
 
 import numpy as np
 import pytest
@@ -1270,3 +1271,609 @@ def test_modern_digestless_resume_cannot_downgrade_to_historical_binding(
     with pytest.raises(ValueError, match="modern.*dataset_source_sha256"):
         mod.train(resumed, dataset_path=str(path))
     assert not (tmp_path / "rejected" / "final_model.pth").exists()
+
+
+# ═══════════════════════════════════════════════════════════════
+# BIO-PERSISTENCE-001: paired lag-one target-history benchmark
+# ═══════════════════════════════════════════════════════════════
+
+def test_persistence_benchmark_ramp_conditional_skill():
+    """A ramp: lag-one is an exact comparator, so a perfect model scores skill 1.
+
+    ``skill_vs_persistence`` is a conditional statement about THIS comparator
+    only, not a universal "the model has temporal skill" verdict.
+    """
+    mod = _load_train_module()
+    y = np.array([0.0, 1.0, 2.0, 3.0, 4.0])
+    # Perfect model: model MSE == 0 -> skill_vs_persistence == 1.
+    m = mod.persistence_benchmark_metrics([y], [y.copy()], escape_band_cm_s=10.0)
+    # lag-one comparator on t>=1: predicts [0,1,2,3] for [1,2,3,4] -> unit errors.
+    assert m["n_trials"] == 1
+    assert m["n_scored_trials"] == 1
+    assert m["n_eligible_frames"] == 4
+    assert m["baseline_mse"] == pytest.approx(1.0)
+    assert m["mse"] == pytest.approx(0.0)
+    assert m["skill_vs_persistence"] == pytest.approx(1.0)
+    # A model that IS the lag-one comparator does not beat it (skill == 0).
+    y_pred_lag = np.array([np.nan, 0.0, 1.0, 2.0, 3.0])
+    m2 = mod.persistence_benchmark_metrics([y], [y_pred_lag], escape_band_cm_s=10.0)
+    assert m2["mse"] == pytest.approx(m2["baseline_mse"])
+    assert m2["skill_vs_persistence"] == pytest.approx(0.0)
+
+
+def test_persistence_benchmark_eligibility_is_per_sequence_t_ge_1():
+    """t>=1 eligibility is PER sequence; no cross-trial lag-one bridging."""
+    mod = _load_train_module()
+    # If seq2's first frame were paired with seq1's last frame (value 0),
+    # its baseline error would be (100-0)^2 = 10000.  Per-sequence pairing
+    # excludes seq2[0] entirely, so the baseline is exact -> base_mse == 0.
+    seq1 = np.array([0.0, 0.0, 0.0])
+    seq2 = np.array([100.0, 100.0, 100.0])
+    m = mod.persistence_benchmark_metrics(
+        [seq1, seq2], [seq1.copy(), seq2.copy()], escape_band_cm_s=10.0,
+    )
+    assert m["n_trials"] == 2
+    assert m["n_eligible_frames"] == 4  # (3-1) + (3-1)
+    assert m["baseline_mse"] == pytest.approx(0.0)
+    assert m["mse"] == pytest.approx(0.0)
+    # zero baseline MSE -> skill undefined, reported as None + reason.
+    assert m["skill_vs_persistence"] is None
+    assert m["skill_vs_persistence_unavailable_reason"] == "zero_baseline_mse"
+
+
+def test_persistence_benchmark_escape_mask_from_original_not_sliced():
+    """Escape membership uses _sustained_run on the ORIGINAL target, then the
+    t>=1 slice -- never a recompute on the sliced array (which would drop the
+    run that started at t=0)."""
+    mod = _load_train_module()
+    # Original [200,200,0]: a sustained run of two over-band frames at t=0,1.
+    # After the t>=1 slice, t=1 remains escape.  Recomputing _sustained_run on
+    # the sliced [200,0] would drop the lone 200 -> escape band empty.
+    y = np.array([200.0, 200.0, 0.0])
+    m = mod.persistence_benchmark_metrics([y], [y.copy()], escape_band_cm_s=10.0)
+    assert m["n_escape_frames"] == 1, "escape mask must be taken pre-slice"
+    assert m["n_rest_frames"] == 1
+
+
+def test_persistence_benchmark_empty_and_zero_variance_explicit_null():
+    """Degenerate inputs report explicit None + reason, never 0/NaN/Inf."""
+    mod = _load_train_module()
+    # No sequence has a t>=1 frame -> every field null with a reason.
+    m = mod.persistence_benchmark_metrics(
+        [np.array([5.0])], [np.array([5.0])], escape_band_cm_s=10.0,
+    )
+    # The trial is counted (reported, not dropped) but contributes no frame.
+    assert m["n_trials"] == 1
+    assert m["n_scored_trials"] == 0
+    assert m["trials"][0]["status"] == "empty_eligible_no_t_ge_1_frame"
+    assert m["n_eligible_frames"] == 0
+    assert m["mse"] is None and m["skill_vs_persistence"] is None
+    assert m["mse_unavailable_reason"] == "no_sequence_with_at_least_two_frames"
+
+    # Constant (zero-variance) target -> R² undefined, MSE still defined.
+    y = np.full(5, 3.0)
+    m2 = mod.persistence_benchmark_metrics([y], [y.copy()], escape_band_cm_s=10.0)
+    assert m2["mse"] == pytest.approx(0.0)
+    assert m2["r2"] is None
+    assert m2["r2_unavailable_reason"] == "zero_target_variance"
+    # All-resting -> escape band empty -> null + reason, rest band populated.
+    assert m2["n_escape_frames"] == 0
+    assert m2["escape_rmse"] is None
+    assert m2["escape_rmse_unavailable_reason"] == "empty_escape_band"
+    assert m2["rest_rmse"] is not None
+
+
+def test_compute_metrics_persistence_optin_preserves_legacy_keys(compute_metrics):
+    """Default stays the legacy 9-key dict; opt-in adds ONE nested object."""
+    y = np.array([0.0, 0.0, 30.0, 30.0, 5.0, 0.0])
+    legacy = compute_metrics(
+        _FakeModel(scale=1.0), _tiny_loader(y), torch.device("cpu"),
+        target_mean=0.0, target_std=1.0, target_clip_cm_s=100.0,
+        escape_band_cm_s=10.0,
+    )
+    assert "persistence_benchmark" not in legacy
+    assert len(legacy) == 9
+
+    optin = compute_metrics(
+        _FakeModel(scale=1.0), _tiny_loader(y), torch.device("cpu"),
+        target_mean=0.0, target_std=1.0, target_clip_cm_s=100.0,
+        escape_band_cm_s=10.0, persistence_benchmark=True,
+    )
+    # Legacy keys are byte-identical; exactly one supplemental key is added.
+    for k, v in legacy.items():
+        assert optin[k] == v
+    assert set(optin) - set(legacy) == {"persistence_benchmark"}
+    bench = optin["persistence_benchmark"]
+    assert bench["n_trials"] == 1
+    assert bench["n_eligible_frames"] == len(y) - 1
+
+
+def test_persistence_benchmark_rescales_normalized_predictions(compute_metrics):
+    """Opt-in benchmark must score model vs baseline in the SAME units.
+
+    The model emits NORMALIZED predictions; the lag-one baseline is built from
+    the RAW cm/s target.  If the model list were not rescaled, a perfect
+    normalized predictor would show a huge, spurious error.  After the rescale
+    the perfect predictor's benchmark MSE is ~0 and skill ~1.
+    """
+    y = np.array([0.0, 0.0, 10.0, 0.0, 60.0, -40.0, 0.0, 0.0])
+    y_norm = (y - 5.0) / 2.0                       # mean=5, std=2
+    yt = torch.as_tensor(y_norm, dtype=torch.float32).view(1, 8)
+    x = yt.unsqueeze(-1).clone()                   # fake head reproduces y_norm
+    y_raw = torch.as_tensor(y, dtype=torch.float32).view(1, 8)
+    lengths = torch.full((1,), 8, dtype=torch.long)
+    loader = torch.utils.data.DataLoader(
+        torch.utils.data.TensorDataset(x, y_raw, lengths), batch_size=1,
+    )
+    m = compute_metrics(
+        _FakeModel(scale=1.0), loader, torch.device("cpu"),
+        target_mean=5.0, target_std=2.0, target_clip_cm_s=0.0,
+        escape_band_cm_s=10.0, persistence_benchmark=True,
+    )
+    bench = m["persistence_benchmark"]
+    # Perfect normalized predictor -> cm/s model MSE ~ 0 (rescale applied).
+    assert bench["mse"] < 1e-3, bench["mse"]
+    assert bench["skill_vs_persistence"] > 0.99
+
+
+def test_persistence_benchmark_clip_counterexample_raw_bands():
+    """Headline errors use the clipped convention; band errors stay RAW.
+
+    ``[0, 20, 20]`` with ``target_clip_cm_s=10``: the headline model MSE is
+    measured on the clipped target (each 20 -> 10), while the escape band is
+    measured on the raw 20.  A helper that scored the headline on raw values
+    would report 400 instead of 100.
+    """
+    mod = _load_train_module()
+    y = np.array([0.0, 20.0, 20.0])
+    z = np.array([0.0, 0.0, 0.0])
+    m = mod.persistence_benchmark_metrics([y], [z], escape_band_cm_s=10.0,
+                                          target_clip_cm_s=10.0)
+    # headline: clipped true [0,10,10] vs clipped pred [0,0,0] -> err 100 each.
+    assert m["mse"] == pytest.approx(100.0)
+    # raw escape band: model err (20-0)^2 = 400 both; lag-one comparator errs
+    # only on the jump: (20-0)^2 + (20-20)^2 over 2 -> 200.
+    assert m["n_escape_frames"] == 2
+    assert m["escape_mse"] == pytest.approx(400.0)
+    assert m["escape_baseline_mse"] == pytest.approx(200.0)
+    assert m["escape_skill_vs_persistence"] == pytest.approx(-1.0)
+
+    # With the clip disabled the headline is measured on the raw 20s
+    # (400 for each of the two eligible frames), distinct from the clipped 100.
+    m0 = mod.persistence_benchmark_metrics([y], [z], escape_band_cm_s=10.0,
+                                           target_clip_cm_s=0.0)
+    assert m0["mse"] == pytest.approx(400.0)
+
+
+def test_persistence_benchmark_padding_crop_no_cross_trial_alignment():
+    """A one-frame trial is reported, never bridged with a neighbour's tail."""
+    mod = _load_train_module()
+    seq1 = np.array([0.0, 0.0, 0.0])      # 2 eligible frames
+    seq2 = np.array([100.0])              # no t>=1 frame
+    m = mod.persistence_benchmark_metrics(
+        [seq1, seq2], [seq1.copy(), seq2.copy()], escape_band_cm_s=10.0,
+    )
+    assert m["n_trials"] == 2
+    assert m["n_scored_trials"] == 1
+    assert m["n_eligible_frames"] == 2   # seq2[0] is NOT paired with seq1[-1]
+    assert m["baseline_mse"] == pytest.approx(0.0)
+    statuses = {row["trial"]: row["status"] for row in m["trials"]}
+    assert statuses[0] == "scored"
+    assert statuses[1] == "empty_eligible_no_t_ge_1_frame"
+    assert [row["trial"] for row in m["trials"]] == [0, 1]  # ordered, none dropped
+
+
+def test_persistence_benchmark_paired_per_trial_deltas_ordered():
+    """Every trial reports its own paired MSE/delta, in input order."""
+    mod = _load_train_module()
+    seq1 = np.array([0.0, 1.0, 2.0])          # perfect model -> model MSE 0
+    seq2 = np.array([0.0, 10.0, 10.0])        # flat-zero model -> large error
+    pred1 = seq1.copy()
+    pred2 = np.array([0.0, 0.0, 0.0])
+    m = mod.persistence_benchmark_metrics([seq1, seq2], [pred1, pred2],
+                                          escape_band_cm_s=10.0)
+    assert [row["trial"] for row in m["trials"]] == [0, 1]
+    r0, r1 = m["trials"]
+    assert r0["length"] == 3 and r0["eligible"] == 2
+    assert r0["model_mse"] == pytest.approx(0.0)
+    assert r0["delta_model_minus_baseline_mse"] == pytest.approx(0.0 - 1.0)
+    assert r1["model_mse"] == pytest.approx(100.0)     # (10-0)^2 each
+    assert r1["baseline_mse"] == pytest.approx(50.0)   # lag-one errs on the jump
+    assert r1["delta_model_minus_baseline_mse"] == pytest.approx(50.0)
+    # pooled headline is the frame-weighted mean of the two trials' frames.
+    assert m["n_eligible_frames"] == 4
+    assert m["mse"] == pytest.approx((0.0 + 0.0 + 100.0 + 100.0) / 4)
+
+
+def test_persistence_benchmark_nonfinite_fails_closed():
+    """Eligible non-finite true/model/lag values raise; unused t0 NaN is fine."""
+    mod = _load_train_module()
+    y = np.array([0.0, 1.0, 2.0, 3.0])
+    good = y.copy()
+    # NaN on a scored model frame -> ValueError (never a NaN metric).
+    bad_pred = good.copy()
+    bad_pred[2] = np.nan
+    with pytest.raises(ValueError, match="model prediction"):
+        mod.persistence_benchmark_metrics([y], [bad_pred], escape_band_cm_s=10.0)
+    # Inf on a scored target frame -> ValueError.
+    bad_true = y.copy()
+    bad_true[3] = np.inf
+    with pytest.raises(ValueError, match="true target"):
+        mod.persistence_benchmark_metrics([bad_true], [good], escape_band_cm_s=10.0)
+    # Non-finite predecessor target (t=0) is consumed by the lag comparator.
+    bad_prev = y.copy()
+    bad_prev[0] = np.nan
+    with pytest.raises(ValueError, match="predecessor target"):
+        mod.persistence_benchmark_metrics([bad_prev], [good], escape_band_cm_s=10.0)
+    # NaN at the UNSCORED model t=0 is permitted (never read).
+    ok_pred = good.copy()
+    ok_pred[0] = np.nan
+    m = mod.persistence_benchmark_metrics([y], [ok_pred], escape_band_cm_s=10.0)
+    assert m["n_eligible_frames"] == 3
+    assert all(np.isfinite(v) for v in (m["mse"], m["baseline_mse"]))
+
+
+def test_persistence_benchmark_invalid_shape_fails_closed():
+    """Multidimensional or mismatched inputs fail closed, never flattened."""
+    mod = _load_train_module()
+    y = np.array([0.0, 1.0, 2.0])
+    with pytest.raises(ValueError, match="1-D"):
+        mod.persistence_benchmark_metrics(
+            [np.zeros((3, 2))], [np.zeros((3, 2))], escape_band_cm_s=10.0,
+        )
+    with pytest.raises(ValueError, match="!="):
+        mod.persistence_benchmark_metrics([y], [y[:2]], escape_band_cm_s=10.0)
+    with pytest.raises(ValueError, match="aligned sequences"):
+        mod.persistence_benchmark_metrics([y], [y, y], escape_band_cm_s=10.0)
+
+
+def test_persistence_benchmark_json_allow_nan_false_round_trips():
+    """Every emitted value is finite-or-null: strict JSON must succeed."""
+    import json
+    mod = _load_train_module()
+    # Degenerate (all-null) and populated cases must both serialize.
+    empty = mod.persistence_benchmark_metrics(
+        [np.array([5.0])], [np.array([5.0])], escape_band_cm_s=10.0,
+    )
+    json.dumps(empty, allow_nan=False)
+    full = mod.persistence_benchmark_metrics(
+        [np.array([0.0, 20.0, 20.0, 0.0])], [np.array([0.0, 1.0, 2.0, 3.0])],
+        escape_band_cm_s=10.0, target_clip_cm_s=10.0,
+    )
+    json.dumps(full, allow_nan=False)
+
+
+# ═══════════════════════════════════════════════════════════════
+# BIO-PERSISTENCE-002: overflow / underflow / scalar-parameter guards
+# ═══════════════════════════════════════════════════════════════
+
+@pytest.mark.parametrize(
+    "true,pred,clip",
+    [
+        ([0.0, 1.0, 2.0], [0.0, 1e200, 0.0], 10.0),
+        ([0.0, 0.0, 0.0], [0.0, 1e154, 1e154], 0.0),
+        ([0.0, 1e-200, 2e-200], [0.0, 0.0, 0.0], 0.0),
+        ([0.0, 1e308], [0.0, -1e308], 0.0),
+        ([1e-200, 0.0], [0.0, 0.0], 0.0),  # baseline-only underflow
+    ],
+)
+def test_persistence_unrepresentable_errors_raise(
+    true: list[float], pred: list[float], clip: float,
+) -> None:
+    """Errors fail closed, even in raw bands behind a safe headline clip."""
+    mod = _load_train_module()
+    with pytest.raises(ValueError, match="error arithmetic is not representable"):
+        mod.persistence_benchmark_metrics(
+            [np.array(true)], [np.array(pred)], target_clip_cm_s=clip,
+        )
+
+
+def test_persistence_pooled_reduction_overflow_raises() -> None:
+    """Individually representable trial sums cannot hide a pooled overflow."""
+    mod = _load_train_module()
+    true = np.zeros(2)
+    pred = np.array([0.0, 1e154])
+    with pytest.raises(ValueError, match="error arithmetic is not representable"):
+        mod.persistence_benchmark_metrics([true, true], [pred, pred])
+
+
+def test_paired_metrics_mean_underflow_raises() -> None:
+    """A representable square sum must not become a zero MSE after dividing."""
+    mod = _load_train_module()
+    pred = np.array([2e-162, 0.0, 0.0, 0.0])
+    with pytest.raises(ValueError, match="error reduction underflow to zero"):
+        mod._paired_metrics(np.zeros(4), pred, np.zeros(4), empty_reason="x")
+
+
+def test_paired_metrics_tiny_variance_ratios_have_independent_reasons() -> None:
+    """Representable error squares may still produce unrepresentable ratios."""
+    import json
+
+    mod = _load_train_module()
+    true = np.array([0.0, 1e-160, 2e-160])
+    blk = mod._paired_metrics(true, np.ones(3), true, empty_reason="x")
+    assert blk["r2"] is None
+    assert blk["r2_unavailable_reason"] == "non_finite_r2"
+    assert blk["baseline_r2"] == 1.0
+    assert "baseline_r2_unavailable_reason" not in blk
+    json.dumps(blk, allow_nan=False)
+
+    # A perfect model must not inherit a baseline's overflowing R2 reason.
+    y = np.array([1e154, 0.0, 1e-160, 2e-160])
+    result = mod.persistence_benchmark_metrics([y], [y.copy()])
+    for prefix in ("", "rest_"):
+        assert result[f"{prefix}r2"] == 1.0
+        assert f"{prefix}r2_unavailable_reason" not in result
+        assert result[f"{prefix}baseline_r2"] is None
+        assert result[f"{prefix}baseline_r2_unavailable_reason"] == "non_finite_r2"
+    json.dumps(result, allow_nan=False)
+
+
+def test_paired_metrics_variance_underflow_is_not_constant() -> None:
+    """Undefined variance is distinct from genuine constant targets."""
+    mod = _load_train_module()
+    y = np.array([0.0, 1e-200])
+    result = mod._paired_metrics(y, y, y, empty_reason="x")
+    assert result["mse"] == 0.0
+    for key in ("r2", "baseline_r2"):
+        assert result[key] is None
+        assert result[f"{key}_unavailable_reason"] == "nonrepresentable_target_variance"
+
+    # Tiny but representable squares and variance must remain valid.
+    y = np.array([0.0, 1e-150, 2e-150])
+    result = mod._paired_metrics(y, np.zeros(3), y, empty_reason="x")
+    assert result["mse"] == pytest.approx(5e-300 / 3, rel=1e-12, abs=0.0)
+    assert result["mae"] == pytest.approx(1e-150, rel=1e-12, abs=0.0)
+    assert result["r2"] == pytest.approx(-1.5)
+
+
+def test_paired_metrics_finite_huge_over_tiny_skill_is_null():
+    """A finite model MSE over a finite tiny baseline overflows the ratio."""
+    import json
+    mod = _load_train_module()
+    skill = mod._lag1_skill_ratio(1e300, 1e-300)
+    assert skill is None  # 1 - 1e300/1e-300 overflows float64
+    # A representable negative skill is preserved exactly (not nulled).
+    assert mod._lag1_skill_ratio(2.0, 1.0) == pytest.approx(-1.0)
+    json.dumps({"skill": skill}, allow_nan=False)
+
+
+def test_paired_metrics_preserves_valid_negative_r2_and_zero_error():
+    """The guard must not nullify legitimately finite negative R² or exact 0."""
+    mod = _load_train_module()
+    true = np.array([0.0, 10.0, 0.0, 10.0])
+    model_pred = true + 20.0  # model MSE 400 >> variance
+    blk = mod._paired_metrics(true, model_pred, true, empty_reason="x")
+    assert blk["r2"] is not None and blk["r2"] < 0.0
+    assert blk["baseline_r2"] == pytest.approx(1.0)
+    # Exact zero errors stay exactly zero (not dropped to null).
+    true = np.array([1.0, 2.0])
+    zero = mod._paired_metrics(true, true, true, empty_reason="x")
+    assert zero["mse"] == 0.0 and zero["skill_vs_persistence"] is None
+    assert zero["skill_vs_persistence_unavailable_reason"] == "zero_baseline_mse"
+
+
+def test_persistence_benchmark_constant_target_complete_reasons():
+    """Constant target/pred must carry EVERY baseline reason, not just r2."""
+    import json
+    mod = _load_train_module()
+    y = np.full(3, 3.0)
+    m = mod.persistence_benchmark_metrics([y], [y.copy()], escape_band_cm_s=10.0)
+    assert m["r2"] is None and m["baseline_r2"] is None
+    assert m["r2_unavailable_reason"] == "zero_target_variance"
+    assert m["baseline_r2_unavailable_reason"] == "zero_target_variance"
+    assert m["rest_r2_unavailable_reason"] == "zero_target_variance"
+    assert m["rest_baseline_r2_unavailable_reason"] == "zero_target_variance"
+    # zero-variance target -> baseline MSE exactly 0 -> skill undefined.
+    assert m["skill_vs_persistence"] is None
+    assert m["skill_vs_persistence_unavailable_reason"] == "zero_baseline_mse"
+    assert m["rest_skill_vs_persistence_unavailable_reason"] == "zero_baseline_mse"
+    json.dumps(m, allow_nan=False)
+
+
+def test_persistence_benchmark_scalar_rejected_length_one_accepted():
+    """A 0-D scalar is rejected; a length-one 1-D array is a valid empty trial."""
+    mod = _load_train_module()
+    with pytest.raises(ValueError, match="1-D"):
+        mod.persistence_benchmark_metrics(
+            [np.array(5.0)], [np.array(5.0)], escape_band_cm_s=10.0,
+        )
+    m = mod.persistence_benchmark_metrics(
+        [np.array([5.0])], [np.array([5.0])], escape_band_cm_s=10.0,
+    )
+    assert m["trials"][0]["status"] == "empty_eligible_no_t_ge_1_frame"
+    assert m["trials"][0]["skill_vs_persistence_unavailable_reason"] == (
+        "no_t_ge_1_frame")
+    assert m["trials"][0]["model_mse_unavailable_reason"] == "no_t_ge_1_frame"
+
+
+def test_persistence_benchmark_scalar_params_reject_bool_and_nonscalar():
+    """Band/clip must be finite real scalars: bool and arrays are rejected."""
+    mod = _load_train_module()
+    y = np.array([0.0, 1.0, 2.0])
+    for bad in (True, np.array([10.0]), [10.0]):
+        with pytest.raises(ValueError, match="finite real scalar"):
+            mod.persistence_benchmark_metrics([y], [y.copy()], escape_band_cm_s=bad)
+    for bad in (np.nan, np.inf):
+        with pytest.raises(ValueError, match="must be finite"):
+            mod.persistence_benchmark_metrics(
+                [y], [y.copy()], escape_band_cm_s=10.0, target_clip_cm_s=bad,
+            )
+
+
+@pytest.mark.parametrize(
+    "values", [[3.0, 3.0, 3.0], [0.0, 20.0, 20.0, 0.0], [20.0, 20.0, 20.0]],
+)
+def test_compute_metrics_optin_full_return_strict_json(
+    compute_metrics: Callable[..., Dict[str, Any]], values: list[float],
+) -> None:
+    """Full opt-in output is strict JSON for constant/normal/empty bands."""
+    import json
+
+    result = compute_metrics(
+        _FakeModel(), _tiny_loader(np.array(values)), torch.device("cpu"),
+        persistence_benchmark=True,
+    )
+    json.dumps(result, allow_nan=False)
+    assert result["mse"] == 0.0
+    for key in ("r2", "escape_rmse", "resting_rmse"):
+        assert (f"{key}_unavailable_reason" in result) == (result[key] is None)
+    if values[0] == 3.0:
+        assert result["escape_rmse"] is None
+        assert result["escape_rmse_unavailable_reason"] == "empty_escape_band"
+        assert result["r2_unavailable_reason"] == "zero_target_variance"
+    if values == [20.0, 20.0, 20.0]:
+        assert result["resting_rmse"] is None
+        assert result["resting_rmse_unavailable_reason"] == "empty_rest_band"
+
+
+def test_compute_metrics_optin_overflow_rejects_before_legacy_scoring(
+    compute_metrics: Callable[..., Dict[str, Any]],
+) -> None:
+    """Use float64 so the finite inputs reach the real shared scoring seam."""
+    y = torch.tensor([[0.0, 1.0, 2.0]], dtype=torch.float64)
+    pred = torch.tensor([[[0.0], [1e200], [0.0]]], dtype=torch.float64)
+    loader = [(pred, y, torch.tensor([3]))]
+    with pytest.raises(ValueError, match="error arithmetic is not representable"):
+        compute_metrics(
+            _FakeModel(), loader, torch.device("cpu"), target_clip_cm_s=10.0,
+            persistence_benchmark=True,
+        )
+
+
+def test_compute_metrics_optin_padding_crop_matches_unpadded(
+    compute_metrics: Callable[..., Dict[str, Any]],
+) -> None:
+    """Padded/cropped unequal lengths keep the same masks and t>=1 pairs."""
+    mod = _load_train_module()
+    y = torch.tensor([[20.0, 20.0, 0.0, 999.0], [100.0, 999.0, 999.0, 999.0]])
+    lengths = torch.tensor([3, 1])
+    result = compute_metrics(
+        _FakeModel(), [(y.unsqueeze(-1), y, lengths)], torch.device("cpu"),
+        target_clip_cm_s=10.0, persistence_benchmark=True,
+    )
+    expected = mod.persistence_benchmark_metrics(
+        [np.array([20.0, 20.0, 0.0]), np.array([100.0])],
+        [np.array([20.0, 20.0, 0.0]), np.array([100.0])],
+        target_clip_cm_s=10.0,
+    )
+    assert result["persistence_benchmark"] == expected
+    assert result["n_escape_frames"] == 2
+    assert expected["n_eligible_frames"] == 2
+    assert expected["n_escape_frames"] == 1
+
+
+# ═══════════════════════════════════════════════════════════════
+# BIO-PERSISTENCE-003: float64 rescale boundary / JSON scalar / log nulls
+# ═══════════════════════════════════════════════════════════════
+
+def _const_frame_loader(
+    pred_norm: float, y_true: float, n: int = 1, *,
+    dtype: torch.dtype = torch.float32,
+) -> list:
+    """An ``n``-frame batch whose model output is the standardized ``pred_norm``."""
+    x = torch.full((1, n, 1), pred_norm, dtype=dtype)
+    y = torch.full((1, n), y_true, dtype=dtype)
+    lengths = torch.tensor([n])
+    return [(x, y, lengths)]
+
+
+def test_compute_metrics_optin_float32_underflow_not_lost(
+    compute_metrics: Callable[..., Dict[str, Any]],
+) -> None:
+    """Promote to float64 BEFORE rescale: a float32 1e-20 * 1e-30 is not 0.
+
+    float32 ``1e-20 * 1e-30`` underflows to 0.0, which would report a perfect
+    MSE=0 for a nonzero prediction error.  The rescale must happen in float64,
+    where ``(1e-20 * 1e-30)**2`` is the representable ~9.999999365310462e-101.
+    Two frames give the lag-one benchmark an eligible ``t>=1`` frame, covering
+    the second rescale site as well.
+    """
+    with np.errstate(over="raise", invalid="raise"):
+        result = compute_metrics(
+            _FakeModel(), _const_frame_loader(1e-20, 0.0, n=2),
+            torch.device("cpu"), target_mean=0.0, target_std=1e-30,
+            target_clip_cm_s=0.0, escape_band_cm_s=10.0,
+            persistence_benchmark=True,
+        )
+    assert result["mse"] != 0.0
+    assert result["mse"] == pytest.approx(9.999999365310462e-101, rel=1e-9)
+    assert result["persistence_benchmark"]["mse"] == pytest.approx(
+        9.999999365310462e-101, rel=1e-9,
+    )
+
+
+def test_compute_metrics_optin_float32_rescale_no_overflow(
+    compute_metrics: Callable[..., Dict[str, Any]],
+) -> None:
+    """float32 1e20 * std 1e20 must not overflow float32 (or raise)."""
+    x = torch.tensor([[[1e20], [1e20]]], dtype=torch.float32)
+    y = torch.tensor([[0.0, 0.0]], dtype=torch.float32)
+    with np.errstate(over="raise", invalid="raise"):
+        result = compute_metrics(
+            _FakeModel(), [(x, y, torch.tensor([2]))], torch.device("cpu"),
+            target_mean=0.0, target_std=1e20, target_clip_cm_s=0.0,
+            escape_band_cm_s=10.0, persistence_benchmark=True,
+        )
+    assert math.isfinite(result["mse"]) and result["mse"] > 0.0
+
+
+def test_compute_metrics_optin_unrepresentable_rescale_raises(
+    compute_metrics: Callable[..., Dict[str, Any]],
+) -> None:
+    """A genuinely unrepresentable float64 rescale raises, not inf/NaN."""
+    with pytest.raises(ValueError, match="not representable in float64"):
+        compute_metrics(
+            _FakeModel(), _const_frame_loader(1e300, 0.0, dtype=torch.float64),
+            torch.device("cpu"), target_mean=0.0, target_std=1e300,
+            target_clip_cm_s=0.0, escape_band_cm_s=10.0,
+            persistence_benchmark=True,
+        )
+
+
+@pytest.mark.parametrize(
+    "band", [np.float32(10), np.int64(10), np.longdouble(10)],
+)
+def test_compute_metrics_optin_numpy_scalar_band_is_native_json(
+    compute_metrics: Callable[..., Dict[str, Any]], band,
+) -> None:
+    """Accepted NumPy scalar bands must serialise as native JSON numbers."""
+    import json
+
+    result = compute_metrics(
+        _FakeModel(), _tiny_loader(np.array([0.0, 20.0, 20.0])),
+        torch.device("cpu"), target_clip_cm_s=0.0, escape_band_cm_s=band,
+        persistence_benchmark=True,
+    )
+    value = result["escape_band_cm_s"]
+    assert type(value) in (int, float), type(value)
+    assert value == 10
+    json.dumps(result, allow_nan=False)
+
+
+def test_log_best_metrics_tolerates_null_r2_and_empty_band() -> None:
+    """Best-eval logging must spell out null metrics, not raise TypeError."""
+    import logging
+
+    mod = _load_train_module()
+    captured: list[logging.LogRecord] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, rec): captured.append(rec)
+
+    handler = _Capture()
+    mod.logger.addHandler(handler)
+    mod.logger.setLevel(logging.INFO)
+    try:
+        mod._log_best_metrics({
+            "mse": 0.0, "rmse": 0.0, "mae": 0.0, "r2": None,
+            "escape_band_cm_s": 10.0, "n_escape_frames": 0.0,
+            "escape_ratio": 0.0, "escape_rmse": None, "resting_rmse": 0.0,
+        })
+    finally:
+        mod.logger.removeHandler(handler)
+    # getMessage() would raise TypeError on a None %-arg; it must not.
+    messages = [rec.getMessage() for rec in captured]
+    assert len(messages) == 2
+    assert "R²: unavailable" in messages[0]
+    assert "escape_rmse=unavailable" in messages[1]

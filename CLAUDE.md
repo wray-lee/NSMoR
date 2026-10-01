@@ -15,7 +15,7 @@ NSMoR (Biological Mixture-of-Recursions) models **cricket multi-sensory integrat
 
 - **LIF Pathway:** Leaky Integrate-and-Fire spiking neuron for fast, event-driven sensory transients.
 - **GRU Pathway:** Gated Recurrent Unit for smooth, continuous temporal integration.
-- **MoR Router:** Learned causal inference gate that blends LIF and GRU outputs per timestep.
+- **MoR Router:** Learned representational-routing gate that blends LIF and GRU outputs per timestep. It produces per-step softmax weights ``[g_lif, g_gru]`` over the two pathway outputs; it is not a causal-inference estimator.
 
 Designed for **white-box dynamical systems analysis**: expose routing gates, membrane potentials, spike events, and GRU hidden states for fixed-point and Jacobian analysis.
 

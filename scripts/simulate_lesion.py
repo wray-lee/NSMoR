@@ -1,14 +1,23 @@
 """
 NSMoR In-Silico Lesion (Virtual Ablation) Experiment — Phase 7.
 
-Runs a deterministic ablation experiment comparing the behavioral
-(kinematic) output of the Intact model versus Lesioned models:
-  - Condition 1 (Intact): Natural routing
-  - Condition 2 (LIF-Lesioned): Forces all routing through GRU pathway
-  - Condition 3 (GRU-Lesioned): Forces all routing through LIF pathway
+Runs a deterministic readout intervention experiment comparing the behavioral
+(kinematic) output of the Intact model versus gate-manipulated models. Three
+default conditions describe pathway *substitutions*, not biological lesions:
+  - Condition 1 (intact): Natural routing.
+  - Condition 2 (lif_lesioned): g_lif := 0 AND g_gru := 1 — substitutes the
+    GRU readout for the whole integrated output (the GRU-only readout).
+  - Condition 3 (gru_lesioned): g_gru := 0 AND g_lif := 1 — the LIF-only
+    readout. Both recurrent branches still compute under every condition.
 
-Generates a Lancet/Cell-quality publication figure demonstrating
-behavioral collapse when specific pathways are lesioned.
+An optional ``--include_readout_knockouts`` flag adds two separately named,
+unrenormalized single-key knockouts:
+  - lif_knockout: g_lif := 0, retaining the natural time-varying g_gru.
+  - gru_knockout: g_gru := 0, retaining the natural time-varying g_lif.
+
+These conditions manipulate the learned routing readout only. They do not
+remove, silence, or establish necessity of any biological pathway, and the
+recorded target peaks are identical across conditions.
 
 Output: ``results/ablation_kinematics.png`` at 300 DPI.
 
@@ -18,6 +27,7 @@ CLI::
 
     python scripts/simulate_lesion.py --checkpoint runs/default/best_model.pth
     python scripts/simulate_lesion.py --checkpoint runs/default/best_model.pth --dataset data/processed/nsmor_dataset.pt --target_class 0
+    python scripts/simulate_lesion.py --checkpoint runs/default/best_model.pth --include_readout_knockouts
 """
 
 from __future__ import annotations
@@ -68,19 +78,55 @@ logger = logging.getLogger(__name__)
 GROUND_TRUTH_COLOR: str = "#C92A2A"   # Lancet Crimson Red
 PREDICTED_COLOR: str = "#495057"       # Strong Slate Gray
 
-# ── Lesion condition names ──
+# ── Pathway-substitution condition names (default, backward compatible) ──
+# These force the complementary gate to 1.0, i.e. they substitute a single
+# pathway's readout for the integrated output. They are NOT biological
+# knockouts and do not demonstrate pathway necessity.
 CONDITION_NAMES: Dict[str, str] = {
     "intact": "Intact Model",
-    "lif_lesioned": "LIF-Lesioned (g_lif=0)",
-    "gru_lesioned": "GRU-Lesioned (g_gru=0)",
+    "lif_lesioned": "LIF-Substituted (g_lif=0, g_gru=1)",
+    "gru_lesioned": "GRU-Substituted (g_gru=0, g_lif=1)",
 }
 
-# ── Lesion gate overrides ──
+# ── Lesion gate overrides (substitutions: complementary gate forced to 1.0) ──
 LESION_OVERRIDES: Dict[str, Optional[Dict[str, float]]] = {
     "intact": None,
     "lif_lesioned": {"g_lif": 0.0, "g_gru": 1.0},
     "gru_lesioned": {"g_lif": 1.0, "g_gru": 0.0},
 }
+
+# ── Optional unrenormalized readout knockouts (single-key) ──
+# Zeroing one gate while retaining the other's natural time-varying value is a
+# readout ablation, not a pathway substitution. Added only when requested, so
+# the default three-condition output is unchanged.
+READOUT_KNOCKOUT_OVERRIDES: Dict[str, Dict[str, float]] = {
+    "lif_knockout": {"g_lif": 0.0},
+    "gru_knockout": {"g_gru": 0.0},
+}
+
+# ── Condition registries ──
+DEFAULT_CONDITIONS: Tuple[str, ...] = tuple(LESION_OVERRIDES)
+READOUT_KNOCKOUT_CONDITIONS: Tuple[str, ...] = tuple(READOUT_KNOCKOUT_OVERRIDES)
+ALL_CONDITIONS: Tuple[str, ...] = DEFAULT_CONDITIONS + READOUT_KNOCKOUT_CONDITIONS
+
+# ── Readout-intervention condition display names ──
+_READOUT_KNOCKOUT_NAMES: Dict[str, str] = {
+    "lif_knockout": "LIF-Readout Knockout (g_lif=0, g_gru natural)",
+    "gru_knockout": "GRU-Readout Knockout (g_gru=0, g_lif natural)",
+}
+
+
+def condition_display(name: str) -> str:
+    """Human-readable label for a condition; falls back to the raw key."""
+    return CONDITION_NAMES.get(name) or _READOUT_KNOCKOUT_NAMES.get(name, name)
+
+
+def condition_override(name: str) -> Optional[Dict[str, float]]:
+    """Gate override for a condition name, or ``None`` for natural routing."""
+    if name in LESION_OVERRIDES:
+        return LESION_OVERRIDES[name]
+    return READOUT_KNOCKOUT_OVERRIDES[name]
+
 
 # ── Typography ─────────────────────────────────────────────────
 FONT_FAMILY: str = "Arial"
@@ -379,14 +425,17 @@ def run_full_ablation(
     model: NSMoRCore,
     dataloader: torch.utils.data.DataLoader,
     device: torch.device,
+    conditions: Optional[Sequence[str]] = None,
 ) -> Dict[str, Tuple[List[np.ndarray], List[np.ndarray], List[int]]]:
     """
-    Run the full ablation experiment (all three conditions).
+    Run the full ablation experiment over the requested conditions.
 
     Args:
         model: Trained NSMoRCore model.
         dataloader: DataLoader yielding (X, Y, lengths) tuples.
         device: Computation device.
+        conditions: Condition names to run. Defaults to
+            :data:`DEFAULT_CONDITIONS` (intact + two pathway substitutions).
 
     Returns:
         Dictionary mapping condition name to
@@ -394,8 +443,9 @@ def run_full_ablation(
     """
     results: Dict[str, Tuple[List[np.ndarray], List[np.ndarray], List[int]]] = {}
 
-    for condition_name, override in LESION_OVERRIDES.items():
-        logger.info("Running condition: %s", CONDITION_NAMES[condition_name])
+    for condition_name in (DEFAULT_CONDITIONS if conditions is None else conditions):
+        override = condition_override(condition_name)
+        logger.info("Running condition: %s", condition_display(condition_name))
 
         if override is not None:
             logger.info("  Override gates: %s", override)
@@ -476,6 +526,35 @@ def _observed_peak(post_true: np.ndarray, dt_ms: float) -> Tuple[float, Optional
     # ponytail: same absolute-range floor as Phase F/G; calibrate prominence if drift matters.
     latency = None if maximum - float(np.min(absolute)) < 1e-6 else float(np.argmax(absolute) * dt_ms)
     return maximum, latency
+
+
+def _prediction_delta_metrics(
+    intact_pred: np.ndarray, pred: np.ndarray, frame: Optional[int],
+) -> Optional[Tuple[int, float, float]]:
+    """Paired prediction divergence of a condition from the intact readout.
+
+    Computes RMSE and MAE between a condition's predictions and the intact
+    predictions over the same observed post-reference window. This isolates the
+    readout intervention's effect on predictions from the (condition-invariant)
+    recorded target, whose peak is identical across conditions.
+    """
+    if frame is None:
+        return None
+    n = min(len(intact_pred), len(pred))
+    if n <= frame:
+        return None
+    a = np.asarray(intact_pred[frame:n], dtype=np.float64)
+    b = np.asarray(pred[frame:n], dtype=np.float64)
+    assert a.shape == b.shape == (n - frame,)
+    if not np.isfinite(a).all() or not np.isfinite(b).all():
+        return None
+    diff = b - a
+    with np.errstate(over="ignore", invalid="ignore"):
+        rmse = float(np.sqrt(np.mean(diff ** 2)))
+        mae = float(np.mean(np.abs(diff)))
+    if not np.isfinite(rmse) or not np.isfinite(mae):
+        return None
+    return int(n - frame), rmse, mae
 
 def average_trajectories_by_class(
     y_preds: List[np.ndarray],
@@ -713,7 +792,7 @@ def export_lesion_statistics_csv(
 
                 csv_rows.append({
                     "Class": class_name,
-                    "Condition": CONDITION_NAMES[condition_name],
+                    "Condition": condition_display(condition_name),
                     "Trial_ID": str(trial_idx),
                     "Peak_Velocity_cms": f"{v_max:.4f}",
                     "Latency_to_Peak_ms": f"{t_max:.2f}" if t_max is not None else "",
@@ -807,7 +886,8 @@ def create_ablation_figure(
     """
     Create the Lancet/Cell ablation comparison figure.
 
-    Layout: subplots(3, 1) — Intact, LIF-Lesioned, GRU-Lesioned
+    Layout: one subplot per condition (default Intact, LIF-substituted,
+    GRU-substituted; optionally two readout knockouts).
 
     Args:
         results: Dictionary from :func:`run_full_ablation`.
@@ -823,16 +903,19 @@ def create_ablation_figure(
     except ValueError:
         class_name = f"Class {target_class}"
 
-    # ── Create figure with [3, 1] layout ──
-    fig, axes = plt.subplots(3, 1, figsize=(FIG_WIDTH_INCHES, FIG_HEIGHT_INCHES))
+    # ── Create one panel per condition ──
+    n_conditions = len(results)
+    fig, axes = plt.subplots(n_conditions, 1, figsize=(FIG_WIDTH_INCHES, FIG_HEIGHT_INCHES),
+                             squeeze=False)
+    axes = axes[:, 0]
 
-    # Panel labels
-    panel_labels = ["A", "B", "C"]
+    # Panel labels (extend past Z only if the registry ever grows that far).
+    panel_labels = [chr(ord("A") + i) if i < 26 else str(i + 1) for i in range(n_conditions)]
 
     for idx, (condition_name, (y_preds, y_trues, trial_labels)) in enumerate(results.items()):
         ax = axes[idx]
 
-        logger.info("Plotting condition: %s", CONDITION_NAMES[condition_name])
+        logger.info("Plotting condition: %s", condition_display(condition_name))
 
         # Average trajectories by class
         try:
@@ -917,7 +1000,7 @@ def create_ablation_figure(
 
         # Panel label and condition title
         ax.set_title(
-            f"{panel_labels[idx]}  {CONDITION_NAMES[condition_name]}",
+            f"{panel_labels[idx]}  {condition_display(condition_name)}",
             fontsize=FONT_SIZE_PANEL_LABEL,
             fontweight="bold",
             color=AXIS_COLOR,
@@ -926,7 +1009,7 @@ def create_ablation_figure(
 
     # ── Suptitle ──
     fig.suptitle(
-        f"In-Silico Lesion Analysis — {class_name} Trials ("
+        f"In-Silico Readout-Intervention Analysis — {class_name} Trials ("
         + (analysis_population["selection"].replace("_", " ") + "; "
            + analysis_population["evidence_scope"].replace("_", " ")
            if analysis_population is not None else "descriptive population unavailable") + ")",
@@ -966,9 +1049,10 @@ def run_lesion_experiment(
     qc_sealed_nested_prior_sha256: Optional[str] = None,
     trusted_historical_checkpoint_sha256: Optional[str] = None,
     trusted_historical_artifact_sha256: Optional[str] = None,
+    include_readout_knockouts: bool = False,
 ) -> None:
     """
-    Run the full in-silico lesion experiment.
+    Run the full in-silico readout-intervention experiment.
 
     Args:
         checkpoint_path: Path to the trained model checkpoint.
@@ -987,9 +1071,13 @@ def run_lesion_experiment(
             None uses each recorded/derived dataset anchor as a reference;
             loaders without metadata retain the legacy scalar fallback of 1200.
             A dataset anchor need not represent physical stimulus onset.
+        include_readout_knockouts: If True, also run the two unrenormalized
+            single-key readout knockouts (``lif_knockout``, ``gru_knockout``)
+            alongside the default three pathway substitutions. Default False
+            keeps the three-condition output.
     """
     logger.info("=" * 60)
-    logger.info("NSMoR In-Silico Lesion Experiment (Phase 7)")
+    logger.info("NSMoR In-Silico Readout-Intervention Experiment")
     logger.info("=" * 60)
 
     # ── Default paths ─────────────────────────────────────────
@@ -1028,11 +1116,13 @@ def run_lesion_experiment(
     else:
         stim_onset_frame = 1200  # Legacy loaders without reference metadata.
 
-    logger.info("Lesion MSE compares unclipped physical predictions and raw targets; "
-                "it differs from clipped training/evaluation scoring.")
+    logger.info("Intervention MSE compares unclipped physical predictions and raw "
+                "targets; it differs from clipped training/evaluation scoring. These "
+                "conditions manipulate the routing readout, not biological pathways.")
 
     # ── Run ablation ──────────────────────────────────────────
-    results = run_full_ablation(model, dataloader, device)
+    conditions = ALL_CONDITIONS if include_readout_knockouts else DEFAULT_CONDITIONS
+    results = run_full_ablation(model, dataloader, device, conditions)
 
     # Recording prefixes collapse session blocks, but do not prove independent
     # animal identity. Report descriptive group means/effects; no trial t-tests
@@ -1071,6 +1161,9 @@ def run_lesion_experiment(
         "summary_class": int(target_class), "dt_ms": float(dt_ms),
         "mse_units": "(cm/s)^2", "mse_window": "observed_post_reference",
         "reference_semantics": "trial_reference_not_verified_stimulus_onset",
+        "intervention_semantics": "readout_gate_intervention_not_biological_lesion",
+        "peak_latency_metrics_source": "recorded_target_not_model_prediction",
+        "peak_latency_reference": "trial_reference_not_verified_stimulus_onset",
         "ci_status": unavailable_p, "p_status": unavailable_p,
         "trials": reference_trials, "conditions": {}, "comparisons": {},
     }
@@ -1162,7 +1255,40 @@ def run_lesion_experiment(
         }
         summary["comparisons"][name] = comparison
         logger.info("%s vs Intact: recording-prefix descriptive d=%s (%s); p/adjusted p unavailable: %s",
-                    CONDITION_NAMES[name], effect, effect_status, unavailable_p)
+                    condition_display(name), effect, effect_status, unavailable_p)
+
+    # ── Paired prediction divergence from the intact readout ───
+    # The recorded target is identical across conditions, so target-peak MSE
+    # deltas cannot separate them. Pair each condition's predictions against
+    # the intact predictions over the same observed window to measure the
+    # readout intervention itself. Descriptive only; units are cm/s.
+    intact_preds = results.get("intact", ([], [], []))[0]
+    prediction_divergence: Dict[str, Optional[Dict[str, Optional[float]]]] = {}
+    for name, (y_preds, _, _) in results.items():
+        rmse_values: List[float] = []
+        mae_values: List[float] = []
+        for i, pred in enumerate(y_preds):
+            intact_pred = intact_preds[i] if i < len(intact_preds) else None
+            metrics = (
+                _prediction_delta_metrics(intact_pred, pred, frames[i])
+                if intact_pred is not None else None
+            )
+            entry = ({"n_frames": None, "rmse": None, "mae": None} if metrics is None else
+                     {"n_frames": metrics[0], "rmse": metrics[1], "mae": metrics[2]})
+            reference_trials[i].setdefault("prediction_divergence_by_condition", {})[name] = entry
+            if metrics is not None:
+                rmse_values.append(metrics[1])
+                mae_values.append(metrics[2])
+        prediction_divergence[name] = {
+            "mean_trial_rmse": float(np.mean(rmse_values)) if rmse_values else None,
+            "mean_trial_mae": float(np.mean(mae_values)) if mae_values else None,
+            "n_trials": len(rmse_values),
+            "unit": "cm/s",
+            "comparison": "condition_predictions_vs_intact_predictions",
+            "status": "descriptive_only" if rmse_values else "unavailable_no_paired_post_reference",
+            "p_value": None, "p_status": unavailable_p,
+        }
+    summary["prediction_divergence"] = prediction_divergence
 
     # ── Export statistics CSV ──────────────────────────────────
     export_error = None
@@ -1202,7 +1328,7 @@ def run_lesion_experiment(
     )
 
     logger.info("=" * 60)
-    logger.info("Lesion experiment complete!")
+    logger.info("Readout-intervention experiment complete!")
     logger.info("=" * 60)
 
 
@@ -1213,7 +1339,7 @@ def run_lesion_experiment(
 def build_parser() -> argparse.ArgumentParser:
     """Build CLI argument parser."""
     parser = argparse.ArgumentParser(
-        description="NSMoR In-Silico Lesion (Virtual Ablation) Experiment",
+        description="NSMoR In-Silico Readout-Intervention Experiment",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
@@ -1302,6 +1428,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Override all cropped trial reference indices with one scalar (legacy fallback: 1200). "
              "By default use each recorded/derived dataset anchor, which need not be stimulus onset.",
     )
+    parser.add_argument(
+        "--include_readout_knockouts",
+        action="store_true",
+        help="Also run the two unrenormalized single-key readout knockouts "
+             "(lif_knockout: g_lif=0; gru_knockout: g_gru=0) alongside the three "
+             "default pathway substitutions. These manipulate the routing readout, "
+             "not biological pathways.",
+    )
     return parser
 
 
@@ -1328,6 +1462,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         pre_anchor_frames=pre_anchor_frames,
         dt_ms=args.dt_ms,
         stim_onset_frame=args.stim_onset_frame,
+        include_readout_knockouts=args.include_readout_knockouts,
     )
 
 

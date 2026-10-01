@@ -2077,6 +2077,459 @@ def _sustained_run(mask: np.ndarray, min_run: int = 2) -> np.ndarray:
     return keep
 
 
+def _lag1_skill_ratio(mse_model: float, mse_base: float) -> Optional[float]:
+    """Return ``1 - mse_model/mse_base`` or ``None`` when undefined.
+
+    ``None`` (not a fabricated 0/NaN) is returned when the lag-one baseline
+    MSE is zero, either input is non-finite, or the ratio itself is not
+    representable (a finite huge model MSE over a finite tiny baseline
+    overflows float64).  ``skill > 0`` means the model beats the lag-one
+    target-history predictor; ``skill <= 0`` means it does not.  This is a
+    conditional comparison against that one comparator, not a universal
+    verdict: a model can score ``skill <= 0`` here yet still beat a trivial
+    zero-predictor.
+    """
+    if not (math.isfinite(mse_model) and math.isfinite(mse_base)):
+        return None
+    if mse_base <= 0.0:
+        return None
+    with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+        skill = 1.0 - mse_model / mse_base
+    if not math.isfinite(skill):
+        return None
+    return float(skill)
+
+
+def _paired_metrics(
+    true_vals: np.ndarray,
+    model_vals: np.ndarray,
+    base_vals: np.ndarray,
+    *,
+    empty_reason: str,
+) -> Dict[str, Any]:
+    """Score aligned predictions, failing closed on unrepresentable errors.
+
+    Subtract and square here, not at callers: signed residuals retain MAE and
+    let us reject nonzero errors whose squares underflow to zero. Only empty
+    blocks and undefined/unrepresentable ratios or target variance yield null
+    with a keyed reason; residuals, squares and error reductions must be finite.
+    """
+    true_vals, model_vals, base_vals = (
+        np.asarray(v, dtype=np.float64) for v in (true_vals, model_vals, base_vals)
+    )
+    assert true_vals.ndim == 1, f"Expected 1-D targets, got {true_vals.shape}"
+    assert true_vals.shape == model_vals.shape == base_vals.shape, (
+        f"Expected aligned {true_vals.shape}, got {model_vals.shape}/{base_vals.shape}"
+    )
+    n = int(true_vals.size)
+    out: Dict[str, Any] = {"n_frames": n}
+    if n == 0:
+        for key in ("mse", "rmse", "mae", "r2", "baseline_mse",
+                    "baseline_rmse", "baseline_mae", "baseline_r2",
+                    "skill_vs_persistence"):
+            out[key] = None
+            out[f"{key}_unavailable_reason"] = empty_reason
+        return out
+
+    sums: List[float] = []
+    for prefix, values in (("", model_vals), ("baseline_", base_vals)):
+        try:
+            with np.errstate(over="raise", invalid="raise", under="ignore"):
+                residual = true_vals - values
+                squared = residual ** 2
+                if not np.isfinite(residual).all() or not np.isfinite(squared).all():
+                    raise ValueError("non-finite residual or squared error")
+                if np.any((residual != 0.0) & (squared == 0.0)):
+                    raise ValueError("nonzero residual square underflow to zero")
+                sumsq = float(squared.sum())
+                mse = sumsq / n
+                mae = float(np.abs(residual).mean())
+            if not all(math.isfinite(v) for v in (sumsq, mse, mae)):
+                raise ValueError("non-finite error reduction")
+            if (sumsq > 0.0 and mse == 0.0) or (np.any(residual) and mae == 0.0):
+                raise ValueError("nonzero error reduction underflow to zero")
+        except (FloatingPointError, ValueError) as exc:
+            raise ValueError(
+                f"{prefix or 'model_'}error arithmetic is not representable: {exc}"
+            ) from exc
+        sums.append(sumsq)
+        out[f"{prefix}mse"] = mse
+        out[f"{prefix}rmse"] = math.sqrt(mse)
+        out[f"{prefix}mae"] = mae
+
+    # Centered variance avoids raw-Gram cancellation. Distinguish a genuinely
+    # constant target from a nonzero spread lost to float64 arithmetic.
+    variance_reason = "zero_target_variance"
+    sumsq_true = 0.0
+    if not np.all(true_vals == true_vals[0]):
+        variance_reason = "nonrepresentable_target_variance"
+        try:
+            with np.errstate(over="raise", invalid="raise", under="ignore"):
+                centered = true_vals - true_vals.mean()
+                squared = centered ** 2
+                sumsq_true = float(squared.sum())
+            if (not np.isfinite(centered).all() or not math.isfinite(sumsq_true)
+                    or np.any((centered != 0.0) & (squared == 0.0))):
+                sumsq_true = 0.0
+        except FloatingPointError:
+            sumsq_true = 0.0
+    for key, sumsq in zip(("r2", "baseline_r2"), sums):
+        out[key] = _lag1_skill_ratio(sumsq, sumsq_true)
+        if out[key] is None:
+            out[f"{key}_unavailable_reason"] = (
+                variance_reason if sumsq_true == 0.0 else "non_finite_r2"
+            )
+
+    out["skill_vs_persistence"] = _lag1_skill_ratio(out["mse"], out["baseline_mse"])
+    if out["skill_vs_persistence"] is None:
+        out["skill_vs_persistence_unavailable_reason"] = (
+            "zero_baseline_mse" if out["baseline_mse"] == 0.0
+            else "non_finite_skill_ratio"
+        )
+    return out
+
+
+def _merge_block(
+    metrics: Dict[str, Any],
+    block: Dict[str, Any],
+    *,
+    prefix: str,
+    count_key: str,
+) -> None:
+    """Merge one :func:`_paired_metrics` block into ``metrics`` in place.
+
+    ``prefix`` namespaces the metric keys (``""`` for the pooled headline,
+    ``"escape_"``/``"rest_"`` for the bands); the block's ``n_frames`` becomes
+    ``metrics[count_key]``.
+    """
+    for key, value in block.items():
+        if key == "n_frames":
+            metrics[count_key] = value
+        else:
+            metrics[f"{prefix}{key}"] = value
+
+
+def persistence_benchmark_metrics(
+    y_true_seqs: Sequence[np.ndarray],
+    y_pred_seqs: Sequence[np.ndarray],
+    *,
+    escape_band_cm_s: float = 10.0,
+    target_clip_cm_s: float = 0.0,
+) -> Dict[str, Any]:
+    """Paired lag-one target-history benchmark over outer-validation sequences.
+
+    Supplemental skill check for the existing ``compute_metrics`` seam: a
+    trivial persistence predictor (``y_hat[t] = y_true[t-1]``) is a strong
+    comparator for smooth, autocorrelated kinematics.  A model scoring
+    ``skill_vs_persistence <= 0`` does not beat that one comparator on these
+    frames — a conditional statement, not a claim that the model has no
+    temporal skill at all (it may still beat a zero predictor).
+
+    Both the model and the comparator are scored on **exactly the same
+    frames**, per trial: the eligible set is ``t >= 1`` (the lag-one
+    comparator needs a previous frame), so no frame is ever compared across a
+    trial boundary and the comparator reads ``y_true[t-1]`` (the target),
+    never a feature channel.  Every input sequence is reported as an explicit
+    per-trial row — ordinal, length, eligible count, status — so no trial is
+    dropped silently.
+
+    Args:
+        y_true_seqs: Per-sequence 1-D ground-truth targets, already cropped
+            to the same window the model was scored on, in physical units
+            (cm/s).  Unpadded true lengths only.
+        y_pred_seqs: Per-sequence 1-D model predictions, aligned
+            element-for-element with ``y_true_seqs`` (same crop, same
+            length, same physical units).
+        escape_band_cm_s: Absolute-velocity magnitude (cm/s) for the
+            escape/rest split, matching ``compute_metrics``.
+        target_clip_cm_s: Symmetric robust clip (cm/s) applied to BOTH the
+            model prediction and the target before the headline errors are
+            scored, mirroring ``compute_metrics``' headline convention
+            (``0.0`` disables).  The escape/rest band membership and band
+            errors are always measured on the RAW, unclipped values, exactly
+            as the legacy band audit does.
+
+    Returns:
+        A supplemental metrics dict with headline MSE/RMSE/MAE/R² for both the
+        model and the lag-one comparator, the escape/rest breakdown, the
+        scalar ``skill_vs_persistence`` (``1 - MSE_model/MSE_base``, or
+        ``None`` when undefined), the frame/trial denominators, and the
+        ordered per-trial ``trials`` list.  Each ``trials`` row carries the
+        trial ordinal, true length, eligible-frame count, an explicit status,
+        and that trial's paired ``model_mse`` / ``baseline_mse`` /
+        ``delta_model_minus_baseline_mse`` / ``skill_vs_persistence`` — so the
+        pooled numbers are auditable per trial and no trial is dropped
+        silently.  Degenerate bands and undefined statistics report ``None``
+        plus a ``*_unavailable_reason`` string rather than a fabricated value.
+        Every value is finite or ``None``, so ``json.dumps(..., allow_nan=False)``
+        succeeds.
+
+    Raises:
+        ValueError: On mismatched sequence counts, per-sequence shape
+            mismatch, a non-real/boolean/non-scalar band or clip parameter,
+            or any non-finite value on an eligible true/model frame (or on
+            the lag-one predecessor target), or unrepresentable residual,
+            squared error or error reduction. The benchmark fails closed
+            rather than dropping bad frames or emitting NaN/Inf.
+    """
+    for name, value in (("escape_band_cm_s", escape_band_cm_s),
+                        ("target_clip_cm_s", target_clip_cm_s)):
+        # Accept only a finite real scalar: reject bool (an int subclass) and
+        # array-likes/sequences rather than silently casting them.
+        if isinstance(value, (bool, np.bool_)) or not isinstance(
+            value, (int, float, np.integer, np.floating)
+        ):
+            raise ValueError(
+                f"{name} must be a finite real scalar, got {value!r}"
+            )
+        if not math.isfinite(float(value)):
+            raise ValueError(f"{name} must be finite, got {value!r}")
+
+    if len(y_true_seqs) != len(y_pred_seqs):
+        raise ValueError(
+            f"persistence benchmark requires aligned sequences, got "
+            f"{len(y_true_seqs)} targets vs {len(y_pred_seqs)} predictions"
+        )
+
+    true_raw: List[np.ndarray] = []
+    pred_raw: List[np.ndarray] = []
+    prev_raw: List[np.ndarray] = []
+    is_escape_seq: List[np.ndarray] = []
+    trials: List[Dict[str, Any]] = []
+    clip = float(target_clip_cm_s)
+    clip_on = clip > 0.0
+
+    for i, (true_i, pred_i) in enumerate(zip(y_true_seqs, y_pred_seqs)):
+        true_i = np.asarray(true_i, dtype=np.float64)
+        pred_i = np.asarray(pred_i, dtype=np.float64)
+        # Require exactly 1-D BEFORE any reshape: a 0-D scalar (np.array(5.0))
+        # or a >=2-D block is rejected, never silently flattened/reshaped into
+        # a bogus "sequence" (a scalar would otherwise masquerade as a
+        # length-one trial indistinguishable from np.array([5.0])).
+        if true_i.ndim != 1 or pred_i.ndim != 1:
+            raise ValueError(
+                f"sequence {i}: expected 1-D per-sequence arrays, got shapes "
+                f"{true_i.shape} / {pred_i.shape}"
+            )
+        if true_i.shape != pred_i.shape:
+            raise ValueError(
+                f"sequence {i}: y_true {true_i.shape} != y_pred {pred_i.shape}"
+            )
+        n = true_i.size
+        if n < 2:
+            # No t>=1 frame.  It contributes no frame, but is still reported
+            # with an explicit status so no trial vanishes from the count.
+            reason = "no_t_ge_1_frame"
+            trials.append({"trial": i, "length": n, "eligible": 0,
+                           "status": "empty_eligible_no_t_ge_1_frame",
+                           "model_mse": None, "baseline_mse": None,
+                           "delta_model_minus_baseline_mse": None,
+                           "skill_vs_persistence": None,
+                           "model_mse_unavailable_reason": reason,
+                           "baseline_mse_unavailable_reason": reason,
+                           "delta_model_minus_baseline_mse_unavailable_reason": reason,
+                           "skill_vs_persistence_unavailable_reason": reason})
+            continue
+
+        eligible = np.arange(1, n)  # t >= 1, per sequence; never cross-sequence
+        t_prev = eligible - 1
+        # The predecessor target is consumed by every eligible frame, so it
+        # must be finite (t=0 is a predecessor even though never scored).
+        true_prev = true_i[t_prev]
+        if not np.isfinite(true_prev).all():
+            bad = int(t_prev[~np.isfinite(true_prev)][0])
+            raise ValueError(
+                f"sequence {i}: lag-one predecessor target at t={bad} is "
+                f"non-finite; cannot score this trial"
+            )
+        # Scored true/model frames must be finite: fail closed instead of
+        # emitting NaN/Inf or silently dropping bad frames.  A NaN model
+        # output at the unscored t=0 is permitted (it is never used).
+        for label, values in (("true target", true_i), ("model prediction", pred_i)):
+            scored = values[eligible]
+            if not np.isfinite(scored).all():
+                bad = int(eligible[~np.isfinite(scored)][0])
+                raise ValueError(f"sequence {i}: non-finite {label} at t={bad}")
+
+        # Escape/rest membership is derived from the ORIGINAL target with the
+        # existing _sustained_run guard, BEFORE the t>=1 slice, then sliced —
+        # never recomputed on the sliced array (which would shift run
+        # boundaries at the cut).
+        escape_full = _sustained_run(np.abs(true_i) >= escape_band_cm_s, min_run=2)
+        true_raw.append(true_i[eligible])
+        pred_raw.append(pred_i[eligible])
+        prev_raw.append(true_prev)
+        is_escape_seq.append(escape_full[eligible])
+
+        # Per-trial paired metrics in the same (clipped) headline space, so a
+        # trial's contribution to the pooled numbers is auditable and no trial
+        # is dropped silently.  Reuse the SAME paired helper (not a duplicated
+        # formula) so a trial row carries identical guarded values and
+        # null+reason semantics as the pooled block.
+        t_true, t_pred, t_prev = true_i[eligible], pred_i[eligible], true_prev
+        if clip_on:
+            t_true = np.clip(t_true, -clip, clip)
+            t_pred = np.clip(t_pred, -clip, clip)
+            t_prev = np.clip(t_prev, -clip, clip)
+        t = _paired_metrics(t_true, t_pred, t_prev, empty_reason="empty_trial")
+        t_model_mse, t_base_mse = t["mse"], t["baseline_mse"]
+        delta = t_model_mse - t_base_mse
+        if not math.isfinite(delta):
+            raise ValueError("per-trial MSE delta is not representable")
+        row: Dict[str, Any] = {
+            "trial": i, "length": n, "eligible": int(eligible.size),
+            "status": "scored",
+            "model_mse": t_model_mse,
+            "baseline_mse": t_base_mse,
+            "delta_model_minus_baseline_mse": delta,
+            "skill_vs_persistence": t["skill_vs_persistence"],
+        }
+        if t["skill_vs_persistence"] is None:
+            row["skill_vs_persistence_unavailable_reason"] = (
+                t["skill_vs_persistence_unavailable_reason"]
+            )
+        trials.append(row)
+
+    metrics: Dict[str, Any] = {
+        "n_trials": len(y_true_seqs),
+        "n_scored_trials": int(sum(e.size > 0 for e in true_raw)),
+        "n_eligible_frames": int(sum(e.size for e in true_raw)),
+        "trials": trials,
+    }
+
+    if not true_raw:
+        # No eligible frames anywhere: every field is an explicit null with a
+        # reason.  Never a fabricated 0/NaN/Inf.
+        empty = _paired_metrics(np.zeros(0), np.zeros(0), np.zeros(0),
+                                empty_reason="no_sequence_with_at_least_two_frames")
+        _merge_block(metrics, empty, prefix="", count_key="n_pooled_frames")
+        _merge_block(metrics, empty, prefix="escape_", count_key="n_escape_frames")
+        _merge_block(metrics, empty, prefix="rest_", count_key="n_rest_frames")
+        return metrics
+
+    y_true = np.concatenate(true_raw)
+    y_pred = np.concatenate(pred_raw)
+    y_prev = np.concatenate(prev_raw)
+    is_escape = np.concatenate(is_escape_seq)
+
+    # Headline convention: same symmetric clip as ``compute_metrics`` applied
+    # to the model prediction and to the target (and to the lag-one comparator
+    # values, which are target frames), so model/true/lag are scored in the
+    # same space.
+    true_score, pred_score, prev_score = y_true, y_pred, y_prev
+    if clip_on:
+        true_score = np.clip(true_score, -clip, clip)
+        pred_score = np.clip(pred_score, -clip, clip)
+        prev_score = np.clip(prev_score, -clip, clip)
+
+    _merge_block(
+        metrics,
+        _paired_metrics(true_score, pred_score, prev_score,
+                        empty_reason="no_pooled_frames"),
+        prefix="", count_key="n_pooled_frames",
+    )
+
+    # ── Escape / rest breakdown: membership AND error from RAW values ──
+    for band, mask in (("escape", is_escape), ("rest", ~is_escape)):
+        _merge_block(
+            metrics,
+            _paired_metrics(y_true[mask], y_pred[mask], y_prev[mask],
+                            empty_reason=f"empty_{band}_band"),
+            prefix=f"{band}_", count_key=f"n_{band}_frames",
+        )
+
+    return metrics
+
+
+def _rescale_to_physical(
+    values: np.ndarray, target_std: float, target_mean: float,
+) -> np.ndarray:
+    """Rescale standardized values to physical units in float64, fail closed.
+
+    The multiply is done in float64 so a float32 input scaled by a tiny/large
+    ``target_std`` cannot underflow to a spurious 0.0 (silently losing a
+    representable error) or overflow to inf.  Genuinely unrepresentable
+    float64 arithmetic raises ``ValueError`` rather than emitting NaN/Inf or a
+    silently-lost nonzero value.
+    """
+    values = np.asarray(values, dtype=np.float64)
+    try:
+        with np.errstate(over="raise", invalid="raise", under="ignore"):
+            scaled = values * target_std
+            rescaled = scaled + target_mean
+    except FloatingPointError as exc:
+        raise ValueError(
+            f"rescaled values are not representable in float64: {exc}"
+        ) from exc
+    if not np.isfinite(rescaled).all():
+        raise ValueError(
+            "rescaled values are not representable in float64: non-finite result"
+        )
+    if target_std != 0.0 and np.any((values != 0.0) & (scaled == 0.0)):
+        raise ValueError(
+            "rescaled values are not representable in float64: nonzero input "
+            "underflowed to zero"
+        )
+    return rescaled
+
+
+def _json_scalar(value: Any) -> Any:
+    """Coerce a NumPy scalar to a native Python scalar for strict JSON.
+
+    ``np.float32``/``np.int64`` (accepted band parameters) are not
+    serialisable by the stdlib JSON encoder; ``np.generic.item()`` yields the
+    native ``float``/``int`` that ``json.dumps(..., allow_nan=False)`` emits
+    as a plain number.  ``np.longdouble`` is the exception: its ``.item()``
+    stays a ``np.longdouble``, so it is promoted to ``float`` when that is
+    lossless, else rejected rather than silently rounded.  Non-NumPy values
+    pass through unchanged.
+    """
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, (int, float)):
+        return value
+    as_float = float(value)
+    if as_float != value or not math.isfinite(as_float):
+        raise ValueError(f"{value!r} is not a representable JSON scalar")
+    return as_float
+
+
+def _fmt_optional(value: Optional[float], spec: str = ".4f") -> str:
+    """Format an optional metric for logging, spelling out unavailability.
+
+    ``None`` (a guarded-but-undefined metric) is rendered as ``"unavailable"``
+    rather than letting ``%.4f`` raise ``TypeError`` or substituting NaN.
+    """
+    return "unavailable" if value is None else format(value, spec)
+
+
+def _log_best_metrics(metrics: Dict[str, Any]) -> None:
+    """Log the best-model headline and escape audit, tolerating null metrics.
+
+    The opted-in ``compute_metrics`` return can carry ``None`` for undefined
+    statistics (e.g. constant-target R², empty-band RMSE); those are spelled
+    out as ``unavailable`` instead of letting a ``%.4f`` directive raise
+    ``TypeError`` on ``None`` (or substituting a fabricated NaN).
+    """
+    logger.info(
+        "Best model metrics — MSE: %s  RMSE: %s  MAE: %s  R²: %s",
+        _fmt_optional(metrics["mse"], ".6f"),
+        _fmt_optional(metrics["rmse"], ".6f"),
+        _fmt_optional(metrics["mae"], ".6f"),
+        _fmt_optional(metrics["r2"]),
+    )
+    if "escape_rmse" in metrics:
+        logger.info(
+            "Escape-signal audit — escape_band=%.1f cm/s  n_escape=%d (%.3f%% of frames)  "
+            "escape_rmse=%s  resting_rmse=%s",
+            metrics["escape_band_cm_s"],
+            metrics["n_escape_frames"],
+            metrics["escape_ratio"] * 100.0,
+            _fmt_optional(metrics["escape_rmse"]),
+            _fmt_optional(metrics["resting_rmse"]),
+        )
+
+
 @torch.no_grad()
 def compute_metrics(
     model: NSMoRCore,
@@ -2086,7 +2539,8 @@ def compute_metrics(
     target_std: float = 1.0,
     target_clip_cm_s: float = 0.0,
     escape_band_cm_s: float = 10.0,
-) -> Dict[str, float]:
+    persistence_benchmark: bool = False,
+) -> Dict[str, Any]:
     """
     Compute regression metrics on a dataset using the given model.
 
@@ -2108,6 +2562,13 @@ def compute_metrics(
         target_clip_cm_s: Robust clip magnitude (cm/s) applied to both
             predictions and targets before computing metrics, mirroring
             the training-time target clip.  ``0.0`` disables.
+        persistence_benchmark: When ``True``, additionally attach a
+            supplemental ``"persistence_benchmark"`` sub-object scoring the
+            model against a paired lag-one target-history predictor (see
+            :func:`persistence_benchmark_metrics`). The full opted-in result
+            uses guarded float64 scoring: undefined R²/empty bands become null
+            with keyed reasons; unrepresentable errors raise ValueError.
+            Legacy keys and behavior are unchanged when ``False`` (default).
 
     Returns:
         Dictionary with keys ``"mse"``, ``"rmse"``, ``"mae"``, ``"r2"``
@@ -2128,6 +2589,12 @@ def compute_metrics(
         per-trial-baseline-subtracted escape definition — see the
         ``escape_band_cm_s`` config docstring.  A single band value does not by
         itself prove escape learning; sweep the band for sensitivity.
+
+    Raises:
+        ValueError: When the physical-unit rescale is not representable in
+            float64 (overflow to inf, or a nonzero standardized prediction
+            underflowing to 0.0), rather than emitting NaN/Inf or silently
+            losing a nonzero value.
     """
     model.eval()
     all_pred: List[np.ndarray] = []
@@ -2150,13 +2617,16 @@ def compute_metrics(
             all_pred.append(y_pred[i, :n].cpu().numpy())
             all_true.append(y_batch[i, :n].cpu().numpy())
 
-    y_pred_all = np.concatenate(all_pred)
-    y_true_all = np.concatenate(all_true)
+    # Promote to float64 BEFORE any physical-unit rescaling so the rescale is
+    # validated (and computed) at float64 precision — a float32 input scaled
+    # by a tiny ``target_std`` must not underflow to a spurious 0.0.
+    y_pred_all = np.concatenate(all_pred).astype(np.float64)
+    y_true_all = np.concatenate(all_true).astype(np.float64)
 
     # Rescale predictions from standardized units back to cm/s (units
     # matching y_true) so metrics are reported in physical velocity units.
     if target_std != 1.0 or target_mean != 0.0:
-        y_pred_all = y_pred_all * target_std + target_mean
+        y_pred_all = _rescale_to_physical(y_pred_all, target_std, target_mean)
 
     # Symmetric robust clip before scoring (mirrors training-target clip).
     # Keep RAW copies of both prediction and target (post-rescale, pre-clip)
@@ -2169,10 +2639,29 @@ def compute_metrics(
         y_pred_all = np.clip(y_pred_all, -target_clip_cm_s, target_clip_cm_s)
         y_true_all = np.clip(y_true_all, -target_clip_cm_s, target_clip_cm_s)
 
-    mse = float(mean_squared_error(y_true_all, y_pred_all))
-    rmse = float(np.sqrt(mse))
-    mae = float(mean_absolute_error(y_true_all, y_pred_all))
-    r2 = float(r2_score(y_true_all, y_pred_all))
+    benchmark: Optional[Dict[str, Any]] = None
+    headline: Dict[str, Any] = {}
+    if persistence_benchmark:
+        # Validate the paired benchmark BEFORE any legacy reduction. Use the
+        # same guarded scoring for full-frame opt-in fields (including t=0).
+        bench_pred = all_pred
+        if target_std != 1.0 or target_mean != 0.0:
+            bench_pred = [
+                _rescale_to_physical(p, target_std, target_mean) for p in all_pred
+            ]
+        benchmark = persistence_benchmark_metrics(
+            all_true, bench_pred, escape_band_cm_s=escape_band_cm_s,
+            target_clip_cm_s=target_clip_cm_s,
+        )
+        headline = _paired_metrics(
+            y_true_all, y_pred_all, y_true_all, empty_reason="no_frames",
+        )
+        mse, rmse, mae, r2 = (headline[k] for k in ("mse", "rmse", "mae", "r2"))
+    else:
+        mse = float(mean_squared_error(y_true_all, y_pred_all))
+        rmse = float(np.sqrt(mse))
+        mae = float(mean_absolute_error(y_true_all, y_pred_all))
+        r2 = float(r2_score(y_true_all, y_pred_all))
 
     # ── High-velocity-band escape-signal check ────────────────
     # Reviewer requirement: a bulk-fitting model can report an excellent
@@ -2209,22 +2698,48 @@ def compute_metrics(
     keep_seq = [_sustained_run(o, min_run=2) for o in over_seq]
     is_escape = np.concatenate(keep_seq) if keep_seq else np.zeros(0, dtype=bool)
     n_escape = int(is_escape.sum())
-    escape_rmse = float(np.sqrt(mean_squared_error(
-        y_true_all_raw[is_escape], y_pred_all_raw[is_escape]))) if n_escape else float("nan")
-    resting_rmse = float(np.sqrt(mean_squared_error(
-        y_true_all_raw[~is_escape], y_pred_all_raw[~is_escape]))) if (~is_escape).any() else float("nan")
+    if persistence_benchmark:
+        bands = {
+            key: _paired_metrics(
+                y_true_all_raw[mask], y_pred_all_raw[mask], y_true_all_raw[mask],
+                empty_reason=reason,
+            )
+            for key, mask, reason in (
+                ("escape_rmse", is_escape, "empty_escape_band"),
+                ("resting_rmse", ~is_escape, "empty_rest_band"),
+            )
+        }
+        escape_rmse = bands["escape_rmse"]["rmse"]
+        resting_rmse = bands["resting_rmse"]["rmse"]
+    else:
+        escape_rmse = float(np.sqrt(mean_squared_error(
+            y_true_all_raw[is_escape], y_pred_all_raw[is_escape]))) if n_escape else float("nan")
+        resting_rmse = float(np.sqrt(mean_squared_error(
+            y_true_all_raw[~is_escape], y_pred_all_raw[~is_escape]))) if (~is_escape).any() else float("nan")
 
-    metrics: Dict[str, float] = {
+    metrics: Dict[str, Any] = {
         "mse": mse,
         "rmse": rmse,
         "mae": mae,
         "r2": r2,
-        "escape_band_cm_s": escape_band_cm_s,
+        "escape_band_cm_s": _json_scalar(escape_band_cm_s),
         "n_escape_frames": float(n_escape),
         "escape_rmse": escape_rmse,
         "resting_rmse": resting_rmse,
         "escape_ratio": n_escape / max(1, int(y_true_all.size)),
     }
+
+    if persistence_benchmark:
+        metrics["persistence_benchmark"] = benchmark
+        for key in ("mse", "rmse", "mae", "r2"):
+            if metrics[key] is None:
+                metrics[f"{key}_unavailable_reason"] = (
+                    headline[f"{key}_unavailable_reason"]
+                )
+        for key, block in bands.items():
+            if metrics[key] is None:
+                metrics[f"{key}_unavailable_reason"] = block["rmse_unavailable_reason"]
+
     return metrics
 
 
@@ -3503,21 +4018,9 @@ def train(
             target_mean=target_mean, target_std=target_std,
             target_clip_cm_s=config.training.target_clip_cm_s,
             escape_band_cm_s=config.training.escape_band_cm_s,
+            persistence_benchmark=True,
         )
-        logger.info(
-            "Best model metrics — MSE: %.6f  RMSE: %.6f  MAE: %.6f  R²: %.4f",
-            metrics["mse"], metrics["rmse"], metrics["mae"], metrics["r2"],
-        )
-        if "escape_rmse" in metrics:
-            logger.info(
-                "Escape-signal audit — escape_band=%.1f cm/s  n_escape=%d (%.3f%% of frames)  "
-                "escape_rmse=%.4f  resting_rmse=%.4f",
-                metrics["escape_band_cm_s"],
-                metrics["n_escape_frames"],
-                metrics["escape_ratio"] * 100.0,
-                metrics["escape_rmse"],
-                metrics["resting_rmse"],
-            )
+        _log_best_metrics(metrics)
         metrics["eval_provenance"] = eval_provenance
         if mcmc_prior_consistency is not None:
             metrics["mcmc_prior_train_serve_consistency"] = mcmc_prior_consistency

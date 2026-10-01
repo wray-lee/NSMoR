@@ -127,6 +127,11 @@ Findings, reported within the accepted declared scope only:
   block sensitivity grouped by recording prefix (52 train / 12 val prefixes);
   6,912 rows. LIF-Lesioned vs Intact descriptive d=-0.456; GRU-Lesioned vs
   Intact d=1.899 — both `estimable_descriptive_only`, p/adjusted p unavailable.
+  The overrides are a readout substitution, not a biological pathway ablation:
+  the gate vector is `[g_lif, g_gru]`, so `{"g_lif": 0, "g_gru": 1}`
+  (LIF-Lesioned) and `{"g_lif": 1, "g_gru": 0}` (GRU-Lesioned) each set both
+  gate columns to a constant, replacing the natural time-varying gate entirely.
+  Both recurrent branches still run; only their integration weights change.
 - **Jacobian** — JAX backend, `max_states=100`, `sampling_seed=42`. The
   frozen-input control failed honestly, so `jacobian_spectrum.json` is published
   with `status=withheld` and empty `spectral_statistics` for all epochs
@@ -151,7 +156,10 @@ Findings, reported within the accepted declared scope only:
   (`empirically_calibrated=false`). Output hashes were verified.
 
 Observed median source interval of 4.997 ms is a canonical diagnostic, not proof
-of raw unbatched timestamps; the 4 ms model grid contains estimates. Animal
+of raw unbatched timestamps; the 4 ms model grid contains estimates. The nominal
+source cadence is approximately 5 ms (about 200 Hz) and is distinct from the
+4.0 ms model grid (250 Hz); neither proves hardware emission calibration, and
+the nominal source cadence is not the host-arrival residual P95. Animal
 identity across recording prefixes remains unverified; analyses are descriptive
 and do not constitute independent animal holdout evaluation.
 
@@ -483,8 +491,10 @@ intervals or significance tests:
   descriptive trial-level Cohen's d for Escape vs No-Response when defined.
 - **Lesion (Phase D)** — the CSV contains per-trial peak velocity, latency, and
   MSE; the sidecar reports condition MSE and descriptive paired recording-prefix
-  Cohen's dz when defined. Animal-population CIs and p-values are unavailable;
-  `p_value`, `p_adjusted`, and `significant` are `null`.
+  Cohen's dz when defined. The gate vector is `[g_lif, g_gru]`; each override
+  pins both columns to a constant, so this is a readout substitution, not a
+  biological pathway ablation (both recurrent branches still run). Animal-population
+  CIs and p-values are unavailable; `p_value`, `p_adjusted`, and `significant` are `null`.
 - **Psychophysics (Phase G)** — visual-angle noise on fixed trials labeled TTC=0 with
   MCMC prior columns held fixed. Gate trajectories, trial latency mean ± SEM,
   and paired-trial Hodges-Lehmann latency shifts vs σ=0 are descriptive (when
@@ -524,7 +534,7 @@ X_batch [B,T,8] ──┬── Sensory_X [B,T,4] ─→ FrontendEncoder ─→ 
 | 1     | Sensory Encoder  | `SensoryEncoder`  | trainable | frozen |
 | 2     | LIF Pathway      | `LIFCell`         | frozen    | trainable |
 | 2     | GRU Pathway      | `GRUUnit`         | frozen    | trainable |
-| 2     | Causal Gate      | `MoRRouter`       | frozen    | trainable |
+| 2     | Routing Gate     | `MoRRouter`       | frozen    | trainable |
 | 2     | Decoder          | `DirectionHead`   | frozen    | trainable |
 
 **Gradient isolation** is achieved via `requires_grad` toggling — not
@@ -559,7 +569,7 @@ The `forward()` method supports `return_internals=True` for dynamical systems an
 predictions, internals = model(X_batch, lengths, return_internals=True)
 
 # Access internal states for analysis
-routing_gates = internals["routing_gates"]      # (B, T, 2) — per-step blending weights
+routing_gates = internals["routing_gates"]      # (B, T, 2) — per-step weights [g_lif, g_gru]
 lif_potentials = internals["lif_potentials"]    # (B, T, H) — membrane potentials
 lif_spikes = internals["lif_spikes"]            # (B, T, H) — spike events
 gru_hidden = internals["gru_hidden"]            # (B, T, H) — GRU hidden states
@@ -588,7 +598,7 @@ Freeze specific pathways for fine-tuning experiments:
 ```python
 model = NSMoRCore()
 
-# Freeze only the LIF pathway and causal gate
+# Freeze only the LIF pathway and routing gate
 model.freeze_modules(["lif_cell", "router"])
 
 # Freeze everything except GRU (GRU receives gradients)
