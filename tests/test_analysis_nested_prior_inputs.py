@@ -153,6 +153,47 @@ def test_modern_nonnested_rejects_missing_or_retagged_scope(nested_inputs, tmp_p
 
 
 @pytest.mark.parametrize("phase", list("CDEFGH"))
+def test_each_analysis_loader_requests_zero_workers(phase, nested_inputs, monkeypatch):
+    """Every analysis loader must run single-process.
+
+    The full corpus is already resident in RAM (``NSMoRDataset.__init__``
+    deep-copies every sequence array), so ``num_workers=-1`` auto-scaling to
+    4 forkserver workers only replicates that memory into each child.  That
+    replication drove the capped production run past its cgroup limit.  This
+    pins the request at each producer's public loader seam.
+    """
+    import multiprocessing as mp
+
+    import nsmor.dataloader_factory as factory
+
+    dataset, _, _, checkpoint, _, _, _, _ = nested_inputs
+    model = load_model_from_checkpoint(checkpoint, torch.device("cpu"))
+
+    requested: list = []
+    real = factory.create_optimized_dataloader
+
+    def spy(ds, **kwargs):
+        requested.append(kwargs.get("num_workers"))
+        return real(ds, **kwargs)
+
+    name = {"C": "analyze_dynamics", "D": "simulate_lesion",
+            "E": "analyze_jacobian", "F": "analyze_integration",
+            "G": "simulate_psychophysics", "H": "analyze_gating"}[phase]
+    module = importlib.import_module(f"scripts.{name}")
+    # psychophysics imports the factory inside the function; the rest bind it
+    # at module scope.  Patch both so the seam is observed either way.
+    monkeypatch.setattr(factory, "create_optimized_dataloader", spy)
+    if hasattr(module, "create_optimized_dataloader"):
+        monkeypatch.setattr(module, "create_optimized_dataloader", spy)
+
+    before = set(mp.active_children())
+    phase_inputs(phase, checkpoint, dataset, None, model)
+
+    assert requested == [0], f"{phase} requested num_workers={requested}"
+    assert set(mp.active_children()) == before, f"{phase} forked worker processes"
+
+
+@pytest.mark.parametrize("phase", list("CDEFGH"))
 def test_each_analysis_model_receives_checkpoint_nested_prior(phase, nested_inputs):
     dataset, artifact, wrong, checkpoint, source, nested, val_idx, _ = nested_inputs
     model = load_model_from_checkpoint(checkpoint, torch.device("cpu"))
@@ -722,6 +763,7 @@ def test_restricted_artifact_preserves_known_configs_numpy_and_mcmc(tmp_path, dt
         return storage
 
     loaded = load_artifact_bytes(captured, map_storage)
+    assert set(torch.serialization.get_safe_globals()) == previous
     assert locations and set(locations) == {"cpu"}
     assert loaded["feature_config"] == artifact["feature_config"]
     assert loaded["time_window_config"] == window
@@ -732,6 +774,8 @@ def test_restricted_artifact_preserves_known_configs_numpy_and_mcmc(tmp_path, dt
     for key, value in model.state_dict().items():
         torch.testing.assert_close(loaded["mcmc_model"].state_dict()[key], value, rtol=0, atol=0)
     torch.testing.assert_close(loaded["tensor"], torch.tensor([3.0, 7.0]), rtol=0, atol=0)
+    # assert_close can lazily register DTensor globals in newer PyTorch versions.
+    previous = set(torch.serialization.get_safe_globals())
     via_path, digest = load_dataset_with_fingerprint(artifact_path, map_location="cpu")
     assert digest == hashlib.sha256(captured).hexdigest()
     np.testing.assert_array_equal(via_path["values"], values)

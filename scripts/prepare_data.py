@@ -70,6 +70,7 @@ from nsmor.data_extractor import (
     build_snapshot_dataset,
     extract_trial_sequence,
     extract_mcmc_snapshot,
+    resolve_snapshot_anchor,
     PURE_WIND_PREPEND_FRAMES,
     _compute_pure_wind_prepend_frames,
 )
@@ -82,6 +83,7 @@ from nsmor.pipeline.labeling import (
     labeling_funnel_summary,
 )
 from nsmor.pipeline.io import extract_trial_data, load_and_concat_sessions
+from nsmor.pipeline.clock_storage import pack_clock_provenance
 
 # ── Logging ────────────────────────────────────────────────────
 logging.basicConfig(
@@ -965,6 +967,8 @@ def _load_trials_and_diagnostics(
                 raise ValueError(
                     f"Trial extraction failed for session={sid!r}, trial={tid!r}: {exc}"
                 ) from exc
+            if "clock_provenance" in trial:
+                trial["clock_provenance"] = pack_clock_provenance(trial["clock_provenance"])
             trial_index[key] = len(trials)
             trials.append(trial)
 
@@ -1001,6 +1005,9 @@ def _load_trials_and_diagnostics(
                 {"kinematics": pd.concat(kin_parts, ignore_index=True),
                  "events": pd.concat(evt_parts, ignore_index=True)}, sid, tid,
             )
+            trial = trials[trial_index[key]]
+            if "clock_provenance" in trial:
+                trial["clock_provenance"] = pack_clock_provenance(trial["clock_provenance"])
         except ValueError as exc:
             raise ValueError(
                 f"Trial extraction failed for session={sid!r}, trial={tid!r}: {exc}"
@@ -1100,7 +1107,39 @@ def prepare_dataset(
     # the elimination funnel records which criterion stage eliminated
     # each trial, and the aggregated waterfall is logged so an entire
     # behavioural class disappearing can never pass silently again.
+    if not trials:
+        raise ValueError("No source trials available for labeling")
     labeled_trials = assign_ground_truth_labels(trials, return_funnel=True)
+    labeled_keys = {
+        (str(item["session_id"]), int(item["trial_id"])): item
+        for item in labeled_trials
+    }
+    if len(labeled_keys) != len(labeled_trials):
+        raise ValueError("Duplicate labeled trial identity")
+    labeling_eligibility = []
+    loaded_keys = set()
+    for trial in trials:
+        key = (str(trial["session_id"]), int(trial["trial_id"]))
+        if key in loaded_keys:
+            raise ValueError(f"Duplicate loaded trial identity: {key}")
+        loaded_keys.add(key)
+        item = labeled_keys.get(key)
+        has_onset = bool(np.any(trial["event_types"] == "stimulus_onset"))
+        if (item is not None) != has_onset:
+            raise ValueError(f"Unaccounted labeling outcome: {key}")
+        labeling_eligibility.append({
+            "session_id": key[0], "trial_id": key[1],
+            "status": "labeled" if item is not None else "unavailable_no_stimulus_anchor",
+            "label": item["label"].name if item is not None else None,
+            "source_rows": len(trial["time_ms"]),
+            "source_channel_condition": classify_stimulus_condition(trial),
+            "clock_provenance": trial.get("clock_provenance"),
+        })
+    if not set(labeled_keys).issubset(loaded_keys):
+        raise ValueError("Labeled trial absent from source cohort")
+    del labeled_keys, item, trial
+    logger.info("Label eligibility: %d loaded, %d labeled, %d unavailable",
+                len(trials), len(labeled_trials), len(trials) - len(labeled_trials))
     logger.info("Labeled %d trials.", len(labeled_trials))
 
     funnel = labeling_funnel_summary(labeled_trials)
@@ -1394,6 +1433,8 @@ def prepare_dataset(
     # pure-wind zero-prepend makes that ambiguous downstream).
     seq_conditions: List[str] = []
     seq_clock_provenance: List[Any] = []
+    seq_model_grid_provenance: List[Dict[str, Any]] = []
+    from nsmor.pipeline.resampling import resample_trial_for_model
 
     # Step 4 fitted OOF priors on this cohort. Any Step 5 failure must abort
     # before save so sequences and trained prior rows stay aligned.
@@ -1447,14 +1488,27 @@ def prepare_dataset(
                 raise ValueError(
                     f"prepare_dataset requires explicit positive finite dt_ms, got {dt_ms!r} (fail closed)"
                 )
+            model_trial = resample_trial_for_model(trial_data, dt_ms)
             X_seq, Y_seq = extract_trial_sequence(
-                trial_data,
+                model_trial,
                 feature_config=feature_config,
                 dt_ms=dt_ms,
             )
+            grid_record = model_trial["model_grid_provenance"]
+            grid_record["synthetic_prepend_frames"] = (
+                len(X_seq) - len(model_trial["time_ms"])
+            )
+            source_anchor_ms, source_anchor_rule = resolve_snapshot_anchor(
+                trial_data, stimulus_onset_ms,
+            )
+            grid_record["source_anchor_ms"] = float(source_anchor_ms)
+            grid_record["source_anchor_rule"] = source_anchor_rule
+            from nsmor.pipeline.resampling import resolve_model_anchor_frame
+            model_anchor_frame = resolve_model_anchor_frame(grid_record)
+            seq_model_grid_provenance.append(grid_record)
 
-            # 4. 处理视觉特征：优先使用原始数据，否则重构
-            raw_visual_angle = trial_data.get("visual_angle", None)
+            # 4. Model-grid visual values must not be replaced by source-grid rows.
+            raw_visual_angle = model_trial.get("visual_angle", None)
             has_raw_visual = (
                 raw_visual_angle is not None
                 and isinstance(raw_visual_angle, np.ndarray)
@@ -1466,7 +1520,7 @@ def prepare_dataset(
             if has_raw_visual:
                 # 使用原始 visual_angle（已由实验设备记录）
                 visual_angle_to_use = raw_visual_angle
-                l_v_to_use = trial_data.get("l_v_ratio", np.zeros_like(raw_visual_angle))
+                l_v_to_use = model_trial.get("l_v_ratio", np.zeros_like(raw_visual_angle))
                 if isinstance(l_v_to_use, np.ndarray) and len(l_v_to_use) > 0:
                     l_v_to_use = l_v_to_use
                 else:
@@ -1474,7 +1528,7 @@ def prepare_dataset(
             else:
                 # 重构视觉特征（纯风试验或缺失数据）
                 visual_angle_to_use, l_v_to_use = reconstruct_trial_visual_features(
-                    trial_data=trial_data,
+                    trial_data=model_trial,
                     stimulus_onset_ms=stimulus_onset_ms,
                     l_v_ratio=l_v_ratio,
                     dt_ms=dt_ms,
@@ -1499,15 +1553,18 @@ def prepare_dataset(
 
             X_seq[:, 0] = visual_angle_to_use
 
-            # Keep the float64 anchor for an exact comparison with the
-            # float32 sequence used by the DataLoader and persisted below.
-            anchor_frames_before_cast.append(derive_anchor_frames([X_seq])[0])
+            # The source snapshot anchor is authoritative; held-grid peaks are
+            # only legacy diagnostics and may move under causal resampling.
+            anchor_frames_before_cast.append(model_anchor_frame)
             X_saved = X_seq.astype(np.float32)
             Y_saved = Y_seq.astype(np.float32)
             assert X_saved.shape == X_seq.shape
             assert Y_saved.shape == Y_seq.shape
             assert np.isfinite(X_saved).all(), "non-finite X after float32 conversion (fail closed)"
             assert np.isfinite(Y_saved).all(), "non-finite Y after float32 conversion (fail closed)"
+            assert derive_anchor_frames([X_saved]) == derive_anchor_frames([X_seq]), (
+                "Float32 conversion changed legacy physical-channel anchors"
+            )
             # 同步入库：保证 sequences 和 valid_snaps 绝对对齐
             sequences.append((X_saved, Y_saved, int(info["label"])))
             valid_snaps.append(snap)
@@ -1516,6 +1573,7 @@ def prepare_dataset(
             seq_target_ttc_ms.append(target_ttc_ms_val)
             seq_conditions.append(classify_stimulus_condition(trial_data))
             seq_clock_provenance.append(trial_data.get("clock_provenance"))
+            del model_trial
 
             logger.debug(
                 "Trial %s/%d: θ(t) range [%.2f°, %.2f°], "
@@ -1703,6 +1761,9 @@ def prepare_dataset(
         "is_pure_wind": is_pure_wind,
         # Round-3 (Reviewer A MAJ-3B): label-composition sensitivity to
         # a ±25% scaling of the velocity thresholds.
+        "labeling_eligibility": labeling_eligibility,
+        "model_grid_provenance": seq_model_grid_provenance,
+        "model_dt_ms": float(dt_ms),
         "labeling_threshold_sensitivity": labeling_threshold_sensitivity,
         # Exact ``labeling_funnel_summary(labeled_trials)``; do not mutate.
         "labeling_funnel": funnel,
@@ -1724,26 +1785,23 @@ def prepare_dataset(
         "pipeline_semantics_version": PIPELINE_SEMANTICS_VERSION,
     }
 
-    # Derive anchor frames for anchor-aligned cropping (addresses
-    # stimulus-loss bug where random crops miss the stimulus in 88-95%
-    # of trials when sequences are uncapped).  Stored per-trial so
-    # NSMoRDataset can crop deterministically around the stimulus onset.
-    anchor_frames_list = derive_anchor_frames(X_seqs, lengths)
-    assert anchor_frames_list == anchor_frames_before_cast, (
-        "Float32 conversion changed stimulus anchor frames"
-    )
-    dataset["anchor_frames"] = anchor_frames_list
+    # Anchors refer to source events, mapped causally into saved coordinates.
+    # The shared loader validates these against model_grid_provenance and
+    # explicitly reports any disagreement with legacy held-channel peaks.
+    dataset["anchor_frames"] = anchor_frames_before_cast
     logger.info(
-        "Derived %d anchor frames from physical channels.",
-        len(anchor_frames_list),
+        "Mapped %d source anchors onto the supported model grid.",
+        len(anchor_frames_before_cast),
     )
 
-    # Sequences are float32 at extraction, matching DataLoader precision and
-    # bounding the ZIP pickle buffer while preserving every trial and frame.
+    # Preserve every float32 frame; ZIP supports the restricted loader's scan.
     if any(item is not None for item in seq_clock_provenance):
         assert len(seq_clock_provenance) == len(X_seqs)
         dataset["source_clock_provenance"] = seq_clock_provenance
-    torch.save(dataset, output_path)
+    dataset_to_save = dict(dataset)
+    for key in ("X_seqs", "Y_seqs"):
+        dataset_to_save[key] = [torch.from_numpy(seq) for seq in dataset[key]]
+    torch.save(dataset_to_save, output_path)
     logger.info("Saved dataset to %s", output_path)
 
     logger.info("=" * 60)

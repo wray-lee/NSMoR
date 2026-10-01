@@ -205,7 +205,12 @@ smor_dataset.pt`` and return the validation split.
         logger.error("Dataset not found: %s", dataset_path)
         sys.exit(1)
 
-    data, loaded_source_fingerprint = load_dataset_with_fingerprint(dataset_path, map_location="cpu")
+    data, loaded_source_fingerprint = load_dataset_with_fingerprint(
+        dataset_path, map_location="cpu", restore_provenance=False,
+        expected_dt_ms=(
+            resolve_dt_ms(checkpoint_model) if checkpoint_model is not None else None
+        ),
+    )
     # Round-2 CRITICAL-A: refuse pre-2.0 datasets (leaked priors)
     from nsmor.model_utils import resolve_dataset_session_ids, validate_dataset_provenance
     validate_dataset_provenance(data, Path(dataset_path))
@@ -275,7 +280,7 @@ smor_dataset.pt`` and return the validation split.
         val_dataset,
         batch_size=len(val_dataset),
         shuffle=False,
-        num_workers=-1,  # Auto-scale based on dataset size
+        num_workers=0,  # Whole corpus is already resident; workers only replicate it
     )
 
     X_val, Y_val, lengths_val = next(iter(val_loader))

@@ -8,8 +8,115 @@ Validation: stdlib AST/compile only; runtime is deferred until training release.
 A fresh v5 seal and independent A/B review remain required.
 """
 
+from __future__ import annotations
+
+from contextlib import nullcontext
+import logging
+
 import numpy as np
 import pytest
+import torch
+
+from nsmor.analysis.dynamics import FixedPointAdapter
+from nsmor.analysis.dynamics_jax import FixedPointAdapterJAX
+from nsmor.model_nsmor_core import NSMoRCore
+
+
+def _model_with_zero_point_jacobian(jacobian: torch.Tensor) -> NSMoRCore:
+    """Build an actual GRU whose zero-input fixed point has this Jacobian."""
+    hidden_dim = jacobian.shape[0]
+    assert jacobian.shape == (hidden_dim, hidden_dim)
+    model = NSMoRCore(hidden_dim=hidden_dim, dt_ms=4.0, dropout=0.0).cpu().eval()
+    gru = model.backend.gru_unit.gru
+    with torch.no_grad():
+        for parameter in gru.parameters():
+            parameter.zero_()
+        # r = z = 0.5; at h = x = 0, J = 0.5*I + 0.25*W_hh_n.
+        gru.weight_hh_l0[2 * hidden_dim:].copy_(
+            4.0 * (jacobian - 0.5 * torch.eye(hidden_dim))
+        )
+    return model
+
+
+@pytest.mark.parametrize("backend", ["torch", "jax", "jax-torch"])
+@pytest.mark.parametrize(
+    ("mode", "expected_attractor"),
+    [
+        ("unstable_real", False),
+        ("unstable_complex", False),
+        ("weakly_expanding", False),
+        ("stable_real", True),
+        ("stable_complex", True),
+        ("within_spectral_tolerance", True),
+    ],
+)
+def test_attractor_checks_full_spectrum(
+    backend: str,
+    mode: str,
+    expected_attractor: bool,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Near-unit slow modes must not hide an expanding mode in a 64-D GRU."""
+    hidden_dim = 64
+    diagonal = torch.full((hidden_dim,), 0.5)
+    diagonal[:3] = torch.tensor([0.99, 0.98, 0.97])
+    jacobian = torch.diag(diagonal)
+    if mode == "unstable_real":
+        jacobian[3, 3] = 1.5
+    elif mode == "weakly_expanding":
+        jacobian[3, 3] = 1.0001
+    elif mode == "within_spectral_tolerance":
+        jacobian[3, 3] = 1.0 + 5e-7
+    elif mode.endswith("complex"):
+        imaginary = 1.1 if mode == "unstable_complex" else 0.95
+        jacobian[3:5, 3:5] = torch.tensor(
+            [[0.3, -imaginary], [imaginary, 0.3]]
+        )
+    model = _model_with_zero_point_jacobian(jacobian)
+
+    context = nullcontext()
+    if backend == "jax":
+        jax = pytest.importorskip("jax")
+        context = jax.default_device(jax.devices("cpu")[0])
+    with context:
+        adapter = (
+            FixedPointAdapter(model, device=torch.device("cpu"))
+            if backend == "torch"
+            else FixedPointAdapterJAX(
+                model, device=torch.device("cpu"),
+                backend="jax" if backend == "jax" else "torch",
+            )
+        )
+        if backend == "jax":
+            assert adapter.use_jax  # Do not validate only the fallback.
+        h_star = torch.zeros(hidden_dim)
+        x_input = torch.zeros(hidden_dim)
+        actual_jacobian = adapter.compute_jacobian_at_state(h_star, x_input)
+        assert actual_jacobian.shape == (hidden_dim, hidden_dim)
+        torch.testing.assert_close(actual_jacobian, jacobian)
+        spectrum = torch.linalg.eigvals(actual_jacobian)
+        if mode.endswith("complex"):
+            assert spectrum.imag.abs().max() > 0.7
+        assert bool((spectrum.abs() > 1.0 + 1e-6).any()) == (
+            not expected_attractor
+        )
+        with caplog.at_level(logging.WARNING):
+            is_attractor, max_residual, monotonic = adapter.test_attractor_convergence(
+                h_star, x_input, perturbation_magnitude=0.01,
+                convergence_radius=0.02, K=50, n_directions=3,
+            )
+
+    assert is_attractor is expected_attractor
+    assert np.isfinite(max_residual)
+    # These sampled rollouts converge even for the saddle: they are not proof
+    # of stability. A loose radius also admits the weakly expanding rollout.
+    assert monotonic
+    if expected_attractor:
+        assert "unstable eigenmode" not in caplog.text
+        assert 0.0 < max_residual < 0.02
+    else:
+        assert "unstable eigenmode" in caplog.text
+        assert "|lambda|=" in caplog.text
 
 
 def test_actual_jax_attractor_rollout_at_distinct_static_lengths():

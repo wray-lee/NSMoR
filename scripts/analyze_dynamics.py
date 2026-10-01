@@ -26,7 +26,7 @@ import json
 import sys
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
 # Direct CLI execution must use this checkout, including its prior/lineage helpers.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -37,6 +37,7 @@ import numpy as np
 import torch
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 (3D projection)
 from sklearn.decomposition import PCA
+from sklearn.utils.extmath import svd_flip
 
 from nsmor.analysis.uq import cohens_d, log_pca_variance
 from nsmor.dataloader_factory import create_optimized_dataloader
@@ -47,7 +48,9 @@ from nsmor.analysis.analysis_priors import (
     describe_analysis_population, load_analysis_priors, population_for_output,
 )
 from nsmor.pipeline.nested_prior import load_dataset_with_fingerprint
-from nsmor.analysis.prediction_units import load_model_from_checkpoint as _shared_load_model
+from nsmor.analysis.prediction_units import (
+    load_model_from_checkpoint as _shared_load_model, resolve_dt_ms,
+)
 from nsmor.model_utils import validate_dataset_provenance
 
 # -- Logging ----------------------------------------------------------------
@@ -151,7 +154,12 @@ def load_dataset(
         raise FileNotFoundError(f"Dataset not found: {dataset_path}")
 
     logger.info("Loading dataset from %s", dataset_path)
-    dataset, loaded_source_fingerprint = load_dataset_with_fingerprint(dataset_path)
+    dataset, loaded_source_fingerprint = load_dataset_with_fingerprint(
+        dataset_path, restore_provenance=False,
+        expected_dt_ms=(
+            resolve_dt_ms(checkpoint_model) if checkpoint_model is not None else None
+        ),
+    )
 
     # Round-2 CRITICAL-A: refuse pre-2.0 datasets (leaked priors, np.max labels)
     validate_dataset_provenance(dataset, Path(dataset_path))
@@ -202,7 +210,7 @@ def load_dataset(
         bio_dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=-1,  # Auto-scale based on dataset size
+        num_workers=0,  # Whole corpus is already resident; workers only replicate it
     )
 
     return dataloader, labels
@@ -358,6 +366,167 @@ def extract_full_dynamics(
 # 4.  PCA Dimensionality Reduction
 # =========================================================================
 
+def _iter_feature_blocks(
+    bundle: DynamicsBundle,
+    use_combined: bool,
+) -> Iterator[np.ndarray]:
+    """Yield per-trajectory feature matrices ``(T_i, D)``.
+
+    Feature order is GRU hidden states first, then full LIF membrane potentials
+    (matching the historical ``np.concatenate([gru, lif], axis=1)``), with the
+    LIF-rate fallback and GRU-only variants preserved.  Trials are yielded one
+    at a time so the full corpus is never materialised.
+
+    Args:
+        bundle: DynamicsBundle from extract_full_dynamics.
+        use_combined: If True, use LIF potentials (or rate fallback) + GRU.
+
+    Yields:
+        ``(T_i, D)`` arrays; ``D`` is 2H, H+1, or H depending on mode.
+
+    Raises:
+        ValueError: If the LIF potential/rate count does not match the number
+            of GRU trajectories.
+    """
+    n_traj = len(bundle.gru_trajectories)
+    lif_pot = bundle.lif_potential_trajs if use_combined else []
+    lif_rate = bundle.lif_rate_trajs if use_combined else []
+    if lif_pot and len(lif_pot) != n_traj:
+        raise ValueError(
+            f"LIF potential count {len(lif_pot)} != GRU trajectory count {n_traj}"
+        )
+    if lif_rate and len(lif_rate) != n_traj:
+        raise ValueError(
+            f"LIF rate count {len(lif_rate)} != GRU trajectory count {n_traj}"
+        )
+    for i, traj_gru in enumerate(bundle.gru_trajectories):
+        gru_np = traj_gru.numpy()  # (T_i, H)
+        if lif_pot:
+            yield np.concatenate([gru_np, lif_pot[i].numpy()], axis=1)  # (T_i, 2H)
+        elif lif_rate:
+            lif_col = np.asarray(lif_rate[i]).reshape(-1, 1)  # (T_i, 1)
+            yield np.concatenate([gru_np, lif_col], axis=1)  # (T_i, H+1)
+        else:
+            yield gru_np
+
+
+def _fit_centered_pca(
+    blocks: Iterator[np.ndarray],
+    n_components: int,
+) -> PCA:
+    """Exact whole-corpus centered PCA fit with O(D^2) memory.
+
+    Streams per-trajectory ``(T_i, D)`` blocks and merges their centered
+    moments (Chan-style pairwise update), so the ``(n_states, D)`` stacked
+    corpus is never built.  Every frame keeps equal weight and the mean is the
+    exact population mean.  Merging *centered* scatter (not a raw ``X^T X``
+    Gram) avoids catastrophic cancellation when features have a large offset
+    and small variance.
+
+    Args:
+        blocks: Iterator of per-trajectory ``(T_i, D)`` arrays.
+        n_components: Number of principal components to retain.
+
+    Returns:
+        Fitted ``PCA`` (``svd_solver="covariance_eigh"``) exposing the standard
+        ``mean_``/``components_``/``explained_variance[_ratio]_``/
+        ``singular_values_``/``noise_variance_``/``n_samples_`` attributes so
+        ``pca.transform`` behaves exactly as before.
+
+    Raises:
+        ValueError: On empty, singleton, non-finite, or inconsistent-dimension
+            input, or ``n_components`` outside ``[1, min(n_samples, D)]``.
+    """
+    n_samples = 0
+    mean: Optional[np.ndarray] = None
+    scatter: Optional[np.ndarray] = None
+    n_features: Optional[int] = None
+
+    for block in blocks:
+        if block.ndim != 2:
+            raise ValueError(f"Feature block must be 2D; got shape {block.shape}")
+        if block.shape[0] == 0:
+            continue
+        if n_features is None:
+            n_features = block.shape[1]
+        elif block.shape[1] != n_features:
+            raise ValueError(
+                "Inconsistent feature dimension across trajectories: "
+                f"expected {n_features}, got {block.shape[1]}"
+            )
+        if not np.isfinite(block).all():
+            raise ValueError(
+                "Non-finite value in PCA feature block; refusing to fit a "
+                "centered covariance on non-finite states."
+            )
+        block = block.astype(np.float64, copy=False)
+        block_n = block.shape[0]
+        block_mean = block.mean(axis=0)
+        centered = block - block_mean
+        block_scatter = centered.T @ centered
+        if n_samples == 0:
+            mean, scatter = block_mean, block_scatter
+        else:
+            total = n_samples + block_n
+            delta = block_mean - mean
+            scatter = scatter + block_scatter + np.outer(delta, delta) * (
+                n_samples * block_n / total
+            )
+            mean = mean + delta * (block_n / total)
+        n_samples += block_n
+
+    if n_samples < 2 or n_features is None or mean is None or scatter is None:
+        raise ValueError(
+            "No states available for PCA fit." if n_samples == 0
+            else f"PCA needs at least 2 states; got {n_samples}."
+        )
+    assert mean.shape == (n_features,)
+    assert scatter.shape == (n_features, n_features)
+
+    if isinstance(n_components, bool) or not float(n_components).is_integer():
+        raise ValueError(f"n_components must be an integer; got {n_components!r}")
+    n_components = int(n_components)
+    if n_components < 1 or n_components > min(n_samples, n_features):
+        raise ValueError(
+            f"n_components={n_components} must be in [1, "
+            f"{min(n_samples, n_features)}] with svd_solver='covariance_eigh'"
+        )
+
+    covariance = scatter / (n_samples - 1)
+    eigenvals, eigenvecs = np.linalg.eigh(covariance)
+    # eigh returns ascending eigenvalues: reorder to descending (PC1 first) and
+    # clip fp-rounding of tiny negatives (covariance is PSD by construction).
+    eigenvals = np.clip(eigenvals[::-1], 0.0, None)
+    components = eigenvecs[:, ::-1].T
+    # Deterministic sign convention identical to sklearn (svd_flip on Vt rows).
+    _, components = svd_flip(None, components, u_based_decision=False)
+
+    singular_values = np.sqrt(eigenvals * (n_samples - 1))
+    total_var = float(eigenvals.sum())
+    explained_variance_ratio = (
+        eigenvals / total_var if total_var > 0.0 else np.zeros_like(eigenvals)
+    )
+    noise_variance = (
+        float(eigenvals[n_components:].mean())
+        if n_components < min(n_features, n_samples)
+        else 0.0
+    )
+
+    pca = PCA(n_components=n_components, svd_solver="covariance_eigh")
+    pca.mean_ = mean
+    pca.components_ = np.ascontiguousarray(components[:n_components, :])
+    pca.explained_variance_ = np.ascontiguousarray(eigenvals[:n_components])
+    pca.explained_variance_ratio_ = np.ascontiguousarray(
+        explained_variance_ratio[:n_components]
+    )
+    pca.singular_values_ = np.ascontiguousarray(singular_values[:n_components])
+    pca.noise_variance_ = noise_variance
+    pca.n_samples_ = n_samples
+    pca.n_components_ = n_components
+    pca.n_features_in_ = n_features
+    return pca
+
+
 def compute_pca_manifold(
     bundle: DynamicsBundle,
     n_components: int = 3,
@@ -373,67 +542,57 @@ def compute_pca_manifold(
     rate scalar to the 64-D GRU state, effectively drowning the LIF
     signal in PCA.
 
+    The fit streams the corpus in per-trajectory blocks and accumulates only
+    the ``(D, D)`` centered scatter, so the historical ``(n_states, D)``
+    stacked array (which OOM'd a 8 GiB cgroup at n_states≈5.5M) is never
+    materialised.  All frames are retained; the centered covariance spectrum
+    is exact.
+
     Args:
         bundle: DynamicsBundle from extract_full_dynamics.
         n_components: Number of PCA components (default 3).
         use_combined: If True, use LIF potentials + GRU states.
 
     Returns:
-        ``(trajectories_3d, all_labels, pca)`` tuple.
+        ``(trajectories_3d, all_labels, pca)`` tuple, with ``all_labels`` a
+        per-state ``int64`` array in trial order (one entry per state).
     """
     logger.info("Fitting PCA with %d components (combined=%s)...", n_components, use_combined)
 
-    # Build feature arrays per trajectory
-    feature_list: List[np.ndarray] = []
-    for i, traj_gru in enumerate(bundle.gru_trajectories):
-        gru_np = traj_gru.numpy()  # (T_i, H)
-        if use_combined and bundle.lif_potential_trajs:
-            # Concatenate full LIF membrane potentials with GRU hidden states
-            # This gives the LIF pathway equal weight: (T_i, H) + (T_i, H) = (T_i, 2H)
-            lif_np = bundle.lif_potential_trajs[i].numpy()  # (T_i, H)
-            combined = np.concatenate([gru_np, lif_np], axis=1)  # (T_i, 2H)
-            feature_list.append(combined)
-        elif use_combined and bundle.lif_rate_trajs:
-            # Fallback: append LIF spike rate as an extra feature column
-            lif_rate = bundle.lif_rate_trajs[i]  # (T_i,)
-            lif_col = lif_rate.reshape(-1, 1)     # (T_i, 1)
-            combined = np.concatenate([gru_np, lif_col], axis=1)  # (T_i, H+1)
-            feature_list.append(combined)
-        else:
-            feature_list.append(gru_np)
+    lengths = [int(traj.shape[0]) for traj in bundle.gru_trajectories]
 
-    # Concatenate all states for PCA fitting
-    all_states = np.concatenate(feature_list, axis=0)
-    logger.info("PCA input shape: %s", all_states.shape)
-
-    # Build per-state labels
-    all_labels_list = []
-    for i, feat in enumerate(feature_list):
-        T_i = feat.shape[0]
-        all_labels_list.extend([bundle.labels[i]] * T_i)
-    all_labels = np.array(all_labels_list, dtype=np.int64)
-
-    assert all_labels.shape[0] == all_states.shape[0]
-
-    # Fit PCA
-    pca = PCA(n_components=n_components)
-    pca.fit(all_states)
+    # Fit the exact whole-corpus centered PCA without materialising the corpus.
+    pca = _fit_centered_pca(
+        _iter_feature_blocks(bundle, use_combined), n_components,
+    )
+    logger.info("PCA input shape: (%d, %d)", pca.n_samples_, pca.n_features_in_)
 
     explained_var = pca.explained_variance_ratio_
     logger.info(
-        "PCA explained variance: %.2f%%, %.2f%%, %.2f%% (total=%.2f%%)",
-        explained_var[0] * 100, explained_var[1] * 100, explained_var[2] * 100,
-        sum(explained_var) * 100,
+        "PCA explained variance: %s (total=%.2f%%)",
+        ", ".join(f"{v * 100:.2f}%" for v in explained_var),
+        float(explained_var.sum()) * 100,
     )
     log_pca_variance(explained_var, logger.info)
 
-    # Transform trajectories
+    # Transform trajectories (second streaming pass; the fitted mean_ and
+    # components_ give the same per-trajectory projection as pca.transform).
     trajectories_3d = []
-    for feat in feature_list:
+    for feat in _iter_feature_blocks(bundle, use_combined):
         traj_3d = pca.transform(feat)
         trajectories_3d.append(traj_3d)
 
     logger.info("Transformed %d trajectories to 3D.", len(trajectories_3d))
+    if len(bundle.labels) != len(lengths):
+        raise ValueError(
+            f"Label count {len(bundle.labels)} != trajectory count {len(lengths)}"
+        )
+    all_labels = np.repeat(
+        np.asarray(bundle.labels, dtype=np.int64), np.asarray(lengths, dtype=np.int64)
+    )
+    assert all_labels.shape[0] == sum(lengths), (
+        f"Expected {sum(lengths)} per-state labels, got {all_labels.shape[0]}"
+    )
     return trajectories_3d, all_labels, pca
 
 

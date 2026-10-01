@@ -17,6 +17,7 @@ import torch
 
 from nsmor.model_utils import load_model_from_checkpoint as _canonical_load_model
 from nsmor.pipeline.nested_prior import load_artifact_bytes
+from nsmor.pipeline.resampling import validate_checkpoint_clock, validate_dt_ms
 
 logger = logging.getLogger(__name__)
 
@@ -49,17 +50,14 @@ def _target_transform(checkpoint: Mapping) -> tuple[float, float, float]:
     return mean, std, clip
 
 
-def resolve_dt_ms(model, requested: float | None = None) -> float:
+def resolve_dt_ms(model: torch.nn.Module, requested: float | None = None) -> float:
     """Use the saved clock; an explicit cadence must match the model biophysics."""
-    saved = getattr(model, 'dt_ms', None)
-    for name, value in (('model.dt_ms', saved), ('requested dt_ms', requested)):
-        if value is None and name == 'requested dt_ms':
-            continue
-        if isinstance(value, bool) or not isinstance(value, Real) or not math.isfinite(float(value)) or value <= 0:
-            raise ValueError(f'{name} must be a finite positive interval in milliseconds')
-    if requested is not None and not math.isclose(float(requested), float(saved), rel_tol=1e-9, abs_tol=0.0):
+    saved = validate_dt_ms(getattr(model, 'dt_ms', None), name='model.dt_ms')
+    if requested is not None:
+        requested = validate_dt_ms(requested, name='requested dt_ms')
+    if requested is not None and not math.isclose(requested, saved, rel_tol=1e-9, abs_tol=0.0):
         raise ValueError(f'Explicit dt_ms={requested} conflicts with saved model.dt_ms={saved}')
-    return float(saved)
+    return saved
 
 
 def prediction_to_physical(prediction: torch.Tensor, model) -> torch.Tensor:
@@ -80,7 +78,9 @@ def _physical_backend_output(backend, _inputs, output):
     return prediction_to_physical(output, backend)
 
 
-def load_model_from_checkpoint(checkpoint_path: Path, device: torch.device):
+def load_model_from_checkpoint(
+    checkpoint_path: Path, device: torch.device,
+) -> torch.nn.Module:
     """Load one checkpoint payload through the canonical loader, then restore units.
 
     Modern checkpoints require a dataset SHA-256; nested source digests must agree.
@@ -92,6 +92,7 @@ def load_model_from_checkpoint(checkpoint_path: Path, device: torch.device):
     """
     checkpoint_bytes = Path(checkpoint_path).read_bytes()
     checkpoint = load_artifact_bytes(checkpoint_bytes, map_location='cpu')
+    validate_checkpoint_clock(checkpoint, require_dt_ms=True)
     mean, std, clip = _target_transform(checkpoint)
     lineage_keys = ('is_nested_cv', 'nested_prior_artifact', 'nested_prior_artifact_sha256',
                     'nested_prior_fingerprint',

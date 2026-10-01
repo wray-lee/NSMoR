@@ -14,6 +14,12 @@ Outputs
 -------
     results/sim_session/events.csv      — trial events
     results/sim_session/kinematics.csv  — per-frame kinematics
+    results/sim_session/simulation_manifest.json — synthetic run provenance
+
+The uniform default / CLI prior is synthetic, not fitted to or verified against
+an empirical dataset or nested-prior artifact. Fatigue is an uncalibrated
+macro-variable assumption. This CLI sets no seed and restores no checkpoint
+RNG state; the manifest does not certify reproducibility.
 
 Usage
 -----
@@ -29,11 +35,12 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import logging
 import os
 import sys
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -51,6 +58,11 @@ from nsmor.data_extractor import _compute_pure_wind_prepend_frames  # noqa: E402
 from nsmor.model_nsmor_core import NSMoRCore  # noqa: E402
 from nsmor.analysis.prediction_units import resolve_dt_ms
 from nsmor.analysis.prediction_units import load_model_from_checkpoint as _shared_load_model  # noqa: E402
+from nsmor.model_utils import _extract_model_params  # noqa: E402
+from nsmor.pipeline.nested_prior import (  # noqa: E402
+    compute_source_fingerprint,
+    load_artifact_bytes,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -289,7 +301,15 @@ def load_model_from_checkpoint(
     Delegates to the shared :func:`nsmor.analysis.prediction_units.load_model_from_checkpoint`
     which guarantees all biophysical parameters are restored.
     """
-    return _shared_load_model(checkpoint_path, device)
+    model = _shared_load_model(checkpoint_path, device)
+    # Bind the saved config to the bytes actually loaded, not a later replacement.
+    payload = checkpoint_path.read_bytes()
+    if hashlib.sha256(payload).hexdigest() != model.analysis_checkpoint_sha256:
+        raise ValueError("Checkpoint changed while capturing simulation provenance")
+    model.simulation_checkpoint_config = load_artifact_bytes(
+        payload, map_location="cpu",
+    ).get("config", {})
+    return model
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -316,6 +336,8 @@ def apply_fatigue_to_priors_leaky(
     Returns:
         ``(4,)`` fatigue-adjusted prior, renormalised to sum to 1.0.
     """
+    # The caller may use the empirical feature layout with a synthetic prior.
+    assert base_prior.shape == (4,), f"Expected (4,), got {base_prior.shape}"
     fatigued = base_prior.copy()
     shift_startle = base_prior[0] * current_fatigue
     shift_walk = base_prior[1] * current_fatigue
@@ -685,6 +707,91 @@ def export_stimulus_evidence(trials: List[TrialResult], output_dir: Path) -> Non
                    "trials": summaries}, stream, indent=2, allow_nan=False)
 
 
+def export_simulation_manifest(
+    output_dir: Path,
+    args: argparse.Namespace,
+    model: NSMoRCore,
+    base_prior: np.ndarray,
+    trial_provenance: List[Dict[str, object]],
+) -> None:
+    """Bind exported bytes to synthetic assumptions, not empirical validation."""
+    assert base_prior.shape == (4,), f"Expected (4,), got {base_prior.shape}"
+    assert len(trial_provenance) == len(args.paradigms)
+    config = model.simulation_checkpoint_config
+    manifest = {
+        "schema_version": 1,
+        "scope": "synthetic_autoregressive",
+        "empirical_dataset_bound": False,
+        "nested_prior_artifact_bound": False,
+        "checkpoint": {
+            "path": str(Path(args.checkpoint).resolve()),
+            "sha256": model.analysis_checkpoint_sha256,
+        },
+        "checkpoint_config": config,
+        "resolved_model_config": _extract_model_params(config.get("model", {})),
+        "training_config": config.get("training"),
+        "training_config_status": "saved_checkpoint_only; no defaults inferred",
+        "dt_ms": args.dt_ms,
+        "device": str(next(model.parameters()).device),
+        "model_mode": "eval",
+        "prediction_units": {
+            "units": "cm/s", "target_mean": model.target_mean,
+            "target_std": model.target_std,
+            "target_clip_cm_s": model.target_clip_cm_s,
+            "inference_clipped": False,
+        },
+        "synthetic_prior": {
+            "source": "uniform_default" if args.mcmc_prior is None else "cli_vector",
+            "base_vector": base_prior.tolist(),
+            "class_order": ["P_startle", "P_walk", "P_pre_active", "P_no_response"],
+            "model_input_dtype": "float32",
+        },
+        "paradigm_order": args.paradigms,
+        "paradigm_specs": [asdict(PARADIGMS[name]) for name in args.paradigms],
+        "randomness": {
+            "cli_seed": None,
+            "seed_status": "not_set_by_cli",
+            "checkpoint_rng_restored": False,
+            "rng_state_captured": False,
+            "entropy_status": "uncontrolled_process_rng; no replay guarantee",
+            "reproducibility_guaranteed": False,
+        },
+        "fatigue": {
+            "initial_level": 0.0, "cap": 1.0,
+            "trial_cost": args.trial_cost,
+            "recovery_rate_per_second": args.recovery_rate,
+            "iti_seconds": args.iti_seconds,
+            "max_fatigue_penalty": args.max_fatigue_penalty,
+            "update_equation": (
+                "min(previous * exp(-recovery_rate_per_second * iti_seconds) "
+                "+ trial_cost, cap)"
+            ),
+            "update_timing": "before_every_trial_including_first",
+            "within_trial_level": "constant",
+            "neural_state_between_trials": "reset",
+            "rest_semantics": "scalar recovery only; no neural rollout during ITI",
+            "prior_modulation": (
+                "transfer fatigue fraction of P_startle/P_walk to P_no_response; "
+                "renormalize by sum when positive"
+            ),
+            "velocity_modulation": (
+                "physical velocity * (1 - fatigue * max_fatigue_penalty); "
+                "adjusted velocity/acceleration feed back into model"
+            ),
+            "empirically_calibrated": False,
+        },
+        "session_num": args.session_num,
+        "trials": trial_provenance,
+        "outputs_sha256": {
+            name: compute_source_fingerprint(output_dir / name) for name in (
+                "events.csv", "kinematics.csv", "stimuli.csv", "stimulus_summary.json",
+            )
+        },
+    }
+    with (output_dir / "simulation_manifest.json").open("w", encoding="utf-8") as stream:
+        json.dump(manifest, stream, indent=2, allow_nan=False)
+
+
 # ═══════════════════════════════════════════════════════════════
 # 7.  Summary Statistics
 # ═══════════════════════════════════════════════════════════════
@@ -752,8 +859,9 @@ def main() -> None:
         "--mcmc_prior",
         type=float,
         nargs=4,
-        default=[0.25, 0.25, 0.25, 0.25],
-        help="MCMC prior [P_startle, P_walk, P_pre_active, P_no_response].",
+        default=None,
+        help=("Synthetic prior [P_startle, P_walk, P_pre_active, P_no_response] "
+              "(default: uniform 0.25 each; no empirical/nested prior binding)."),
     )
     parser.add_argument(
         "--output_dir",
@@ -814,9 +922,13 @@ def main() -> None:
     model = load_model_from_checkpoint(Path(args.checkpoint), device)
     args.dt_ms = resolve_dt_ms(model, args.dt_ms)
 
-    # ── MCMC prior ───────────────────────────────────────────
-    mcmc_prior = np.array(args.mcmc_prior, dtype=np.float64)
-    logger.info("MCMC prior: %s", mcmc_prior)
+    # ── Synthetic prior (legacy CLI name retained) ────────────
+    mcmc_prior = np.array(
+        [0.25] * 4 if args.mcmc_prior is None else args.mcmc_prior,
+        dtype=np.float64,
+    )
+    logger.info("Synthetic prior (not empirically bound): %s", mcmc_prior)
+    logger.info("No CLI seed set; checkpoint RNG is not restored.")
 
     # ── Log fatigue configuration ─────────────────────────────
     if args.trial_cost > 0.0:
@@ -832,6 +944,7 @@ def main() -> None:
     # ── Run generation ───────────────────────────────────────
     logger.info("Generating %d paradigms...", len(args.paradigms))
     trials: List[TrialResult] = []
+    trial_provenance: List[Dict[str, object]] = []
 
     # ── Leaky-accumulator state ──────────────────────────────
     current_fatigue: float = 0.0
@@ -862,6 +975,15 @@ def main() -> None:
             max_fatigue_penalty=args.max_fatigue_penalty,
         )
         trials.append(trial)
+        trial_provenance.append({
+            "global_trial_id": global_trial_id,
+            "paradigm": paradigm_name,
+            "fatigue_level": float(current_fatigue),
+            "effective_prior": apply_fatigue_to_priors_leaky(
+                mcmc_prior, current_fatigue,
+            ).tolist(),
+            "velocity_gain": float(1.0 - current_fatigue * args.max_fatigue_penalty),
+        })
 
     # ── Summary ──────────────────────────────────────────────
     log_trial_summary(trials, dt_ms=args.dt_ms)
@@ -871,6 +993,7 @@ def main() -> None:
     export_events_csv(trials, output_dir / "events.csv", args.session_num)
     export_kinematics_csv(trials, output_dir / "kinematics.csv", args.session_num, dt_ms=args.dt_ms)
     export_stimulus_evidence(trials, output_dir)
+    export_simulation_manifest(output_dir, args, model, mcmc_prior, trial_provenance)
 
     logger.info("Done. Outputs in %s", output_dir)
 

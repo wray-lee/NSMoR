@@ -8,6 +8,8 @@ Disjoint from tests/test_precollection_mutation_contracts.py.
 from __future__ import annotations
 
 import csv
+import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -307,7 +309,8 @@ def test_phase_d_cli_csv_latency_figure_axis_and_raw_mse(monkeypatch, tmp_path, 
 
 @pytest.mark.parametrize('dt_ms', [4.0, 10.0])
 @pytest.mark.parametrize('explicit', [False, True])
-def test_phase_e_cli_selects_actual_epoch_frames_from_saved_clock(monkeypatch, tmp_path, dt_ms, explicit):
+@pytest.mark.parametrize('wind_present', [False, True])
+def test_phase_e_cli_selects_actual_epoch_frames_from_saved_clock(monkeypatch, tmp_path, dt_ms, explicit, wind_present):
     from scripts import analyze_jacobian as jacobian
 
     class ProbeModel(torch.nn.Module):
@@ -328,7 +331,7 @@ def test_phase_e_cli_selects_actual_epoch_frames_from_saved_clock(monkeypatch, t
         dataset = Dataset([(None, None, 1)])
 
     x = torch.zeros(1, 601, 8)
-    x[0, 300:, 1] = 1.0
+    x[0, 300:, 1 if wind_present else 0] = 1.0
     x[0, :, 2] = torch.arange(601)
     loader = Loader([(x, torch.zeros(1, 601), torch.tensor([601]))])
     model, adapter = ProbeModel(), SimpleNamespace()
@@ -1201,8 +1204,612 @@ def test_phase_d_sidecar_retains_row_specific_mse_for_same_prefix(monkeypatch, t
     ]) > 5.01e-7 for row in swapped)
 
 
+@pytest.mark.parametrize('sigma_hi,weight_lo', [(0.4, 0.7), (0.15, 0.6)])
+def test_jacobian_gmm_boundary_matches_weighted_posterior(
+    sigma_hi: float, weight_lo: float,
+) -> None:
+    from sklearn.mixture import GaussianMixture
+    from scripts import analyze_jacobian as jacobian
+
+    gm = GaussianMixture(2, covariance_type='full')
+    gm.weights_ = np.array([weight_lo, 1.0 - weight_lo])
+    gm.means_ = np.array([[-5.0], [-4.0]])
+    gm.covariances_ = np.array([[[0.15**2]], [[sigma_hi**2]]])
+    gm.precisions_cholesky_ = 1.0 / np.sqrt(gm.covariances_)
+    boundary = jacobian._gmm_posterior_half_boundary_log(
+        -5.0, 0.15, weight_lo, -4.0, sigma_hi, 1.0 - weight_lo,
+    )
+    assert -5.0 < boundary < -4.0
+    np.testing.assert_allclose(gm.predict_proba([[boundary]]), [[0.5, 0.5]],
+                               atol=1e-12)
+    assert gm.predict_proba([[boundary - 1e-4]])[0, 0] > 0.5
+    assert gm.predict_proba([[boundary + 1e-4]])[0, 0] < 0.5
+
+
+def test_jacobian_calibration_caller_matches_fitted_gmm() -> None:
+    from sklearn.mixture import GaussianMixture
+    from scripts import analyze_jacobian as jacobian
+
+    rng = np.random.default_rng(42)
+    residuals = np.exp(np.r_[rng.normal(-5.3, 0.2, 150),
+                              rng.normal(-3.9, 0.4, 50)])
+    threshold, diag = jacobian._calibrate_fp_threshold(residuals)
+    x_log = np.log(residuals)[:, None]
+    gm = GaussianMixture(2, random_state=42).fit(x_log)
+    lo = int(np.argmin(gm.means_.ravel()))
+    assert diag['bic_1comp'] - diag['bic_2comp'] > 200.0
+    assert gm.weights_[lo] != pytest.approx(0.5)
+    assert gm.covariances_[0, 0, 0] != pytest.approx(gm.covariances_[1, 0, 0])
+    assert gm.predict_proba([[np.log(threshold)]])[0, lo] == pytest.approx(0.5)
+    # Across the component means, the caller's threshold classifies exactly
+    # like the fitted posterior (not the reversed prior/variance polynomial).
+    grid = np.linspace(*sorted(gm.means_.ravel()), 2000)
+    np.testing.assert_array_equal(grid < np.log(threshold),
+                                   gm.predict_proba(grid[:, None])[:, lo] > 0.5)
+    # Unequal variance can put high-component mass below the between-means
+    # threshold too. The accepted set must use the posterior, not just x < gate.
+    probes = np.r_[residuals, np.exp(grid), np.exp(-8.0)]
+    np.testing.assert_array_equal(
+        jacobian._posterior_keep(probes, threshold, diag),
+        gm.predict_proba(np.log(probes)[:, None])[:, lo] > 0.5,
+    )
+
+
+class _JacobianProbeModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.dt_ms, self.sensory_dim, self.hidden_dim = 4.0, 4, 1
+        self.sensory_encoder = lambda x: x[:, :, 2:3]
+
+    def forward(
+        self, x: torch.Tensor, lengths: torch.Tensor, *, return_internals: bool,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        assert x.shape == (len(lengths), x.shape[1], 8)
+        assert lengths.shape == (x.shape[0],)
+        return torch.zeros(x.shape[:2]), {'gru_hidden': x[:, :, 2:3]}
+
+
+def _jacobian_probe_loader(
+    *, wind: bool = False, n_frames: int = 601,
+    anchor: int = 300, max_seq_len: int | None = None,
+) -> torch.utils.data.DataLoader:
+    from nsmor.nsmor_dataloader import NSMoRDataset, collate_variable_length
+
+    x = np.zeros((n_frames, 8), dtype=np.float32)
+    x[:, 0] = 2.0  # Static visual baseline does not establish visual onset.
+    x[:, 2] = np.arange(n_frames)
+    if wind:
+        x[anchor:, 1] = 1.0
+    dataset = NSMoRDataset(
+        [(x, np.zeros(n_frames, dtype=np.float32), 1)],
+        np.full((1, 4), 0.25, dtype=np.float32), anchor_frames=[anchor],
+        max_seq_len=max_seq_len, pre_anchor_frames=300,
+        source_indices=[17],
+    )
+    dataset.trial_ids = [101]
+    dataset.session_ids = ['recording_session_1']
+    return torch.utils.data.DataLoader(dataset, collate_fn=collate_variable_length)
+
+
+@pytest.mark.parametrize('wind', [False, True])
+@pytest.mark.parametrize('cropped', [False, True])
+@pytest.mark.parametrize('legacy', [False, True])
+def test_jacobian_both_callers_preserve_reference_and_crop(
+    monkeypatch: pytest.MonkeyPatch, wind: bool, cropped: bool, legacy: bool,
+) -> None:
+    from scripts import analyze_jacobian as jacobian
+
+    anchor = 600 if cropped else 300
+    loader = _jacobian_probe_loader(wind=wind, n_frames=1201 if cropped else 601,
+                                    anchor=anchor, max_seq_len=601 if cropped else None)
+    monkeypatch.setattr(jacobian, '_find_slow_point',
+                        lambda h, centre, _length: (centre, h[centre]))
+    monkeypatch.setattr(jacobian, '_fixed_point_residual', lambda *_args: 0.01)
+    monkeypatch.setattr(jacobian, '_calibrate_fp_threshold',
+                        lambda *_args, **_kwargs: (0.02, {}))
+    model = _JacobianProbeModel()
+    references = [] if legacy and wind else [anchor]
+    states = jacobian.extract_gru_states_at_epochs(
+        model, loader, torch.device('cpu'), references,
+        adapter=SimpleNamespace(),
+    )
+    offset = anchor - 300
+    for name, centre in zip(jacobian.EPOCH_DEFINITIONS, (50, 300, 550)):
+        assert states[name][0].item() == centre + offset
+    seen = []
+
+    def full_jacobian(x: torch.Tensor, lengths: torch.Tensor) -> tuple[torch.Tensor, dict]:
+        assert torch.is_grad_enabled()
+        assert x.shape == (1, 1, 8) and lengths.shape == (1,)
+        seen.append(int(x[0, 0, 2]))
+        return torch.tensor([[3.0, 4.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]]), {}
+
+    result = jacobian.compute_full_system_eigenvalues(
+        model, SimpleNamespace(compute_full_system_jacobian=full_jacobian),
+        loader, torch.device('cpu'), references,
+    )
+    assert seen == [50 + offset, 300 + offset, 550 + offset]
+    for values in result.values():
+        np.testing.assert_allclose(values, [[5.0]])
+        assert not np.iscomplexobj(values)
+
+
+@pytest.mark.parametrize('reference', [None, -1, 601, float('nan'), True])
+@pytest.mark.parametrize('wind', [False, True])
+def test_jacobian_unavailable_reference_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, reference: object, wind: bool,
+) -> None:
+    from scripts import analyze_jacobian as jacobian
+
+    monkeypatch.setattr(jacobian, '_fixed_point_residual', lambda *_args: 0.01)
+    monkeypatch.setattr(jacobian, '_calibrate_fp_threshold',
+                        lambda *_args, **_kwargs: (0.02, {}))
+    loader = _jacobian_probe_loader(wind=wind)
+    with pytest.raises(ValueError, match='reference.*unavailable|unavailable.*reference'):
+        jacobian.extract_gru_states_at_epochs(
+            _JacobianProbeModel(), loader, torch.device('cpu'), [reference],
+            adapter=SimpleNamespace(),
+        )
+    with pytest.raises(ValueError, match='reference.*unavailable|unavailable.*reference'):
+        jacobian.compute_full_system_eigenvalues(
+            _JacobianProbeModel(), SimpleNamespace(), loader, torch.device('cpu'),
+            [reference],
+        )
+
+
+def test_jacobian_onset_detection_does_not_invent_references() -> None:
+    from scripts import analyze_jacobian as jacobian
+
+    silent = np.zeros((601, 8))
+    static = silent.copy()
+    static[:, 0] = 2.0
+    visual = silent.copy()
+    visual[300:, 0] = 2.0
+    wind = static.copy()
+    wind[300:, 1] = 1.0
+    assert jacobian.detect_stimulus_onset_frames([silent, static, visual, wind]) == [
+        None, None, 300, 300,
+    ]
+
+
+def test_jacobian_full_system_all_fail_is_unavailable() -> None:
+    from scripts import analyze_jacobian as jacobian
+
+    def fail(*_args: object) -> None:
+        raise RuntimeError('synthetic SVD failure')
+
+    with pytest.raises(ValueError, match='unavailable'):
+        jacobian.compute_full_system_eigenvalues(
+            _JacobianProbeModel(), SimpleNamespace(compute_full_system_jacobian=fail),
+            _jacobian_probe_loader(), torch.device('cpu'), [300],
+        )
+
+
+def test_jacobian_capped_sampling_is_seeded_and_auditable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scripts import analyze_jacobian as jacobian
+
+    class Adapter:
+        def test_attractor_convergence(self, *_args: object) -> tuple[bool, float, bool]:
+            return False, 0.1, False
+
+        def compute_jacobian_batch(
+            self, h: torch.Tensor, x: torch.Tensor,
+        ) -> torch.Tensor:
+            assert h.shape == x.shape == (len(h), 1)
+            return h.detach().unsqueeze(-1)
+
+    monkeypatch.setattr(jacobian, '_fixed_point_residual', lambda *_args: 0.01)
+    monkeypatch.setattr(jacobian, '_calibrate_fp_threshold',
+                        lambda *_args, **_kwargs: (0.02, {}))
+    h = torch.arange(30, dtype=torch.float32).reshape(-1, 1)
+    identities = [{'candidate_id': f'early:{i}:300', 'source_row_index': 10 + i,
+                   'source_trial_id': 101 + i, 'session_id': 'recording_session_1'}
+                  for i in range(30)]
+    data = {'early': (h, h), 'early__gate_diag': {
+        'n_candidates': 40, 'n_accepted': 30, 'n_rejected': 10,
+        'accepted_candidates': identities,
+    }}
+    first = jacobian.compute_eigenvalues_at_epochs(
+        Adapter(), data, torch.device('cpu'), max_states_per_epoch=5,
+    )
+    torch.rand(100)  # Unrelated callers must not affect the selection.
+    second = jacobian.compute_eigenvalues_at_epochs(
+        Adapter(), data, torch.device('cpu'), max_states_per_epoch=5,
+    )
+    np.testing.assert_array_equal(first[0]['early'], second[0]['early'])
+    assert first[1] == second[1]
+    stats = first[1]['early']
+    assert stats['sampling_seed'] == 42
+    assert (stats['n_candidates'], stats['n_accepted'], stats['n_rejected'],
+            stats['n_sampled']) == (40, 30, 10, 5)
+    for index, identity, value in zip(stats['selected_state_indices'],
+                                     stats['selected_candidates'], first[0]['early']):
+        assert identity == identities[index]
+        assert value[0].real == index
+
+
+def test_jacobian_full_system_runner_uses_singular_plot_and_status(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    import matplotlib.pyplot as plt
+    from scripts import analyze_jacobian as jacobian
+
+    loader = _jacobian_probe_loader()
+    loader.dataset.analysis_reference_frames = [300]
+    loader.dataset.analysis_reference_rules = ['looming_collision']
+    monkeypatch.setattr(jacobian, 'load_model_from_checkpoint',
+                        lambda *_args: _JacobianProbeModel())
+    monkeypatch.setattr(jacobian, 'load_dataset', lambda *_args, **_kwargs:
+                        (loader, np.array([1]), [601], [loader.dataset.sequences[0][0]]))
+    monkeypatch.setattr(jacobian, 'extract_gru_states_at_epochs',
+                        lambda **_kwargs: pytest.fail('Input sensitivity uses no GRU FP gate'))
+    monkeypatch.setattr(jacobian, 'create_jacobian_adapter', lambda *_args, **_kwargs:
+                        SimpleNamespace(compute_full_system_jacobian=
+                                        lambda *_args: (torch.ones(1, 8), {})))
+    monkeypatch.setattr(jacobian, 'plot_eigenvalue_spectrum',
+                        lambda **_kwargs: pytest.fail('Singular values are not eigenvalues'))
+    figures = []
+    monkeypatch.setattr(plt, 'savefig', lambda *_args, **_kwargs: figures.append(plt.gcf()))
+    output = tmp_path / 'sensitivity.png'
+    jacobian.run_jacobian_analysis(tmp_path / 'unused.pth', tmp_path / 'unused.pt',
+                                   output, full_system=True)
+    assert figures
+    figure = figures[0]
+    assert 'singular' in figure._suptitle.get_text().lower()
+    assert 'surrogate' in figure._suptitle.get_text().lower()
+    for axis in figure.axes:
+        assert 'singular' in axis.get_xlabel().lower()
+        assert 'Re(' not in axis.get_xlabel()
+    summary = json.loads(output.with_suffix('.json').read_text())
+    assert summary['status'] == 'ok'
+    assert summary['spectral_quantity'] == 'surrogate_input_singular_values'
+    assert summary['stability_interpretation'] is False
+    assert 'pct_near_unit_circle' not in summary['spectral_statistics']['early']
+
+    monkeypatch.setattr(jacobian, 'compute_full_system_eigenvalues',
+                        lambda **_kwargs: {})
+    with pytest.raises(ValueError, match='unavailable'):
+        jacobian.run_jacobian_analysis(tmp_path / 'unused.pth', tmp_path / 'unused.pt',
+                                       output, full_system=True)
+    summary = json.loads(output.with_suffix('.json').read_text())
+    assert summary['status'] == 'unavailable'
+    assert summary['spectral_statistics'] == {}
+
+
+def test_jacobian_actual_adapter_sampling_and_full_system_svd() -> None:
+    from nsmor.analysis.dynamics import FixedPointAdapter
+    from scripts import analyze_jacobian as jacobian
+
+    with torch.random.fork_rng():
+        torch.manual_seed(7)
+        model = NSMoRCore(hidden_dim=4, dt_ms=4.0, sensory_noise_std=0.0,
+                          dropout=0.0).cpu().eval()
+        h = torch.randn(24, 4)
+        x = torch.randn(24, 4)
+    adapter = FixedPointAdapter(model, device=torch.device('cpu'))
+    data = {'early': (h, x)}
+    first = jacobian.compute_eigenvalues_at_epochs(
+        adapter, data, torch.device('cpu'), max_states_per_epoch=5,
+        sampling_seed=19,
+    )
+    second = jacobian.compute_eigenvalues_at_epochs(
+        adapter, data, torch.device('cpu'), max_states_per_epoch=5,
+        sampling_seed=19,
+    )
+    np.testing.assert_array_equal(first[0]['early'], second[0]['early'])
+    indices = first[1]['early']['selected_state_indices']
+    expected = torch.linalg.eigvals(adapter.compute_jacobian_batch(h[indices], x[indices]))
+    np.testing.assert_allclose(first[0]['early'], expected.numpy())
+    assert 'n_candidates' not in first[1]['early']  # No imaginary upstream gate.
+    assert 'selected_candidates' not in first[1]['early']
+    other = jacobian.compute_eigenvalues_at_epochs(
+        adapter, data, torch.device('cpu'), max_states_per_epoch=5,
+        sampling_seed=20,
+    )
+    assert indices != other[1]['early']['selected_state_indices']
+
+    loader = _jacobian_probe_loader()
+    selected = {}
+    with torch.no_grad():
+        result = jacobian.compute_full_system_eigenvalues(
+            model, adapter, loader, torch.device('cpu'), [300],
+            max_states_per_epoch=1, selection_metadata=selected,
+        )
+    for name, frame in zip(jacobian.EPOCH_DEFINITIONS, (50, 300, 550)):
+        batch = loader.dataset[0][0][frame:frame + 1].unsqueeze(0)
+        with torch.enable_grad():
+            matrix, _ = adapter.compute_full_system_jacobian(batch, torch.tensor([1]))
+        assert matrix.shape == (4, 8)
+        np.testing.assert_allclose(
+            result[name][0], np.linalg.svd(matrix.detach().numpy(), compute_uv=False),
+            rtol=1e-5, atol=1e-7,
+        )
+        assert selected[name]['n_candidates'] == selected[name]['n_sampled'] == 1
+        assert selected[name]['n_accepted'] == 1 and selected[name]['n_rejected'] == 0
+
+
+def test_jacobian_full_system_cap_records_exact_sampled_candidates() -> None:
+    from scripts import analyze_jacobian as jacobian
+    from nsmor.nsmor_dataloader import NSMoRDataset, collate_variable_length
+
+    source = _jacobian_probe_loader().dataset.sequences[0][0]
+    sequences = []
+    for i in range(12):
+        x = source.copy()
+        x[:, 2] = i + 1
+        x[:, 4:8] = 0.0
+        sequences.append((x, np.zeros(601), 1))
+    dataset = NSMoRDataset(
+        sequences, np.full((12, 4), 0.25), max_seq_len=None,
+        anchor_frames=[300] * 12, source_indices=list(range(100, 112)),
+    )
+    loader = torch.utils.data.DataLoader(
+        dataset, batch_size=4, collate_fn=collate_variable_length,
+    )
+    seen = []
+
+    def jacobian_matrix(x: torch.Tensor, _lengths: torch.Tensor) -> tuple[torch.Tensor, dict]:
+        seen.append(int(x[0, 0, 2]))
+        return x[0, :, :], {}
+
+    metadata = {}
+    result = jacobian.compute_full_system_eigenvalues(
+        _JacobianProbeModel(), SimpleNamespace(compute_full_system_jacobian=jacobian_matrix),
+        loader, torch.device('cpu'), [300] * 12, max_states_per_epoch=3,
+        sampling_seed=17, selection_metadata=metadata,
+    )
+    assert len(seen) == 9
+    expected = torch.randperm(12, generator=torch.Generator().manual_seed(17))[:3].tolist()
+    for name in jacobian.EPOCH_DEFINITIONS:
+        stats = metadata[name]
+        assert stats['selected_state_indices'] == expected
+        assert (stats['n_candidates'], stats['n_sampled'], stats['n_accepted'],
+                stats['n_rejected'], stats['n_unsampled']) == (12, 3, 3, 0, 9)
+        assert [i['source_row_index'] for i in stats['selected_candidates']] == [100 + i for i in expected]
+        assert result[name].shape == (3, 1)
+        assert all('source_trial_id' not in item and 'session_id' not in item
+                   for item in stats['selected_candidates'])
+
+
+def test_jacobian_loader_maps_wind_onset_through_producer_crop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """A crop anchor is not necessarily the observed wind onset."""
+    from scripts import analyze_jacobian as jacobian
+
+    features = [np.zeros((1201, 8), dtype=np.float32) for _ in range(3)]
+    features[0][:, 0] = 2.0
+    features[0][600:, 1] = 1.0
+    features[0][:, 2] = np.arange(1201)
+    features[1][:, 0] = 2.0  # Visual collision supplied; onset is not observed.
+    features[1][:, 2] = np.arange(1201)
+    path = tmp_path / 'jacobian_crop.pt'
+    torch.save({
+        'pipeline_semantics_version': PIPELINE_SEMANTICS_VERSION,
+        'mcmc_prior_provenance': 'oof_2fold_recording_prefix_grouped_cv',
+        'animal_identity_status': 'unverified',
+        'X_seqs': features, 'Y_seqs': [np.zeros(1201) for _ in features],
+        'labels': np.ones(3, dtype=np.int64), 'lengths': [1201] * 3,
+        'anchor_frames': [800, 600, 600],
+        'session_ids': ['recording_session_1'] * 3,
+        'mcmc_priors': np.full((3, 4), 0.25),
+    }, path)
+    model = SimpleNamespace(dt_ms=4., analysis_checkpoint_lineage=_diagnostic_lineage(path))
+    loader, *_ = jacobian.load_dataset(
+        path, max_seq_len=601, pre_anchor_frames=300, checkpoint_model=model,
+    )
+    dataset = loader.dataset
+    assert dataset.analysis_reference_frames == [100, 300, None]
+    assert dataset.analysis_reference_rules == [
+        'wind_onset', 'looming_collision', 'unavailable',
+    ]
+    assert torch.nonzero(dataset[0][0][:, 1] > 0.5)[0].item() == 100
+
+    # Only wind and visual trials enter either caller; the silent row is not PREWALK.
+    dataset.sequences[2] = (*dataset.sequences[2][:2], 3)
+    monkeypatch.setattr(jacobian, '_find_slow_point',
+                        lambda h, centre, _length: (centre, h[centre]))
+    monkeypatch.setattr(jacobian, '_fixed_point_residual', lambda *_args: 0.01)
+    monkeypatch.setattr(jacobian, '_calibrate_fp_threshold',
+                        lambda *_args, **_kwargs: (0.02, {}))
+    probe = _JacobianProbeModel()
+    states = jacobian.extract_gru_states_at_epochs(
+        probe, loader, torch.device('cpu'), [800, 600, None],
+        adapter=SimpleNamespace(),
+    )
+    expected = {'early': [350], 'transient': [600, 600], 'sustained': [850, 850]}
+    for name, frames in expected.items():
+        assert states[name][0][:, 0].tolist() == frames
+    selected = {}
+    jacobian.compute_full_system_eigenvalues(
+        probe, SimpleNamespace(compute_full_system_jacobian=lambda *_args:
+                               (torch.ones(1, 8), {})),
+        loader, torch.device('cpu'), [800, 600, None], selection_metadata=selected,
+    )
+    for name, frames in {'early': [50], 'transient': [100, 300],
+                         'sustained': [350, 550]}.items():
+        assert [item['frame'] for item in
+                selected[name]['selected_candidates']] == frames
+
+
+@pytest.mark.parametrize('caller', ['gru', 'full_system'])
+@pytest.mark.parametrize('reference_source', ['mapped', 'unavailable', 'supplied',
+                                            'legacy'])
+@pytest.mark.parametrize('n_frames,first,second', [(1601, 400, 1000),
+                                                (1201, 100, 600)])
+def test_jacobian_original_wind_onset_outside_crop_fails_closed(
+    tmp_path: Path, caller: str, reference_source: str,
+    n_frames: int, first: int, second: int,
+) -> None:
+    """A later cropped pulse cannot replace the original analysis time origin."""
+    from scripts import analyze_jacobian as jacobian
+
+    x = np.zeros((n_frames, 8), dtype=np.float32)
+    x[first:first + 100, 1] = 1.0
+    x[second:second + 100, 1] = 1.0
+    path = tmp_path / 'two_wind_pulses.pt'
+    torch.save({
+        'pipeline_semantics_version': PIPELINE_SEMANTICS_VERSION,
+        'mcmc_prior_provenance': 'oof_2fold_recording_prefix_grouped_cv',
+        'animal_identity_status': 'unverified',
+        'X_seqs': [x], 'Y_seqs': [np.zeros(n_frames, dtype=np.float32)],
+        'labels': np.ones(1, dtype=np.int64), 'lengths': [n_frames],
+        'anchor_frames': [second], 'session_ids': ['recording_session_1'],
+        'mcmc_priors': np.full((1, 4), 0.25),
+    }, path)
+    loader, *_ = jacobian.load_dataset(
+        path, max_seq_len=601, pre_anchor_frames=300,
+        checkpoint_model=SimpleNamespace(
+            dt_ms=4., analysis_checkpoint_lineage=_diagnostic_lineage(path),
+        ),
+    )
+    assert loader.dataset.anchor_frames == [second]
+    assert loader.dataset.analysis_reference_frames == [first - (second - 300)]
+    assert loader.dataset.analysis_reference_rules == ['wind_onset']
+    assert torch.nonzero(loader.dataset[0][0][:, 1] > 0.5)[0].item() == 300
+    references = [second]  # The mapped sidecar takes precedence over crop anchor.
+    if reference_source == 'unavailable':
+        loader.dataset.analysis_reference_frames = [None]
+    elif reference_source in ('supplied', 'legacy'):
+        del loader.dataset.analysis_reference_frames
+        references = [first] if reference_source == 'supplied' else []
+    extract = (jacobian.extract_gru_states_at_epochs if caller == 'gru'
+               else jacobian.compute_full_system_eigenvalues)
+    with pytest.raises(ValueError, match='analysis reference unavailable'):
+        extract(
+            model=_JacobianProbeModel(), adapter=SimpleNamespace(),
+            dataloader=loader, device=torch.device('cpu'), onset_frames=references,
+        )
+
+
+def test_jacobian_actual_residual_gate_accepts_posterior_candidates(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Exercise extraction + actual GRU residuals + fitted posterior end to end."""
+    from sklearn.mixture import GaussianMixture
+    from nsmor.nsmor_dataloader import NSMoRDataset, collate_variable_length
+    from scripts import analyze_jacobian as jacobian
+
+    class ResidualModel(_JacobianProbeModel):
+        def __init__(self) -> None:
+            super().__init__()
+            self.sensory_encoder = lambda x: torch.zeros_like(x[:, :, 2:3])
+
+    rng = np.random.default_rng(42)
+    residuals = np.exp(np.r_[rng.normal(-5.3, 0.2, 150),
+                              rng.normal(-3.9, 0.4, 50), -8.0])
+    features = []
+    for residual in residuals:
+        x = np.zeros((601, 8), dtype=np.float32)
+        x[:, 0] = 2.0
+        x[300:, 1] = 1.0
+        x[:, 2] = 2 * residual
+        features.append(x)
+    dataset = NSMoRDataset(
+        [(x, np.zeros(601), 1) for x in features],
+        np.full((len(features), 4), 0.25), max_seq_len=None,
+        anchor_frames=[300] * len(features),
+    )
+    loader = torch.utils.data.DataLoader(
+        dataset, batch_size=32, collate_fn=collate_variable_length,
+    )
+    gru = torch.nn.GRU(1, 1, batch_first=True)
+    with torch.no_grad():
+        for parameter in gru.parameters():
+            parameter.zero_()  # Exact one-step residual = 0.5 * |h|.
+    result = jacobian.extract_gru_states_at_epochs(
+        ResidualModel(), loader, torch.device('cpu'), [300] * len(features),
+        adapter=SimpleNamespace(_gru_cell=gru),
+    )
+    gm = GaussianMixture(2, random_state=42).fit(
+        np.log(np.asarray(residuals, dtype=np.float32).astype(float))[:, None],
+    )
+    low = int(np.argmin(gm.means_.ravel()))
+    expected = np.flatnonzero(gm.predict_proba(np.log(residuals)[:, None])[:, low] > 0.5)
+    assert len(expected) < len(residuals)
+    for name in jacobian.EPOCH_DEFINITIONS:
+        diag = result[name + '__gate_diag']
+        accepted = [item['source_row_index'] for item in diag['accepted_candidates']]
+        np.testing.assert_array_equal(accepted, expected)
+        assert diag['n_candidates'] == len(features)
+        assert diag['n_accepted'] + diag['n_rejected'] == len(features)
+        np.testing.assert_allclose(result[name][0][:, 0], residuals[expected] * 2)
+
+    adapter = SimpleNamespace(
+        _gru_cell=gru,
+        test_attractor_convergence=lambda *_args: (False, 0.1, False),
+        compute_jacobian_batch=lambda h, _x: torch.full((len(h), 1, 1), 0.5),
+    )
+    monkeypatch.setattr(torch.cuda, 'is_available', lambda: False)
+    monkeypatch.setattr(jacobian, 'load_model_from_checkpoint',
+                        lambda *_args: ResidualModel())
+    monkeypatch.setattr(jacobian, 'load_dataset', lambda *_args, **_kwargs: (
+        loader, np.ones(len(features), dtype=int), [601] * len(features), features,
+    ))
+    monkeypatch.setattr(jacobian, 'create_jacobian_adapter',
+                        lambda *_args, **_kwargs: adapter)
+    monkeypatch.setattr(jacobian, 'plot_eigenvalue_spectrum',
+                        lambda **_kwargs: None)
+    output = tmp_path / 'posterior_gate.png'
+    jacobian.run_jacobian_analysis(tmp_path / 'unused.pth', tmp_path / 'unused.pt',
+                                   output, max_states_per_epoch=1)
+    summary = json.loads(output.with_suffix('.json').read_text())
+    for name in jacobian.EPOCH_DEFINITIONS:
+        diag = summary['fp_gate_calibration'][name + '__gate_diag']
+        assert diag['n_accepted'] == 151
+        assert (diag['n_accept_at_75pct'], diag['n_accept_at_125pct']) == (148, 154)
+        assert diag['acceptance_rule'] == (
+            'low_component_posterior > 0.5 and residual < residual_cap'
+        )
+        assert diag['residual_cap'] == 0.3
+        assert diag['threshold_sensitivity_status'] == (
+            'scalar_cutoff_diagnostic_not_posterior_gate_robustness'
+        )
+        assert diag['threshold_sensitivity_interpretation'] == (
+            'n_accept_at_75pct/n_accept_at_125pct count residual < scaled '
+            'fp_threshold only; they do not perturb the fitted posterior gate.'
+        )
+        assert [jacobian._posterior_keep(residuals, diag['fp_threshold'] * scale,
+                                         diag).sum()
+                for scale in (0.75, 1.0, 1.25)] == [151, 151, 151]
+
+
+@pytest.mark.parametrize("module_name,entry", [
+    ("analyze_dynamics", "load_model_from_checkpoint"),
+    ("analyze_gating", "load_model_and_dataset"),
+    ("analyze_integration", "load_model_from_checkpoint"),
+    ("analyze_jacobian", "load_model_from_checkpoint"),
+    ("simulate_autoregressive", "load_model_from_checkpoint"),
+    ("simulate_lesion", "load_model_from_checkpoint"),
+    ("simulate_psychophysics", "load_checkpoint"),
+])
+def test_all_analysis_loaders_reject_serialized_boolean_clock(
+    normalized_checkpoint: tuple, tmp_path: Path,
+    module_name: str, entry: str,
+) -> None:
+    """Every production wrapper must reject before canonical reconstruction."""
+    import importlib
+    from unittest import mock
+
+    path, payload = normalized_checkpoint
+    payload["config"]["model"]["dt_ms"] = True
+    torch.save(payload, path)
+    with mock.patch.object(prediction_units, "_canonical_load_model") as construct:
+        module = importlib.import_module("scripts." + module_name)
+        argument = (
+            tmp_path / "absent-dataset.pt" if entry == "load_model_and_dataset"
+            else torch.device("cpu")
+        )
+        with pytest.raises(ValueError, match="dt_ms.*finite positive"):
+            getattr(module, entry)(path, argument)
+        construct.assert_not_called()
+
+
 @pytest.mark.parametrize("nested", [False, True])
 @pytest.mark.parametrize("change,accepted", [
+
     ({}, True),
     ({"dataset_source_sha256": None}, False),
     ({"dataset_source_sha256": "a" * 63}, False),

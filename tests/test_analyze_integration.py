@@ -142,5 +142,9 @@ def test_phase_f_tonic_latency_gate_and_signed_peak_compatibility(tmp_path: Path
     figure_path = tmp_path / "response.png"
     export_integration_summary({"visual_only": stats}, summary_path, dt_ms=dt_ms)
     assert json.loads(summary_path.read_text(encoding="utf-8"))["status"] == "ok"
-    create_integration_figure({"visual_only": stats}, figure_path)
+    # The wind-axis figure needs a genuine wind delta_t; visual-only alone
+    # must not fabricate an x=0 point to satisfy the plotting gate.
+    create_integration_figure(
+        {"visual_only": stats, "multisensory_ttc_-225ms": stats}, figure_path
+    )
     assert figure_path.stat().st_size > 0

@@ -58,6 +58,8 @@ _PER_TRIAL_KEYS: Tuple[str, ...] = (
     "anchor_frames",
     "anchor_rules",
     "anchor_rule",
+    "model_grid_provenance",
+    "source_clock_provenance",
 )
 
 
@@ -170,6 +172,39 @@ def subset_dataset(
             subset[key] = value[kept]
         else:  # list of ragged per-trial arrays
             subset[key] = [value[i] for i in kept]
+
+    if "labeling_eligibility" in data:
+        # This ledger is not per sequence: keep every parent unavailable trial,
+        # but only labels whose identity belongs to a selected sequence.
+        selected = {
+            (str(session_ids[i]), int(data["trial_ids"][i])) for i in kept
+        }
+        ledger = [
+            row for row in data["labeling_eligibility"]
+            if row["status"] != "labeled"
+            or (str(row["session_id"]), int(row["trial_id"])) in selected
+        ]
+        labeled = [row for row in ledger if row["status"] == "labeled"]
+        labeled_keys = {
+            (str(row["session_id"]), int(row["trial_id"])) for row in labeled
+        }
+        if len(labeled) != len(kept) or labeled_keys != selected:
+            raise ValueError("labeling_eligibility must identify every selected sequence")
+        subset["labeling_eligibility"] = ledger
+        subset["subset_labeling_accounting"] = {
+            "scope": "selected_sequences_and_all_parent_unavailable",
+            "n_sequences": len(kept),
+            "n_parent_entries": len(data["labeling_eligibility"]),
+            "n_excluded_labeled": len(data["labeling_eligibility"]) - len(ledger),
+            "n_labeled": len(labeled),
+            "n_unavailable": len(ledger) - len(labeled),
+            "n_entries": len(ledger),
+            # These aggregate audits remain parent-scoped, not subset counts.
+            "parent_summary_keys": [
+                key for key in ("labeling_funnel", "labeling_funnel_retention",
+                                "labeling_threshold_sensitivity") if key in data
+            ],
+        }
 
     subset["animal_identity_status"] = prior_identity_status(
         data.get("mcmc_prior_provenance"), data.get("animal_identity_status")

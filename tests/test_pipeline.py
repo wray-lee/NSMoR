@@ -1649,11 +1649,20 @@ def test_etl_releases_raw_trials_before_serialization(
 
     raw_dir = tmp_path / "raw"
     _make_label_audit_csvs(raw_dir, n_sessions=5)
-    # The previous artifact stored float64 and the DataLoader cast on read.
-    # Compare every saved sequence with that original model-facing cast.
+    # Independently construct the causal 4ms grid, then compare the
+    # model-facing float32 cast. Source observations remain on their own axis.
     expected = {}
     for trial in _extract_label_audit_trials(raw_dir):
-        x64, y64 = extract_trial_sequence(trial, dt_ms=4.0)
+        source_time = trial["time_ms"]
+        grid = source_time[0] + np.arange(
+            int(np.floor((source_time[-1] - source_time[0]) / 4.0)) + 1
+        ) * 4.0
+        indices = np.searchsorted(source_time, grid, side="right") - 1
+        model_trial = dict(trial)
+        for channel in ("visual_angle", "wind_state", "velocity", "acceleration"):
+            model_trial[channel] = trial[channel][indices]
+        model_trial["time_ms"] = grid
+        x64, y64 = extract_trial_sequence(model_trial, dt_ms=4.0)
         expected[(trial["session_id"], trial["trial_id"])] = (
             x64.copy(), y64.copy(), derive_anchor_frames([x64])[0],
         )
@@ -1675,6 +1684,10 @@ def test_etl_releases_raw_trials_before_serialization(
             "Raw trial arrays remained live when serializing X_seqs/Y_seqs"
         )
         assert len(dataset["X_seqs"]) == len(dataset["Y_seqs"]) == 25
+        for key in ("X_seqs", "Y_seqs"):
+            assert all(isinstance(seq, torch.Tensor) and seq.dtype == torch.float32
+                       and seq.device.type == "cpu" for seq in dataset[key])
+        assert kwargs.get("_use_new_zipfile_serialization", True) is True
         return original_save(dataset, path, **kwargs)
 
     monkeypatch.setattr(prep, "_load_trials_and_diagnostics", record_raw_arrays)
@@ -1683,10 +1696,18 @@ def test_etl_releases_raw_trials_before_serialization(
     prep.prepare_dataset(raw_dir=raw_dir, output_path=output, random_seed=42)
 
     assert save_calls == 1
-    dataset = torch.load(output, weights_only=False)
+    import hashlib
+    from nsmor.pipeline.nested_prior import load_dataset_with_fingerprint
+
+    dataset, fingerprint = load_dataset_with_fingerprint(output)
+    assert fingerprint == hashlib.sha256(output.read_bytes()).hexdigest()
     assert len(dataset["X_seqs"]) == 25
     assert dataset["labeling_funnel_retention"]["n_retained_sequences"] == 25
     assert zipfile.is_zipfile(output)
+    assert len(dataset["labeling_eligibility"]) == 25
+    assert all(item["status"] == "labeled" for item in dataset["labeling_eligibility"])
+    assert len(dataset["model_grid_provenance"]) == 25
+    assert dataset["model_dt_ms"] == 4.0
     assert len(dataset["anchor_frames"]) == 25
     assert all(isinstance(x, np.ndarray) and x.dtype == np.float32
                for x in dataset["X_seqs"])

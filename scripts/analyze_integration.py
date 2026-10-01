@@ -196,7 +196,12 @@ def load_dataset(
         raise FileNotFoundError(f"Dataset not found: {dataset_path}")
 
     logger.info("Loading dataset from %s", dataset_path)
-    dataset, loaded_source_fingerprint = load_dataset_with_fingerprint(dataset_path)
+    dataset, loaded_source_fingerprint = load_dataset_with_fingerprint(
+        dataset_path, restore_provenance=False,
+        expected_dt_ms=(
+            resolve_dt_ms(checkpoint_model) if checkpoint_model is not None else None
+        ),
+    )
 
     # Round-2 CRITICAL-A: refuse pre-2.0 datasets (leaked priors, np.max labels)
     validate_dataset_provenance(dataset, Path(dataset_path))
@@ -249,7 +254,7 @@ def load_dataset(
         bio_dataset,
         batch_size=batch_size,
         shuffle=False,  # Preserve ordering for condition matching
-        num_workers=-1,  # Auto-scale based on dataset size
+        num_workers=0,  # Whole corpus is already resident; workers only replicate it
     )
 
     lengths_list = [int(l) for l in lengths]
@@ -726,11 +731,13 @@ def create_integration_figure(
     setup_lancet_style()
 
     # ── Prepare data for plotting ─────────────────────────────
-    # Every observed condition is included. X coordinates for
-    # multisensory_ttc_* groups are derived from the dynamic group name
-    # itself (e.g. -225/-261/-308), not a hardcoded expected-condition
-    # list. Conditions without a parseable TTC stay explicit (logged
-    # skip reason) and are never given a fabricated x coordinate.
+    # X coordinates for multisensory_ttc_* groups are derived from the
+    # dynamic group name itself (e.g. -225/-261/-308), not a hardcoded
+    # expected-condition list. Conditions without a parseable wind
+    # delta_t stay explicit (logged skip reason) and are never given a
+    # fabricated x coordinate. The visual-only group has no wind onset
+    # time, so it never enters the wind delta-t response series; it is
+    # reported only as a separate no-wind reference line below.
     observed = list(condition_stats.keys())
     skipped_conds: Dict[str, str] = {}
 
@@ -750,20 +757,22 @@ def create_integration_figure(
             logger.warning("No data for condition '%s', skipping.", cond)
             continue
 
-        if cond == "visual_only":
-            # Visual-Only is the documented reference point at x=0 (no wind).
-            delta_t = 0.0
-        else:
-            parsed = parse_ttc_condition_delta(cond)
-            if parsed is None:
-                skipped_conds[cond] = "no parseable delta_t from condition name"
-                logger.warning(
-                    "Condition %r has no parseable delta_t; omitted from "
-                    "chronometric x-axis (explicit skip, not dropped silently).",
-                    cond,
-                )
-                continue
-            delta_t = float(parsed)
+        # Visual-only has no wind onset, so it has no wind delta_t. It must
+        # not be coerced to 0.0 (a fabricated wind-at-TTC point) nor connected
+        # to the wind response curve; it is a no-wind reference only. The
+        # same guard drops any other condition lacking a parseable wind
+        # delta_t (e.g. wind_only) from the wind axis explicitly.
+        parsed = parse_ttc_condition_delta(cond)
+        if parsed is None:
+            skipped_conds[cond] = "no wind delta_t from condition name"
+            logger.warning(
+                "Condition %r has no wind delta_t; omitted from the "
+                "chronometric x-axis as a separate no-wind reference "
+                "(explicit skip, not dropped silently).",
+                cond,
+            )
+            continue
+        delta_t = float(parsed)
 
         x_values.append(delta_t)
         latency_means.append(latency["mean"])
@@ -774,6 +783,24 @@ def create_integration_figure(
 
     if not x_values:
         raise ValueError("Phase F unavailable: no measurable peak latencies in observed conditions")
+
+    # ── Order the wind response series by physical delta_t ────
+    # Dictionary insertion order reflects how conditions were observed,
+    # not the physical wind-onset axis. Plotting unsorted x values makes
+    # the connected response curve self-cross (e.g. x = [-261, -308,
+    # -373, -225]); the chronometric curve must be monotone in delta_t.
+    # Sort by numeric delta_t with a stable tie-break on the original
+    # index, and apply the same permutation to the paired latency and
+    # velocity means/errors so x/y/error stay jointly aligned. Conditions
+    # lacking a wind delta_t were already excluded above, so they never
+    # enter this permutation.
+    order = sorted(range(len(x_values)), key=lambda i: (x_values[i], i))
+    x_values = [x_values[i] for i in order]
+    latency_means = [latency_means[i] for i in order]
+    latency_sems = [latency_sems[i] for i in order]
+    velocity_means = [velocity_means[i] for i in order]
+    velocity_sems = [velocity_sems[i] for i in order]
+    cond_labels = [cond_labels[i] for i in order]
 
     # Convert to numpy arrays
     x_arr = np.array(x_values)

@@ -39,7 +39,7 @@ except ImportError:
     lax = None
     JAX_AVAILABLE = False
 
-from nsmor.analysis.dynamics import FixedPointAdapter
+from nsmor.analysis.dynamics import FixedPointAdapter, _has_expanding_eigenmode
 from nsmor.model_nsmor_core import NSMoRCore
 
 logger = logging.getLogger(__name__)
@@ -308,8 +308,10 @@ class FixedPointAdapterJAX:
         """
         Test whether candidate slow point h* converges as an attractor.
 
-        Perturbs along the principal eigenvectors of the Jacobian at h*
-        and evaluates trajectory convergence over K steps.
+        Checks the full complex spectrum for expansion (1e-6 numerical
+        tolerance), then evaluates sampled eigenvector rollouts over K steps.
+        Passing these finite tests is not proof of attraction for marginal
+        modes or approximate fixed points.
 
         Args:
             h_star: (H,) candidate fixed point.
@@ -348,6 +350,7 @@ class FixedPointAdapterJAX:
             J_np = np.asarray(J)
 
         eigvals, eigvecs = np.linalg.eig(J_np)
+        has_expanding_mode = _has_expanding_eigenmode(torch.from_numpy(eigvals))
         eigval_mags = np.abs(eigvals)
         distance_to_boundary = np.abs(eigval_mags - 1.0)
         n_dirs = min(n_directions, H)
@@ -390,7 +393,11 @@ class FixedPointAdapterJAX:
                 if np.any(diffs > residuals[:-1] * 0.01):
                     all_monotonic = False
 
-        is_attractor = all_converged and (max_residual <= convergence_radius)
+        is_attractor = (
+            not has_expanding_mode
+            and all_converged
+            and (max_residual <= convergence_radius)
+        )
         return is_attractor, float(max_residual), all_monotonic
 
     @property

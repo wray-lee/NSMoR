@@ -237,7 +237,9 @@ def generate_nested_priors(
     # One authoritative byte snapshot supplies both the source fingerprint
     # and every input used to generate priors. The supplied in-memory dataset
     # remains an independent consistency check below.
-    authoritative_dataset, fingerprint = load_dataset_with_fingerprint(source_dataset_path)
+    authoritative_dataset, fingerprint = load_dataset_with_fingerprint(
+        source_dataset_path, restore_provenance=False,
+    )
     if not isinstance(authoritative_dataset, dict):
         raise ValueError(
             f"Authoritative dataset file must contain a dict, got {type(authoritative_dataset).__name__}"

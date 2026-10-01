@@ -55,7 +55,8 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from tqdm import tqdm
 
 # ── Project imports ────────────────────────────────────────────
-from nsmor.checkpoint import load_checkpoint, save_checkpoint
+from nsmor.checkpoint import load_checkpoint as _canonical_load_checkpoint
+from nsmor.checkpoint import save_checkpoint
 from nsmor.config import DEFAULT_FEATURE
 from nsmor.config_parser import ExperimentConfig
 from nsmor.dataloader_factory import create_dataloaders_from_config
@@ -72,6 +73,33 @@ from nsmor.pipeline.nested_prior import (
     load_dataset_with_fingerprint,
     load_nested_prior_split,
 )
+from nsmor.pipeline.resampling import validate_checkpoint_clock, validate_dt_ms
+
+
+def load_checkpoint(
+    path: str | Path,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer | None = None,
+    scheduler: torch.optim.lr_scheduler._LRScheduler | None = None,
+    *,
+    map_location: str | torch.device | None = None,
+    payload: bytes | None = None,
+) -> Dict[str, Any]:
+    """Guard resume and final-best clocks, then restore the same captured bytes."""
+    if payload is None:
+        payload = Path(path).read_bytes()
+    checkpoint = load_artifact_bytes(payload, map_location="cpu")
+    active_dt = (
+        validate_dt_ms(model.dt_ms, name="active dt_ms")
+        if hasattr(model, "dt_ms") else None
+    )
+    validate_checkpoint_clock(
+        checkpoint, active_dt, require_dt_ms=hasattr(model, "dt_ms"),
+    )
+    return _canonical_load_checkpoint(
+        path, model, optimizer, scheduler, map_location=map_location,
+        payload=payload,
+    )
 
 
 # ── Deployment provenance keys ────────────────────────────────
@@ -210,8 +238,9 @@ def _validate_best_checkpoint(
     *,
     trusted_historical_checkpoint_sha256=None,
     checkpoint_sha256=None,
-) -> float:
-    """Validate that candidate checkpoint is a certified best model matching active lineage.
+    require_best: bool = True,
+) -> Optional[float]:
+    """Validate checkpoint lineage and, for best selection, its coupled score.
 
     Enforces:
     1. Lineage consistency (is_nested_cv, artifact/content SHA-256, source fingerprint, split_seed, val_split).
@@ -316,6 +345,9 @@ def _validate_best_checkpoint(
                     f"Checkpoint at {path} has mismatched dataset_path "
                     f"({c_ds!r} vs {exp_ds!r}); fail closed."
                 )
+
+    if not require_best:
+        return None
 
     own_val = ckpt.get("val_loss")
     if own_val is None or not math.isfinite(float(own_val)):
@@ -672,6 +704,7 @@ def build_model(config: ExperimentConfig) -> NSMoRCore:
     Returns:
         Instantiated model (on CPU; move to device after).
     """
+    validate_dt_ms(config.model.dt_ms, name="active config dt_ms")
     model = NSMoRCore(
         sensory_dim=config.model.sensory_dim,
         mcmc_dim=config.model.mcmc_dim,
@@ -961,7 +994,9 @@ def build_dataloaders(
         logger.info("Loading metadata from %s (lazy mode)", dataset_file)
 
         # Read one metadata snapshot for both lazy rows and provenance.
-        raw_meta, loaded_source_fingerprint = load_dataset_with_fingerprint(dataset_file)
+        raw_meta, loaded_source_fingerprint = load_dataset_with_fingerprint(
+            dataset_file, expected_dt_ms=config.model.dt_ms, restore_provenance=False,
+        )
         prior_status = validate_dataset_provenance(raw_meta, dataset_file)
         prior_tag = raw_meta["mcmc_prior_provenance"]
         full_dataset = NSMoRLazyDataset(
@@ -1105,7 +1140,9 @@ def build_dataloaders(
     from nsmor.nsmor_dataloader import NSMoRDataset
 
     logger.info("Loading dataset from %s", dataset_file)
-    dataset, loaded_source_fingerprint = load_dataset_with_fingerprint(dataset_file)
+    dataset, loaded_source_fingerprint = load_dataset_with_fingerprint(
+        dataset_file, expected_dt_ms=config.model.dt_ms, restore_provenance=False,
+    )
 
     # Round-2 CRITICAL-A: refuse pre-2.0 datasets (leaked priors,
     # np.max labels) — training on them is scientifically invalid.
@@ -1368,7 +1405,9 @@ def compute_target_stats(
         )
         return 0.0, 1.0, np.empty(0, dtype=np.int64)
 
-    dataset, loaded_source_fingerprint = load_dataset_with_fingerprint(dataset_file)
+    dataset, loaded_source_fingerprint = load_dataset_with_fingerprint(
+        dataset_file, expected_dt_ms=config.model.dt_ms, restore_provenance=False,
+    )
     from nsmor.model_utils import validate_dataset_provenance
     validate_dataset_provenance(dataset, dataset_file)
     session_ids = resolve_dataset_session_ids(dataset)
@@ -2559,11 +2598,50 @@ def train(
         raise ValueError("Loaded train dataset lacks its source SHA-256")
     active_lineage["dataset_source_sha256"] = dataset_source_sha256
 
-    def certify_best_checkpoint(state, candidate_path, payload):
-        return _validate_best_checkpoint(
-            state, candidate_path, active_lineage,
+    def validate_checkpoint_lineage(state, candidate_path, payload):
+        validate_checkpoint_clock(state, model.dt_ms, require_dt_ms=True)
+        _check_checkpoint_prior_lineage(
+            state, active_lineage, candidate_path,
             trusted_historical_checkpoint_sha256=trusted_historical_checkpoint_sha256,
             checkpoint_sha256=hashlib.sha256(payload).hexdigest(),
+        )
+
+    generated_checkpoint_shas: Dict[Path, str] = {}
+
+    def evaluation_checkpoint_pins(
+        candidate_path: Path, payload: bytes,
+    ) -> Any:
+        """Trust own writes only while their captured bytes remain unchanged."""
+        digest = hashlib.sha256(payload).hexdigest()
+        if generated_checkpoint_shas.get(candidate_path) == digest:
+            return digest
+        return trusted_historical_checkpoint_sha256
+
+    def certify_best_checkpoint(
+        state: Dict[str, Any], candidate_path: Path, payload: bytes,
+        *, evaluation: bool = False,
+    ) -> float:
+        validate_checkpoint_clock(state, model.dt_ms, require_dt_ms=True)
+        return _validate_best_checkpoint(
+            state, candidate_path, active_lineage,
+            trusted_historical_checkpoint_sha256=(
+                evaluation_checkpoint_pins(candidate_path, payload)
+                if evaluation else trusted_historical_checkpoint_sha256
+            ),
+            checkpoint_sha256=hashlib.sha256(payload).hexdigest(),
+        )
+
+    def certify_final_checkpoint(
+        state: Dict[str, Any], candidate_path: Path, payload: bytes,
+    ) -> None:
+        validate_checkpoint_clock(state, model.dt_ms, require_dt_ms=True)
+        _validate_best_checkpoint(
+            state, candidate_path, active_lineage,
+            trusted_historical_checkpoint_sha256=evaluation_checkpoint_pins(
+                candidate_path, payload,
+            ),
+            checkpoint_sha256=hashlib.sha256(payload).hexdigest(),
+            require_best=False,
         )
     dataset_source_binding = "sha256_bound" if dataset_source_sha256 is not None else "unbound_lazy"
     logger.info(
@@ -2673,6 +2751,7 @@ def train(
         # the phase the run will continue in.
         resume_payload = ckpt_path.read_bytes()
         ckpt_peek = load_artifact_bytes(resume_payload, map_location="cpu")
+        validate_checkpoint_clock(ckpt_peek, model.dt_ms, require_dt_ms=True)
 
         # ── Fail-closed nested resume validation ──
         # Checkpoint provenance vs active run configuration:
@@ -2828,6 +2907,76 @@ def train(
         _landing_phase2 = two_phase and start_epoch > phase1_epochs
         _crosses_boundary = two_phase and start_epoch == phase1_epochs
 
+        # Capture and validate every best candidate before any state restoration.
+        # Reconciliation below uses these same bytes; never reread a mutable path.
+        resume_phase = 2 if _landing_phase2 else current_phase
+        best_target = output_dir / "best_model.pth"
+        claimed_best: Optional[float] = None
+        if "best_val_loss" in ckpt_peek and ckpt_peek["best_val_loss"] is not None and math.isfinite(float(ckpt_peek["best_val_loss"])):
+            claimed_best = float(ckpt_peek["best_val_loss"])
+        elif "val_loss" in ckpt_peek and ckpt_peek["val_loss"] is not None and math.isfinite(float(ckpt_peek["val_loss"])):
+            claimed_best = float(ckpt_peek["val_loss"])
+
+        src_cand_path: Optional[Path] = None
+        src_cand_payload: Optional[bytes] = None
+        src_cand_val: Optional[float] = None
+        companion = ckpt_path.parent / "best_model.pth"
+        companion_payload: Optional[bytes] = None
+        comp_peek: Optional[Dict[str, Any]] = None
+        if ckpt_path.name == "best_model.pth":
+            src_cand_path = ckpt_path
+            src_cand_payload = resume_payload
+            if not _crosses_boundary:
+                src_cand_val = certify_best_checkpoint(
+                    ckpt_peek, ckpt_path, resume_payload,
+                )
+        elif companion.exists() and companion.resolve() != ckpt_path.resolve():
+            companion_payload = companion.read_bytes()
+            comp_peek = load_artifact_bytes(companion_payload, map_location="cpu")
+            validate_checkpoint_clock(comp_peek, model.dt_ms, require_dt_ms=True)
+            if two_phase and comp_peek.get("training_phase") not in (1, 2):
+                raise ValueError(f"Best checkpoint {companion} lacks training_phase; fail closed.")
+            if not _crosses_boundary and (
+                not two_phase or comp_peek["training_phase"] == resume_phase
+            ):
+                src_cand_path = companion
+                src_cand_payload = companion_payload
+                src_cand_val = certify_best_checkpoint(
+                    comp_peek, companion, companion_payload,
+                )
+            elif not _crosses_boundary and claimed_best is not None and ckpt_peek.get("val_loss") == claimed_best:
+                src_cand_path = ckpt_path
+                src_cand_payload = resume_payload
+                src_cand_val = certify_best_checkpoint(
+                    ckpt_peek, ckpt_path, resume_payload,
+                )
+
+        dest_val: Optional[float] = None
+        dest_stale = False
+        destination_payload: Optional[bytes] = None
+        if best_target.exists():
+            if best_target.resolve() == ckpt_path.resolve():
+                destination_payload = resume_payload
+                dest_peek = ckpt_peek
+            elif best_target.resolve() == companion.resolve():
+                destination_payload = companion_payload
+                dest_peek = comp_peek
+            else:
+                destination_payload = best_target.read_bytes()
+                dest_peek = load_artifact_bytes(destination_payload, map_location="cpu")
+            validate_checkpoint_clock(dest_peek, model.dt_ms, require_dt_ms=True)
+            if two_phase and dest_peek.get("training_phase") not in (1, 2):
+                raise ValueError(f"Best checkpoint {best_target} lacks training_phase; fail closed.")
+            if two_phase and dest_peek["training_phase"] != resume_phase:
+                dest_stale = True
+            elif not _crosses_boundary:
+                dest_val = certify_best_checkpoint(
+                    dest_peek, best_target, destination_payload,
+                )
+
+        if src_cand_val is not None:
+            assert src_cand_payload is not None
+
         if _landing_phase2:
             # Restore the phase-2 freeze state (requires_grad is NOT carried
             # by the checkpoint): init leaves frontend unfrozen/backend frozen
@@ -2895,57 +3044,7 @@ def train(
 
     # Phase-1 best is discarded at the boundary; its loss cannot rank Phase-2 weights.
     if config.checkpoint.resume_from is not None and not _crosses_boundary:
-        best_target = output_dir / "best_model.pth"
-        claimed_best: Optional[float] = None
-        if "best_val_loss" in ckpt_peek and ckpt_peek["best_val_loss"] is not None and math.isfinite(float(ckpt_peek["best_val_loss"])):
-            claimed_best = float(ckpt_peek["best_val_loss"])
-        elif "val_loss" in ckpt_peek and ckpt_peek["val_loss"] is not None and math.isfinite(float(ckpt_peek["val_loss"])):
-            claimed_best = float(ckpt_peek["val_loss"])
-
-        # Discover and validate only best weights scored under this phase's objective.
-        src_cand_path: Optional[Path] = None
-        src_cand_payload: Optional[bytes] = None
-        src_cand_val: Optional[float] = None
-        if ckpt_path.name == "best_model.pth":
-            src_cand_path = ckpt_path
-            src_cand_payload = resume_payload
-            src_cand_val = certify_best_checkpoint(ckpt_peek, ckpt_path, resume_payload)
-        else:
-            companion = ckpt_path.parent / "best_model.pth"
-            if companion.exists() and companion.resolve() != ckpt_path.resolve():
-                companion_payload = companion.read_bytes()
-                comp_peek = load_artifact_bytes(companion_payload, map_location="cpu")
-                if two_phase and comp_peek.get("training_phase") not in (1, 2):
-                    raise ValueError(f"Best checkpoint {companion} lacks training_phase; fail closed.")
-                if two_phase and comp_peek["training_phase"] != current_phase:
-                    if claimed_best is not None and ckpt_peek.get("val_loss") == claimed_best:
-                        src_cand_path = ckpt_path
-                        src_cand_payload = resume_payload
-                        src_cand_val = certify_best_checkpoint(ckpt_peek, ckpt_path, resume_payload)
-                else:
-                    src_cand_path = companion
-                    src_cand_payload = companion_payload
-                    src_cand_val = certify_best_checkpoint(comp_peek, companion, companion_payload)
-
-        # Discover and validate destination candidate best model
-        dest_val: Optional[float] = None
-        dest_stale = False
-        if best_target.exists():
-            destination_payload = best_target.read_bytes()
-            dest_peek = load_artifact_bytes(destination_payload, map_location="cpu")
-            if best_target.read_bytes() != destination_payload:
-                raise ValueError(f"Destination best checkpoint {best_target} changed after validation; fail closed.")
-            if two_phase and dest_peek.get("training_phase") not in (1, 2):
-                raise ValueError(f"Best checkpoint {best_target} lacks training_phase; fail closed.")
-            if two_phase and dest_peek["training_phase"] != current_phase:
-                dest_stale = True
-            else:
-                dest_val = certify_best_checkpoint(dest_peek, best_target, destination_payload)
-
-        if src_cand_val is not None:
-            assert src_cand_payload is not None
-
-        # Symmetric reconciliation between source and destination candidates
+        # Symmetric reconciliation uses only the preflighted snapshots.
         if dest_val is not None and src_cand_val is not None:
             if claimed_best is not None and min(dest_val, src_cand_val) > claimed_best + 1e-5:
                 raise ValueError(
@@ -2962,6 +3061,8 @@ def train(
                     dest_val, src_cand_path, best_val_loss,
                 )
             else:
+                assert destination_payload is not None
+                best_target.write_bytes(destination_payload)
                 best_val_loss = dest_val
                 logger.info(
                     "Retained existing destination best model at %s (val_loss=%.6f <= source %.6f)",
@@ -2975,6 +3076,8 @@ def train(
                     f"destination {best_target} has worse val_loss={dest_val:.6f} and companion "
                     f"source best model is absent; refusing to silently degrade best score (fail closed)."
                 )
+            assert destination_payload is not None
+            best_target.write_bytes(destination_payload)
             best_val_loss = dest_val
             logger.info(
                 "Validated existing destination best_model.pth at %s (val_loss=%.6f)",
@@ -3270,6 +3373,9 @@ def train(
                 best_val_loss=float(best_val_loss),
                 **nested_provenance,
             )
+            generated_checkpoint_shas[best_path] = hashlib.sha256(
+                best_path.read_bytes(),
+            ).hexdigest()
             logger.info("Saved best model (val_loss=%.6f): %s", val_loss, best_path)
         elif math.isfinite(val_loss):
             epochs_without_improvement += 1
@@ -3338,6 +3444,9 @@ def train(
         best_val_loss=float(best_val_loss),
         **nested_provenance,
     )
+    generated_checkpoint_shas[final_path] = hashlib.sha256(
+        final_path.read_bytes(),
+    ).hexdigest()
     logger.info("Saved final model: %s", final_path)
 
     logger.info("Final LR: %.2e", scheduler.get_last_lr()[0])
@@ -3371,7 +3480,23 @@ def train(
         )
 
     if eval_ckpt_path is not None and val_loader is not None:
-        load_checkpoint(path=eval_ckpt_path, model=model, map_location=device)
+        eval_payload = eval_ckpt_path.read_bytes()
+        eval_state = load_artifact_bytes(eval_payload, map_location="cpu")
+        if eval_provenance == "best":
+            certify_best_checkpoint(
+                eval_state, eval_ckpt_path, eval_payload,
+                evaluation=True,
+            )
+        else:
+            certify_final_checkpoint(
+                eval_state, eval_ckpt_path, eval_payload,
+            )
+        load_checkpoint(
+            path=eval_ckpt_path,
+            model=model,
+            map_location=device,
+            payload=eval_payload,
+        )
         model.to(device)
         metrics = compute_metrics(
             model, val_loader, device,

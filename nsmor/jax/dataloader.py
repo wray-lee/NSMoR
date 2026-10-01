@@ -30,12 +30,16 @@ except ImportError:
 logger = logging.getLogger("nsmor.jax.dataloader")
 
 
-def load_nsmor_dataset(dataset_path: Union[str, Path]) -> Dict[str, Any]:
+def load_nsmor_dataset(
+    dataset_path: Union[str, Path], *, expected_dt_ms: Optional[float] = None,
+) -> Dict[str, Any]:
     """
     Load preprocessed NSMoR dataset from a PyTorch .pt artifact.
 
     Args:
         dataset_path: Path to nsmor_dataset_*.pt.
+        expected_dt_ms: Consuming model/config interval, when available. Legacy
+            artifacts without a grid contract retain explicitly unverified cadence.
 
     Returns:
         Dataset dictionary with keys:
@@ -45,7 +49,10 @@ def load_nsmor_dataset(dataset_path: Union[str, Path]) -> Dict[str, Any]:
     if not path.exists():
         raise FileNotFoundError(f"Dataset not found at {path}")
 
-    data, fingerprint = load_dataset_with_fingerprint(path, map_location="cpu")
+    data, fingerprint = load_dataset_with_fingerprint(
+        path, map_location="cpu", expected_dt_ms=expected_dt_ms,
+        restore_provenance=False,
+    )
     if not isinstance(data, dict):
         raise ValueError(f"Expected dataset dict, got {type(data)}")
     required = ("X_seqs", "Y_seqs", "mcmc_priors", "lengths", "labels")

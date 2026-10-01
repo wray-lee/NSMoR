@@ -1515,6 +1515,386 @@ def test_legacy_digestless_resume_keeps_historical_source_unbound(tmp_path: Path
                  trusted_historical_checkpoint_sha256=_checkpoint_shas(final)[0])
     assert model.analysis_dataset_binding == "legacy_resume_unbound"
 
+@pytest.mark.parametrize("bad_dt", [
+    True, False, float("nan"), float("inf"), -float("inf"), 0., -4.,
+    "4", None, [4.], torch.tensor(4.), np.array([4.]),
+])
+@pytest.mark.parametrize("entry", ["reconstruct", "build"])
+def test_invalid_model_clock_rejected_before_construction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bad_dt: object, entry: str,
+) -> None:
+    """Serialized and active config clocks must not reach the frozen constructor."""
+    from nsmor import model_utils
+    from nsmor.analysis.prediction_units import load_model_from_checkpoint
+    from scripts import train
+
+    def forbidden_constructor(**kwargs: object) -> None:
+        pytest.fail("Invalid dt_ms reached the frozen NSMoRCore constructor")
+
+    if entry == "build":
+        config = _make_config(tmp_path)
+        config.model.dt_ms = bad_dt
+        monkeypatch.setattr(train, "NSMoRCore", forbidden_constructor)
+        with pytest.raises(ValueError, match="dt_ms.*finite positive"):
+            train.build_model(config)
+    else:
+        checkpoint = tmp_path / "invalid-clock.pth"
+        torch.save({
+            "pipeline_semantics_version": PIPELINE_SEMANTICS_VERSION,
+            "config": {"model": {"dt_ms": bad_dt, "hidden_dim": 4}},
+            "model_state_dict": {},
+        }, checkpoint)
+        monkeypatch.setattr(model_utils, "NSMoRCore", forbidden_constructor)
+        with pytest.raises(ValueError, match="dt_ms.*finite positive"):
+            load_model_from_checkpoint(checkpoint, torch.device("cpu"))
+
+
+@pytest.mark.parametrize("captured", [False, True])
+def test_restore_clock_mismatch_is_atomic(
+    tmp_path: Path, captured: bool,
+) -> None:
+    """An 8ms checkpoint must not change any 4ms weights, buffers, or RNG."""
+    from nsmor.checkpoint import save_checkpoint
+    from scripts.train import load_checkpoint
+    from nsmor.model_nsmor_core import NSMoRCore
+
+    saved = NSMoRCore(hidden_dim=4, dt_ms=8., lif_tau_syn=12.)
+    active = NSMoRCore(hidden_dim=4, dt_ms=4., lif_tau_syn=12.)
+    optimizer = torch.optim.AdamW(active.parameters(), lr=0.7)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=7)
+    checkpoint = tmp_path / "dt8.pth"
+    save_checkpoint(saved, torch.optim.AdamW(saved.parameters()), 3, 1.,
+                    {"model": {"dt_ms": 8.}}, checkpoint)
+    payload = checkpoint.read_bytes() if captured else None
+    if captured:
+        checkpoint.write_bytes(b"pathname replaced after capture")
+    before = {key: value.clone() for key, value in active.state_dict().items()}
+    before_optimizer = optimizer.state_dict()
+    before_scheduler = scheduler.state_dict()
+    before_rng = torch.get_rng_state().clone()
+    with pytest.raises(ValueError, match="dt_ms.*conflicts|clock.*mismatch"):
+        load_checkpoint(checkpoint, active, optimizer, scheduler,
+                        map_location="cpu", payload=payload)
+    assert active.dt_ms == 4.
+    for key, expected in before.items():
+        assert torch.equal(active.state_dict()[key], expected), key
+    assert optimizer.state_dict() == before_optimizer
+    assert scheduler.state_dict() == before_scheduler
+    assert torch.equal(torch.get_rng_state(), before_rng)
+
+
+@pytest.mark.parametrize("bad_dt", [True, np.bool_(True), float("inf"), None])
+def test_invalid_active_restore_clock_is_atomic(
+    tmp_path: Path, bad_dt: object,
+) -> None:
+    from scripts.train import load_checkpoint
+    from nsmor.model_nsmor_core import NSMoRCore
+
+    active = NSMoRCore(hidden_dim=4, dt_ms=4.)
+    before = {key: value.clone() for key, value in active.state_dict().items()}
+    active.dt_ms = bad_dt
+    path = tmp_path / "valid-saved-clock.pth"
+    torch.save({
+        "pipeline_semantics_version": PIPELINE_SEMANTICS_VERSION,
+        "model_state_dict": {key: value + 1 for key, value in before.items()},
+        "config": {"model": {"dt_ms": 4.}},
+    }, path)
+    with pytest.raises(ValueError, match="dt_ms.*finite positive"):
+        load_checkpoint(path, active, map_location="cpu")
+    for key, expected in before.items():
+        assert torch.equal(active.state_dict()[key], expected), key
+
+
+@pytest.mark.parametrize("bad_dt", [True, float("inf"), "4", [4.], None])
+def test_restore_invalid_clock_is_atomic(tmp_path: Path, bad_dt: object) -> None:
+    from scripts.train import load_checkpoint
+    from nsmor.model_nsmor_core import NSMoRCore
+
+    active = NSMoRCore(hidden_dim=4, dt_ms=4.)
+    before = {key: value.clone() for key, value in active.state_dict().items()}
+    path = tmp_path / "invalid.pth"
+    torch.save({
+        "pipeline_semantics_version": PIPELINE_SEMANTICS_VERSION,
+        "model_state_dict": {key: value + 1 for key, value in before.items()},
+        "config": {"model": {"dt_ms": bad_dt}},
+    }, path)
+    with pytest.raises(ValueError, match="dt_ms.*finite positive"):
+        load_checkpoint(path, active, map_location="cpu")
+    for key, expected in before.items():
+        assert torch.equal(active.state_dict()[key], expected), key
+
+
+@pytest.mark.parametrize("modern", [False, True])
+@pytest.mark.parametrize("dt_ms", [4., 8.])
+def test_valid_clock_restores_real_model_and_legacy_metadata(
+    tmp_path: Path, modern: bool, dt_ms: float,
+) -> None:
+    from nsmor.checkpoint import save_checkpoint
+    from scripts.train import load_checkpoint
+    from nsmor.analysis.prediction_units import load_model_from_checkpoint
+    from nsmor.model_nsmor_core import NSMoRCore
+
+    saved = NSMoRCore(hidden_dim=4, dt_ms=dt_ms, lif_tau_syn=12.)
+    path = tmp_path / "valid.pth"
+    save_checkpoint(saved, torch.optim.AdamW(saved.parameters()), 3, 1.,
+                    {"model": {"hidden_dim": 4, "dt_ms": dt_ms, "lif_tau_syn": 12.}},
+                    path)
+    if modern:
+        from nsmor.pipeline.nested_prior import load_artifact_bytes
+        state = load_artifact_bytes(path.read_bytes(), map_location="cpu")
+        state.update(dataset_source_sha256="a" * 64, animal_identity_status="unverified",
+                     mcmc_prior_provenance="oof_5fold_recording_prefix_grouped_cv")
+        torch.save(state, path)
+    restored = NSMoRCore(hidden_dim=4, dt_ms=dt_ms, lif_tau_syn=12.)
+    load_checkpoint(path, restored, map_location="cpu")
+    reconstructed = load_model_from_checkpoint(path, torch.device("cpu"))
+    for model in (restored, reconstructed):
+        assert model.dt_ms == dt_ms
+        for key, expected in saved.state_dict().items():
+            assert torch.equal(model.state_dict()[key], expected), key
+
+
+@pytest.mark.parametrize("entry", ["restore", "reconstruct"])
+def test_modern_checkpoint_missing_clock_fails_closed(
+    tmp_path: Path, entry: str,
+) -> None:
+    from scripts.train import load_checkpoint
+    from nsmor.analysis.prediction_units import load_model_from_checkpoint
+    from nsmor.model_nsmor_core import NSMoRCore
+
+    active = NSMoRCore(hidden_dim=4, dt_ms=4.)
+    path = tmp_path / "missing-clock.pth"
+    torch.save({
+        "pipeline_semantics_version": PIPELINE_SEMANTICS_VERSION,
+        "config": {"model": {"hidden_dim": 4}},
+        "model_state_dict": active.state_dict(),
+        "dataset_source_sha256": "a" * 64, "animal_identity_status": "unverified",
+    }, path)
+    with pytest.raises(ValueError, match="dt_ms"):
+        if entry == "restore":
+            load_checkpoint(path, active, map_location="cpu")
+        else:
+            load_model_from_checkpoint(path, torch.device("cpu"))
+
+
+@pytest.mark.parametrize("filename", ["resume.pth", "best_model.pth", "final_model.pth"])
+@pytest.mark.parametrize("dt_ms", [4., 8.])
+def test_training_restore_uses_guarded_bytes_after_path_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, filename: str, dt_ms: float,
+) -> None:
+    """Resume/final evaluation must restore the snapshot the clock guard saw."""
+    from nsmor.checkpoint import save_checkpoint
+    from nsmor.model_nsmor_core import NSMoRCore
+    from scripts import train as trainer
+
+    saved = NSMoRCore(hidden_dim=4, dt_ms=dt_ms)
+    active = NSMoRCore(hidden_dim=4, dt_ms=dt_ms)
+    path = tmp_path / filename
+    save_checkpoint(saved, torch.optim.AdamW(saved.parameters()), 0, 1.,
+                    {"model": {"dt_ms": dt_ms}}, path)
+    payload = path.read_bytes()
+    real_restore = trainer._canonical_load_checkpoint
+
+    def replace_then_restore(*args: object, **kwargs: object) -> dict:
+        assert kwargs["payload"] == payload
+        path.write_bytes(b"replaced after clock validation")
+        return real_restore(*args, **kwargs)
+
+    monkeypatch.setattr(trainer, "_canonical_load_checkpoint", replace_then_restore)
+    trainer.load_checkpoint(path, active, map_location="cpu")
+    for key, expected in saved.state_dict().items():
+        assert torch.equal(active.state_dict()[key], expected), key
+
+
+@pytest.mark.parametrize("candidate", ["best_model.pth", "final_model.pth"])
+@pytest.mark.parametrize("violation", ["clock", "lineage"])
+def test_final_evaluation_rejects_replaced_clock_before_state_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, candidate: str,
+    violation: str,
+) -> None:
+    """Reach the real final-best call without executing training or plotting."""
+    from nsmor.pipeline.nested_prior import load_artifact_bytes
+    from scripts import train as trainer
+    from tests.test_pipeline_resampling import clock_dataset
+
+    dataset = tmp_path / "dataset.pt"
+    torch.save(clock_dataset(), dataset)
+    config = _make_config(tmp_path)
+    config.training.num_workers = 0
+    captured: dict = {}
+
+    def fake_epoch(**kwargs: object) -> tuple[float, dict]:
+        captured.update(model=kwargs["model"], optimizer=kwargs["optimizer"])
+        return 1., {}
+
+    def replace_clock(history: dict, output_dir: Path) -> Path:
+        path = output_dir / candidate
+        state = load_artifact_bytes(path.read_bytes(), map_location="cpu")
+        if violation == "clock":
+            state["config"]["model"]["dt_ms"] = 8.
+        else:
+            state["dataset_source_sha256"] = "f" * 64
+        state["model_state_dict"] = {
+            key: value + 1 for key, value in state["model_state_dict"].items()
+        }
+        torch.save(state, path)
+        captured["weights"] = {
+            key: value.clone() for key, value in captured["model"].state_dict().items()
+        }
+        captured["optimizer_state"] = captured["optimizer"].state_dict()
+        captured["rng"] = torch.get_rng_state().clone()
+        return output_dir / "unused.png"
+
+    monkeypatch.setattr(trainer, "train_one_epoch", fake_epoch)
+    monkeypatch.setattr(trainer, "_maybe_step_scheduler", lambda *_: None)
+    monkeypatch.setattr(trainer, "validate", lambda **_: (
+        1. if candidate == "best_model.pth" else float("nan")
+    ))
+    monkeypatch.setattr(trainer, "plot_loss_curve", replace_clock)
+    with mock.patch.object(trainer, "_canonical_load_checkpoint") as restore:
+        with mock.patch.object(trainer, "compute_metrics") as metrics:
+            error = "dt_ms.*conflicts" if violation == "clock" else "dataset_source_sha256"
+            with pytest.raises(ValueError, match=error):
+                trainer.train(config, dataset_path=str(dataset))
+            restore.assert_not_called()
+            metrics.assert_not_called()
+    for key, expected in captured["weights"].items():
+        assert torch.equal(captured["model"].state_dict()[key], expected), key
+    assert captured["optimizer"].state_dict() == captured["optimizer_state"]
+    assert torch.equal(torch.get_rng_state(), captured["rng"])
+
+
+@pytest.mark.parametrize("phase1_epochs", [None, 2, 1, 0])
+@pytest.mark.parametrize("candidate", [
+    "resume", "source_best", "companion_best", "destination_best",
+])
+def test_train_preflight_rejects_checkpoint_clock_without_running_epochs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, candidate: str,
+    phase1_epochs: int | None,
+) -> None:
+    """Every candidate clock is checked before restoring any resume state."""
+    from nsmor.checkpoint import save_checkpoint
+    from nsmor.pipeline.nested_prior import load_artifact_bytes
+    from scripts import train as trainer
+    from tests.test_pipeline_resampling import clock_dataset
+
+    dataset_path = tmp_path / "dataset.pt"
+    torch.save(clock_dataset(), dataset_path)
+    config = _make_config(tmp_path, epochs=3, warmup_epochs=0)
+    config.model.dt_ms = 4.
+    config.training.num_workers = 0
+    source = tmp_path / "source"
+    source.mkdir()
+    resume = source / ("best_model.pth" if candidate == "source_best" else "epoch_1.pth")
+    saved = trainer.build_model(config)
+    save_checkpoint(saved, trainer.build_optimizer(saved, config), 0, 1.,
+                    config.to_dict(), resume)
+    state = load_artifact_bytes(resume.read_bytes(), map_location="cpu")
+    state.update(
+        dataset_path=str(dataset_path),
+        dataset_source_sha256=hashlib.sha256(dataset_path.read_bytes()).hexdigest(),
+        is_nested_cv=False, validation_scope="diagnostic_global_oof",
+        animal_identity_status="unverified",
+        mcmc_prior_provenance="oof_5fold_recording_prefix_grouped_cv",
+        val_loss=1., best_val_loss=1.,
+    )
+    if phase1_epochs is not None:
+        state["training_phase"] = 1 if phase1_epochs > 0 else 2
+    torch.save(state, resume)
+    config.checkpoint.resume_from = str(resume)
+
+    bad_path = None
+    if candidate in ("resume", "source_best"):
+        state["config"]["model"]["dt_ms"] = 8.
+        torch.save(state, resume)
+        bad_path = resume
+    elif candidate == "companion_best":
+        bad_state = dict(state, config={"model": {"dt_ms": 8.}})
+        torch.save(bad_state, source / "best_model.pth")
+        bad_path = source / "best_model.pth"
+    elif candidate == "destination_best":
+        output = Path(config.checkpoint.output_dir)
+        output.mkdir()
+        bad_state = dict(state, config={"model": {"dt_ms": 8.}})
+        torch.save(bad_state, output / "best_model.pth")
+        bad_path = output / "best_model.pth"
+
+    def forbidden_epoch(*args: object, **kwargs: object) -> None:
+        pytest.fail("Clock preflight reached an epoch or evaluation")
+
+    from copy import deepcopy
+
+    captured: dict = {}
+    real_build = trainer.build_model
+    real_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR
+    real_clock_guard = trainer.validate_checkpoint_clock
+    real_restore = trainer._canonical_load_checkpoint
+    restores: list[bool] = []
+
+    def capture_model(cfg: object) -> torch.nn.Module:
+        model = real_build(cfg)
+        captured["model"] = model
+        return model
+
+    def capture_scheduler(*args: object, **kwargs: object) -> object:
+        scheduler = real_scheduler(*args, **kwargs)
+        captured["scheduler"] = scheduler
+        return scheduler
+
+    def snapshot_before_guard(*args: object, **kwargs: object) -> None:
+        if "weights" not in captured:
+            model = captured["model"]
+            scheduler = captured["scheduler"]
+            captured["weights"] = {
+                key: value.clone() for key, value in model.state_dict().items()
+            }
+            captured["freeze"] = [p.requires_grad for p in model.parameters()]
+            captured["optimizer_state"] = deepcopy(scheduler.optimizer.state_dict())
+            captured["scheduler_state"] = deepcopy(scheduler.state_dict())
+            captured["rng"] = torch.get_rng_state().clone()
+        real_clock_guard(*args, **kwargs)
+
+    def record_restore(*args: object, **kwargs: object) -> dict:
+        restores.append(True)
+        return real_restore(*args, **kwargs)
+
+    monkeypatch.setattr(trainer, "build_model", capture_model)
+    monkeypatch.setattr(torch.optim.lr_scheduler, "CosineAnnealingLR", capture_scheduler)
+    monkeypatch.setattr(trainer, "validate_checkpoint_clock", snapshot_before_guard)
+    monkeypatch.setattr(trainer, "_canonical_load_checkpoint", record_restore)
+    monkeypatch.setattr(trainer, "train_one_epoch", forbidden_epoch)
+    monkeypatch.setattr(trainer, "validate", forbidden_epoch)
+    monkeypatch.setattr(trainer, "compute_metrics", forbidden_epoch)
+    with pytest.raises(ValueError, match="dt_ms.*conflicts"):
+        trainer.train(
+            config, dataset_path=str(dataset_path), phase1_epochs=phase1_epochs,
+        )
+    assert restores == []
+    for key, expected in captured["weights"].items():
+        assert torch.equal(captured["model"].state_dict()[key], expected), key
+    assert [p.requires_grad for p in captured["model"].parameters()] == captured["freeze"]
+    scheduler = captured["scheduler"]
+    assert scheduler.optimizer.state_dict() == captured["optimizer_state"]
+    assert scheduler.state_dict() == captured["scheduler_state"]
+    assert torch.equal(torch.get_rng_state(), captured["rng"])
+    assert bad_path is not None and bad_path.exists()
+    assert not (Path(config.checkpoint.output_dir) / "final_model.pth").exists()
+
+
+def test_clockless_generic_legacy_checkpoint_remains_loadable(tmp_path: Path) -> None:
+    from nsmor.checkpoint import load_checkpoint
+
+    saved, active = torch.nn.Linear(2, 1), torch.nn.Linear(2, 1)
+    path = tmp_path / "generic-legacy.pth"
+    torch.save({
+        "pipeline_semantics_version": PIPELINE_SEMANTICS_VERSION,
+        "model_state_dict": saved.state_dict(),
+    }, path)
+    load_checkpoint(path, active, map_location="cpu")
+    for key, expected in saved.state_dict().items():
+        assert torch.equal(active.state_dict()[key], expected)
+
+
 class _GeneratedArtifactReducer:
     def __init__(self, marker: Path) -> None:
         self.marker = str(marker)
@@ -1674,14 +2054,6 @@ def test_resume_uses_captured_checkpoint_after_same_path_swap(
         return loaded
 
     monkeypatch.setattr(torch, "load", replace_after_decode)
-    if artifact == "destination_best":
-        with pytest.raises(ValueError, match="Destination best checkpoint.*changed"):
-            train(config, dataset_path=str(dataset),
-                  trusted_historical_checkpoint_sha256=trusted)
-        assert swaps == [True]
-        assert attacked.read_bytes() == replacement_bytes
-        assert not (attacked.parent / "final_model.pth").exists()
-        return
     train(config, dataset_path=str(dataset),
           trusted_historical_checkpoint_sha256=trusted)
     assert swaps == [True]

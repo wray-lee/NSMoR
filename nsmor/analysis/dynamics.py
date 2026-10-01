@@ -18,6 +18,7 @@ Shape legend
 
 from __future__ import annotations
 
+import logging
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -25,6 +26,29 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from nsmor.model_nsmor_core import NSMoRCore
+
+
+logger = logging.getLogger(__name__)
+
+
+def _has_expanding_eigenmode(eigenvalues: torch.Tensor) -> bool:
+    """Reject local GRU instability using the full complex spectrum.
+
+    A 1e-6 numerical tolerance avoids treating eigensolver roundoff at the
+    unit circle as expansion. Absence of expansion alone is not proof of
+    attraction, especially for marginal modes or approximate fixed points.
+    """
+    assert eigenvalues.ndim == 1, f"Expected (H,), got {eigenvalues.shape}"
+    magnitudes = eigenvalues.abs()
+    index = magnitudes.argmax()
+    if magnitudes[index].item() <= 1.0 + 1e-6:
+        return False
+    logger.warning(
+        "Attractor rejected: unstable eigenmode lambda=%s, |lambda|=%.8g "
+        "exceeds 1 + 1e-6; sampled rollouts cannot certify stability.",
+        eigenvalues[index].item(), magnitudes[index].item(),
+    )
+    return True
 
 
 class FixedPointAdapter:
@@ -334,10 +358,11 @@ class FixedPointAdapter:
         """
         Test whether a candidate fixed point h* is an attractor.
 
-        CF2 fix: Perturbs along the top-k eigenvectors of the Jacobian
-        at h* (not just a random direction), which is necessary to
-        detect saddle points.  Separates perturbation_magnitude from
-        convergence_radius.  Verifies monotonic convergence.
+        Checks the full complex spectrum for expanding modes, then perturbs
+        along the top-k slow eigenvectors of the Jacobian at h*. Separates
+        perturbation_magnitude from convergence_radius and reports monotonicity.
+        Finite sampled rollouts are not a proof of attraction for marginal
+        modes or approximate fixed points.
 
         CF3 fix: K is calibrated to 3-5 membrane time constants.
         For alpha=0.9, tau_membrane = -1/ln(0.9) ≈ 9.5 steps.
@@ -365,7 +390,8 @@ class FixedPointAdapter:
 
         Returns:
             ``(is_attractor, max_residual, monotonic_convergence)`` where:
-            - ``is_attractor``: True if all directions converge within
+            - ``is_attractor``: True if no mode expands beyond the 1e-6
+              spectral tolerance and sampled directions converge within
               convergence_radius after K steps.
             - ``max_residual``: Maximum ||h_{t+K} - h*|| across directions.
             - ``monotonic_convergence``: True if residual decreases
@@ -441,8 +467,9 @@ class FixedPointAdapter:
                 # Restore training mode GUARANTEED, even on exceptions.
                 self._gru_cell.train(prev_mode)
 
-        # Eigenvectors of J (principal perturbation directions)
+        # Check every mode before selecting a subset for finite rollouts.
         eigvals, eigvecs = torch.linalg.eig(J)
+        has_expanding_mode = _has_expanding_eigenmode(eigvals)
 
         # CF-FIX (Reviewer A #1 + B #1): Use complex modulus |lambda|
         # for the stability boundary criterion, NOT |Re(lambda)|.
@@ -524,7 +551,7 @@ class FixedPointAdapter:
                 if not monotonic:
                     all_monotonic = False
 
-        return all_converged, max_residual, all_monotonic
+        return all_converged and not has_expanding_mode, max_residual, all_monotonic
 
     # ═══════════════════════════════════════════════════════════
     # 5.  Full System Jacobian (LIF + GRU + Router)

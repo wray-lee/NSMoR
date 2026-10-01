@@ -29,7 +29,7 @@ These diagnostics describe host-arrival association and model-dependent prefix s
 
 ## Pending release evidence
 
-Biological response-window sensitivity, an evidence-based operational tolerance, staged ETL, nested-prior evaluation, training, downstream analyses, and scientific acceptance remain pending. The historical failed Stage-02 QC evidence is preserved unchanged. Missing experimental conditions and verified animal identity remain explicit limitations. The engineering safeguards and descriptive diagnostics are not a completed scientific release.
+Biological response-window sensitivity and an evidence-based operational tolerance remain pending. Staged ETL, nested-prior evaluation, training, and the downstream descriptive analyses have since executed (current receipt `/mnt/d/Projects/NSMoR/.scratch/seven-analysis-sorted-20261001-r6/status.json`; `scientific_acceptance=pending`). The earlier `.scratch/clock-corpus-r4/exploratory-chain-tiZddw2c/seven-final-analyses-single-process-20261001/status.json` receipt is superseded history only and is not current evidence. The Jacobian frozen-input control failed, so `jacobian_spectrum.json` is published `status=withheld` with empty spectral statistics for every epoch and carries no stability interpretation. The historical failed Stage-02 QC evidence is preserved unchanged. Missing experimental conditions and verified animal identity remain explicit limitations. The engineering safeguards and descriptive diagnostics are not a completed scientific release.
 
 Evidence paths (external scratch, not release artifacts):
 
