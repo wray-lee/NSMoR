@@ -198,7 +198,7 @@ def load_analysis_priors(dataset, dataset_path, nested_prior_artifact=None, mode
         raise ValueError("Nested artifact SHA-256 must be a 64-character lowercase hex digest")
     def verify_artifact_bytes():
         with artifact_path.open("rb") as stream:
-            actual = hashlib.file_digest(stream, "sha256").hexdigest()
+            actual = hashlib.sha256(stream.read()).hexdigest()
         if actual != digest:
             raise ValueError("Nested artifact SHA-256 mismatch with checkpoint")
     verify_artifact_bytes()
