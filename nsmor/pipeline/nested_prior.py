@@ -32,6 +32,7 @@ from nsmor.pipeline.grouping import (
     grouped_train_val_split,
     prior_identity_status,
 )
+from nsmor.pipeline.resampling import validate_lazy_artifact_clock
 
 logger = logging.getLogger(__name__)
 
@@ -147,12 +148,27 @@ def load_dataset_with_fingerprint(
     del source_bytes
     if isinstance(dataset, dict):
         restore_clock_provenance(dataset, materialize=restore_provenance)
+        # Bind a declared lazy model clock to the consumer's expected cadence.
+        # A present-but-null/partial/contradicted declaration fails closed; this
+        # validates only the lazy-clock artifact and never trips the eager
+        # tensor-completeness gate below.
+        validate_lazy_artifact_clock(dataset, expected_dt_ms)
     # Version 2.2 and held-channel anchors also predate the model-grid contract.
     # Any grid-era marker requires sidecars; losing them is not genuine legacy.
-    modern_clock = isinstance(dataset, dict) and any(
-        key in dataset for key in (
-            "model_dt_ms", "model_grid_provenance", "labeling_eligibility",
-            "source_clock_provenance",
+    # A modern producer emits the eager tensor namespace (X_seqs/Y_seqs/lengths)
+    # together with its grid clock and source ledgers.  A v2.2-era artifact may
+    # carry the tensors but predates the grid clock and the ledgers, and a
+    # tensor-free lazy artifact (``trial_specs``) may carry source ledgers with
+    # no eager payload at all.  So a ledger is a grid-era marker only alongside
+    # the eager tensor namespace; a grid clock is always one.  (A ``trial_specs``
+    # artifact beside any eager key was already refused by
+    # ``validate_lazy_artifact_clock`` above, so this gate never sees one.)
+    modern_clock = isinstance(dataset, dict) and (
+        "model_dt_ms" in dataset or "model_grid_provenance" in dataset or (
+            any(key in dataset for key in ("X_seqs", "Y_seqs", "lengths"))
+            and any(key in dataset for key in (
+                "labeling_eligibility", "source_clock_provenance",
+            ))
         )
     )
     if modern_clock and any(

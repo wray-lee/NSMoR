@@ -301,6 +301,36 @@ alias). Per-trial `session_ids` and `trial_ids` follow the selected rows. Source
 are retained and may depend on labels outside the subset; this is not a new prior fit
 or independent validation dataset.
 
+### Lazy (ELT) model-clock contract
+
+The enhanced lazy entry point is `nsmor.pipeline.io.ClockAwareLazyDataset`. When the
+tensor-free metadata declares `lazy_model_clock_contract`
+(`{"schema_version": "lazy-model-clock-v1", "dt_ms": <model dt>, "resampler": ...}`,
+emitted by `scripts/prepare_metadata.py`), the reader resamples each trial **on demand**
+from the source CSV onto the declared model grid, reusing the shared
+`nsmor.pipeline.resampling.resample_trial_for_model`. Source time stays source evidence;
+model-grid samples are causal previous-source-sample-hold **estimates**, and a pure-wind
+trial's leading zeros are **synthetic** alignment padding (`synthetic_prepend_frames`,
+1425 at a 4.0 ms grid) rather than observed baseline.
+
+`scripts/convert_metadata_to_etl.py` emits the full eager contract when it resamples
+(`model_dt_ms`, `model_grid_provenance`, `anchor_frames`, unpadded `X_seqs`/`Y_seqs`/
+`lengths`), which `load_dataset_with_fingerprint(path, expected_dt_ms=...)` validates and
+binds to the consumer clock; a consumer dt mismatch fails closed. The `lazy_model_clock_*`
+keys are a separate namespace from the eager grid keys, so tensor-free metadata does not
+trip the eager completeness gate.
+
+Legacy markerless metadata (no contract) still loads on the source cadence with an
+explicit "clock unverified" warning and is never stamped with a false
+`model_grid_provenance`. A present-but-invalid/partial contract (including a
+present-but-null one), a per-spec `lazy_model_clock` flag that contradicts the top-level
+declaration, or a declared dt that contradicts the consumer clock all fail clearly rather
+than degrading silently; the restricted loader and the enhanced dataset constructor share
+one validator so their verdicts cannot drift. The declared `n_frames` is a source-frame
+count checked against the raw contributing source pairs *before* resampling, so a missing
+or truncated source pair is refused at both the dataset and the converter rather than
+being resampled and published.
+
 ---
 
 ## Quick Start

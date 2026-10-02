@@ -35,7 +35,6 @@ from nsmor.config import (
     TimeWindowConfig,
 )
 from nsmor.data_extractor import (
-    _compute_pure_wind_prepend_frames,
     build_snapshot_dataset,
     resolve_snapshot_anchor,
 )
@@ -49,6 +48,7 @@ from nsmor.pipeline.io import (
     load_kinematics_csv,
     verify_source_pair,
 )
+from nsmor.pipeline.resampling import build_lazy_model_clock_contract
 from nsmor.pipeline.labeling import (
     assign_ground_truth_labels,
     labeling_funnel_summary,
@@ -201,7 +201,8 @@ def main() -> None:
         "--dt_ms",
         type=float,
         default=4.0,
-        help="Frame interval in milliseconds (nominal 250 Hz = 4.0 ms, for reference only in ELT mode).",
+        help="Declared model-grid interval in milliseconds (nominal 250 Hz = "
+             "4.0 ms). The lazy reader resamples source trials onto this grid.",
     )
     args = parser.parse_args()
 
@@ -401,16 +402,11 @@ def main() -> None:
             condition = "no_stimulus"
         is_pure_wind = (condition == "wind_only")
 
-        # Pure-wind baseline alignment: NSMoRLazyDataset prepends baseline frames
-        # in _build_sequence. Adjust spec anchor_frame and n_frames to match the
-        # built sequence so lazy-cropping aligns correctly on stimulus.
-        prepend_frames = 0
-        if is_pure_wind:
-            dt_ms_eff = float(np.median(np.diff(time_ms))) if n_frames > 1 else args.dt_ms
-            prepend_frames = _compute_pure_wind_prepend_frames(dt_ms_eff)
-            anchor_frame += prepend_frames
-            n_frames += prepend_frames
-
+        # The enhanced lazy reader resamples every trial onto the declared model
+        # grid (``lazy_model_clock_contract``), so source-coordinate fields stay
+        # as source evidence: ``n_frames`` counts source frames, the anchor is the
+        # source-coordinate frame, and the model-grid prepend is derived at read
+        # time from the model dt (5.7 s / dt_ms), never from the source cadence.
         trial_specs.append({
             "session_id": session_id,
             "session_dir": source["session_dir"],
@@ -429,7 +425,7 @@ def main() -> None:
             "label": info["label"].name,  # Label enum -> string
             "stimulus_condition": condition,
             "is_pure_wind": is_pure_wind,
-            "pure_wind_prepended_frames": prepend_frames,
+            "lazy_model_clock": True,
         })
 
     logger.info("Built %d trial specs.", len(trial_specs))
@@ -448,6 +444,10 @@ def main() -> None:
         "mcmc_prior_provenance": f"oof_{n_folds}fold_recording_prefix_grouped_cv",
         "animal_identity_status": "unverified",
         "pipeline_semantics_version": PIPELINE_SEMANTICS_VERSION,
+        # Declared model clock for the enhanced lazy reader.  Distinct namespace
+        # from the eager ``model_dt_ms``/``model_grid_provenance`` keys, so
+        # tensor-free metadata does not trip the eager completeness gate.
+        "lazy_model_clock_contract": build_lazy_model_clock_contract(args.dt_ms),
         "n_trials": len(trial_specs),
         "label_encoder": {
             label.name: label.value

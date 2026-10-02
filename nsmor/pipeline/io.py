@@ -10,6 +10,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
+import logging
 import tempfile
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
@@ -17,6 +18,16 @@ from typing import Any, Callable, Dict, Iterator, List, Tuple, Union
 
 import numpy as np
 import pandas as pd
+import torch
+
+from nsmor.pipeline.resampling import (
+    resample_trial_for_model,
+    resolve_model_anchor_frame,
+    validate_lazy_artifact_clock,
+    validate_source_frame_count,
+)
+
+logger = logging.getLogger(__name__)
 
 # ──────────────────────────────────────────────────────────────
 # Expected CSV column schemas
@@ -627,11 +638,59 @@ class ClockAwareLazyDataset:
     def __init__(self, metadata_path: str, **kwargs: Any) -> None:
         from nsmor.lazy_dataloader import NSMoRLazyDataset
 
-        self._inner = NSMoRLazyDataset(metadata_path, **kwargs)
+        self._metadata_path = metadata_path
+        # Acquire exactly one metadata snapshot and validate *that* object, then
+        # hand it to the frozen inner loader through its existing ``metadata=``
+        # seam.  Reading the path here and again inside ``_resolve_lazy_clock``
+        # would let a path swapped between the two reads be validated as one
+        # revision while a different revision is served.
+        metadata = kwargs.pop("metadata", None)
+        if metadata is None:
+            from nsmor.pipeline.nested_prior import load_artifact_bytes
+
+            metadata = load_artifact_bytes(Path(metadata_path).read_bytes())
+        self._metadata = metadata
+        self._inner = NSMoRLazyDataset(metadata_path, metadata=metadata, **kwargs)
         self._source_audits: Dict[Path, Dict[str, Any]] | None = None
         # Redirect the frozen loader's per-trial source read to the clock-aware
         # override below, per instance (no global monkeypatching).
         self._inner._load_session = self._load_session
+        # The frozen ``__getitem__`` compares reconstructed frames against
+        # ``spec['n_frames']``, which counts *source* frames.  When the trial is
+        # resampled onto the model grid the built length is ``model_n`` (+ the
+        # synthetic pure-wind prepend), so the item build is owned here and
+        # delegates the feature math to the frozen ``_build_sequence``.
+        self._inner._build_sequence = self._build_sequence
+        self._lazy_clock_contract: Dict[str, Any] | None = None
+        self._lazy_clock_dt_ms: float | None = None
+        self._last_grid_record: Dict[str, Any] | None = None
+        self._resolve_lazy_clock()
+
+    def _resolve_lazy_clock(self) -> None:
+        """Validate the metadata's lazy model-clock contract, if declared.
+
+        Absence keeps the legacy source-cadence behavior (with an explicit
+        unverified-clock warning); a present-but-invalid (including present-but-
+        null) contract, or a per-spec flag contradicting the top-level
+        declaration, fails closed via the shared validator.
+        """
+        metadata = self._metadata
+        dt_ms = validate_lazy_artifact_clock(metadata, self._inner.dt_ms)
+        if dt_ms is None:
+            logger.warning(
+                "Lazy metadata declares no model-clock contract; source cadence "
+                "is unverified and no model-grid resampling is applied."
+            )
+            self._lazy_clock_contract = None
+            self._lazy_clock_dt_ms = None
+        else:
+            self._lazy_clock_contract = dict(metadata["lazy_model_clock_contract"])
+            self._lazy_clock_dt_ms = dt_ms
+
+    @property
+    def uses_model_grid(self) -> bool:
+        """Whether a declared lazy model-clock contract resamples trials."""
+        return self._lazy_clock_dt_ms is not None
 
     def __getattr__(self, name: str) -> Any:
         # ``_inner`` is set in ``__init__``; guard the unpickle window (and any
@@ -641,20 +700,69 @@ class ClockAwareLazyDataset:
         return getattr(self._inner, name)
 
     def __getstate__(self) -> Dict[str, Any]:
-        """Pickle only the frozen inner dataset, not the instance-bound override."""
-        return {"_inner": self._inner}
+        """Pickle the frozen inner dataset plus the small resolved clock state.
+
+        The instance-bound overrides cannot be pickled; the resolved contract
+        and dt are stored so the rebuilt item math is identical after unpickle.
+        """
+        return {
+            "_inner": self._inner,
+            "_metadata_path": self._metadata_path,
+            "_lazy_clock_contract": self._lazy_clock_contract,
+            "_lazy_clock_dt_ms": self._lazy_clock_dt_ms,
+        }
 
     def __setstate__(self, state: Dict[str, Any]) -> None:
         self.__dict__.update(state)
+        self._metadata = None
         self._source_audits = None
-        # The bound method cannot be pickled; rebind it to this wrapper instance.
+        self._last_grid_record = None
+        # The bound methods cannot be pickled; rebind them to this wrapper.
         self._inner._load_session = self._load_session
+        self._inner._build_sequence = self._build_sequence
 
     def __len__(self) -> int:
         return len(self._inner)
 
     def __getitem__(self, idx: int) -> Any:
-        return self._inner[idx]
+        # A declared model clock builds the item here: the frozen check compares
+        # the built length against ``spec['n_frames']`` (source frames), which is
+        # intentionally different from the model-grid length.  Legacy metadata
+        # keeps the frozen item path byte-identical.
+        if self._lazy_clock_dt_ms is None:
+            return self._inner[idx]
+        inner = self._inner
+        spec = inner.trial_specs[idx]
+        trial_data = extract_trial_data(
+            self._load_session(spec),
+            session_id=spec["session_id"],
+            trial_id=spec["trial_id"],
+        )
+        X_seq, Y_seq = self._build_sequence(trial_data, idx)
+        # Reuse the grid record built during the single resample above rather
+        # than resampling the trial a second time for the anchor.
+        anchor_frame = (
+            None if self._last_grid_record is None
+            else resolve_model_anchor_frame(self._last_grid_record)
+        )
+        actual_length = X_seq.shape[0]
+        if inner.max_seq_len is not None and actual_length > inner.max_seq_len:
+            from nsmor.pipeline.conditions import resolve_anchor_crop
+
+            start, end = resolve_anchor_crop(
+                n_frames=actual_length,
+                anchor_frame=anchor_frame,
+                max_seq_len=inner.max_seq_len,
+                pre_anchor_frames=inner.pre_anchor_frames,
+            )
+            X_seq = X_seq[start:end]
+            Y_seq = Y_seq[start:end]
+            actual_length = X_seq.shape[0]
+        return (
+            torch.from_numpy(X_seq).float(),
+            torch.from_numpy(Y_seq).float(),
+            actual_length,
+        )
 
     @contextmanager
     def captured_sources(self) -> Iterator[List[Dict[str, str]]]:
@@ -768,3 +876,98 @@ class ClockAwareLazyDataset:
             "kinematics": pd.concat(kin_parts, ignore_index=True),
             "events": pd.concat(evt_parts, ignore_index=True),
         }
+
+    def _prepend_frames(self, spec: Dict) -> int:
+        """Synthetic leading-zero count for a pure-wind trial.
+
+        On the declared model grid the prepend is computed from the *model* dt
+        (5.7 s / dt_ms), never the source cadence.  Legacy metadata without a
+        contract keeps its recorded source-cadence prepend.
+        """
+        if not bool(spec.get("is_pure_wind")):
+            return 0
+        if self._lazy_clock_dt_ms is not None:
+            from nsmor.data_extractor import _compute_pure_wind_prepend_frames
+
+            return _compute_pure_wind_prepend_frames(self._lazy_clock_dt_ms)
+        return int(spec.get("pure_wind_prepended_frames", 0) or 0)
+
+    def _build_sequence(
+        self, trial_data: Dict[str, np.ndarray], idx: int,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Resample the source trial onto the model grid, then build features.
+
+        Delegates the feature assembly to the frozen
+        ``NSMoRLazyDataset._build_sequence`` (called on the class, so the
+        per-instance binding does not recurse); only the pure-wind prepend is
+        forced to the model-grid count.  A trial with no declared contract is
+        passed through unchanged, preserving legacy byte-identical behavior.
+
+        The eager grid/anchor record for this trial is cached on
+        ``self._last_grid_record`` so a single caller can reuse one resample for
+        both the features and the anchor, instead of resampling twice.
+        """
+        spec = self._inner.trial_specs[idx]
+        self._last_grid_record = None
+        if self._lazy_clock_dt_ms is not None:
+            # Source completeness is checked on raw source frames, before any
+            # resampling: a partial/missing contributing pair must fail here.
+            validate_source_frame_count(spec, len(trial_data["time_ms"]))
+            source_trial = trial_data
+            trial_data = resample_trial_for_model(trial_data, self._lazy_clock_dt_ms)
+            self._last_grid_record = self._grid_record(spec, source_trial, trial_data)
+        previous = spec.get("pure_wind_prepended_frames")
+        spec["pure_wind_prepended_frames"] = self._prepend_frames(spec)
+        try:
+            return type(self._inner)._build_sequence(self._inner, trial_data, idx)
+        finally:
+            if previous is None:
+                spec.pop("pure_wind_prepended_frames", None)
+            else:
+                spec["pure_wind_prepended_frames"] = previous
+
+    def _grid_record(
+        self, spec: Dict, source_trial: Dict[str, np.ndarray],
+        model_trial: Dict[str, np.ndarray],
+    ) -> Dict[str, Any]:
+        """Build the eager grid/anchor record from a source and resampled trial.
+
+        Single builder shared by :meth:`_build_sequence` and
+        :meth:`model_grid_provenance`, so the on-demand item and the converter's
+        published artifact carry the exact same contract.
+        """
+        from nsmor.data_extractor import resolve_snapshot_anchor
+
+        anchor_ms, anchor_rule = resolve_snapshot_anchor(
+            source_trial, float(spec["stimulus_onset_ms"]),
+        )
+        record = dict(model_trial["model_grid_provenance"])
+        record["synthetic_prepend_frames"] = self._prepend_frames(spec)
+        record["source_anchor_ms"] = float(anchor_ms)
+        record["source_anchor_rule"] = anchor_rule
+        resolve_model_anchor_frame(record)  # fail closed on an unmappable anchor
+        return record
+
+    def model_grid_provenance(
+        self, spec: Dict, trial_data: Dict[str, np.ndarray],
+    ) -> Dict[str, Any] | None:
+        """Full eager grid/anchor record for a resampled trial, or ``None``.
+
+        Reuses the shared :func:`resample_trial_for_model` record and the shared
+        :func:`resolve_snapshot_anchor` source anchor, so the converter's eager
+        artifact carries the exact contract the restricted loader validates.
+        Source completeness is re-validated here (before resampling) so the
+        converter refuses a partial trial even if it never called ``__getitem__``.
+        """
+        if self._lazy_clock_dt_ms is None:
+            return None
+        validate_source_frame_count(spec, len(trial_data["time_ms"]))
+        model_trial = resample_trial_for_model(trial_data, self._lazy_clock_dt_ms)
+        return self._grid_record(spec, trial_data, model_trial)
+
+    def model_anchor_frame(
+        self, spec: Dict, trial_data: Dict[str, np.ndarray],
+    ) -> int | None:
+        """Map the source anchor onto the model grid, or ``None`` for legacy."""
+        record = self.model_grid_provenance(spec, trial_data)
+        return None if record is None else resolve_model_anchor_frame(record)
