@@ -989,7 +989,7 @@ def build_dataloaders(
 
     # ── ELT Mode: Lazy Loading ────────────────────────────────
     if use_lazy_loading:
-        from nsmor.lazy_dataloader import NSMoRLazyDataset
+        from nsmor.pipeline.io import ClockAwareLazyDataset
 
         logger.info("Loading metadata from %s (lazy mode)", dataset_file)
 
@@ -999,7 +999,7 @@ def build_dataloaders(
         )
         prior_status = validate_dataset_provenance(raw_meta, dataset_file)
         prior_tag = raw_meta["mcmc_prior_provenance"]
-        full_dataset = NSMoRLazyDataset(
+        full_dataset = ClockAwareLazyDataset(
             metadata_path=str(dataset_file),
             max_seq_len=config.training.max_seq_len,
             dt_ms=config.model.dt_ms,

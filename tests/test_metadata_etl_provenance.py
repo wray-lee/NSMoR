@@ -617,9 +617,9 @@ def test_source11_producer_refuses_source_changed_during_parse(tmp_path, monkeyp
     original_load = prepare_metadata.load_kinematics_csv
     calls = 0
 
-    def change_after_parse(source):
+    def change_after_parse(source, **kwargs):
         nonlocal calls
-        table = original_load(source)
+        table = original_load(source, **kwargs)
         calls += 1
         if calls == 1:
             _source11_substitute(path, '0.1', '0.9')

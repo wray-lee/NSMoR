@@ -17,7 +17,7 @@ from tqdm import tqdm
 # Add parent to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from nsmor.lazy_dataloader import NSMoRLazyDataset
+from nsmor.pipeline.io import ClockAwareLazyDataset
 from nsmor.pipeline.nested_prior import load_artifact_bytes
 from nsmor.pipeline.grouping import prior_identity_status
 
@@ -221,7 +221,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         dt_ms = float(dt_ms)
 
     # Create lazy dataset to leverage existing loading logic
-    lazy_ds = NSMoRLazyDataset(
+    lazy_ds = ClockAwareLazyDataset(
         metadata_path=metadata_path,
         metadata=metadata,
         max_seq_len=args.max_seq_len,

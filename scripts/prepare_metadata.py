@@ -39,14 +39,15 @@ from nsmor.data_extractor import (
     build_snapshot_dataset,
     resolve_snapshot_anchor,
 )
-from nsmor.lazy_dataloader import load_csv_snapshot, verify_source_pair
 from nsmor.pipeline.events import parse_event_details
 from nsmor.mcmc_module import train_mcmc_cross_fitted
 from nsmor.pipeline.grouping import animal_keys_of, resolve_group_folds
 from nsmor.pipeline.io import (
     extract_trial_data,
+    load_csv_snapshot,
     load_events_csv,
     load_kinematics_csv,
+    verify_source_pair,
 )
 from nsmor.pipeline.labeling import (
     assign_ground_truth_labels,
@@ -229,7 +230,9 @@ def main() -> None:
     source_pairs_by_key: Dict[Tuple[str, int], List[Dict[str, str]]] = {}
     all_source_pairs = []
     for kin_path, evt_path in csv_pairs:
-        kin_df, kin_digest = load_csv_snapshot(kin_path, load_kinematics_csv)
+        kin_df, kin_digest = load_csv_snapshot(
+            kin_path, load_kinematics_csv, source_path=kin_path,
+        )
         evt_df, evt_digest = load_csv_snapshot(evt_path, load_events_csv)
         kin_parts.append(kin_df)
         evt_parts.append(evt_df)
