@@ -12,6 +12,7 @@ from __future__ import annotations
 from typing import Dict, List, Optional, Tuple
 
 import logging
+import math
 
 import numpy as np
 from scipy.stats import norm as _scipy_norm
@@ -304,17 +305,32 @@ def holm_bonferroni(p_values: Dict[str, float]) -> Dict[str, Tuple[float, bool]]
     linkage explicitly.
 
     Args:
-        p_values: Dict mapping test name to uncorrected p-value.
+        p_values: Dict mapping test name to uncorrected p-value.  Every
+            value must be a finite number in ``[0, 1]``.
 
     Returns:
         Dict mapping test name to ``(adjusted_p, significant)`` tuple,
         where ``adjusted_p`` is the standard Holm-adjusted p-value and
         ``significant`` reflects the full step-down rejection rule.
+
+    Raises:
+        ValueError: If any p-value is non-finite or outside ``[0, 1]``.
+            The sort order and the per-rank thresholds are meaningless
+            for such input, so the correction fails closed instead of
+            silently ranking on a corrupt key.
     """
     alpha = 0.05
     m = len(p_values)
     if m == 0:
         return {}
+
+    for name, p in p_values.items():
+        if not math.isfinite(p) or p < 0.0 or p > 1.0:
+            raise ValueError(
+                f"holm_bonferroni received an invalid p-value for "
+                f"{name!r}: {p!r}; every p-value must be finite and "
+                "within [0, 1]."
+            )
 
     # Sort by ascending p-value
     sorted_items = sorted(p_values.items(), key=lambda x: x[1])

@@ -112,7 +112,7 @@ def test_phase_f_tonic_latency_gate_and_signed_peak_compatibility(tmp_path: Path
             [np.full(length, level, dtype=np.float32)], [0],
             dt_ms=dt_ms, anchor_frames=[anchor],
         ))
-        assert stats["peak_velocity"] == {"mean": level, "sem": 0.0, "n": 1}
+        assert stats["peak_velocity"] == {"mean": level, "sem": None, "n": 1}
         assert stats["latency"] == {"mean": None, "sem": None, "n": 0}
         summary_path = tmp_path / f"{level}.json"
         figure_path = tmp_path / f"{level}.png"
@@ -148,3 +148,15 @@ def test_phase_f_tonic_latency_gate_and_signed_peak_compatibility(tmp_path: Path
         {"visual_only": stats, "multisensory_ttc_-225ms": stats}, figure_path
     )
     assert figure_path.stat().st_size > 0
+
+def test_create_integration_figure_removes_stale_figure_on_failure(tmp_path):
+    """T3: a fail-closed branch must not leave a stale figure on disk."""
+    from scripts.analyze_integration import create_integration_figure
+
+    figure_path = tmp_path / "integration_window.png"
+    figure_path.write_bytes(b"\x89PNG stale")
+
+    stats = {"visual_only": {"latency": {"mean": None, "sem": None, "n": 0}}}
+    with pytest.raises(ValueError, match="no measurable peak latencies"):
+        create_integration_figure(stats, figure_path)
+    assert not figure_path.exists()

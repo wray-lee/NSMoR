@@ -1383,7 +1383,7 @@ def test_phase_f_unmeasured_visual_baseline_stays_null_in_figure_and_summary(
         [response], [0], dt_ms=dt_ms, anchor_frames=[anchor],
     ))
     assert visual["latency"] == {"mean": None, "sem": None, "n": 0}
-    assert visual["peak_velocity"] == {"mean": 0.0, "sem": 0.0, "n": 1}
+    assert visual["peak_velocity"] == {"mean": 0.0, "sem": None, "n": 1}
     assert multisensory["latency"]["mean"] == 500.0
     stats = {"visual_only": visual, "multisensory_ttc_-225ms": multisensory}
     summary_path = tmp_path / "integration.json"

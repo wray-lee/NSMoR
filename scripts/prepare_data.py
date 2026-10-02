@@ -1583,8 +1583,14 @@ def prepare_dataset(
             # The source snapshot anchor is authoritative; held-grid peaks are
             # only legacy diagnostics and may move under causal resampling.
             anchor_frames_before_cast.append(model_anchor_frame)
-            X_saved = X_seq.astype(np.float32)
-            Y_saved = Y_seq.astype(np.float32)
+            # The float32 cast is the intended storage precision; an
+            # out-of-range value overflows to +/-inf, which the finite
+            # assertions below reject (fail closed).  Suppress only that
+            # expected cast-overflow RuntimeWarning so a strict warning
+            # filter does not abort before the guard runs.
+            with np.errstate(over="ignore"):
+                X_saved = X_seq.astype(np.float32)
+                Y_saved = Y_seq.astype(np.float32)
             assert X_saved.shape == X_seq.shape
             assert Y_saved.shape == Y_seq.shape
             assert np.isfinite(X_saved).all(), "non-finite X after float32 conversion (fail closed)"

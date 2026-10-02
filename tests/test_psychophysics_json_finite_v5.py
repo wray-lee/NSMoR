@@ -297,3 +297,52 @@ def test_ttc0_with_no_measurable_latency_is_explicitly_unavailable(monkeypatch, 
     missing = subprocess.run(["bash", "-c", command], cwd=root, env=env,
                              text=True, capture_output=True, check=False)
     assert missing.returncode != 0 and "missing or empty artefact" in missing.stderr
+
+
+def test_not_applicable_removes_stale_figure_and_summary(monkeypatch, tmp_path):
+    """T3: a not_applicable run must not leave a stale figure/summary behind."""
+    from scripts import simulate_psychophysics as phase_g
+
+    class FlatModel:
+        dt_ms = 4.0
+
+        def __call__(self, X, lengths, return_internals=False):
+            batch, frames, channels = X.shape
+            assert channels == 8 and lengths.shape == (batch,)
+            values = torch.zeros((batch, frames), dtype=X.dtype, device=X.device)
+            gates = torch.full((batch, frames, 2), 0.5, dtype=X.dtype, device=X.device)
+            return values, {"routing_gates": gates}
+
+    X = torch.zeros(2, 12, 8)
+    X[:, :, 0] = 20.0
+    X[:, :, 1] = 1.0
+    X[:, :, 4:] = 0.25
+    lengths = torch.full((2,), 12, dtype=torch.int64)
+    meta = phase_g.TrialMeta(
+        val_indices=[0, 1], target_ttc_ms=[-225.0, -261.0],
+        stimulus_conditions=["multisensory", "multisensory"],
+        anchor_frames=[2, 2], stim_onset_frame=2, pre_anchor_frames=2,
+    )
+    data = phase_g.ValidationData(X, torch.zeros(2, 12), lengths, meta)
+    monkeypatch.setattr(phase_g, "load_checkpoint", lambda *_: FlatModel())
+    monkeypatch.setattr(phase_g, "load_validation_data", lambda *a, **k: data)
+
+    out = tmp_path / "stale"
+    out.mkdir()
+    (out / "bayesian_reliability.png").write_bytes(b"\x89PNG stale")
+    (out / "psychophysics_summary.json").write_text(
+        '{"stale": true}', encoding="utf-8"
+    )
+
+    monkeypatch.setattr(sys, "argv", ["simulate_psychophysics.py",
+                                      "--dataset", "synthetic.pt",
+                                      "--output_dir", str(out)])
+    phase_g.main()
+    with (out / "bayesian_reliability.json").open(encoding="utf-8") as stream:
+        status = json.load(
+            stream,
+            parse_constant=lambda val: (_ for _ in ()).throw(ValueError(val)),
+        )
+    assert status["status"] == "not_applicable"
+    assert not (out / "bayesian_reliability.png").exists()
+    assert not (out / "psychophysics_summary.json").exists()

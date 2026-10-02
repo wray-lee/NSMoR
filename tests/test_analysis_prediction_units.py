@@ -1848,3 +1848,72 @@ def test_analysis_model_rejects_conflicting_nested_source_digest(normalized_chec
     torch.save(payload, path)
     with pytest.raises(ValueError, match="dataset_source_sha256.*nested_prior_fingerprint"):
         prediction_units.load_model_from_checkpoint(path, torch.device("cpu"))
+
+
+# =========================================================================
+# T2: Exact GRU-input reconstruction must follow the FrontendEncoder path
+# =========================================================================
+
+def _capture_gru_input(monkeypatch, model):
+    """Record the exact (B, T, H) tensor the GRU cell receives in forward()."""
+    captured = {}
+    original = model.gru_unit.forward
+
+    def spy(x, lengths, h0=None):
+        captured["input"] = x.detach().clone()
+        return original(x, lengths, h0=h0)
+
+    monkeypatch.setattr(model.gru_unit, "forward", spy)
+    return captured
+
+
+def test_jacobian_reconstruction_matches_dendritic_frontend(monkeypatch) -> None:
+    """Real NSMoRCore: reconstruction must route through the dendritic frontend.
+
+    With dendritic filtering enabled the GRU input is the *filtered*
+    frontend output, so reconstructing via ``sensory_encoder`` alone
+    yields a different vector than the GRU actually saw.
+    """
+    from scripts import analyze_jacobian as jacobian
+
+    torch.manual_seed(0)
+    model = NSMoRCore(
+        sensory_dim=4, mcmc_dim=4, hidden_dim=8, num_gru_layers=1,
+        dropout=0.0, lif_dendritic_tau=20.0, dt_ms=4.0,
+    )
+    model.eval()
+    assert model.frontend._dendritic_enabled
+
+    X = torch.randn(2, 12, 8)
+    lengths = torch.tensor([12, 9], dtype=torch.int64)
+
+    captured = _capture_gru_input(monkeypatch, model)
+    with torch.no_grad():
+        model(X, lengths, return_internals=True)
+    assert "input" in captured, "GRU spy never fired"
+
+    reconstructed = jacobian._reconstruct_gru_input(model, X, lengths)
+    assert reconstructed.shape == (2, 12, 8)
+    torch.testing.assert_close(reconstructed, captured["input"])
+
+    # The raw encoder path (no dendritic filtering) must NOT reproduce the
+    # GRU input — otherwise this regression would pass on the broken code.
+    raw = model.sensory_encoder(X[:, :, :4])
+    assert not torch.allclose(raw, captured["input"])
+
+
+def test_jacobian_reconstruction_falls_back_for_frontendless_probe() -> None:
+    """Legacy probe models without .frontend still reconstruct via encoder."""
+    from scripts import analyze_jacobian as jacobian
+
+    class ProbeModel:
+        def __init__(self) -> None:
+            self.sensory_dim = 4
+            self.sensory_encoder = lambda x: x[:, :, 2:4]
+
+    model = ProbeModel()
+    X = torch.randn(2, 6, 8)
+    lengths = torch.tensor([6, 4], dtype=torch.int64)
+    out = jacobian._reconstruct_gru_input(model, X, lengths)
+    assert out.shape == (2, 6, 2)
+    torch.testing.assert_close(out, X[:, :, 2:4])

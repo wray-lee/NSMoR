@@ -2020,6 +2020,37 @@ def test_production_sequence_error_preserves_prior_cohort(
     assert not output.exists()
 
 
+def test_float32_cast_overflow_warning_suppressed_but_guard_still_rejects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A representable but out-of-float32-range value must not raise a
+    RuntimeWarning before the finite guard runs; the guard itself still
+    rejects the data (fail closed)."""
+    import warnings
+
+    from scripts import prepare_data as prep
+
+    raw_dir = tmp_path / "raw"
+    _make_label_audit_csvs(raw_dir, n_sessions=5)
+    original = prep.extract_trial_sequence
+
+    def overflow_sequence(*args, **kwargs):
+        x64, y64 = original(*args, **kwargs)
+        x64 = np.array(x64, dtype=np.float64)
+        # 1e300 is finite in float64 but overflows float32 to +inf; the
+        # cast emits an expected "overflow encountered in cast" warning.
+        x64[0, 3] = 1e300
+        return x64, y64
+
+    monkeypatch.setattr(prep, "extract_trial_sequence", overflow_sequence)
+    output = tmp_path / "dataset.pt"
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        with pytest.raises(AssertionError, match="non-finite X after float32"):
+            prep.prepare_dataset(raw_dir, output)
+    assert not output.exists()
+
+
 def test_metadata_valid_trials_keep_prior_rows(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

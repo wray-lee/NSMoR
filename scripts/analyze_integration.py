@@ -645,7 +645,10 @@ def compute_condition_statistics(
 
     Returns:
         Dictionary with keys ``"latency"`` and ``"peak_velocity"``,
-        each containing ``{"mean": float, "sem": float, "n": int}``.
+        each containing ``{"mean": float|None, "sem": float|None,
+        "n": int}``.  ``sem`` is ``None`` when fewer than two finite
+        observations are available (a single trial has no estimable
+        standard error; reporting 0.0 would fabricate precision).
     """
     stats: Dict[str, Dict[str, float]] = {}
 
@@ -654,7 +657,7 @@ def compute_condition_statistics(
         valid = arr[np.isfinite(arr)]
         n = len(valid)
         mean = float(np.mean(valid)) if n > 0 else None
-        sem = float(np.std(valid, ddof=1) / np.sqrt(n)) if n > 1 else 0.0 if n else None
+        sem = float(np.std(valid, ddof=1) / np.sqrt(n)) if n > 1 else None
 
         # Map metric names
         if metric_name == "latencies":
@@ -750,8 +753,8 @@ def create_integration_figure(
 
     for cond in observed:
         stats = condition_stats[cond]
-        latency = stats.get("latency", {"mean": 0.0, "sem": 0.0, "n": 0})
-        velocity = stats.get("peak_velocity", {"mean": 0.0, "sem": 0.0, "n": 0})
+        latency = stats.get("latency", {"mean": 0.0, "sem": None, "n": 0})
+        velocity = stats.get("peak_velocity", {"mean": 0.0, "sem": None, "n": 0})
         if latency["n"] == 0:
             skipped_conds[cond] = "latency n==0"
             logger.warning("No data for condition '%s', skipping.", cond)
@@ -776,12 +779,22 @@ def create_integration_figure(
 
         x_values.append(delta_t)
         latency_means.append(latency["mean"])
-        latency_sems.append(latency["sem"])
+        # A singleton group has no estimable SEM (None); plot no error bar
+        # (NaN) rather than a fabricated zero-length one.
+        latency_sems.append(
+            latency["sem"] if latency["sem"] is not None else float("nan")
+        )
         velocity_means.append(velocity["mean"])
-        velocity_sems.append(velocity["sem"])
+        velocity_sems.append(
+            velocity["sem"] if velocity["sem"] is not None else float("nan")
+        )
         cond_labels.append(cond)
 
     if not x_values:
+        # Remove only this run's target figure before failing closed so a
+        # stale figure cannot masquerade as the output of a run that
+        # produced no measurable latency curve.
+        Path(output_path).unlink(missing_ok=True)
         raise ValueError("Phase F unavailable: no measurable peak latencies in observed conditions")
 
     # ── Order the wind response series by physical delta_t ────
@@ -802,12 +815,18 @@ def create_integration_figure(
     velocity_sems = [velocity_sems[i] for i in order]
     cond_labels = [cond_labels[i] for i in order]
 
-    # Convert to numpy arrays
+    # Convert to numpy arrays. A single-trial group has no estimable SEM
+    # (None); plot no error bar for it (matplotlib skips NaN) rather than a
+    # fabricated zero-length bar.
     x_arr = np.array(x_values)
-    latency_mean_arr = np.array(latency_means)
-    latency_sem_arr = np.array(latency_sems)
-    velocity_mean_arr = np.array(velocity_means)
-    velocity_sem_arr = np.array(velocity_sems)
+    latency_mean_arr = np.array(latency_means, dtype=float)
+    latency_sem_arr = np.array(
+        [np.nan if s is None else s for s in latency_sems], dtype=float
+    )
+    velocity_mean_arr = np.array(velocity_means, dtype=float)
+    velocity_sem_arr = np.array(
+        [np.nan if s is None else s for s in velocity_sems], dtype=float
+    )
 
     # ── Get visual-only baseline values ───────────────────────
     # No fabricated 0.0 baseline when visual_only is absent: use NaN so
@@ -1027,6 +1046,15 @@ def export_integration_summary(
             % (analysis_population["evidence_scope"].replace("_", " ")
                if analysis_population is not None else "Population-unavailable descriptive"),
         ),
+        # Reported "sem" is the standard error across recorded trials
+        # within a condition. It is a descriptive trial-level dispersion,
+        # not an animal-level confidence interval: trials can share an
+        # animal, so it must not be read as population uncertainty.
+        "dispersion_definition": (
+            "sem = SD across recorded trials within a condition (ddof=1) "
+            "/ sqrt(n); descriptive trial-level dispersion, not an "
+            "animal-level confidence interval. null when n<2."
+        ),
         "inference": {
             "status": "descriptive_only",
             "effect_sizes": None,
@@ -1228,19 +1256,19 @@ def run_integration_analysis(
         stats = compute_condition_statistics(metrics)
         condition_stats[cond_name] = stats
 
-        # Log summary
+        # Log summary (a single trial has no estimable SEM; say so).
         if stats.get("latency", {}).get("n", 0) > 0:
             logger.info(
-                "    Latency: %.1f ± %.1f ms (n=%d)",
+                "    Latency: %.1f ± %s ms (n=%d)",
                 stats["latency"]["mean"],
-                stats["latency"]["sem"],
+                f"{stats['latency']['sem']:.1f}" if stats["latency"]["sem"] is not None else "unavailable",
                 stats["latency"]["n"],
             )
         if stats.get("peak_velocity", {}).get("n", 0) > 0:
             logger.info(
-                "    Peak Velocity: %.2f ± %.2f cm/s (n=%d)",
+                "    Peak Velocity: %.2f ± %s cm/s (n=%d)",
                 stats["peak_velocity"]["mean"],
-                stats["peak_velocity"]["sem"],
+                f"{stats['peak_velocity']['sem']:.2f}" if stats["peak_velocity"]["sem"] is not None else "unavailable",
                 stats["peak_velocity"]["n"],
             )
 

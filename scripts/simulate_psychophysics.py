@@ -844,7 +844,12 @@ def create_figure(
     sigmas = sorted(latency_stats.keys())
     measured = [s for s in sigmas if latency_stats[s]["n"] > 0]
     means = [latency_stats[s]["mean"] for s in measured]
-    sems = [latency_stats[s]["sem"] for s in measured]
+    # A single measured trial has no estimable SEM (None); plot no error
+    # bar for it rather than a fabricated zero-length one.
+    sems = [
+        latency_stats[s]["sem"] if latency_stats[s]["sem"] is not None else np.nan
+        for s in measured
+    ]
 
     ax_b.errorbar(
         measured,
@@ -1034,6 +1039,13 @@ def main() -> None:
         # Structured not_applicable: missing experimental condition is
         # legitimate (real corpus has 0 declared TTC=0). No dummy figure.
         os.makedirs(args.output_dir, exist_ok=True)
+        # Remove only this run's figure and summary so stale artefacts
+        # from a prior run cannot masquerade as this run's output.
+        for stale in ("bayesian_reliability.png", "psychophysics_summary.json"):
+            try:
+                os.remove(os.path.join(args.output_dir, stale))
+            except FileNotFoundError:
+                pass
         summary_path = os.path.join(args.output_dir, "bayesian_reliability.json")
         not_applicable = {
             **analysis_evidence,
@@ -1139,7 +1151,7 @@ def main() -> None:
         mean_lat = float(np.mean(valid)) if valid.size else None
         sem_lat = (
             float(np.std(valid, ddof=1) / np.sqrt(valid.size))
-            if valid.size > 1 else 0.0 if valid.size else None
+            if valid.size > 1 else None
         )
         latency_stats[sigma] = {
             "mean": mean_lat,
@@ -1148,7 +1160,7 @@ def main() -> None:
             # Honest label: NaN exclusions cover flat/zero/nonfinite windows
             # and zero-length trials, not only prestim peaks.
             "n_excluded": int((~np.isfinite(latency_arrays[sigma])).sum()),
-            "std": float(np.std(valid, ddof=1)) if valid.size > 1 else 0.0 if valid.size else None,
+            "std": float(np.std(valid, ddof=1)) if valid.size > 1 else None,
         }
         # Round-2 fix (Reviewer B M-1c): report the VALID count, not the
         # raw array length (which includes NaN-excluded trials).

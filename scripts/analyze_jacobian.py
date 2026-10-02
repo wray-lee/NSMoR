@@ -766,6 +766,61 @@ def _trial_identity(
     return identity
 
 
+def _reconstruct_gru_input(
+    model: Any,
+    X_batch: torch.Tensor,
+    lengths: torch.Tensor,
+) -> torch.Tensor:
+    """Reconstruct the exact per-frame input the GRU cell received.
+
+    For a real :class:`NSMoRCore` the GRU input is produced by the
+    ``FrontendEncoder`` (dendritic IIR on the visual channels followed by
+    the ``SensoryEncoder``), *not* by ``sensory_encoder`` alone.  Route
+    through ``model.frontend`` so the reconstruction matches
+    ``forward()`` when dendritic filtering is enabled; legacy probe
+    models without a ``.frontend`` fall back to
+    ``model.sensory_encoder``.
+
+    ``FrontendEncoder`` keeps a module-level ``_dendritic_state`` cache
+    that leaks ACROSS forward calls when dendritic filtering is enabled
+    (Round-1 BLOCKER-2 item 3).  It is reset before re-encoding so the
+    filter history starts from the sequence start, matching the original
+    forward.  The reset is also required for correctness even without
+    dendritic filtering, because it restores the documented
+    "starts-from-zero at each sequence" contract.
+
+    Args:
+        model: Trained model exposing ``sensory_dim`` and either
+            ``frontend`` or ``sensory_encoder``.
+        X_batch: ``(B, T, D_total)`` padded feature tensor.
+        lengths: ``(B,)`` true sequence lengths.
+
+    Returns:
+        ``(B, T, H)`` sensory encoding fed to the GRU.
+
+    Raises:
+        AssertionError: If the reconstructed shape does not match
+            ``(B, T, H)``.
+    """
+    B, T, _ = X_batch.shape
+    sensory_x = X_batch[:, :, :model.sensory_dim]  # (B, T, D_sensory)
+    frontend = getattr(model, "frontend", None)
+    if frontend is not None:
+        if getattr(frontend, "_dendritic_enabled", False):
+            frontend._dendritic_state = None
+        e_sensory = frontend(sensory_x, lengths)     # (B, T, H)
+    else:
+        if getattr(model.sensory_encoder, "_dendritic_enabled", False):
+            model.sensory_encoder._dendritic_state = None
+        e_sensory = model.sensory_encoder(sensory_x)  # (B, T, H)
+    H = e_sensory.shape[-1]
+    assert e_sensory.shape == (B, T, H), (
+        f"Reconstructed e_sensory shape {tuple(e_sensory.shape)} "
+        f"!= (B={B}, T={T}, H={H})"
+    )
+    return e_sensory
+
+
 def extract_gru_states_at_epochs(
     model: NSMoRCore,
     dataloader: torch.utils.data.DataLoader,
@@ -803,9 +858,13 @@ def extract_gru_states_at_epochs(
     never silently.
 
     The input passed to the Jacobian adapter is the **full sensory
-    encoding** ``e_sensory_t`` (dim H), i.e. the exact vector the
-    GRU cell receives at time *t*.  This captures the partial
-    derivative ∂h_{t+1}/∂h_t holding the GRU input fixed.
+    encoding** ``e_sensory_t`` (dim H) produced by the model's
+    ``frontend`` (dendritic IIR filtering when enabled, then the
+    sensory encoder) — the vector the GRU cell actually receives at
+    time *t*, reconstructed by :func:`_reconstruct_gru_input`.  For
+    legacy probe models without a ``.frontend`` it is the inner
+    ``sensory_encoder`` output.  This captures the partial derivative
+    ∂h_{t+1}/∂h_t holding the GRU input fixed.
 
     Args:
         model: Trained NSMoRCore model.
@@ -872,19 +931,9 @@ def extract_gru_states_at_epochs(
             H = gru_hidden.shape[2]
 
             # ── Task 2: Exact input reconstruction ─────────────
-            # The GRU cell receives e_sensory = sensory_encoder(X[:, :, :4]).
-            # We encode the FULL sensory slice so that x_t reflects
-            # the exact input the GRU saw at each frame.
-            #
-            # Round-1 BLOCKER-2 item 3: FrontendEncoder's dendritic IIR
-            # keeps a module-level cache (_dendritic_state) that leaks
-            # ACROSS forward calls when dendritic filtering is enabled.
-            # Reset it before re-encoding so the filter history starts
-            # from the sequence start, matching the original forward.
-            if getattr(model.sensory_encoder, "_dendritic_enabled", False):
-                model.sensory_encoder._dendritic_state = None
-            sensory_x = X_batch[:, :, :model.sensory_dim]  # (B, T, D_sensory)
-            e_sensory = model.sensory_encoder(sensory_x)    # (B, T, H)
+            # Rebuild the exact vector the GRU cell received at each
+            # frame (see :func:`_reconstruct_gru_input`).
+            e_sensory = _reconstruct_gru_input(model, X_batch, lengths)
 
             for i in range(B):
                 if global_idx >= len(dataloader.dataset):

@@ -827,7 +827,11 @@ trajectories = adapter.extract_gru_states(dataloader)
 
 # Compute Jacobian at a specific hidden state
 h_t = torch.randn(H, requires_grad=True)
-x_t = sensory_encoder(sensory_input)  # (H,)
+# x_t is the vector the GRU cell received: for NSMoRCore that is the
+# frontend output (dendritic filtering + sensory encoder), not the inner
+# sensory_encoder alone. The analysis script reconstructs it exactly via
+# scripts/analyze_jacobian.py::_reconstruct_gru_input.
+x_t = model.frontend(sensory_input, lengths)  # (H,) per frame
 J = adapter.compute_jacobian_at_state(h_t, x_t)  # (H, H)
 eigenvalues = torch.linalg.eigvals(J)
 
