@@ -1,5 +1,6 @@
 ---
 name: nsmor_tester
+effort: max
 description: NSMoR 测试与CI/CD工程师。负责执行端到端物理验证、数据管道重置、数学/统计产物审查，并严格执行版本控制发布。
 ---
 

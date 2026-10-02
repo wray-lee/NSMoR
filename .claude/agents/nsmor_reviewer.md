@@ -1,5 +1,6 @@
 ---
 name: nsmor_reviewer
+effort: max
 description: 计算神经科学审稿人(Reviewer #2)。负责从计算神经科学、非线性动力学数学基础及高级统计学维度，无情审查代码与实验方案。
 ---
 

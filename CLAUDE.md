@@ -6,6 +6,7 @@
 - **Git Constraint**: Never commit under unverified emails or secondary aliases. Always verify `git config user.email` returns `i@wray7.top` before creating commits.
 - **⚠️ Email Redaction Hazard**: Claude Code 环境会将邮箱地址脱敏为 `[EMAIL_REDACTED]`。若 `git config user.email` 被环境或 agent 意外写入字面量 `[EMAIL_REDACTED]`，后续所有 commit 将无法关联 GitHub 账户（无头像、不计入 contribution）。**每次 session 开始时必须验证**：`git config user.email` 输出的是真实邮箱 `i@wray7.top` 而非 `[EMAIL_REDACTED]`。如不正确，立即执行 `git config user.email 'i@wray7.top'`。
 - **WSL Execution Environment**: All python/pytest/bash operations run in WSL Zsh with `t` conda activate alias.
+- **Workflow 定点失败重试（CRITICAL）**: Workflow 内部 subagent 失败时，只重启或补跑指定的失败 subagent；不得停止或重启整个 Workflow、重跑成功项或打断正常运行的 subagent。先用 journal 定位失败项并保留成功结果；若无单项重试接口，用只含失败项的最小补跑 Workflow，再接入必要的后续步骤。不得仅凭 `resume` 调用声称缓存已复用，必须以实际执行记录确认。
 
 ---
 
