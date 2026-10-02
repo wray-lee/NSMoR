@@ -657,6 +657,28 @@ class TestPipelineIO:
         assert len(trial["time_ms"]) == 400
         assert trial["velocity"].dtype == np.float64
 
+    def test_extract_trial_data_normalizes_numpy_groupby_keys(
+        self, tmp_path: Path,
+    ) -> None:
+        """Groupby keys (np.int64 on pandas 2.x) are returned as native scalars.
+
+        Regression for the NumPy 2.x scalar-repr leak: ``prepare_data`` /
+        ``prepare_metadata`` iterate a ``groupby(["session_id", "trial_id"])``
+        key and pass it straight to :func:`extract_trial_data`, so the dict
+        must normalise numpy scalars — otherwise ``trial=np.int64(2)`` leaks
+        into error messages and breaks the documented scalar contract.
+        """
+        kin_path, evt_path = _make_synthetic_csvs(tmp_path)
+        data = load_and_concat_sessions([kin_path], [evt_path])
+        for sid, tid in data["kinematics"].groupby(
+            ["session_id", "trial_id"]
+        ).indices:
+            trial = extract_trial_data(data, sid, tid)
+            assert isinstance(trial["session_id"], str)
+            assert type(trial["trial_id"]) is int, (
+                f"trial_id leaked as {type(trial['trial_id'])}"
+            )
+
     def test_sanitize_trial_first_frame_spike(self, tmp_path: Path) -> None:
         """First-frame phantom spike is zeroed; legitimate onsets preserved.
 

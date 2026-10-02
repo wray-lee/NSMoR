@@ -1187,6 +1187,33 @@ class TestRollbackOwnership:
         leftovers = [x for x in s_dir.iterdir() if x.name.endswith(".tmp")]
         assert leftovers == []
 
+    def test_rollback_requires_ctime_identity(self, tmp_path: Path) -> None:
+        """Ownership proof must include st_ctime_ns, not just (dev, ino).
+
+        On Linux, unlinking and recreating a path reuses the inode number, so
+        a competing replacement can share ``(st_dev, st_ino)`` with the file
+        this process created.  A stale ``st_ctime_ns`` marks that file as
+        foreign and it must be preserved; only an exact dev+ino+ctime match
+        authorizes unlinking.
+        """
+        import scripts.pre_load_adapt as adapter
+
+        foreign = tmp_path / "foreign.tmp"
+        foreign.write_text("foreign", encoding="utf-8")
+        st = os.stat(foreign)
+        adapter._rollback_owned([(foreign, st.st_dev, st.st_ino, st.st_ctime_ns - 1)], [])
+        assert foreign.is_file(), "rollback deleted a file with a stale ctime"
+        adapter._rollback_owned([(foreign, st.st_dev, st.st_ino, st.st_ctime_ns)], [])
+        assert not foreign.exists(), "rollback failed to remove an owned file"
+
+        published = tmp_path / "published.csv"
+        published.write_text("mine", encoding="utf-8")
+        pst = os.stat(published)
+        adapter._rollback_owned([], [(published, pst.st_dev, pst.st_ino, pst.st_ctime_ns - 1)])
+        assert published.is_file(), "rollback deleted a published file with a stale ctime"
+        adapter._rollback_owned([], [(published, pst.st_dev, pst.st_ino, pst.st_ctime_ns)])
+        assert not published.exists(), "rollback failed to remove an owned published file"
+
 
 class TestMultiSessionPartialFailure:
     """P7: multi-session partial batch failure reporting regression."""

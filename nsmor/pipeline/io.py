@@ -363,6 +363,16 @@ def extract_trial_data(
     Raises:
         ValueError: If rows are missing or trial timestamps/declarations are ambiguous.
     """
+    # Normalise pandas/numpy groupby keys to native scalars so the returned
+    # trial dict honours the documented contract (session_id str/int scalar,
+    # trial_id int scalar) and messages print e.g. ``trial=5`` instead of
+    # ``trial=np.int64(5)`` on NumPy 2.x.  ``==`` is value-based, so the
+    # masks below are unaffected by the normalisation.
+    if isinstance(session_id, np.generic):
+        session_id = session_id.item()
+    if isinstance(trial_id, np.generic):
+        trial_id = trial_id.item()
+
     kin = session_data["kinematics"]
     mask_kin = (kin["session_id"] == session_id) & (kin["trial_id"] == trial_id)
     kin_trial = kin.loc[mask_kin]

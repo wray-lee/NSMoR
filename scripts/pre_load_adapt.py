@@ -198,13 +198,35 @@ def _reject_symlink_components(path: Union[str, Path], *, kind: str = 'path') ->
             )
 
 
-def _publish_no_replace(tmp: Path, target: Path, published: List[Tuple[Path, int, int]]) -> None:
+def _stat_identity(st: os.stat_result) -> Tuple[int, int, int]:
+    """Return the (st_dev, st_ino, st_ctime_ns) identity of a stat result.
+
+    The inode-change timestamp ``st_ctime_ns`` is part of the identity
+    because Linux filesystems (ext4, btrfs, ...) aggressively reuse inode
+    numbers: a competing writer that unlinks and recreates a path can land
+    on the same ``(st_dev, st_ino)`` pair, so dev+ino alone cannot prove
+    ownership.  ``st_ctime_ns`` is bumped by unlink+recreate (and by every
+    later hard link / chmod), so a matching triple is a positive ownership
+    proof while a mismatching timestamp marks a foreign file to preserve.
+    """
+    return (st.st_dev, st.st_ino, st.st_ctime_ns)
+
+
+def _publish_no_replace(
+    tmp: Path, target: Path, published: List[Tuple[Path, int, int, int]]
+) -> None:
     """Publish tmp to target with genuine no-replace semantics via hard link.
 
-    Records (target, st_dev, st_ino) in published so rollback can verify
-    ownership before unlinking. Refuses any overwrite fallback.
+    Records (target, st_dev, st_ino, st_ctime_ns) in published so rollback
+    can verify ownership before unlinking. Refuses any overwrite fallback.
     """
     _reject_symlink_components(target.parent, kind='output session directory')
+    try:
+        tmp_stat = os.stat(tmp)
+    except OSError as exc:
+        raise OSError(
+            f'Cannot stat temporary {tmp!r} for ownership record: {exc}'
+        ) from exc
     try:
         os.link(tmp, target)
     except FileExistsError as exc:
@@ -219,50 +241,61 @@ def _publish_no_replace(tmp: Path, target: Path, published: List[Tuple[Path, int
             ) from exc
         raise
     try:
-        st = os.stat(tmp)
-    except OSError as exc:
-        # Do not bare-unlink target here: another process may have replaced target.
-        raise OSError(
-            f'Cannot stat published temporary {tmp!r} for ownership record: {exc}'
-        ) from exc
-    published.append((target, st.st_dev, st.st_ino))
-    try:
         tmp.unlink()
     except OSError:
         pass
+    try:
+        # Record the target identity only after the temporary is unlinked:
+        # removing a hard link bumps the sibling's st_ctime, so statting the
+        # target earlier would store a stale timestamp and defeat ownership
+        # verification (or, worse, let rollback delete a foreign file).
+        st = os.stat(target)
+    except OSError as exc:
+        # Do not bare-unlink target here: another process may have replaced target.
+        raise OSError(
+            f'Cannot stat published target {target!r} for ownership record: {exc}'
+        ) from exc
+    if (st.st_dev, st.st_ino) != (tmp_stat.st_dev, tmp_stat.st_ino):
+        # A racer swapped the target between os.link and os.stat.  Do not
+        # claim ownership of a file we did not create.
+        raise OSError(
+            f'Published target {target!r} changed during publish; refusing to '
+            'record ownership of a foreign file.'
+        )
+    published.append((target, *_stat_identity(st)))
 
 
 def _rollback_owned(
-    owned_tmps: List[Tuple[Path, int, int]],
-    published: List[Tuple[Path, int, int]],
+    owned_tmps: List[Tuple[Path, int, int, int]],
+    published: List[Tuple[Path, int, int, int]],
 ) -> None:
     """Delete only positively owned temporaries and published outputs.
 
-    A temporary or published target is removed only when lstat still matches the inode
-    recorded at creation/publish time and it is not a symlink (i.e. another writer
-    has not replaced it).
+    A temporary or published target is removed only when lstat still matches
+    the dev+ino+ctime identity recorded at creation/publish time and it is
+    not a symlink (i.e. another writer has not replaced it).
     """
-    for tmp, dev, ino in owned_tmps:
+    for tmp, dev, ino, ctime_ns in owned_tmps:
         try:
             st = os.lstat(tmp)
         except OSError:
             continue
         if stat_mod.S_ISLNK(st.st_mode):
             continue
-        if st.st_dev != dev or st.st_ino != ino:
+        if _stat_identity(st) != (dev, ino, ctime_ns):
             continue
         try:
             os.unlink(tmp)
         except OSError:
             pass
-    for target, dev, ino in published:
+    for target, dev, ino, ctime_ns in published:
         try:
             st = os.lstat(target)
         except OSError:
             continue
         if stat_mod.S_ISLNK(st.st_mode):
             continue
-        if st.st_dev != dev or st.st_ino != ino:
+        if _stat_identity(st) != (dev, ino, ctime_ns):
             continue
         try:
             os.unlink(target)
@@ -1656,8 +1689,8 @@ def adapt_session_pair(
         _reject_symlink_components(target_kin.parent, kind='output session directory')
         target_kin.parent.mkdir(parents=True, exist_ok=True)
         _reject_symlink_components(target_kin.parent, kind='output session directory')
-        owned_tmps: List[Tuple[Path, int, int]] = []
-        published: List[Tuple[Path, int, int]] = []
+        owned_tmps: List[Tuple[Path, int, int, int]] = []
+        published: List[Tuple[Path, int, int, int]] = []
 
         def _write_exclusive(df: pd.DataFrame, target: Path) -> Path:
             fd, tmp_name = tempfile.mkstemp(
@@ -1667,18 +1700,21 @@ def adapt_session_pair(
             )
             tmp_path = Path(tmp_name)
             try:
-                st = os.fstat(fd)
-                owned_tmps.append((tmp_path, st.st_dev, st.st_ino))
                 with os.fdopen(fd, 'w', newline='', encoding='utf-8') as fh:
                     df.to_csv(fh, index=False)
                     fh.flush()
                     os.fsync(fh.fileno())
-            except Exception:
-                raise
-            try:
-                os.chmod(tmp_path, 0o644)
-            except OSError:
-                pass
+                try:
+                    os.chmod(tmp_path, 0o644)
+                except OSError:
+                    pass
+            finally:
+                # Register after all writes: st_ctime is bumped by every
+                # modification, so the sampled identity must reflect the
+                # final state that rollback will later compare against.
+                # ``finally`` still records the temp when the write raises,
+                # so a partial file is not leaked.
+                owned_tmps.append((tmp_path, *_stat_identity(os.stat(tmp_path))))
             return tmp_path
 
         try:
@@ -1690,12 +1726,15 @@ def adapt_session_pair(
                 clock_audit["staged_events_sha256"] = _clock_source_hash(tmp_e)
                 fd, name = tempfile.mkstemp(dir=str(target_kin.parent))
                 tmp_audit = Path(name)
-                st = os.fstat(fd)
-                owned_tmps.append((tmp_audit, st.st_dev, st.st_ino))
-                with os.fdopen(fd, "w", encoding="utf-8") as stream:
-                    json.dump(clock_audit, stream, indent=2, allow_nan=False)
-                    stream.flush()
-                    os.fsync(stream.fileno())
+                try:
+                    with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                        json.dump(clock_audit, stream, indent=2, allow_nan=False)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                finally:
+                    owned_tmps.append(
+                        (tmp_audit, *_stat_identity(os.stat(tmp_audit)))
+                    )
                 _publish_no_replace(tmp_audit, clock_target, published)
             _publish_no_replace(tmp_k, target_kin, published)
             _publish_no_replace(tmp_e, target_evt, published)
