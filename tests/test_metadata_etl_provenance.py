@@ -375,9 +375,15 @@ def _source10_produce(raw_dir, metadata_path, monkeypatch):
     return torch.load(metadata_path, weights_only=False), priors
 
 
-@pytest.mark.parametrize('dt_ms', [4.0, 10.0])
-def test_split_trial_replays_all_source_pairs_at_both_cadences(tmp_path, monkeypatch, dt_ms):
+@pytest.mark.parametrize('dt_ms,lengths,anchor,onset,step', [
+    (4.0, [400, 300], 200, 200, 300),   # source cadence == model grid (identity)
+    (10.0, [998, 748], 500, 500, 750),  # source cadence 10 ms -> model grid 4 ms
+])
+def test_split_trial_replays_all_source_pairs_at_both_cadences(
+    tmp_path, monkeypatch, dt_ms, lengths, anchor, onset, step,
+):
     from nsmor.lazy_dataloader import NSMoRLazyDataset
+    from nsmor.pipeline.io import ClockAwareLazyDataset
 
     raw = tmp_path / 'raw'
     first, second = 'animalA_session_1', 'animalB_session_1'
@@ -394,9 +400,12 @@ def test_split_trial_replays_all_source_pairs_at_both_cadences(tmp_path, monkeyp
     metadata_path = tmp_path / 'metadata.pt'
     output_path = tmp_path / 'etl.pt'
     metadata, priors = _source10_produce(raw, metadata_path, monkeypatch)
+    # Source frames stay source evidence in the tensor-free metadata.
     assert [s['n_frames'] for s in metadata['trial_specs']] == [400, 300]
     assert metadata['target_ttc_ms'] == [-119.0, None]
+    assert metadata['lazy_model_clock_contract']['dt_ms'] == 4.0
 
+    # Legacy reader without a clock contract keeps source-cadence behavior.
     lazy = NSMoRLazyDataset(str(metadata_path))
     X, Y, length = lazy[0]
     assert length == 400 and X.shape == (400, 8) and Y.shape == (400,)
@@ -405,19 +414,37 @@ def test_split_trial_replays_all_source_pairs_at_both_cadences(tmp_path, monkeyp
     np.testing.assert_allclose(Y[300:], 2.1)
     np.testing.assert_allclose(X[:, 4:].numpy(), np.broadcast_to(priors[0], (400, 4)), atol=1e-7)
 
+    # The enhanced reader resamples each trial onto the declared model grid.
+    enhanced = ClockAwareLazyDataset(str(metadata_path), dt_ms=4.0)
+    Xe, Ye, le = enhanced[0]
+    assert le == lengths[0] and Xe.shape == (lengths[0], 8)
+
     convert_main(['--input', str(metadata_path), '--output', str(output_path)])
     saved = torch.load(output_path, weights_only=False)
     validate_dataset_provenance(saved, output_path)
     assert metadata["animal_identity_status"] == saved["animal_identity_status"] == "unverified"
     assert saved["mcmc_prior_provenance"].endswith("recording_prefix_grouped_cv")
-    assert saved['lengths'].tolist() == [400, 300]
+    assert saved['lengths'].tolist() == lengths
     assert list(zip(saved['session_ids'], saved['trial_ids'])) == [(first, 11), (second, 12)]
     assert saved['target_ttc_ms'] == [-119.0, None]
     np.testing.assert_allclose(saved['mcmc_priors'], priors, atol=1e-7)
-    np.testing.assert_allclose(saved['Y_seqs'][0], Y.numpy())
-    np.testing.assert_allclose(saved['Y_seqs'][0][300:], 2.1)
-    np.testing.assert_allclose(saved['X_seqs'][0][200:, 0], 10.0)
-    np.testing.assert_allclose(saved['X_seqs'][0][301, 2], 2.1)
+    # Complete eager model-grid contract on the resampled arrays.
+    assert saved['model_dt_ms'] == 4.0
+    assert saved['anchor_frames'] == [anchor, anchor]
+    assert len(saved['model_grid_provenance']) == 2
+    record = saved['model_grid_provenance'][0]
+    assert record['method'] == 'causal_previous_source_sample_hold'
+    assert record['synthetic_prepend_frames'] == 0
+    assert len(saved['X_seqs'][0]) == record['model_n'] + record['synthetic_prepend_frames']
+    np.testing.assert_allclose(saved['Y_seqs'][0][:step], 0.1)
+    np.testing.assert_allclose(saved['Y_seqs'][0][step:], 2.1)
+    np.testing.assert_allclose(saved['X_seqs'][0][onset:, 0], 10.0)
+    np.testing.assert_allclose(saved['X_seqs'][0][onset - 1, 0], 0.0)
+    np.testing.assert_allclose(saved['X_seqs'][0][step + 1, 2], 2.1)
+    from nsmor.pipeline.nested_prior import load_dataset_with_fingerprint
+    load_dataset_with_fingerprint(output_path, expected_dt_ms=4.0)
+    with pytest.raises(ValueError, match='model_dt_ms.*expected_dt_ms'):
+        load_dataset_with_fingerprint(output_path, expected_dt_ms=10.0)
 
     # A damaged new spec cannot silently convert the producer's 400 frames as 300.
     metadata['trial_specs'][0]['source_pairs'] = metadata['trial_specs'][0]['source_pairs'][:1]
@@ -617,9 +644,9 @@ def test_source11_producer_refuses_source_changed_during_parse(tmp_path, monkeyp
     original_load = prepare_metadata.load_kinematics_csv
     calls = 0
 
-    def change_after_parse(source):
+    def change_after_parse(source, **kwargs):
         nonlocal calls
-        table = original_load(source)
+        table = original_load(source, **kwargs)
         calls += 1
         if calls == 1:
             _source11_substitute(path, '0.1', '0.9')

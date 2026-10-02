@@ -17,9 +17,10 @@ from tqdm import tqdm
 # Add parent to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from nsmor.lazy_dataloader import NSMoRLazyDataset
+from nsmor.pipeline.io import ClockAwareLazyDataset
 from nsmor.pipeline.nested_prior import load_artifact_bytes
 from nsmor.pipeline.grouping import prior_identity_status
+from nsmor.pipeline.resampling import resolve_model_anchor_frame
 
 
 def populate_etl_provenance_and_conditions(
@@ -28,6 +29,7 @@ def populate_etl_provenance_and_conditions(
     X_seqs: Optional[List[np.ndarray]] = None,
     lengths: Optional[Sequence[int]] = None,
     max_seq_len: Optional[int] = 2400,
+    anchor_frames: Optional[Sequence[int]] = None,
 ) -> Dict[str, Any]:
     """Populate provenance and condition metadata into output ETL dictionary.
 
@@ -83,7 +85,12 @@ def populate_etl_provenance_and_conditions(
 
     # ── Anchor frames ─────────────────────────────────────────────
     # Anchor_frames stored in ETL MUST describe the SAVED arrays.
-    if X_seqs is not None and lengths is not None:
+    if anchor_frames is not None:
+        # A model-grid resampling pass already mapped the authoritative source
+        # anchor onto the saved model grid (resolve_model_anchor_frame); reuse it
+        # verbatim rather than re-deriving a held-channel peak.
+        output["anchor_frames"] = [int(a) for a in anchor_frames]
+    elif X_seqs is not None and lengths is not None:
         from nsmor.pipeline.conditions import derive_anchor_frames
 
         saved_anchors: List[int] = []
@@ -221,7 +228,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         dt_ms = float(dt_ms)
 
     # Create lazy dataset to leverage existing loading logic
-    lazy_ds = NSMoRLazyDataset(
+    lazy_ds = ClockAwareLazyDataset(
         metadata_path=metadata_path,
         metadata=metadata,
         max_seq_len=args.max_seq_len,
@@ -230,21 +237,28 @@ def main(argv: Sequence[str] | None = None) -> None:
         dt_ms=dt_ms,
     )
 
-    # Validate / migrate pure-wind anchor_frames for lazy cropping
-    # NSMoRLazyDataset._build_sequence prepends baseline frames to pure-wind trials.
-    # If a legacy metadata spec does not have pure_wind_prepended_frames recorded,
-    # adjust the in-memory spec anchor_frame so the lazy crop window captures stimulus.
-
-    for spec in lazy_ds.trial_specs:
-        if spec.get("is_pure_wind") and spec.get("pure_wind_prepended_frames", 0) == 0:
-            prepend = resolve_legacy_pure_wind_prepend_frames(spec, dt_ms)
-            spec["anchor_frame"] = int(spec["anchor_frame"]) + prepend
-            spec["pure_wind_prepended_frames"] = prepend
+    # Validate / migrate pure-wind anchor_frames for lazy cropping.
+    # The enhanced reader resamples onto the declared model grid and derives the
+    # pure-wind prepend from the model dt, so source-coordinate fields are left
+    # untouched; only the legacy (no contract) reader needs the source-cadence
+    # anchor migration below.  A model-grid pass must save the FULL sequence
+    # (the eager loader's invariant is len(xs[i]) == model_n + prepend), so
+    # cropping is disabled here and stays consumer-side, exactly as eager.
+    if lazy_ds.uses_model_grid:
+        lazy_ds._inner.max_seq_len = None
+    else:
+        for spec in lazy_ds.trial_specs:
+            if spec.get("is_pure_wind") and spec.get("pure_wind_prepended_frames", 0) == 0:
+                prepend = resolve_legacy_pure_wind_prepend_frames(spec, dt_ms)
+                spec["anchor_frame"] = int(spec["anchor_frame"]) + prepend
+                spec["pure_wind_prepended_frames"] = prepend
 
     X_seqs = []
     Y_seqs = []
     labels = []
     lengths = []
+    anchor_frames: List[int] = []
+    grid_records: List[Dict[str, Any]] = []
 
     with lazy_ds.captured_sources() as revision:
         for i in tqdm(range(len(lazy_ds)), desc="Loading sequences"):
@@ -258,6 +272,31 @@ def main(argv: Sequence[str] | None = None) -> None:
             label_str = lazy_ds.get_label(i)
             labels.append(label_encoder[label_str])  # Convert to int
             lengths.append(length)
+
+            # A model-grid pass MUST emit the full eager grid/anchor contract,
+            # validated against the resampled arrays before publish.  The
+            # on-demand reader never crops, so the saved length equals model_n
+            # plus the synthetic prepend (the eager loader's invariant).
+            if lazy_ds.uses_model_grid:
+                # Reuse the record built during this item's single resample
+                # (set by ``__getitem__``) instead of resampling the trial again.
+                record = lazy_ds._last_grid_record
+                if record is None:
+                    raise ValueError(
+                        f"trial {i}: model-grid item produced no provenance record"
+                    )
+                anchor = resolve_model_anchor_frame(record)
+                # The saved array must be the full model grid: model_n frames
+                # plus the synthetic pure-wind prepend, no crop (the eager
+                # loader's invariant).  A mismatch means the reader and the
+                # provenance disagree and must not be published.
+                if (len(X_8d) != record["model_n"] + record["synthetic_prepend_frames"]
+                        or not 0 <= anchor < len(X_8d)):
+                    raise ValueError(
+                        f"trial {i}: model grid disagrees with the saved sequence"
+                    )
+                anchor_frames.append(int(anchor))
+                grid_records.append(record)
 
     # Build output dict matching old format
     priors_np = (
@@ -298,7 +337,12 @@ def main(argv: Sequence[str] | None = None) -> None:
     populate_etl_provenance_and_conditions(
         output, metadata, X_seqs=X_seqs, lengths=lengths,
         max_seq_len=args.max_seq_len,
+        anchor_frames=anchor_frames if lazy_ds.uses_model_grid else None,
     )
+
+    if lazy_ds.uses_model_grid:
+        output["model_dt_ms"] = float(lazy_ds._lazy_clock_dt_ms)
+        output["model_grid_provenance"] = grid_records
 
     output["raw_input_revision"] = {
         "claim": "SHA-256 of captured CSV bytes; paths are labels, not a live-path guarantee",

@@ -677,3 +677,151 @@ def test_declared_trial_kinematics_completeness_at_production_boundary(
         ]
         assert len(saved["mcmc_priors"]) == 2
         assert saved["target_ttc_ms"][0] == -119.0
+
+
+@pytest.mark.parametrize("end_ms,anchor_ms,condition,expected_frame,origin_ms,dt_ms", [
+    (105, 105., "visual_only", None, 0., 4.),
+    (104, 104., "visual_only", 26, 0., 4.),
+    (110, 105., "visual_only", 27, 0., 4.),
+    (110, 83., "wind_only", 1446, 0., 4.),
+    (110, 83., "multisensory", 21, 0., 4.),
+    (65.1, 65.1, "visual_only", 16, 1.1, 4.),
+    (1400.1, 1400.1, "visual_only", 100, 1000.1, 4.),
+    (65.1, 65.1, "visual_only", 8, 1.1, 8.),
+])
+def test_producer_maps_source_anchor_causally(
+    tmp_path: Path, end_ms: float, anchor_ms: float,
+    condition: str, expected_frame: int | None, origin_ms: float, dt_ms: float,
+) -> None:
+    """Real CSV → ETL → restricted loader, including peak/onset disagreements."""
+    from tests.test_pipeline import _make_label_audit_csvs
+    from nsmor.data_extractor import resolve_snapshot_anchor, build_snapshot_dataset
+    from nsmor.pipeline.io import load_and_concat_sessions, extract_trial_data
+    from nsmor.pipeline.labeling import assign_ground_truth_labels
+    from nsmor.pipeline.nested_prior import load_dataset_with_fingerprint
+    from nsmor.nsmor_dataloader import NSMoRDataset
+
+    raw = tmp_path / "raw"
+    _make_label_audit_csvs(raw, n_sessions=5)
+    directory = sorted(raw.iterdir())[0]
+    sid, tid = directory.name, 777
+    if origin_ms:
+        n = 17 if origin_ms == 1.1 else 101
+        times = origin_ms + np.arange(n) * 4
+    else:
+        times = np.arange(0, end_ms + 1, 5, dtype=np.float64)
+        if times[-1] != end_ms:
+            times = np.r_[times, float(end_ms)]
+    visual = np.zeros_like(times)
+    lv = 30.
+    init_deg = float(np.degrees(2 * np.arctan2(lv, anchor_ms - origin_ms)))
+    if condition != "wind_only":
+        visual = np.minimum(np.degrees(2 * np.arctan2(
+            lv, np.maximum(anchor_ms - times, 0.),
+        )), 179.)
+        # One early angle artifact must not turn the peak into the collision.
+        visual[1] = 180.
+    wind = ((times >= anchor_ms).astype(float) if condition != "visual_only"
+            else np.zeros_like(times))
+    special_kin = pd.DataFrame({
+        "session_id": sid, "trial_id": tid, "time_ms": times,
+        "x_pos": 0., "y_pos": 0., "heading": 0., "velocity": 0.1,
+        "acceleration": 0., "visual_angle": visual, "wind_state": wind,
+        "l_v_ratio": lv if condition != "wind_only" else 0.,
+    })
+    onset = origin_ms if condition == "visual_only" else anchor_ms
+    special_evt = pd.DataFrame([
+        {"session_id": sid, "trial_id": tid, "time_ms": origin_ms,
+         "event_type": "trial_start", "event_value": json.dumps({
+             "lv_ratio_ms": lv, "init_deg": init_deg,
+         })},
+        {"session_id": sid, "trial_id": tid, "time_ms": onset,
+         "event_type": "stimulus_onset", "event_value": ""},
+    ])
+    kin_path, evt_path = directory / "kinematics.csv", directory / "events.csv"
+    for path, extra in ((kin_path, special_kin), (evt_path, special_evt)):
+        pd.concat([pd.read_csv(path), extra], ignore_index=True).to_csv(path, index=False)
+    trial = extract_trial_data(load_and_concat_sessions([kin_path], [evt_path]), sid, tid)
+    source_times = trial["time_ms"].copy()
+    resolved_ms, rule = resolve_snapshot_anchor(trial, onset)
+    assert resolved_ms == pytest.approx(anchor_ms, abs=1e-12)
+    expected_snaps, expected_labels = build_snapshot_dataset(assign_ground_truth_labels([trial]))
+    output = tmp_path / "dataset.pt"
+    if expected_frame is None:
+        with pytest.raises(ValueError, match="777.*source anchor.*no model frame"):
+            prepare_dataset(raw, output, dt_ms=4.)
+        assert not output.exists()
+        return
+
+    prepare_dataset(raw, output, dt_ms=dt_ms)
+    saved, _ = load_dataset_with_fingerprint(output, expected_dt_ms=dt_ms)
+    index = list(saved["trial_ids"]).index(tid)
+    assert saved["anchor_frames"][index] == expected_frame
+    record = saved["model_grid_provenance"][index]
+    assert record["source_anchor_ms"] == resolved_ms
+    assert record["source_anchor_rule"] == rule
+    assert saved["stimulus_conditions"][index] == condition
+    np.testing.assert_array_equal(saved["snapshots"][index], expected_snaps[0])
+    assert saved["labels"][index] == expected_labels[0]
+    np.testing.assert_array_equal(trial["time_ms"], source_times)
+    # No invented visual collision: persisted features are causal source holds.
+    grid = source_times[::int(dt_ms / 4)] if origin_ms else np.arange(
+        0, end_ms + 1, dt_ms, dtype=np.float64,
+    )
+    assert record["model_n"] == len(grid)
+    assert record["model_end_ms"] == grid[-1]
+    assert record["model_end_ms"] <= record["source_end_ms"]
+    held_indices = np.searchsorted(source_times, grid, side="right") - 1
+    prepend = record["synthetic_prepend_frames"]
+    np.testing.assert_array_equal(
+        saved["X_seqs"][index][prepend:, 0], trial["visual_angle"][held_indices].astype(np.float32),
+    )
+    sequence = (saved["X_seqs"][index], saved["Y_seqs"][index], saved["labels"][index])
+    loader = NSMoRDataset([sequence], saved["mcmc_priors"][[index]],
+                          max_seq_len=8, pre_anchor_frames=2,
+                          anchor_frames=[saved["anchor_frames"][index]])
+    x, _ = loader[0]
+    start = min(expected_frame - 2, len(sequence[0]) - 8)
+    np.testing.assert_array_equal(x[:, :4].numpy(), sequence[0][start:start + 8, :4])
+
+    # The producer's sidecars must survive real train/downstream ingestion.
+    from nsmor.config_parser import ExperimentConfig
+    from scripts import train, analyze_dynamics
+
+    config = ExperimentConfig()
+    config.model.dt_ms = dt_ms
+    config.training.num_workers = 0
+    train_loader, val_loader = train.build_dataloaders(
+        config, dataset_path=str(output),
+    )
+    for split in (train_loader.dataset, val_loader.dataset):
+        assert split.anchor_frames == [
+            saved["anchor_frames"][i] for i in split.source_indices
+        ]
+    downstream, _ = analyze_dynamics.load_dataset(
+        output, max_seq_len=8, pre_anchor_frames=2,
+    )
+    assert downstream.dataset.anchor_frames[index] == expected_frame
+    downstream_x, _ = downstream.dataset[index]
+    np.testing.assert_array_equal(
+        downstream_x[:, :4].numpy(), sequence[0][start:start + 8, :4],
+    )
+
+    # A stale peak-derived stamp must not pass the shared loader validation.
+    saved["anchor_frames"][index] = 2
+    bad = tmp_path / "bad-anchor.pt"
+    torch.save(saved, bad)
+    with pytest.raises(ValueError, match="source anchor.*disagrees"):
+        load_dataset_with_fingerprint(bad)
+
+    # Losing both sidecars must not downgrade a new producer to the peak proxy.
+    saved.pop("model_grid_provenance")
+    saved.pop("anchor_frames")
+    stripped = tmp_path / "stripped-clock.pt"
+    torch.save(saved, stripped)
+    with pytest.raises(ValueError, match="modern.*clock|model grid"):
+        load_dataset_with_fingerprint(stripped)
+    with pytest.raises(ValueError, match="modern.*clock|model grid"):
+        train.build_dataloaders(config, dataset_path=str(stripped))
+    with pytest.raises(ValueError, match="modern.*clock|model grid"):
+        analyze_dynamics.load_dataset(stripped)

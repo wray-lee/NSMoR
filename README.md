@@ -16,6 +16,171 @@ encoding from bio-physical decision-making via gradient isolation.
 
 Clock recovery remains experimental: estimated prefix timestamps are not observed measurements, and host-arrival fit residuals are not physical synchronization bounds. See [method and validation status](docs/clock-recovery-r4.md). Full scientific QC remains pending.
 
+### Delivery status — 2026-10-01 (Current)
+
+Formal training is complete and operationally accepted. The run was segmented
+across three processes: human epochs 1–66
+(`train-causal-formal-persistent-50r7by4t`, interrupted), 67–98
+(`train-causal-formal-resumed-eqnr7_4c`, low-memory terminated), and 99–150
+(`train-causal-formal-compact-qfadtol8`, exit 0). Partial epochs 67 and 99 are
+excluded and no uninterrupted-equivalence claim is made; epochs 1–98 preserve
+six-decimal log precision and epoch 99 onward uses the `train.log` serialized
+full precision. Budget 150 was reached with stopping reason `budget` and zero
+non-improving epochs. Acceptance record:
+`.../formal-terminal-acceptance-46yjj_ne/acceptance.json` (exit 0; 11.61 s
+validator).
+
+- Accepted best/final checkpoint `.../train-causal-formal-compact-qfadtol8/best_model.pth`
+  SHA-256 `4fc2b90663124869049acf1c1a8b9a50250d449e9b2d053472ab01d760ae6f02`
+  (`final_model.pth` `2679223a...`); stored epoch 149 = completed epoch 150;
+  33,995 parameters; strict-loadable; model/optimizer/scheduler tensors finite.
+- Best/final train loss 7.325285180409749; val loss = best_val_loss 11.127355694770813.
+- Formal metrics (best weights): MSE 10.424081802368164, RMSE 3.2286346653606017 cm/s,
+  MAE 0.5784122347831726, R² 0.600713312625885, escape-band (10 cm/s) RMSE
+  19.824984206281147 cm/s over 25,075 escape frames (2.42% of frames), resting
+  RMSE 0.9700182642151225 cm/s. The escape-band RMSE is the declared limitation:
+  escape frames are rare and their error is an order of magnitude above resting
+  error.
+- Scope `nested_outer_validation`; animal identity `unverified`; clock scientific
+  acceptance `experimental_unresolved`; uninterrupted determinism `false`. No
+  final scientific/clock validation is claimed.
+
+Frozen root files (`checkpoint.py`, `model_utils.py`, `model_nsmor_core.py`,
+`loss.py`) remain protected and HEAD-identical. The accepted dataset/nested pins
+and clock repairs are unchanged; dataset `nsmor_dataset.pt` (`b1bd5578...`, strict
+dt 4 ms, finite 2,304 sequences, 58,156,483 frames, 2,432 eligible trials, 128
+unlabeled anchors, 46,873,366 source rows, 2,304×4 priors, 1,872/432 split, 52/12
+recording-prefix groups) and nested split `nested_split_seed42.pt` (`f2585630...`)
+were reused for training and all seven analyses.
+
+Compact source-provenance retention is the restored default for all 11
+production consumers; full strict record validation is unchanged. Actual
+single-load full-corpus acceptance (`compact-corpus-acceptance-20261001-5e9c43`)
+passed at exit 0 in 52.96 s with peak RSS **6,672,196 KiB** (`ru_maxrss`),
+steady RSS **3,458,960 KiB**, loader **28.20 s**: **54.06%** lower peak than the
+earlier 14,523,752 KiB restored-list run, with a max simplex error of
+1.51e-07 and all 2,432 records strict-validated once. Source rows, aliases, raw
+tokens, dataset/nested/checkpoint bytes, model configuration, and inference
+inputs were unchanged. Evidence:
+`/mnt/d/Projects/NSMoR/.scratch/compact-corpus-acceptance-20261001-5e9c43/acceptance.json`.
+
+Two loader/PCA repairs are part of the accepted chain. The dynamics PCA is now
+an exact whole-corpus mean-centered fit that streams the corpus in
+per-trajectory blocks and accumulates only the centered scatter, so all
+5,529,448 frames keep equal weight instead of a raw uncentered `XᵀX`. This
+bounds the *fit workspace* to O(block_rows·D + D²) — one streamed
+per-trajectory block plus the `(D, D)` centered scatter. The retained
+per-trajectory 3-D scores, the per-state int64 label array, and the resident
+corpus bundle sit outside that bound, so total analysis memory is not O(D²).
+The analysis loader is single-process (`num_workers=0`) because the whole
+corpus is already resident and worker processes only replicated it.
+
+The full regression on this checkout (HEAD `f8b6acf7...`, branch
+`delivery/source17-v6`), rerun after the sorting-regression strengthening with
+`python -m pytest tests/ -q -ra -p no:cacheprovider`, produced **1656 passed,
+1 skipped, 11 warnings in 169.20s, exit 0** (raw log
+`/mnt/d/Projects/NSMoR/.scratch/final-delivery-regression-20261001.log`). The
+single skip is the legitimate missing real-subset fixture
+(`tests/test_downstream_anchor_alignment.py::test_all_six_loaders_on_real_small_dataset`,
+`nsmor_subset_small.pt` absent), reported as skipped, not passed; the 11
+warnings are pre-existing script-level warnings. The earlier 1643- and
+1607-passed figures are superseded, not scientific acceptance.
+
+### Seven final analyses — 2026-10-01 (current evidence: r6)
+
+The current accepted seven-analysis evidence is the sorted-corpus receipt
+`/mnt/d/Projects/NSMoR/.scratch/seven-analysis-sorted-20261001-r6/status.json`
+(`state=complete, all_seven_executed=true, all_seven_successful=true`,
+`scientific_acceptance=pending`, `ended_unix_seconds=1790846716.01`). The
+accepted best checkpoint, dataset, and nested prior were run through the seven
+analysis/simulation scripts as seven sequential single-process stages under
+`MemoryMax=12G / Swap=1G`. The checkpoint SHA-256 was verified identical before
+and after every stage, and each stage's declared required outputs are present
+and non-zero. The integration stage ran the current source
+(`scripts/analyze_integration.py`, SHA-256 `fed23f12…`) and the Jacobian stage
+ran `scripts/analyze_jacobian.py` (SHA-256 `8a79475b…`); both match this
+checkout's source.
+
+| Stage | Script | Exit | Runtime (s) | Peak child RSS (KiB) | Declared outputs |
+| ----- | ------ | ---- | ----------- | -------------------- | ---------------- |
+| dynamics | `analyze_dynamics.py` | 0 | 208.04 | 8,550,968 | `mechanism_analysis.png` |
+| lesion | `simulate_lesion.py` | 0 | 484.34 | 6,916,040 | `ablation_kinematics.png`, `lesion_statistics.csv`, `lesion_statistics.block_sensitivity.json` |
+| jacobian | `analyze_jacobian.py` (jax) | 0 | 177.72 | 7,058,808 | `jacobian_spectrum.png`, `jacobian_spectrum.json` |
+| integration | `analyze_integration.py` | 0 | 179.30 | 6,949,272 | `integration_window.png`, `integration_summary.json` |
+| psychophysics | `simulate_psychophysics.py` | 0 | 26.71 | 6,919,880 | `bayesian_reliability.json` |
+| gating | `analyze_gating.py` | 0 | 198.48 | 7,232,776 | `gating_cluster_summary.json`, `gating_cluster_statistics.csv`, `gating_trajectories_by_cluster.png` |
+| autoregressive | `simulate_autoregressive.py` | 0 | 36.44 | 1,544,500 | `events.csv`, `kinematics.csv`, `stimuli.csv`, `stimulus_summary.json`, `simulation_manifest.json` |
+
+**Superseded (history, not current evidence).** The earlier
+`.../seven-final-analyses-single-process-20261001/status.json` run is retained
+as history only. It is explicitly **superseded** by the r6 receipt above: its
+integration predates the visual-only exclusion and sorted wind-axis fixes, and
+its Jacobian log is inconsistent with the withheld-spectrum contract. Its
+per-stage numbers must not be cited as current evidence.
+
+Findings, reported within the accepted declared scope only:
+
+- **Dynamics** — 2,304 trajectories / 5,529,448 states; centered PCA explained
+  variance 45.02% / 19.18% / 5.69% (total 69.89%); class counts Escape 1,067,
+  PreWalk 126, PreActive 181, NoResponse 930.
+- **Lesion** — `scope=descriptive_only`, `p_status=unavailable_unverified_animal_identity`;
+  block sensitivity grouped by recording prefix (52 train / 12 val prefixes);
+  6,912 rows. LIF-Lesioned vs Intact descriptive d=-0.456; GRU-Lesioned vs
+  Intact d=1.899 — both `estimable_descriptive_only`, p/adjusted p unavailable.
+  The overrides are a readout substitution, not a biological pathway ablation:
+  the gate vector is `[g_lif, g_gru]`, so `{"g_lif": 0, "g_gru": 1}`
+  (LIF-Lesioned) and `{"g_lif": 1, "g_gru": 0}` (GRU-Lesioned) each set both
+  gate columns to a constant, replacing the natural time-varying gate entirely.
+  Both recurrent branches still run; only their integration weights change.
+- **Jacobian** — JAX backend, `max_states=100`, `sampling_seed=42`. The
+  frozen-input control failed honestly, so `jacobian_spectrum.json` is published
+  with `status=withheld` and empty `spectral_statistics` for all epochs
+  (`early n_pass=0/63`, `transient 0/9`, `sustained 0/79`); no stability
+  interpretation is made and no own-input magnitude leaks.
+- **Integration** — `evidence_scope=in_sample_descriptive_only`,
+  `inference=descriptive_only` (effect sizes and adjusted p-values null, no
+  grouped effect test run). The connected wind axis is sorted
+  `x = [-373, -308, -261, -225]` with jointly permuted x/y/SEM; visual-only is a
+  disconnected labelled baseline only and wind-only is honestly skipped.
+- **Psychophysics** — `status=not_applicable`: the persisted `multisensory_ttc_0ms`
+  subset is empty (`n_ttc0=0`, `n_trials_matched=0`, `n_candidates=252`), and the
+  432 validation rows are checkpoint-selected outer-validation rows, not an
+  untouched holdout (`holdout_eligible=false`, `dataset_binding=unverified`). No
+  effect is fabricated.
+- **Gating** — ARI 4-way 0.198, NMI 4-way 0.227, visual-vs-wind routing Cohen's d
+  1.19, all `in_sample_descriptive_only`; no p-values were fabricated.
+- **Autoregressive** — `scope=synthetic`, `empirical_dataset_bound=false`,
+  `nested_prior_artifact_bound=false`; it is checkpoint-bound only, not bound to
+  the empirical DATA/NEST pins. Replay is not guaranteed (`seed_status=not_set_by_cli`,
+  `entropy_status=uncontrolled_process_rng`), and fatigue is uncalibrated
+  (`empirically_calibrated=false`). Output hashes were verified.
+
+Observed median source interval of 4.997 ms is a canonical diagnostic, not proof
+of raw unbatched timestamps; the 4 ms model grid contains estimates. The nominal
+source cadence is approximately 5 ms (about 200 Hz) and is distinct from the
+4.0 ms model grid (250 Hz); neither proves hardware emission calibration, and
+the nominal source cadence is not the host-arrival residual P95. Animal
+identity across recording prefixes remains unverified; analyses are descriptive
+and do not constitute independent animal holdout evaluation.
+
+**Final source/artifact review — scoped ACCEPT.** Independent double-blind review
+of this checkout (branch `delivery/source17-v6`, HEAD `f8b6acf7...`) returned
+ACCEPT with zero blockers, majors, or minors. The ACCEPT covers the source and
+artifact scope only: it verifies the r6 citations, the seven stage hashes, the
+withheld Jacobian contract, the honest psychophysics/autoregressive outcomes, and
+the real regression, and it does not resolve the clock estimates, verify animal
+identity, or establish an untouched holdout. Source/artifact scientific
+acceptance is scoped-accepted; the runner receipt's `scientific_acceptance=pending`
+is left as recorded and is not rewritten.
+
+### Historical delivery status — 2026-09-30
+
+The corrected full-corpus dataset, its source-bound nested-prior artifact, and a
+one-epoch smoke run passed operational checks. Earlier formal training (PID 63063)
+was reported running under the default 150 epochs and early-stop patience 20; that
+job was subsequently interrupted as noted above. See
+[delivery work log](docs/delivery-work-log-20260930.md) for detailed lineage and evidence.
+
 ## Project Structure
 
 ```
@@ -136,6 +301,36 @@ alias). Per-trial `session_ids` and `trial_ids` follow the selected rows. Source
 are retained and may depend on labels outside the subset; this is not a new prior fit
 or independent validation dataset.
 
+### Lazy (ELT) model-clock contract
+
+The enhanced lazy entry point is `nsmor.pipeline.io.ClockAwareLazyDataset`. When the
+tensor-free metadata declares `lazy_model_clock_contract`
+(`{"schema_version": "lazy-model-clock-v1", "dt_ms": <model dt>, "resampler": ...}`,
+emitted by `scripts/prepare_metadata.py`), the reader resamples each trial **on demand**
+from the source CSV onto the declared model grid, reusing the shared
+`nsmor.pipeline.resampling.resample_trial_for_model`. Source time stays source evidence;
+model-grid samples are causal previous-source-sample-hold **estimates**, and a pure-wind
+trial's leading zeros are **synthetic** alignment padding (`synthetic_prepend_frames`,
+1425 at a 4.0 ms grid) rather than observed baseline.
+
+`scripts/convert_metadata_to_etl.py` emits the full eager contract when it resamples
+(`model_dt_ms`, `model_grid_provenance`, `anchor_frames`, unpadded `X_seqs`/`Y_seqs`/
+`lengths`), which `load_dataset_with_fingerprint(path, expected_dt_ms=...)` validates and
+binds to the consumer clock; a consumer dt mismatch fails closed. The `lazy_model_clock_*`
+keys are a separate namespace from the eager grid keys, so tensor-free metadata does not
+trip the eager completeness gate.
+
+Legacy markerless metadata (no contract) still loads on the source cadence with an
+explicit "clock unverified" warning and is never stamped with a false
+`model_grid_provenance`. A present-but-invalid/partial contract (including a
+present-but-null one), a per-spec `lazy_model_clock` flag that contradicts the top-level
+declaration, or a declared dt that contradicts the consumer clock all fail clearly rather
+than degrading silently; the restricted loader and the enhanced dataset constructor share
+one validator so their verdicts cannot drift. The declared `n_frames` is a source-frame
+count checked against the raw contributing source pairs *before* resampling, so a missing
+or truncated source pair is refused at both the dataset and the converter rather than
+being resampled and published.
+
 ---
 
 ## Quick Start
@@ -239,8 +434,8 @@ Event types: `trial_start`, `stimulus_onset`, `wind_onset`, `response_detected`,
 ## Extensibility
 
 All functions accept configuration objects with sensible defaults.
-To support experimental variants (e.g., a 5.7 s silent baseline for
-pure-wind trials), instantiate a custom config:
+To support experimental variants (e.g., a synthetic 5.7 s alignment prepend for
+pure-wind trials, not observed baseline data), instantiate a custom config:
 
 ```python
 from nsmor.config import TimeWindowConfig
@@ -313,7 +508,7 @@ leaky integration, all parameterized in physical time (ms) via `dt_ms`:
 | Stochastic resonance (sensory noise) | `sensory_noise_std` | 0.01 | Douglass et al. 1993 |
 
 All time constants are converted internally via `alpha = exp(-dt_ms / tau_ms)`.
-Changing the acquisition rate (`dt_ms`) rescales the per-step coefficients
+Changing the model-grid interval (`dt_ms`) rescales the per-step coefficients
 automatically — the declared biophysics are sampling-rate invariant.
 
 ### Statistical Methodology (Descriptive Analyses)
@@ -326,8 +521,10 @@ intervals or significance tests:
   descriptive trial-level Cohen's d for Escape vs No-Response when defined.
 - **Lesion (Phase D)** — the CSV contains per-trial peak velocity, latency, and
   MSE; the sidecar reports condition MSE and descriptive paired recording-prefix
-  Cohen's dz when defined. Animal-population CIs and p-values are unavailable;
-  `p_value`, `p_adjusted`, and `significant` are `null`.
+  Cohen's dz when defined. The gate vector is `[g_lif, g_gru]`; each override
+  pins both columns to a constant, so this is a readout substitution, not a
+  biological pathway ablation (both recurrent branches still run). Animal-population
+  CIs and p-values are unavailable; `p_value`, `p_adjusted`, and `significant` are `null`.
 - **Psychophysics (Phase G)** — visual-angle noise on fixed trials labeled TTC=0 with
   MCMC prior columns held fixed. Gate trajectories, trial latency mean ± SEM,
   and paired-trial Hodges-Lehmann latency shifts vs σ=0 are descriptive (when
@@ -367,7 +564,7 @@ X_batch [B,T,8] ──┬── Sensory_X [B,T,4] ─→ FrontendEncoder ─→ 
 | 1     | Sensory Encoder  | `SensoryEncoder`  | trainable | frozen |
 | 2     | LIF Pathway      | `LIFCell`         | frozen    | trainable |
 | 2     | GRU Pathway      | `GRUUnit`         | frozen    | trainable |
-| 2     | Causal Gate      | `MoRRouter`       | frozen    | trainable |
+| 2     | Routing Gate     | `MoRRouter`       | frozen    | trainable |
 | 2     | Decoder          | `DirectionHead`   | frozen    | trainable |
 
 **Gradient isolation** is achieved via `requires_grad` toggling — not
@@ -402,7 +599,7 @@ The `forward()` method supports `return_internals=True` for dynamical systems an
 predictions, internals = model(X_batch, lengths, return_internals=True)
 
 # Access internal states for analysis
-routing_gates = internals["routing_gates"]      # (B, T, 2) — per-step blending weights
+routing_gates = internals["routing_gates"]      # (B, T, 2) — per-step weights [g_lif, g_gru]
 lif_potentials = internals["lif_potentials"]    # (B, T, H) — membrane potentials
 lif_spikes = internals["lif_spikes"]            # (B, T, H) — spike events
 gru_hidden = internals["gru_hidden"]            # (B, T, H) — GRU hidden states
@@ -431,7 +628,7 @@ Freeze specific pathways for fine-tuning experiments:
 ```python
 model = NSMoRCore()
 
-# Freeze only the LIF pathway and causal gate
+# Freeze only the LIF pathway and routing gate
 model.freeze_modules(["lif_cell", "router"])
 
 # Freeze everything except GRU (GRU receives gradients)
@@ -660,7 +857,11 @@ trajectories = adapter.extract_gru_states(dataloader)
 
 # Compute Jacobian at a specific hidden state
 h_t = torch.randn(H, requires_grad=True)
-x_t = sensory_encoder(sensory_input)  # (H,)
+# x_t is the vector the GRU cell received: for NSMoRCore that is the
+# frontend output (dendritic filtering + sensory encoder), not the inner
+# sensory_encoder alone. The analysis script reconstructs it exactly via
+# scripts/analyze_jacobian.py::_reconstruct_gru_input.
+x_t = model.frontend(sensory_input, lengths)  # (H,) per frame
 J = adapter.compute_jacobian_at_state(h_t, x_t)  # (H, H)
 eigenvalues = torch.linalg.eigvals(J)
 

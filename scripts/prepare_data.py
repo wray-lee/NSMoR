@@ -1,18 +1,25 @@
 """
 NSMoR Offline Data Preparation Pipeline (Phase 5 ETL).
 
-Ingests raw ``cercus`` CSVs with **hardware-synchronized timestamps**
-(Arduino/Photodiode) and produces a single ``nsmor_dataset.pt`` file
-ready for training.
+Ingests raw ``cercus`` CSVs and produces a single ``nsmor_dataset.pt`` file
+ready for training. The active ETL path in :func:`prepare_dataset` uses
+host-clock event timestamps (host ``trial_start`` and ``stimulus_onset``
+anchoring); no acquisition-linked hardware calibration is established. The
+optional Arduino/Photodiode trigger helpers below are legacy/test-only and are
+NOT invoked by :func:`prepare_dataset`; this pipeline does not establish
+absolute ground-truth stimulus onset or output hardware-corrected timestamps
+on the active path.
 
 Processing Steps
 ----------------
 1. **Data Pairing** — Scan raw data directory, pair events/kinematics CSVs.
-2. **Hardware Time Alignment** — Parse Arduino/Photodiode triggers to
-   override software ``stim_state`` as ground-truth wind onset.
-3. **Kinematics Processing** — Align ``sys_time`` with hardware-corrected
-   timestamps; apply Savitzky-Golay smoothing for velocity/acceleration.
-4. **Physical Labeling** — ``assign_ground_truth_labels`` on corrected axis.
+2. **Time Alignment** — Anchor on host-clock event timestamps (host
+   ``trial_start`` / ``stimulus_onset``). The optional Arduino/Photodiode
+   trigger helpers exist for legacy/test compatibility but are not called on
+   this active path.
+3. **Kinematics Processing** — Align ``sys_time`` on the host clock; apply
+   Savitzky-Golay smoothing for velocity/acceleration.
+4. **Physical Labeling** — ``assign_ground_truth_labels`` on the host-clock axis.
 5. **MCMC Prior Generation** — Train ``MCMCPriorGenerator`` on 5-D snapshots.
 6. **Sequence Extraction with Visual Physics Reconstruction** — Extract
    continuous trajectories and mathematically reconstruct visual looming
@@ -70,6 +77,7 @@ from nsmor.data_extractor import (
     build_snapshot_dataset,
     extract_trial_sequence,
     extract_mcmc_snapshot,
+    resolve_snapshot_anchor,
     PURE_WIND_PREPEND_FRAMES,
     _compute_pure_wind_prepend_frames,
 )
@@ -82,6 +90,7 @@ from nsmor.pipeline.labeling import (
     labeling_funnel_summary,
 )
 from nsmor.pipeline.io import extract_trial_data, load_and_concat_sessions
+from nsmor.pipeline.clock_storage import pack_clock_provenance
 
 # ── Logging ────────────────────────────────────────────────────
 logging.basicConfig(
@@ -93,14 +102,14 @@ logger = logging.getLogger(__name__)
 
 
 # ═══════════════════════════════════════════════════════════════
-# 1.  Hardware Synchronization Constants
+# 1.  Legacy Synchronization Constants (test-only; see §2)
 # ═══════════════════════════════════════════════════════════════
 
-# Arduino/Photodiode event types expected in raw CSVs
+# Arduino/Photodiode event types from legacy raw CSV schema (test-only)
 PHOTODIODE_EVENT: str = "photodiode_trigger"
 ARDUINO_WIND_EVENT: str = "arduino_wind_onset"
 
-# Tolerance for hardware-software clock drift (ms)
+# Legacy tolerance for trigger-software clock drift (ms)
 CLOCK_DRIFT_TOLERANCE_MS: float = 50.0
 
 # Visual physics constants
@@ -211,14 +220,15 @@ def reconstruct_visual_looming(
     where:
         - θ(t) is the visual angle at time t (degrees)
         - l/v is the looming velocity ratio (object_size / approach_speed)
-        - TTC is the time-to-collision (absolute ms)
-        - t is the current time (absolute ms)
+        - TTC is the time-to-collision (ms)
+        - t is the current time (ms)
 
     Args:
         time_ms: 1-D array of timestamps (ms) for this trial.
         l_v_ratio: The l/v ratio extracted from events (constant per trial).
-        ttc_ms: Absolute time-to-collision in ms.
-        stimulus_onset_ms: Absolute stimulus onset time in ms.
+        ttc_ms: Time-to-collision timestamp in ms.
+        stimulus_onset_ms: Host-relative stimulus onset timestamp in ms
+            (no hardware onset calibration established).
         dt_ms: Frame interval in milliseconds (default 4.0ms = 250Hz).
 
     Returns:
@@ -287,11 +297,12 @@ def reconstruct_trial_visual_features(
     Reconstruct visual features for a single trial with pure-wind handling.
 
     For pure-wind trials (no looming stimulus), returns arrays filled
-    with absolute flat zeros (including the 1425-frame prepended region at 4.0ms).
+    with zeros (including the 1425-frame prepended region at 4.0ms).
 
     Args:
         trial_data: Trial data dictionary from extract_trial_data.
-        stimulus_onset_ms: Hardware-corrected stimulus onset time (ms).
+        stimulus_onset_ms: Stimulus onset time in ms (host-clock event timestamp;
+            active prepare_dataset does not apply hardware trigger correction).
         l_v_ratio: The l/v ratio for this trial.
         dt_ms: Frame interval in milliseconds.
 
@@ -348,30 +359,39 @@ def parse_hardware_triggers(
     events_df: pd.DataFrame,
 ) -> Dict[Tuple[str, int], float]:
     """
-    Extract Arduino/Photodiode hardware trigger timestamps from events.
+    Legacy/test-only raw-timestamp comparison/retagging helper. NOT invoked by
+    :func:`prepare_dataset`, which uses host-clock event timestamps; no verified
+    calibration exists for its output.
 
-    This implements the synchronization logic from the legacy
-    ``Cercus-classical-analysis-cli`` codebase:
+    Reads Arduino/Photodiode event rows from ``events_df`` and selects a raw
+    ``time_ms`` value per trial; it performs no verified calibration. It
+    implements the synchronization logic from the legacy
+    ``Cercus-classical-analysis-cli`` codebase and assumes hardware trigger
+    events exist in the corpus, which the current host-relative corpus does
+    not provide. Do not treat its output as absolute ground truth.
 
-    - Photodiode triggers (Arduino time) are the **absolute ground-truth**
-      for stimulus onset.
-    - If a photodiode trigger exists for a trial, it overrides the
-      software ``stim_state`` timestamp.
-    - The photodiode timestamp is mapped to the system clock by finding
-      the nearest ``trial_start`` event and computing the offset.
+    - Photodiode triggers (Arduino time), when present, are used as an
+      unverified stimulus-onset reference (not verified against current corpus).
+    - If a photodiode trigger exists for a trial, the helper returns its
+      raw ``time_ms`` value in place of the software ``stim_state``
+      timestamp: a raw timestamp retag, not a calibrated correction.
+    - No ``trial_start`` offset is applied. The nearest ``trial_start``
+      event is read into ``trial_start_sys`` but never used, so no
+      mapping to a system clock is performed.
 
     Args:
         events_df: Events DataFrame with columns matching
             :data:`EVENT_COLUMNS`.
 
     Returns:
-        Dictionary mapping ``(session_id, trial_id)`` to the
-        hardware-corrected stimulus onset time (in system clock ms).
+        Dictionary mapping ``(session_id, trial_id)`` to a raw event
+        ``time_ms`` value selected as the stimulus-onset reference (no
+        system-clock correction is applied).
 
     Example::
 
         hw_triggers = parse_hardware_triggers(events_df)
-        corrected_onset = hw_triggers[("session_0", 3)]
+        raw_onset = hw_triggers[("session_0", 3)]
     """
     hw_triggers: Dict[Tuple[str, int], float] = {}
 
@@ -382,33 +402,31 @@ def parse_hardware_triggers(
         event_types = group["event_type"].values
         event_times = group["time_ms"].values
 
-        # ── Look for photodiode trigger (Arduino ground truth) ──
+        # ── Look for photodiode trigger (legacy trigger helper) ──
         photodiode_mask = event_types == PHOTODIODE_EVENT
         arduino_mask = event_types == ARDUINO_WIND_EVENT
 
         if np.any(photodiode_mask):
-            # Photodiode trigger is the absolute ground truth
+            # Photodiode trigger reference (unverified against physical emission)
             photodiode_time = float(event_times[photodiode_mask][0])
 
-            # Map Arduino time to system clock:
-            # Find trial_start as the synchronization reference
+            # Locate trial_start, but do not use it: no system-clock
+            # mapping is performed. trial_start_sys is read for legacy
+            # parity and left unused.
             trial_start_mask = event_types == "trial_start"
             if np.any(trial_start_mask):
                 trial_start_sys = float(event_times[trial_start_mask][0])
 
-                # The photodiode fires at a known offset from trial_start
-                # in Arduino time. We use the system clock trial_start
-                # as the anchor and add the photodiode offset.
-                #
-                # In the legacy CLI, the photodiode fires at stimulus onset,
-                # which is typically at 2000ms (baseline_duration) in Arduino time.
-                # We compute the actual system-clock time by finding the
-                # stimulus_onset event and applying the photodiode correction.
+                # The helper simply returns the raw photodiode event_times
+                # value below. No offset is added and no calibrated
+                # system-clock time is computed. A delta between the raw
+                # photodiode value and the software onset is only logged
+                # for diagnostics.
                 stimulus_onset_mask = event_types == "stimulus_onset"
                 if np.any(stimulus_onset_mask):
                     software_onset = float(event_times[stimulus_onset_mask][0])
-                    # Hardware-corrected onset = software_onset + delta
-                    # where delta accounts for Arduino system clock drift
+                    # Diagnostic delta between two raw event_times values;
+                    # this is not a calibration correction.
                     delta_ms = photodiode_time - software_onset
 
                     logger.debug(
@@ -424,7 +442,7 @@ def parse_hardware_triggers(
                     hw_triggers[(session_id, trial_id)] = photodiode_time
 
         elif np.any(arduino_mask):
-            # Arduino wind onset (secondary hardware trigger)
+            # Arduino wind onset (legacy secondary trigger event)
             arduino_time = float(event_times[arduino_mask][0])
             hw_triggers[(session_id, trial_id)] = arduino_time
 
@@ -444,10 +462,16 @@ def log_time_correction_deltas(
     hw_triggers: Dict[Tuple[str, int], float],
 ) -> None:
     """
-    Log the time-correction delta between software and hardware clocks.
+    Log the raw timestamp delta between two event ``time_ms`` values.
 
-    For each trial with a hardware trigger, computes and logs:
-    ``delta = hardware_onset - software_onset``
+    Legacy/test-only diagnostic: NOT invoked by :func:`prepare_dataset`. Active
+    prepare_dataset uses host-clock event timestamps; optional trigger helpers
+    are legacy/test-only and no acquisition-linked hardware calibration is
+    established. This helper compares two raw event ``time_ms`` values and does
+    not imply a calibrated clock.
+
+    For each trial with a trigger entry, computes and logs the raw difference:
+    ``delta = trigger_entry - software_onset``
 
     Args:
         events_df: Raw events DataFrame.
@@ -493,7 +517,7 @@ def log_time_correction_deltas(
 
 
 # ═══════════════════════════════════════════════════════════════
-# 3.  Kinematics Processing with Hardware Alignment
+# 3.  Kinematics Processing with Hardware Alignment (legacy/test-only)
 # ═══════════════════════════════════════════════════════════════
 
 def apply_hardware_time_correction(
@@ -505,11 +529,15 @@ def apply_hardware_time_correction(
     """
     Apply hardware time correction to kinematics and events DataFrames.
 
+    Legacy/test-only helper: NOT invoked by :func:`prepare_dataset`.
+    Active prepare_dataset uses host-clock event timestamps; no acquisition-linked
+    hardware calibration is established.
+
     For trials with hardware triggers:
     1. Replace the software ``stimulus_onset`` event time with the
-       hardware-corrected timestamp.
+       hardware-referenced trigger timestamp.
     2. Recompute velocity and acceleration using Savitzky-Golay smoothing
-       on the corrected time axis.
+       on the unchanged kinematics timestamp axis after event retagging.
 
     Args:
         kinematics_df: Kinematics DataFrame.
@@ -965,6 +993,8 @@ def _load_trials_and_diagnostics(
                 raise ValueError(
                     f"Trial extraction failed for session={sid!r}, trial={tid!r}: {exc}"
                 ) from exc
+            if "clock_provenance" in trial:
+                trial["clock_provenance"] = pack_clock_provenance(trial["clock_provenance"])
             trial_index[key] = len(trials)
             trials.append(trial)
 
@@ -1001,6 +1031,9 @@ def _load_trials_and_diagnostics(
                 {"kinematics": pd.concat(kin_parts, ignore_index=True),
                  "events": pd.concat(evt_parts, ignore_index=True)}, sid, tid,
             )
+            trial = trials[trial_index[key]]
+            if "clock_provenance" in trial:
+                trial["clock_provenance"] = pack_clock_provenance(trial["clock_provenance"])
         except ValueError as exc:
             raise ValueError(
                 f"Trial extraction failed for session={sid!r}, trial={tid!r}: {exc}"
@@ -1095,12 +1128,45 @@ def prepare_dataset(
 
     logger.info("Extracted %d valid trials.", len(trials))
 
-    # Assign ground truth labels using hardware-corrected timestamps.
+    # Assign ground truth labels on the host-clock axis (host trial_start /
+    # stimulus_onset anchoring; no hardware trigger correction is applied here).
     # Round-3 (Reviewer A BLK-3B): label collapses must be auditable —
     # the elimination funnel records which criterion stage eliminated
     # each trial, and the aggregated waterfall is logged so an entire
     # behavioural class disappearing can never pass silently again.
+    if not trials:
+        raise ValueError("No source trials available for labeling")
     labeled_trials = assign_ground_truth_labels(trials, return_funnel=True)
+    labeled_keys = {
+        (str(item["session_id"]), int(item["trial_id"])): item
+        for item in labeled_trials
+    }
+    if len(labeled_keys) != len(labeled_trials):
+        raise ValueError("Duplicate labeled trial identity")
+    labeling_eligibility = []
+    loaded_keys = set()
+    for trial in trials:
+        key = (str(trial["session_id"]), int(trial["trial_id"]))
+        if key in loaded_keys:
+            raise ValueError(f"Duplicate loaded trial identity: {key}")
+        loaded_keys.add(key)
+        item = labeled_keys.get(key)
+        has_onset = bool(np.any(trial["event_types"] == "stimulus_onset"))
+        if (item is not None) != has_onset:
+            raise ValueError(f"Unaccounted labeling outcome: {key}")
+        labeling_eligibility.append({
+            "session_id": key[0], "trial_id": key[1],
+            "status": "labeled" if item is not None else "unavailable_no_stimulus_anchor",
+            "label": item["label"].name if item is not None else None,
+            "source_rows": len(trial["time_ms"]),
+            "source_channel_condition": classify_stimulus_condition(trial),
+            "clock_provenance": trial.get("clock_provenance"),
+        })
+    if not set(labeled_keys).issubset(loaded_keys):
+        raise ValueError("Labeled trial absent from source cohort")
+    del labeled_keys, item, trial
+    logger.info("Label eligibility: %d loaded, %d labeled, %d unavailable",
+                len(trials), len(labeled_trials), len(trials) - len(labeled_trials))
     logger.info("Labeled %d trials.", len(labeled_trials))
 
     funnel = labeling_funnel_summary(labeled_trials)
@@ -1394,6 +1460,8 @@ def prepare_dataset(
     # pure-wind zero-prepend makes that ambiguous downstream).
     seq_conditions: List[str] = []
     seq_clock_provenance: List[Any] = []
+    seq_model_grid_provenance: List[Dict[str, Any]] = []
+    from nsmor.pipeline.resampling import resample_trial_for_model
 
     # Step 4 fitted OOF priors on this cohort. Any Step 5 failure must abort
     # before save so sequences and trained prior rows stay aligned.
@@ -1447,14 +1515,27 @@ def prepare_dataset(
                 raise ValueError(
                     f"prepare_dataset requires explicit positive finite dt_ms, got {dt_ms!r} (fail closed)"
                 )
+            model_trial = resample_trial_for_model(trial_data, dt_ms)
             X_seq, Y_seq = extract_trial_sequence(
-                trial_data,
+                model_trial,
                 feature_config=feature_config,
                 dt_ms=dt_ms,
             )
+            grid_record = model_trial["model_grid_provenance"]
+            grid_record["synthetic_prepend_frames"] = (
+                len(X_seq) - len(model_trial["time_ms"])
+            )
+            source_anchor_ms, source_anchor_rule = resolve_snapshot_anchor(
+                trial_data, stimulus_onset_ms,
+            )
+            grid_record["source_anchor_ms"] = float(source_anchor_ms)
+            grid_record["source_anchor_rule"] = source_anchor_rule
+            from nsmor.pipeline.resampling import resolve_model_anchor_frame
+            model_anchor_frame = resolve_model_anchor_frame(grid_record)
+            seq_model_grid_provenance.append(grid_record)
 
-            # 4. 处理视觉特征：优先使用原始数据，否则重构
-            raw_visual_angle = trial_data.get("visual_angle", None)
+            # 4. Model-grid visual values must not be replaced by source-grid rows.
+            raw_visual_angle = model_trial.get("visual_angle", None)
             has_raw_visual = (
                 raw_visual_angle is not None
                 and isinstance(raw_visual_angle, np.ndarray)
@@ -1466,7 +1547,7 @@ def prepare_dataset(
             if has_raw_visual:
                 # 使用原始 visual_angle（已由实验设备记录）
                 visual_angle_to_use = raw_visual_angle
-                l_v_to_use = trial_data.get("l_v_ratio", np.zeros_like(raw_visual_angle))
+                l_v_to_use = model_trial.get("l_v_ratio", np.zeros_like(raw_visual_angle))
                 if isinstance(l_v_to_use, np.ndarray) and len(l_v_to_use) > 0:
                     l_v_to_use = l_v_to_use
                 else:
@@ -1474,7 +1555,7 @@ def prepare_dataset(
             else:
                 # 重构视觉特征（纯风试验或缺失数据）
                 visual_angle_to_use, l_v_to_use = reconstruct_trial_visual_features(
-                    trial_data=trial_data,
+                    trial_data=model_trial,
                     stimulus_onset_ms=stimulus_onset_ms,
                     l_v_ratio=l_v_ratio,
                     dt_ms=dt_ms,
@@ -1499,15 +1580,24 @@ def prepare_dataset(
 
             X_seq[:, 0] = visual_angle_to_use
 
-            # Keep the float64 anchor for an exact comparison with the
-            # float32 sequence used by the DataLoader and persisted below.
-            anchor_frames_before_cast.append(derive_anchor_frames([X_seq])[0])
-            X_saved = X_seq.astype(np.float32)
-            Y_saved = Y_seq.astype(np.float32)
+            # The source snapshot anchor is authoritative; held-grid peaks are
+            # only legacy diagnostics and may move under causal resampling.
+            anchor_frames_before_cast.append(model_anchor_frame)
+            # The float32 cast is the intended storage precision; an
+            # out-of-range value overflows to +/-inf, which the finite
+            # assertions below reject (fail closed).  Suppress only that
+            # expected cast-overflow RuntimeWarning so a strict warning
+            # filter does not abort before the guard runs.
+            with np.errstate(over="ignore"):
+                X_saved = X_seq.astype(np.float32)
+                Y_saved = Y_seq.astype(np.float32)
             assert X_saved.shape == X_seq.shape
             assert Y_saved.shape == Y_seq.shape
             assert np.isfinite(X_saved).all(), "non-finite X after float32 conversion (fail closed)"
             assert np.isfinite(Y_saved).all(), "non-finite Y after float32 conversion (fail closed)"
+            assert derive_anchor_frames([X_saved]) == derive_anchor_frames([X_seq]), (
+                "Float32 conversion changed legacy physical-channel anchors"
+            )
             # 同步入库：保证 sequences 和 valid_snaps 绝对对齐
             sequences.append((X_saved, Y_saved, int(info["label"])))
             valid_snaps.append(snap)
@@ -1516,6 +1606,7 @@ def prepare_dataset(
             seq_target_ttc_ms.append(target_ttc_ms_val)
             seq_conditions.append(classify_stimulus_condition(trial_data))
             seq_clock_provenance.append(trial_data.get("clock_provenance"))
+            del model_trial
 
             logger.debug(
                 "Trial %s/%d: θ(t) range [%.2f°, %.2f°], "
@@ -1703,6 +1794,9 @@ def prepare_dataset(
         "is_pure_wind": is_pure_wind,
         # Round-3 (Reviewer A MAJ-3B): label-composition sensitivity to
         # a ±25% scaling of the velocity thresholds.
+        "labeling_eligibility": labeling_eligibility,
+        "model_grid_provenance": seq_model_grid_provenance,
+        "model_dt_ms": float(dt_ms),
         "labeling_threshold_sensitivity": labeling_threshold_sensitivity,
         # Exact ``labeling_funnel_summary(labeled_trials)``; do not mutate.
         "labeling_funnel": funnel,
@@ -1724,26 +1818,23 @@ def prepare_dataset(
         "pipeline_semantics_version": PIPELINE_SEMANTICS_VERSION,
     }
 
-    # Derive anchor frames for anchor-aligned cropping (addresses
-    # stimulus-loss bug where random crops miss the stimulus in 88-95%
-    # of trials when sequences are uncapped).  Stored per-trial so
-    # NSMoRDataset can crop deterministically around the stimulus onset.
-    anchor_frames_list = derive_anchor_frames(X_seqs, lengths)
-    assert anchor_frames_list == anchor_frames_before_cast, (
-        "Float32 conversion changed stimulus anchor frames"
-    )
-    dataset["anchor_frames"] = anchor_frames_list
+    # Anchors refer to source events, mapped causally into saved coordinates.
+    # The shared loader validates these against model_grid_provenance and
+    # explicitly reports any disagreement with legacy held-channel peaks.
+    dataset["anchor_frames"] = anchor_frames_before_cast
     logger.info(
-        "Derived %d anchor frames from physical channels.",
-        len(anchor_frames_list),
+        "Mapped %d source anchors onto the supported model grid.",
+        len(anchor_frames_before_cast),
     )
 
-    # Sequences are float32 at extraction, matching DataLoader precision and
-    # bounding the ZIP pickle buffer while preserving every trial and frame.
+    # Preserve every float32 frame; ZIP supports the restricted loader's scan.
     if any(item is not None for item in seq_clock_provenance):
         assert len(seq_clock_provenance) == len(X_seqs)
         dataset["source_clock_provenance"] = seq_clock_provenance
-    torch.save(dataset, output_path)
+    dataset_to_save = dict(dataset)
+    for key in ("X_seqs", "Y_seqs"):
+        dataset_to_save[key] = [torch.from_numpy(seq) for seq in dataset[key]]
+    torch.save(dataset_to_save, output_path)
     logger.info("Saved dataset to %s", output_path)
 
     logger.info("=" * 60)
@@ -1779,7 +1870,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--dt_ms",
         type=float,
         default=4.0,
-        help="Frame interval in milliseconds (hardware nominal 250 Hz = 4.0 ms).",
+        help="Frame interval in milliseconds (model grid target 250 Hz = 4.0 ms).",
     )
     parser.add_argument(
         "--seed",

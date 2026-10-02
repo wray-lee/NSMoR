@@ -41,7 +41,7 @@ def test_invalid_specs_only_cannot_enter_eager_stats_or_psychophysics(tmp_path, 
     ds["trial_specs"][0]["session_id"] = ""
     source = tmp_path / "synthetic.pt"
     source.write_bytes(b"synthetic")
-    monkeypatch.setattr(trainer, "load_dataset_with_fingerprint", lambda *_: (ds, "a" * 64))
+    monkeypatch.setattr(trainer, "load_dataset_with_fingerprint", lambda *a, **k: (ds, "a" * 64))
     monkeypatch.setattr(psych, "load_dataset_with_fingerprint", lambda *a, **k: (ds, "a" * 64))
     cfg = ExperimentConfig()
     cfg.training.normalize_targets = True
@@ -63,7 +63,13 @@ def test_eager_loader_and_statistics_keep_prefixes_disjoint(tmp_path, monkeypatc
         ds.pop("session_ids")
     source = tmp_path / "synthetic.pt"
     source.write_bytes(b"synthetic")
-    monkeypatch.setattr(trainer, "load_dataset_with_fingerprint", lambda *_: (ds, "a" * 64))
+    def load_compact(
+        *args: object, restore_provenance: bool = True, **kwargs: object,
+    ) -> tuple[dict, str]:
+        assert restore_provenance is False
+        return ds, "a" * 64
+
+    monkeypatch.setattr(trainer, "load_dataset_with_fingerprint", load_compact)
     monkeypatch.setattr(trainer, "create_dataloaders_from_config", lambda _cfg, train_dataset, val_dataset: (
         torch.utils.data.DataLoader(train_dataset, batch_size=8),
         torch.utils.data.DataLoader(val_dataset, batch_size=8), None,
@@ -79,7 +85,7 @@ def test_eager_loader_and_statistics_keep_prefixes_disjoint(tmp_path, monkeypatc
     _, _, stat_idx = trainer.compute_target_stats(str(source), cfg, val_split=.5)
     np.testing.assert_array_equal(stat_idx, train_idx)
     if specs_only:
-        monkeypatch.setattr(psych, "load_dataset_with_fingerprint", lambda *a, **k: (ds, "a" * 64))
+        monkeypatch.setattr(psych, "load_dataset_with_fingerprint", load_compact)
         validation = psych.load_validation_data(
             torch.device("cpu"), dataset_path=str(source), val_split=.5,
             random_seed=cfg.training.random_seed, max_seq_len=4, pre_anchor_frames=1,
@@ -226,7 +232,7 @@ def test_checkpoint_loader_captures_bytes_and_validation_scope(tmp_path, monkeyp
 
     ds = _dataset()
     payload = _model(ds, "a" * 64).analysis_checkpoint_lineage
-    payload["config"] = {"training": {"normalize_targets": False}}
+    payload["config"] = {"model": {"dt_ms": 4.0}, "training": {"normalize_targets": False}}
     checkpoint_path = tmp_path / "modern.pth"
     torch.save(payload, checkpoint_path)
     backend = SimpleNamespace(register_forward_hook=lambda hook: None)

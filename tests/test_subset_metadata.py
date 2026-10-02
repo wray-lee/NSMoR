@@ -122,8 +122,9 @@ def test_subset_cli_rejects_reducer_before_side_effect(tmp_path: Path) -> None:
     assert not output.exists()
 
 
-def test_subset_keeps_modern_trial_rows_aligned() -> None:
+def test_subset_keeps_modern_trial_rows_aligned(tmp_path: Path) -> None:
     from nsmor.config import FeatureConfig, PIPELINE_SEMANTICS_VERSION
+    from nsmor.pipeline.nested_prior import load_dataset_with_fingerprint
     from scripts.evaluate_nested_prior import validate_nested_dataset
 
     sessions = ["recording_A_session_1", "recording_A_session_2",
@@ -145,8 +146,44 @@ def test_subset_keeps_modern_trial_rows_aligned() -> None:
                          "rule_4", "rule_5", "rule_6", "rule_7"],
         "pipeline_semantics_version": PIPELINE_SEMANTICS_VERSION,
         "mcmc_prior_provenance": "oof_2fold_recording_prefix_grouped_cv",
+        "source_clock_provenance": [
+            [{"source_row_indices": [i], "raw_sys_time": [str(i)],
+              "raw_ard_time": [str(i)], "time_source": ["sys_time"]}]
+            for i in range(8)
+        ],
+        "model_dt_ms": 4.,
+        "model_grid_provenance": [
+            {"model_n": i + 3, "synthetic_prepend_frames": 0,
+             "source_n": i + 3, "origin_ms": float(i), "dt_ms": 4.,
+             "source_end_ms": float(i + 4 * (i + 2)),
+             "model_end_ms": float(i + 4 * (i + 2)),
+             "source_anchor_ms": float(i + 2),
+             "source_anchor_rule": "looming_collision"}
+            for i in range(8)
+        ],
+        "anchor_frames": [1] * 8,
+        "labeling_eligibility": [
+            {"session_id": sid, "trial_id": 100 + i, "status": "labeled",
+             "label": "NO_RESPONSE", "source_rows": i + 3}
+            for i, sid in enumerate(sessions)
+        ] + [{"session_id": sessions[0], "trial_id": 999,
+              "status": "unavailable_no_stimulus_anchor", "label": None},
+             {"session_id": sessions[2], "trial_id": 998,
+              "status": "unavailable_no_stimulus_anchor", "label": None}],
+        "labeling_funnel_retention": {"n_retained_sequences": 8},
         "animal_identity_status": "unverified",
     }
+    # Distinct lengths expose grid records accidentally retained in source order.
+    data["X_seqs"] = [np.full((i + 3, 8), float(i), dtype=np.float32) for i in range(8)]
+    data["Y_seqs"] = [np.zeros(i + 3, dtype=np.float32) for i in range(8)]
+    data["lengths"] = np.arange(3, 11, dtype=np.int64)
+    from copy import deepcopy
+    from nsmor.pipeline.clock_storage import pack_clock_provenance, unpack_clock_provenance
+    data["source_clock_provenance"][1] = pack_clock_provenance(data["source_clock_provenance"][1])
+    data["source_clock_provenance"][3] = None
+    for i, row in enumerate(data["labeling_eligibility"][:8]):
+        row["clock_provenance"] = data["source_clock_provenance"][i]
+    original_ledger = deepcopy(data["labeling_eligibility"])
 
     subset, kept, prefixes = subset_dataset(data, n_animals=3, seed=42)
 
@@ -163,6 +200,56 @@ def test_subset_keeps_modern_trial_rows_aligned() -> None:
     assert subset["session_ids"] == [sessions[i] for i in (0, 1, 3, 6)]
     assert subset["animal_identity_status"] == "unverified"
     assert validate_nested_dataset(subset, FeatureConfig())[0].tolist() == expected_snapshots
+    assert subset["model_grid_provenance"] == [
+        data["model_grid_provenance"][i] for i in (0, 1, 3, 6)
+    ]
+    assert len(subset["source_clock_provenance"]) == 4
+    for j, i in enumerate((0, 1, 3, 6)):
+        assert subset["source_clock_provenance"][j] is data["source_clock_provenance"][i]
+    assert [row["trial_id"] for row in subset["labeling_eligibility"]] == [
+        100, 101, 103, 106, 999, 998,
+    ]
+    assert subset["labeling_eligibility"][-2:] == original_ledger[-2:]
+    assert subset["subset_labeling_accounting"] == {
+        "scope": "selected_sequences_and_all_parent_unavailable",
+        "n_sequences": 4,
+        "n_parent_entries": 10,
+        "n_excluded_labeled": 4,
+        "n_labeled": 4,
+        "n_unavailable": 2,
+        "n_entries": 6,
+        "parent_summary_keys": ["labeling_funnel_retention"],
+    }
+    assert data["labeling_eligibility"] == original_ledger
+    for j in range(4):
+        assert subset["source_clock_provenance"][j] is (
+            subset["labeling_eligibility"][j]["clock_provenance"]
+        )
+
+    source, output = tmp_path / "source.pt", tmp_path / "subset.pt"
+    torch.save(data, source)
+    main(["--input", str(source), "--output", str(output),
+          "--n_recording_prefixes", "3", "--seed", "42"])
+    saved, _ = load_dataset_with_fingerprint(output)
+    assert saved["model_grid_provenance"] == subset["model_grid_provenance"]
+    assert saved["anchor_frames"] == [1, 1, 1, 1]
+    assert saved["lengths"].tolist() == [3, 4, 6, 9]
+    assert saved["subset_labeling_accounting"] == subset["subset_labeling_accounting"]
+    assert [row["trial_id"] for row in saved["labeling_eligibility"]] == [
+        100, 101, 103, 106, 999, 998,
+    ]
+    assert saved["labeling_eligibility"][-2:] == original_ledger[-2:]
+    assert saved["labeling_funnel_retention"] == {"n_retained_sequences": 8}
+    assert len(saved["source_clock_provenance"]) == 4
+    for j, i in enumerate((0, 1, 3, 6)):
+        assert saved["source_clock_provenance"][j] == unpack_clock_provenance(
+            data["source_clock_provenance"][i]
+        )
+        assert saved["source_clock_provenance"][j] is (
+            saved["labeling_eligibility"][j]["clock_provenance"]
+        )
+        np.testing.assert_array_equal(saved["X_seqs"][j], data["X_seqs"][i])
+        np.testing.assert_array_equal(saved["Y_seqs"][j], data["Y_seqs"][i])
 
 
 @pytest.mark.parametrize("flag", ["--n_recording_prefixes", "--n_animals"])

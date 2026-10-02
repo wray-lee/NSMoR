@@ -1,6 +1,6 @@
 # Pipeline Semantics Version Provenance Stamp
 
-Every checkpoint and dataset carries a version string (currently '2.1'). Loaders hard-reject artifacts with a missing or mismatched version, preventing silent scientific invalidation from mixing incompatible artifacts.
+Every checkpoint and dataset carries a version string. The current value is defined by ``PIPELINE_SEMANTICS_VERSION`` in ``nsmor/config.py`` (currently ``'2.2'``); that constant is the single source of truth, so this ADR deliberately does not pin a literal. Loaders hard-reject artifacts with a missing or mismatched version, preventing silent scientific invalidation from mixing incompatible artifacts.
 
 The pipeline has undergone breaking semantic changes: v2.0 switched LIF time constants from frame units to physical milliseconds and introduced session-grouped MCMC cross-fitting; v2.1 changed the behavioral labeling branch order. Loading a pre-2.0 checkpoint under current code would silently run a completely different biophysical system. Loading a pre-2.1 dataset would use scientifically incorrect labels. The version stamp is the sole programmatic barrier against both failure modes.
 

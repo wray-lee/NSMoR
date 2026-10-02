@@ -69,7 +69,9 @@ from nsmor.analysis.analysis_priors import (
     describe_analysis_population, load_analysis_priors, population_for_output,
 )
 from nsmor.pipeline.nested_prior import load_dataset_with_fingerprint
-from nsmor.analysis.prediction_units import load_model_from_checkpoint as _shared_load_model
+from nsmor.analysis.prediction_units import (
+    load_model_from_checkpoint as _shared_load_model, resolve_dt_ms,
+)
 from nsmor.model_utils import validate_dataset_provenance
 from nsmor.nsmor_dataloader import NSMoRDataset
 from nsmor.pipeline.conditions import derive_stimulus_metadata
@@ -147,7 +149,9 @@ def load_model_and_dataset(
         raise FileNotFoundError(f"Dataset not found: {dataset_path}")
 
     logger.info("Loading dataset from %s", dataset_path)
-    dataset, loaded_source_fingerprint = load_dataset_with_fingerprint(dataset_path)
+    dataset, loaded_source_fingerprint = load_dataset_with_fingerprint(
+        dataset_path, expected_dt_ms=resolve_dt_ms(model), restore_provenance=False,
+    )
 
     # Round-2 CRITICAL-A: refuse pre-2.0 datasets (leaked priors, np.max labels)
     validate_dataset_provenance(dataset, Path(dataset_path))
@@ -230,7 +234,7 @@ def load_model_and_dataset(
         bio_dataset,
         batch_size=batch_size,
         shuffle=False,  # Required for deterministic ordering
-        num_workers=-1,  # Auto-scale based on dataset size
+        num_workers=0,  # Whole corpus is already resident; workers only replicate it
     )
 
     return model, dataloader, labels, is_pure_wind, stimulus_conditions

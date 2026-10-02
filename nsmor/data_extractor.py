@@ -44,7 +44,15 @@ def _compute_pure_wind_prepend_frames(dt_ms: float) -> int:
     return int(round(5700.0 / dt_ms))
 
 
-# Pure-wind prepended baseline: 5.7 s × 100 Hz = 570 frames (default / backward compat)
+# Pure-wind prepended baseline: 5.7 s × 100 Hz = 570 frames.
+# This constant is a LEGACY default for the original 100 Hz grid only.
+# The active code paths (``extract_trial_sequence`` below, plus
+# ``prepare_data``/``prepare_metadata``/``lazy_dataloader``/
+# ``simulate_autoregressive``) all call
+# :func:`_compute_pure_wind_prepend_frames` with the trial's actual
+# ``dt_ms``, so the prepend length is dynamic (e.g. 1425 frames at
+# 4 ms).  The constant is retained for backward-compatible imports and
+# is not the operative value at any non-100 Hz sampling interval.
 PURE_WIND_PREPEND_FRAMES: int = 570
 
 

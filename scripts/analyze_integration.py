@@ -196,7 +196,12 @@ def load_dataset(
         raise FileNotFoundError(f"Dataset not found: {dataset_path}")
 
     logger.info("Loading dataset from %s", dataset_path)
-    dataset, loaded_source_fingerprint = load_dataset_with_fingerprint(dataset_path)
+    dataset, loaded_source_fingerprint = load_dataset_with_fingerprint(
+        dataset_path, restore_provenance=False,
+        expected_dt_ms=(
+            resolve_dt_ms(checkpoint_model) if checkpoint_model is not None else None
+        ),
+    )
 
     # Round-2 CRITICAL-A: refuse pre-2.0 datasets (leaked priors, np.max labels)
     validate_dataset_provenance(dataset, Path(dataset_path))
@@ -249,7 +254,7 @@ def load_dataset(
         bio_dataset,
         batch_size=batch_size,
         shuffle=False,  # Preserve ordering for condition matching
-        num_workers=-1,  # Auto-scale based on dataset size
+        num_workers=0,  # Whole corpus is already resident; workers only replicate it
     )
 
     lengths_list = [int(l) for l in lengths]
@@ -640,7 +645,10 @@ def compute_condition_statistics(
 
     Returns:
         Dictionary with keys ``"latency"`` and ``"peak_velocity"``,
-        each containing ``{"mean": float, "sem": float, "n": int}``.
+        each containing ``{"mean": float|None, "sem": float|None,
+        "n": int}``.  ``sem`` is ``None`` when fewer than two finite
+        observations are available (a single trial has no estimable
+        standard error; reporting 0.0 would fabricate precision).
     """
     stats: Dict[str, Dict[str, float]] = {}
 
@@ -649,7 +657,7 @@ def compute_condition_statistics(
         valid = arr[np.isfinite(arr)]
         n = len(valid)
         mean = float(np.mean(valid)) if n > 0 else None
-        sem = float(np.std(valid, ddof=1) / np.sqrt(n)) if n > 1 else 0.0 if n else None
+        sem = float(np.std(valid, ddof=1) / np.sqrt(n)) if n > 1 else None
 
         # Map metric names
         if metric_name == "latencies":
@@ -726,11 +734,13 @@ def create_integration_figure(
     setup_lancet_style()
 
     # ── Prepare data for plotting ─────────────────────────────
-    # Every observed condition is included. X coordinates for
-    # multisensory_ttc_* groups are derived from the dynamic group name
-    # itself (e.g. -225/-261/-308), not a hardcoded expected-condition
-    # list. Conditions without a parseable TTC stay explicit (logged
-    # skip reason) and are never given a fabricated x coordinate.
+    # X coordinates for multisensory_ttc_* groups are derived from the
+    # dynamic group name itself (e.g. -225/-261/-308), not a hardcoded
+    # expected-condition list. Conditions without a parseable wind
+    # delta_t stay explicit (logged skip reason) and are never given a
+    # fabricated x coordinate. The visual-only group has no wind onset
+    # time, so it never enters the wind delta-t response series; it is
+    # reported only as a separate no-wind reference line below.
     observed = list(condition_stats.keys())
     skipped_conds: Dict[str, str] = {}
 
@@ -743,44 +753,80 @@ def create_integration_figure(
 
     for cond in observed:
         stats = condition_stats[cond]
-        latency = stats.get("latency", {"mean": 0.0, "sem": 0.0, "n": 0})
-        velocity = stats.get("peak_velocity", {"mean": 0.0, "sem": 0.0, "n": 0})
+        latency = stats.get("latency", {"mean": 0.0, "sem": None, "n": 0})
+        velocity = stats.get("peak_velocity", {"mean": 0.0, "sem": None, "n": 0})
         if latency["n"] == 0:
             skipped_conds[cond] = "latency n==0"
             logger.warning("No data for condition '%s', skipping.", cond)
             continue
 
-        if cond == "visual_only":
-            # Visual-Only is the documented reference point at x=0 (no wind).
-            delta_t = 0.0
-        else:
-            parsed = parse_ttc_condition_delta(cond)
-            if parsed is None:
-                skipped_conds[cond] = "no parseable delta_t from condition name"
-                logger.warning(
-                    "Condition %r has no parseable delta_t; omitted from "
-                    "chronometric x-axis (explicit skip, not dropped silently).",
-                    cond,
-                )
-                continue
-            delta_t = float(parsed)
+        # Visual-only has no wind onset, so it has no wind delta_t. It must
+        # not be coerced to 0.0 (a fabricated wind-at-TTC point) nor connected
+        # to the wind response curve; it is a no-wind reference only. The
+        # same guard drops any other condition lacking a parseable wind
+        # delta_t (e.g. wind_only) from the wind axis explicitly.
+        parsed = parse_ttc_condition_delta(cond)
+        if parsed is None:
+            skipped_conds[cond] = "no wind delta_t from condition name"
+            logger.warning(
+                "Condition %r has no wind delta_t; omitted from the "
+                "chronometric x-axis as a separate no-wind reference "
+                "(explicit skip, not dropped silently).",
+                cond,
+            )
+            continue
+        delta_t = float(parsed)
 
         x_values.append(delta_t)
         latency_means.append(latency["mean"])
-        latency_sems.append(latency["sem"])
+        # A singleton group has no estimable SEM (None); plot no error bar
+        # (NaN) rather than a fabricated zero-length one.
+        latency_sems.append(
+            latency["sem"] if latency["sem"] is not None else float("nan")
+        )
         velocity_means.append(velocity["mean"])
-        velocity_sems.append(velocity["sem"])
+        velocity_sems.append(
+            velocity["sem"] if velocity["sem"] is not None else float("nan")
+        )
         cond_labels.append(cond)
 
     if not x_values:
+        # Remove only this run's target figure before failing closed so a
+        # stale figure cannot masquerade as the output of a run that
+        # produced no measurable latency curve.
+        Path(output_path).unlink(missing_ok=True)
         raise ValueError("Phase F unavailable: no measurable peak latencies in observed conditions")
 
-    # Convert to numpy arrays
+    # ── Order the wind response series by physical delta_t ────
+    # Dictionary insertion order reflects how conditions were observed,
+    # not the physical wind-onset axis. Plotting unsorted x values makes
+    # the connected response curve self-cross (e.g. x = [-261, -308,
+    # -373, -225]); the chronometric curve must be monotone in delta_t.
+    # Sort by numeric delta_t with a stable tie-break on the original
+    # index, and apply the same permutation to the paired latency and
+    # velocity means/errors so x/y/error stay jointly aligned. Conditions
+    # lacking a wind delta_t were already excluded above, so they never
+    # enter this permutation.
+    order = sorted(range(len(x_values)), key=lambda i: (x_values[i], i))
+    x_values = [x_values[i] for i in order]
+    latency_means = [latency_means[i] for i in order]
+    latency_sems = [latency_sems[i] for i in order]
+    velocity_means = [velocity_means[i] for i in order]
+    velocity_sems = [velocity_sems[i] for i in order]
+    cond_labels = [cond_labels[i] for i in order]
+
+    # Convert to numpy arrays. A single-trial group has no estimable SEM
+    # (None); plot no error bar for it (matplotlib skips NaN) rather than a
+    # fabricated zero-length bar.
     x_arr = np.array(x_values)
-    latency_mean_arr = np.array(latency_means)
-    latency_sem_arr = np.array(latency_sems)
-    velocity_mean_arr = np.array(velocity_means)
-    velocity_sem_arr = np.array(velocity_sems)
+    latency_mean_arr = np.array(latency_means, dtype=float)
+    latency_sem_arr = np.array(
+        [np.nan if s is None else s for s in latency_sems], dtype=float
+    )
+    velocity_mean_arr = np.array(velocity_means, dtype=float)
+    velocity_sem_arr = np.array(
+        [np.nan if s is None else s for s in velocity_sems], dtype=float
+    )
 
     # ── Get visual-only baseline values ───────────────────────
     # No fabricated 0.0 baseline when visual_only is absent: use NaN so
@@ -1000,6 +1046,15 @@ def export_integration_summary(
             % (analysis_population["evidence_scope"].replace("_", " ")
                if analysis_population is not None else "Population-unavailable descriptive"),
         ),
+        # Reported "sem" is the standard error across recorded trials
+        # within a condition. It is a descriptive trial-level dispersion,
+        # not an animal-level confidence interval: trials can share an
+        # animal, so it must not be read as population uncertainty.
+        "dispersion_definition": (
+            "sem = SD across recorded trials within a condition (ddof=1) "
+            "/ sqrt(n); descriptive trial-level dispersion, not an "
+            "animal-level confidence interval. null when n<2."
+        ),
         "inference": {
             "status": "descriptive_only",
             "effect_sizes": None,
@@ -1201,19 +1256,19 @@ def run_integration_analysis(
         stats = compute_condition_statistics(metrics)
         condition_stats[cond_name] = stats
 
-        # Log summary
+        # Log summary (a single trial has no estimable SEM; say so).
         if stats.get("latency", {}).get("n", 0) > 0:
             logger.info(
-                "    Latency: %.1f ± %.1f ms (n=%d)",
+                "    Latency: %.1f ± %s ms (n=%d)",
                 stats["latency"]["mean"],
-                stats["latency"]["sem"],
+                f"{stats['latency']['sem']:.1f}" if stats["latency"]["sem"] is not None else "unavailable",
                 stats["latency"]["n"],
             )
         if stats.get("peak_velocity", {}).get("n", 0) > 0:
             logger.info(
-                "    Peak Velocity: %.2f ± %.2f cm/s (n=%d)",
+                "    Peak Velocity: %.2f ± %s cm/s (n=%d)",
                 stats["peak_velocity"]["mean"],
-                stats["peak_velocity"]["sem"],
+                f"{stats['peak_velocity']['sem']:.2f}" if stats["peak_velocity"]["sem"] is not None else "unavailable",
                 stats["peak_velocity"]["n"],
             )
 

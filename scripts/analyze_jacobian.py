@@ -9,10 +9,10 @@ default — the "sustained" epoch hypothesis requires a behaviour that
 actually sustains locomotion.  ESCAPE trials may still be selected
 explicitly via ``--target_class 0``.
 
-Epochs relative to detected stimulus onset:
-  1. Early (Baseline):     onset - 1000ms
-  2. Transient (Burst):    onset
-  3. Sustained (Late Walk): onset + 1000ms
+Epochs relative to the observed wind onset or supplied visual collision reference:
+  1. Early (Baseline):      reference - 1000ms
+  2. Transient (Burst):     reference
+  3. Sustained (Late Walk): reference + 1000ms
 
 Slow-point search: For each epoch, a ±5-frame window is searched to
 find the frame that minimises kinetic energy ||h_{t+1} - h_t||₂.
@@ -55,7 +55,7 @@ import json
 import logging
 import math
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 # Direct CLI execution must use this checkout, including its prior/lineage helpers.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -197,6 +197,8 @@ def _calibrate_fp_threshold(
             "cannot calibrate the fixed-point gate."
         )
     r = np.asarray(residuals, dtype=np.float64)
+    if r.ndim != 1 or not np.all(np.isfinite(r)) or np.any(r <= 0):
+        raise ValueError(f"[{context}] residuals must be finite, positive and 1-D")
     # Log-transform: residuals are strictly positive and typically
     # right-skewed; the mixture structure lives in log space.
     x_log = np.log(r)[:, None]
@@ -243,33 +245,15 @@ def _calibrate_fp_threshold(
     mu_lo, mu_hi = float(means[lo_idx]), float(means[hi_idx])
     s_lo = float(np.sqrt(gm2.covariances_[lo_idx, 0, 0]))
     s_hi = float(np.sqrt(gm2.covariances_[hi_idx, 0, 0]))
-    # Quadratic from expanding the two log-densities; take the root
-    # BETWEEN the two means.
-    a = 0.5 / s_hi**2 - 0.5 / s_lo**2
-    b = mu_lo / s_lo**2 - mu_hi / s_hi**2
-    c = (
-        0.5 * mu_hi**2 / s_hi**2 - 0.5 * mu_lo**2 / s_lo**2
-        + np.log(s_lo / s_hi) - np.log(w_lo / gm2.weights_[hi_idx])
+    boundary_log = _gmm_posterior_half_boundary_log(
+        mu_lo, s_lo, w_lo, mu_hi, s_hi, float(gm2.weights_[hi_idx]), context,
     )
-    if abs(a) < 1e-12:
-        boundary_log = -c / b
-    else:
-        disc = b * b - 4 * a * c
-        if disc < 0:
-            raise ValueError(
-                f"[{context}] GMM components too separated to admit a "
-                f"posterior boundary — degenerate fit."
-            )
-        roots = ((-b - np.sqrt(disc)) / (2 * a),
-                 (-b + np.sqrt(disc)) / (2 * a))
-        between = [rt for rt in roots if mu_lo <= rt <= mu_hi]
-        if not between:
-            raise ValueError(
-                f"[{context}] no GMM posterior boundary between the "
-                f"component means — degenerate fit."
-            )
-        boundary_log = float(between[0])
 
+    diag.update(
+        low_mean_log=mu_lo, high_mean_log=mu_hi,
+        low_sigma_log=s_lo, high_sigma_log=s_hi,
+        high_component_weight=float(gm2.weights_[hi_idx]),
+    )
     threshold = float(np.exp(boundary_log))
     diag["fp_threshold"] = threshold
 
@@ -287,6 +271,99 @@ def _calibrate_fp_threshold(
         context, threshold, bic1, bic2, w_lo,
     )
     return threshold, diag
+
+
+def _gmm_posterior_half_boundary_log(
+    mu_lo: float,
+    sigma_lo: float,
+    weight_lo: float,
+    mu_hi: float,
+    sigma_hi: float,
+    weight_hi: float,
+    context: str = "",
+) -> float:
+    """Return the log-residual where the two GMM posteriors are equal.
+
+    The equality is between the *weighted* Gaussian densities.  Keeping this
+    calculation separate makes the prior/variance terms auditable and avoids
+    silently selecting a boundary for the unweighted component densities.
+    """
+    values = (mu_lo, sigma_lo, weight_lo, mu_hi, sigma_hi, weight_hi)
+    if not all(np.isfinite(value) for value in values):
+        raise ValueError(f"[{context}] non-finite GMM boundary parameters")
+    if sigma_lo <= 0.0 or sigma_hi <= 0.0 or weight_lo <= 0.0 or weight_hi <= 0.0:
+        raise ValueError(f"[{context}] invalid GMM boundary scale or weight")
+    if mu_lo >= mu_hi:
+        raise ValueError(f"[{context}] low GMM mean must precede high mean")
+
+    # log(w_lo N_lo) - log(w_hi N_hi) = 0, expanded as a*x²+b*x+c.
+    a = 0.5 / sigma_hi**2 - 0.5 / sigma_lo**2
+    b = mu_lo / sigma_lo**2 - mu_hi / sigma_hi**2
+    c = (
+        0.5 * mu_hi**2 / sigma_hi**2
+        - 0.5 * mu_lo**2 / sigma_lo**2
+        + np.log(weight_lo / weight_hi)
+        + np.log(sigma_hi / sigma_lo)
+    )
+    if abs(a) < 1e-12:
+        if abs(b) < 1e-12:
+            raise ValueError(f"[{context}] GMM components have no unique boundary")
+        roots = [-c / b]
+    else:
+        discriminant = b * b - 4.0 * a * c
+        if discriminant < 0.0:
+            raise ValueError(
+                f"[{context}] GMM components too separated to admit a "
+                "posterior boundary — degenerate fit."
+            )
+        sqrt_discriminant = np.sqrt(discriminant)
+        roots = [
+            (-b - sqrt_discriminant) / (2.0 * a),
+            (-b + sqrt_discriminant) / (2.0 * a),
+        ]
+
+    between = [root for root in roots if mu_lo <= root <= mu_hi]
+    if not between:
+        raise ValueError(
+            f"[{context}] no GMM posterior boundary between the component means "
+            "— degenerate fit."
+        )
+    # In the usual two-component fit there is one crossing in this interval.
+    # If unequal variances create two, use the crossing nearest the midpoint;
+    # it is the boundary between the component means rather than a tail
+    # crossing.
+    return float(min(between, key=lambda root: abs(root - (mu_lo + mu_hi) / 2.0)))
+
+
+def _posterior_keep(
+    residuals: np.ndarray, threshold: float, diagnostics: Dict[str, Any],
+) -> np.ndarray:
+    """Accept the fitted low-component posterior, including unequal-width tails."""
+    if "low_mean_log" not in diagnostics:
+        return residuals < threshold
+    x = np.log(residuals)
+    lo = (
+        np.log(diagnostics["low_component_weight"] / diagnostics["low_sigma_log"])
+        - 0.5 * ((x - diagnostics["low_mean_log"])
+                 / diagnostics["low_sigma_log"]) ** 2
+    )
+    hi = (
+        np.log(diagnostics["high_component_weight"] / diagnostics["high_sigma_log"])
+        - 0.5 * ((x - diagnostics["high_mean_log"])
+                 / diagnostics["high_sigma_log"]) ** 2
+    )
+    return (lo > hi) & (residuals < FP_RESIDUAL_THRESHOLD_CAP)
+
+
+def _sample_indices(n_states: int, cap: int, seed: int) -> torch.Tensor:
+    """Select a capped CPU subset without consuming the caller's RNG."""
+    if cap <= 0:
+        raise ValueError("max_states_per_epoch must be positive")
+    if n_states <= cap:
+        return torch.arange(n_states)
+    return torch.randperm(
+        n_states, generator=torch.Generator().manual_seed(seed),
+    )[:cap]
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -342,7 +419,12 @@ def load_dataset(
         raise FileNotFoundError(f"Dataset not found: {dataset_path}")
 
     logger.info("Loading dataset from %s", dataset_path)
-    dataset, loaded_source_fingerprint = load_dataset_with_fingerprint(dataset_path)
+    dataset, loaded_source_fingerprint = load_dataset_with_fingerprint(
+        dataset_path, restore_provenance=False,
+        expected_dt_ms=(
+            resolve_dt_ms(checkpoint_model) if checkpoint_model is not None else None
+        ),
+    )
 
     # Round-2 CRITICAL-A: refuse pre-2.0 datasets (leaked priors, np.max labels)
     validate_dataset_provenance(dataset, Path(dataset_path))
@@ -387,6 +469,46 @@ def load_dataset(
         anchor_frames=anchor_frames,
     )
 
+    bio_dataset.trial_ids = dataset.get("trial_ids")
+    bio_dataset.session_ids = dataset.get("session_ids")
+    # Producer anchors are model-grid references, not new source observations.
+    # For visual-only trials an explicit anchor means collision, not onset.
+    from nsmor.pipeline.conditions import resolve_anchor_crop
+    detected = detect_stimulus_onset_frames(X_seqs)
+    explicit_anchors = dataset.get("anchor_frames")
+    analysis_references: List[Optional[int]] = []
+    analysis_rules: List[str] = []
+    for i, x_seq in enumerate(X_seqs):
+        x_array = np.asarray(x_seq)
+        valid_length = int(lengths[i])
+        wind_indices = np.flatnonzero(x_array[:valid_length, 1] > 0.5)
+        visual_present = bool(np.any(np.abs(x_array[:valid_length, 0]) > 1e-6))
+        if wind_indices.size:
+            raw_reference: Optional[int] = int(wind_indices[0])
+            rule = "wind_onset"
+        elif visual_present and explicit_anchors is not None:
+            raw_reference = explicit_anchors[i]
+            rule = "looming_collision" if raw_reference is not None else "unavailable"
+        elif visual_present:
+            raw_reference = detected[i]
+            rule = "visual_onset" if raw_reference is not None else "unavailable"
+        else:
+            raw_reference = None
+            rule = "unavailable"
+        if raw_reference is None:
+            analysis_references.append(None)
+        else:
+            raw_reference = _validate_analysis_reference(raw_reference, valid_length, i)
+            start, _end = resolve_anchor_crop(
+                n_frames=len(x_array), anchor_frame=bio_dataset.anchor_frames[i],
+                max_seq_len=bio_dataset.max_seq_len,
+                pre_anchor_frames=bio_dataset.pre_anchor_frames,
+            )
+            mapped_reference = raw_reference - start
+            analysis_references.append(mapped_reference)
+        analysis_rules.append(rule)
+    bio_dataset.analysis_reference_frames = analysis_references
+    bio_dataset.analysis_reference_rules = analysis_rules
     bio_dataset.analysis_population = describe_analysis_population(
         n_total, val_indices, bio_dataset.source_indices,
         getattr(checkpoint_model, "analysis_validation_scope", None),
@@ -395,7 +517,7 @@ def load_dataset(
         bio_dataset,
         batch_size=batch_size,
         shuffle=False,  # Preserve ordering for label matching
-        num_workers=-1,  # Auto-scale based on dataset size
+        num_workers=0,  # Whole corpus is already resident; workers only replicate it
     )
 
     lengths_list = [int(l) for l in lengths]
@@ -410,7 +532,7 @@ def detect_stimulus_onset_frames(
     X_seqs: List[np.ndarray],
     dt_ms: float = 10.0,
     threshold: float = 1e-6,
-) -> List[int]:
+) -> List[Optional[int]]:
     """
     Detect the stimulus onset frame for each trial from the data.
 
@@ -430,41 +552,23 @@ def detect_stimulus_onset_frames(
             considered zero.
 
     Returns:
-        List of frame indices (one per sequence).  Falls back to
-        200 when no onset is detected (e.g. fully padded sequences).
+        List of frame indices (one per sequence).  A sequence without an
+        observed visual or wind onset returns ``None`` so downstream analyses
+        can fail closed instead of inventing a frame-zero reference.
     """
-    default_onset = 200  # Fallback for degenerate sequences
-    onset_frames: List[int] = []
-
+    onset_frames: List[Optional[int]] = []
     for i, X in enumerate(X_seqs):
-        T_i = X.shape[0]
-        visual = np.abs(X[:, 0])   # v_vis(t)
-        wind = np.abs(X[:, 1])     # wind(t)
-
-        # First frame where either sensory channel is non-zero
-        nonzero_mask = (visual > threshold) | (wind > threshold)
-        nonzero_indices = np.where(nonzero_mask)[0]
-
-        if len(nonzero_indices) > 0:
-            onset_frames.append(int(nonzero_indices[0]))
+        assert X.ndim == 2 and X.shape[1] == 8, f"Trial {i}: {X.shape}"
+        wind = np.flatnonzero(X[:, 1] > 0.5)
+        visual_active = np.abs(X[:, 0]) > threshold
+        if wind.size:
+            onset_frames.append(int(wind[0]))
+        elif visual_active.size and not visual_active[0] and visual_active.any():
+            onset_frames.append(int(np.flatnonzero(visual_active)[0]))
         else:
-            logger.warning(
-                "Trial %d: no non-zero sensory channel detected "
-                "(length=%d). Using default onset frame %d.",
-                i, T_i, default_onset,
-            )
-            onset_frames.append(default_onset)
-
-    # Log statistics
-    onset_arr = np.array(onset_frames)
-    logger.info(
-        "Detected stimulus onset frames: mean=%.1f, std=%.1f, "
-        "min=%d, max=%d (N=%d)",
-        onset_arr.mean(), onset_arr.std(),
-        int(onset_arr.min()), int(onset_arr.max()),
-        len(onset_frames),
-    )
-
+            # An active visual baseline does not reveal looming onset/collision.
+            onset_frames.append(None)
+            logger.warning("Trial %d: stimulus reference unavailable.", i)
     return onset_frames
 
 
@@ -540,15 +644,192 @@ def _fixed_point_residual(
     return residual
 
 
+def _validate_analysis_reference(
+    reference: Optional[int],
+    n_frames: int,
+    trial_index: int,
+) -> int:
+    """Validate one supplied reference without inventing a fallback."""
+    if reference is None or isinstance(reference, (bool, np.bool_)):
+        raise ValueError(
+            f"Trial {trial_index}: analysis reference unavailable; "
+            "cannot select Jacobian epochs."
+        )
+    if not isinstance(reference, (int, np.integer)):
+        raise ValueError(
+            f"Trial {trial_index}: analysis reference unavailable; "
+            f"expected an integer, got {reference!r}."
+        )
+    frame = int(reference)
+    if frame < 0 or frame >= n_frames:
+        raise ValueError(
+            f"Trial {trial_index}: analysis reference unavailable; "
+            f"frame {frame} is outside [0, {n_frames})."
+        )
+    return frame
+
+
+def _reference_in_batch_coordinates(
+    reference: Optional[int],
+    dataset: Any,
+    trial_index: int,
+    batch_length: int,
+) -> int:
+    """Map a raw trial reference through the dataset's shared crop window."""
+    analysis_references = getattr(dataset, "analysis_reference_frames", None)
+    if analysis_references is not None:
+        if trial_index >= len(analysis_references):
+            raise ValueError(
+                f"Trial {trial_index}: analysis reference unavailable; "
+                "reference sidecar is misaligned."
+            )
+        mapped = analysis_references[trial_index]
+        return _validate_analysis_reference(mapped, batch_length, trial_index)
+
+    sequences = getattr(dataset, "sequences", None)
+    if sequences is None or trial_index >= len(sequences):
+        raise ValueError(
+            f"Trial {trial_index}: analysis reference unavailable; "
+            "dataset sequence metadata is missing."
+        )
+    x_raw = sequences[trial_index][0]
+    # Minimal test/custom loaders may only supply batch tensors.
+    raw_length = int(x_raw.shape[0]) if x_raw is not None else batch_length
+    raw_reference = _validate_analysis_reference(reference, raw_length, trial_index)
+    from nsmor.pipeline.conditions import resolve_anchor_crop
+
+    anchors = getattr(dataset, "anchor_frames", None)
+    anchor = anchors[trial_index] if anchors is not None else None
+    start, end = resolve_anchor_crop(
+        n_frames=raw_length,
+        anchor_frame=anchor,
+        max_seq_len=getattr(dataset, "max_seq_len", None),
+        pre_anchor_frames=int(getattr(dataset, "pre_anchor_frames", 0)),
+    )
+    if end - start != batch_length:
+        raise ValueError(
+            f"Trial {trial_index}: analysis reference unavailable; "
+            f"crop metadata length {end - start} != batch length {batch_length}."
+        )
+    return _validate_analysis_reference(
+        raw_reference - start, batch_length, trial_index,
+    )
+
+
+def _epoch_reference_frame(
+    dataset: Any,
+    trial_index: int,
+    x_trial: torch.Tensor,
+    onset_frames: Sequence[Optional[int]],
+) -> int:
+    """Prefer original references; never replace them with a later cropped pulse."""
+    length_i = x_trial.shape[0]
+    assert x_trial.shape == (length_i, 8), f"Trial {trial_index}: {x_trial.shape}"
+    if (getattr(dataset, "analysis_reference_frames", None) is not None
+            or len(onset_frames) > 0):
+        reference = (onset_frames[trial_index]
+                     if trial_index < len(onset_frames) else None)
+        return _reference_in_batch_coordinates(
+            reference, dataset, trial_index, length_i,
+        )
+    # Legacy loaders without references may use the original observed wind.
+    sequences = getattr(dataset, "sequences", None)
+    x_raw = (sequences[trial_index][0]
+             if sequences is not None and trial_index < len(sequences) else None)
+    wind = (np.asarray(x_raw)[:, 1] if x_raw is not None
+            else x_trial[:, 1].detach().cpu().numpy())
+    wind_indices = np.flatnonzero(wind > 0.5)
+    if wind_indices.size and int(wind_indices[0]) > 0:
+        return _reference_in_batch_coordinates(
+            int(wind_indices[0]), dataset, trial_index, length_i,
+        )
+    raise ValueError(f"Trial {trial_index}: analysis reference unavailable")
+
+
+def _trial_identity(
+    dataset: Any, trial_index: int, epoch_name: str, frame: int,
+) -> Dict[str, Any]:
+    """Return only available provenance for one candidate state."""
+    source_indices = getattr(dataset, "source_indices", None)
+    row = int(source_indices[trial_index]) if source_indices is not None else trial_index
+    identity = {
+        "candidate_id": f"{epoch_name}:{row}:{frame}",
+        "source_row_index": row, "epoch": epoch_name, "frame": int(frame),
+    }
+    for sidecar, field in (("trial_ids", "source_trial_id"),
+                           ("session_ids", "session_id")):
+        values = getattr(dataset, sidecar, None)
+        if values is not None and trial_index < len(values):
+            value = values[trial_index]
+            if value is not None:
+                identity[field] = value.item() if isinstance(value, np.generic) else value
+    return identity
+
+
+def _reconstruct_gru_input(
+    model: Any,
+    X_batch: torch.Tensor,
+    lengths: torch.Tensor,
+) -> torch.Tensor:
+    """Reconstruct the exact per-frame input the GRU cell received.
+
+    For a real :class:`NSMoRCore` the GRU input is produced by the
+    ``FrontendEncoder`` (dendritic IIR on the visual channels followed by
+    the ``SensoryEncoder``), *not* by ``sensory_encoder`` alone.  Route
+    through ``model.frontend`` so the reconstruction matches
+    ``forward()`` when dendritic filtering is enabled; legacy probe
+    models without a ``.frontend`` fall back to
+    ``model.sensory_encoder``.
+
+    ``FrontendEncoder`` keeps a module-level ``_dendritic_state`` cache
+    that leaks ACROSS forward calls when dendritic filtering is enabled
+    (Round-1 BLOCKER-2 item 3).  It is reset before re-encoding so the
+    filter history starts from the sequence start, matching the original
+    forward.  The reset is also required for correctness even without
+    dendritic filtering, because it restores the documented
+    "starts-from-zero at each sequence" contract.
+
+    Args:
+        model: Trained model exposing ``sensory_dim`` and either
+            ``frontend`` or ``sensory_encoder``.
+        X_batch: ``(B, T, D_total)`` padded feature tensor.
+        lengths: ``(B,)`` true sequence lengths.
+
+    Returns:
+        ``(B, T, H)`` sensory encoding fed to the GRU.
+
+    Raises:
+        AssertionError: If the reconstructed shape does not match
+            ``(B, T, H)``.
+    """
+    B, T, _ = X_batch.shape
+    sensory_x = X_batch[:, :, :model.sensory_dim]  # (B, T, D_sensory)
+    frontend = getattr(model, "frontend", None)
+    if frontend is not None:
+        if getattr(frontend, "_dendritic_enabled", False):
+            frontend._dendritic_state = None
+        e_sensory = frontend(sensory_x, lengths)     # (B, T, H)
+    else:
+        if getattr(model.sensory_encoder, "_dendritic_enabled", False):
+            model.sensory_encoder._dendritic_state = None
+        e_sensory = model.sensory_encoder(sensory_x)  # (B, T, H)
+    H = e_sensory.shape[-1]
+    assert e_sensory.shape == (B, T, H), (
+        f"Reconstructed e_sensory shape {tuple(e_sensory.shape)} "
+        f"!= (B={B}, T={T}, H={H})"
+    )
+    return e_sensory
+
+
 def extract_gru_states_at_epochs(
     model: NSMoRCore,
     dataloader: torch.utils.data.DataLoader,
     device: torch.device,
-    onset_frames: List[int],
+    onset_frames: List[Optional[int]],
     target_class: int = Label.PREWALK.value,
     dt_ms: Optional[float] = None,
     adapter: Optional[FixedPointAdapter] = None,
-) -> Dict[str, Tuple[torch.Tensor, torch.Tensor]]:
+) -> Dict[str, Any]:
     """
     Extract GRU hidden states at specific trial epochs for a target class.
 
@@ -577,9 +858,13 @@ def extract_gru_states_at_epochs(
     never silently.
 
     The input passed to the Jacobian adapter is the **full sensory
-    encoding** ``e_sensory_t`` (dim H), i.e. the exact vector the
-    GRU cell receives at time *t*.  This captures the partial
-    derivative ∂h_{t+1}/∂h_t holding the GRU input fixed.
+    encoding** ``e_sensory_t`` (dim H) produced by the model's
+    ``frontend`` (dendritic IIR filtering when enabled, then the
+    sensory encoder) — the vector the GRU cell actually receives at
+    time *t*, reconstructed by :func:`_reconstruct_gru_input`.  For
+    legacy probe models without a ``.frontend`` it is the inner
+    ``sensory_encoder`` output.  This captures the partial derivative
+    ∂h_{t+1}/∂h_t holding the GRU input fixed.
 
     Args:
         model: Trained NSMoRCore model.
@@ -619,8 +904,12 @@ def extract_gru_states_at_epochs(
     epoch_inputs: Dict[str, List[torch.Tensor]] = {
         name: [] for name in EPOCH_DEFINITIONS
     }
-    n_candidates = 0
-    candidate_records: List[Tuple[str, torch.Tensor, torch.Tensor, float]] = []
+    by_epoch: Dict[str, List[
+        Tuple[torch.Tensor, torch.Tensor, float, Dict[str, Any]]
+    ]] = {name: [] for name in EPOCH_DEFINITIONS}
+    accepted_identities: Dict[str, List[Dict[str, Any]]] = {
+        name: [] for name in EPOCH_DEFINITIONS
+    }
 
     model.eval()
 
@@ -642,19 +931,9 @@ def extract_gru_states_at_epochs(
             H = gru_hidden.shape[2]
 
             # ── Task 2: Exact input reconstruction ─────────────
-            # The GRU cell receives e_sensory = sensory_encoder(X[:, :, :4]).
-            # We encode the FULL sensory slice so that x_t reflects
-            # the exact input the GRU saw at each frame.
-            #
-            # Round-1 BLOCKER-2 item 3: FrontendEncoder's dendritic IIR
-            # keeps a module-level cache (_dendritic_state) that leaks
-            # ACROSS forward calls when dendritic filtering is enabled.
-            # Reset it before re-encoding so the filter history starts
-            # from the sequence start, matching the original forward.
-            if getattr(model.sensory_encoder, "_dendritic_enabled", False):
-                model.sensory_encoder._dendritic_state = None
-            sensory_x = X_batch[:, :, :model.sensory_dim]  # (B, T, D_sensory)
-            e_sensory = model.sensory_encoder(sensory_x)    # (B, T, H)
+            # Rebuild the exact vector the GRU cell received at each
+            # frame (see :func:`_reconstruct_gru_input`).
+            e_sensory = _reconstruct_gru_input(model, X_batch, lengths)
 
             for i in range(B):
                 if global_idx >= len(dataloader.dataset):
@@ -668,9 +947,10 @@ def extract_gru_states_at_epochs(
 
                 length_i = int(lengths[i].item())
 
-                # Detect onset from the ACTUAL batch data (after cropping)
-                wind_channel = X_batch[i, :length_i, 1].cpu().numpy()
-                onset_frame = int(np.argmax(wind_channel > 0.5)) if np.any(wind_channel > 0.5) else 0
+                onset_frame = _epoch_reference_frame(
+                    dataloader.dataset, global_idx, X_batch[i, :length_i],
+                    onset_frames,
+                )
 
                 # ── Compute epoch centre frames ────────────────
                 for epoch_name, epoch_def in EPOCH_DEFINITIONS.items():
@@ -701,15 +981,13 @@ def extract_gru_states_at_epochs(
                         f"x_slow shape {tuple(x_slow.shape)} != (H={H},)"
                     )
 
-                    # ── Round-1 BLOCKER-2: fixed-point residual gate ──
-                    # Round-2 (Reviewer B M-2a): collect ALL candidates
-                    # first; the gate is calibrated from the pooled
-                    # residual distribution after the sweep.
-                    n_candidates += 1
+                    # Collect all candidates before calibrating each epoch's gate.
                     residual = _fixed_point_residual(adapter, h_slow, x_slow)
-                    candidate_records.append(
-                        (epoch_name, h_slow.cpu(), x_slow.cpu(), float(residual))
-                    )
+                    by_epoch[epoch_name].append((
+                        h_slow.cpu(), x_slow.cpu(), float(residual),
+                        _trial_identity(dataloader.dataset, global_idx,
+                                        epoch_name, slow_frame),
+                    ))
 
                 global_idx += 1
 
@@ -720,12 +998,7 @@ def extract_gru_states_at_epochs(
     # previous pooled threshold (a) crashed with NameError when zero
     # candidates were collected, and (b) applied one boundary across
     # epochs whose residual scales may differ by orders of magnitude.
-    gate_diagnostics: Dict[str, Dict[str, float]] = {}
-    by_epoch: Dict[str, List[Tuple[torch.Tensor, torch.Tensor, float]]] = {
-        name: [] for name in EPOCH_DEFINITIONS
-    }
-    for rec_epoch, h_slow, x_slow, residual in candidate_records:
-        by_epoch[rec_epoch].append((h_slow, x_slow, residual))
+    gate_diagnostics: Dict[str, Dict[str, Any]] = {}
 
     for epoch_name in EPOCH_DEFINITIONS:
         recs = by_epoch[epoch_name]
@@ -734,6 +1007,11 @@ def extract_gru_states_at_epochs(
                 "Epoch '%s': no slow-point candidates collected — "
                 "dropped (gate reason: no_candidates).", epoch_name,
             )
+            gate_diagnostics[epoch_name] = {
+                "gate_status": "unavailable", "reason": "no_candidates",
+                "n_candidates": 0, "n_accepted": 0, "n_rejected": 0,
+                "accepted_candidates": [],
+            }
             continue
 
         res_epoch = np.array([rec[2] for rec in recs])
@@ -750,41 +1028,49 @@ def extract_gru_states_at_epochs(
                 "candidates — %s",
                 epoch_name, len(recs), exc,
             )
+            gate_diagnostics[epoch_name] = {
+                "gate_status": "unavailable", "reason": str(exc),
+                "n_candidates": len(recs), "n_accepted": 0,
+                "n_rejected": len(recs), "accepted_candidates": [],
+            }
             continue
 
-        keep = res_epoch < fp_threshold
+        keep = _posterior_keep(res_epoch, fp_threshold, diag)
         n_rejected = int((~keep).sum())
         logger.info(
             "Epoch '%s': residual gate %.4g — %d accepted, %d rejected.",
             epoch_name, fp_threshold,
             int(keep.sum()), n_rejected,
         )
-        # Round-3 (Reviewer B CRITICAL-2.ii): threshold sensitivity —
-        # how stable is the accepted set under a ±25% gate shift?  If
-        # the accepted count swings wildly the spectral comparison
-        # between epochs is fragile and this is recorded.
+        # Preserve legacy scalar-cutoff counts, but distinguish this diagnostic
+        # from the fitted posterior accepted set (including unequal-width tails).
+        diag["acceptance_rule"] = (
+            "low_component_posterior > 0.5 and residual < residual_cap"
+        )
+        diag["residual_cap"] = FP_RESIDUAL_THRESHOLD_CAP
+        diag["threshold_sensitivity_status"] = (
+            "scalar_cutoff_diagnostic_not_posterior_gate_robustness"
+        )
+        diag["threshold_sensitivity_interpretation"] = (
+            "n_accept_at_75pct/n_accept_at_125pct count residual < scaled "
+            "fp_threshold only; they do not perturb the fitted posterior gate."
+        )
         for scale in (0.75, 1.25):
             n_alt = int((res_epoch < fp_threshold * scale).sum())
             diag[f"n_accept_at_{int(scale*100)}pct"] = float(n_alt)
-        if any(
-            diag.get(f"n_accept_at_{int(s*100)}pct", int(keep.sum()))
-            == 0
-            for s in (0.75, 1.25)
-        ):
-            logger.warning(
-                "Epoch '%s': accepted set is EMPTY at a ±25%% gate "
-                "shift — spectral statistics for this epoch are "
-                "threshold-fragile.", epoch_name,
-            )
-        for h_slow, x_slow, residual in recs:
-            if residual < fp_threshold:
+        for accepted, (h_slow, x_slow, residual, identity) in zip(keep, recs):
+            if accepted:
                 epoch_states[epoch_name].append(h_slow)
                 epoch_inputs[epoch_name].append(x_slow)
+                accepted_identities[epoch_name].append(identity)
+        diag["gate_status"] = "ok"
+        diag["n_candidates"] = len(recs)
+        diag["accepted_candidates"] = accepted_identities[epoch_name]
         diag["n_accepted"] = int(keep.sum())
         diag["n_rejected"] = n_rejected
         gate_diagnostics[epoch_name] = diag
 
-    result: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
+    result: Dict[str, Any] = {}
 
     for epoch_name in EPOCH_DEFINITIONS:
         if not epoch_states[epoch_name]:
@@ -816,7 +1102,7 @@ def extract_gru_states_at_epochs(
     # Round-3 (BLK-3A): attach per-epoch gate diagnostics under
     # dedicated keys so the caller can persist the calibration evidence.
     for epoch_name, diag in gate_diagnostics.items():
-        result[f"{epoch_name}__gate_diag"] = diag  # type: ignore[assignment]
+        result[f"{epoch_name}__gate_diag"] = diag
 
     return result
 
@@ -827,11 +1113,12 @@ def extract_gru_states_at_epochs(
 
 def compute_eigenvalues_at_epochs(
     adapter: FixedPointAdapter,
-    epoch_data: Dict[str, Tuple[torch.Tensor, torch.Tensor]],
+    epoch_data: Dict[str, Any],
     device: torch.device,
     max_states_per_epoch: int = 100,
-) -> Tuple[Dict[str, np.ndarray], Dict[str, Dict[str, float]],
-           Dict[str, Dict[str, float]]]:
+    sampling_seed: int = 42,
+) -> Tuple[Dict[str, np.ndarray], Dict[str, Dict[str, Any]],
+           Dict[str, Dict[str, Any]]]:
     """
     Compute Jacobian eigenvalues at each epoch.
 
@@ -845,12 +1132,19 @@ def compute_eigenvalues_at_epochs(
     Returns:
         ``(eigenvalue_results, attractor_stats, frozen_input_stats)``:
         - ``eigenvalue_results`` maps epoch name to complex eigenvalue
-          array (N, H).
+          array (N, H) for EVERY epoch whose own-input spectrum was
+          computed (accepted states).  It is retained as raw evidence;
+          the release gate in :func:`run_jacobian_analysis` is the sole
+          authority on which epochs may be published, because an epoch
+          present here may still be withheld by the frozen-input control.
         - ``attractor_stats`` maps epoch name to perturbation-response
           verification counts (Round-2 M-2c: persisted so the attractor
           claim can be audited alongside the spectra).
         - ``frozen_input_stats`` maps epoch name to frozen-input control
-          statistics (pass counts + spectral magnitudes).
+          status: ``{"status": "ok", ...}`` for epochs verified under the
+          common pooled-median map, or ``{"status": "withheld", ...}``
+          (with a reason, finite residual diagnostics and pass counts)
+          for epochs whose control failed.
     """
     logger.info("Computing Jacobian eigenvalues at each epoch...")
 
@@ -868,14 +1162,17 @@ def compute_eigenvalues_at_epochs(
     # * The verified subset is drawn RANDOMLY (seeded) rather than
     #   taking the first min(10, N) states, which inherited
     #   batch-ordering selection bias.
-    attractor_stats: Dict[str, Dict[str, float]] = {}
-    rng_check = np.random.default_rng(42)
+    attractor_stats: Dict[str, Dict[str, Any]] = {}
+    rng_check = np.random.default_rng(sampling_seed)
     # Round-3 (BLK-3A): skip gate-diagnostic entries — epoch_data now
     # carries "<epoch>__gate_diag" keys alongside state tensors.
     state_epochs = {
         name: val for name, val in epoch_data.items()
-        if not name.endswith("__gate_diag")
+        if not name.endswith("__gate_diag") and val[0].shape[0] > 0
     }
+    if not state_epochs:
+        raise ValueError("GRU eigenvalue spectrum unavailable: no accepted states")
+    _sample_indices(0, max_states_per_epoch, sampling_seed)
     for epoch_name, (h_states_v, x_inputs_v) in state_epochs.items():
         Nv = h_states_v.shape[0]
         n_check = min(10, Nv)
@@ -887,11 +1184,23 @@ def compute_eigenvalues_at_epochs(
             )
             if is_att:
                 ep_verified += 1
+        gate = epoch_data.get(f"{epoch_name}__gate_diag", {})
+        identities = gate.get("accepted_candidates")
         attractor_stats[epoch_name] = {
             "n_tested": int(n_check),
             "n_verified": int(ep_verified),
             "fraction": float(ep_verified / n_check) if n_check else 0.0,
+            "sampling_seed": sampling_seed,
+            "attractor_state_indices": [int(i) for i in check_idx],
+            **{key: gate[key] for key in ("n_candidates", "n_accepted", "n_rejected")
+               if key in gate},
         }
+        if identities is not None:
+            if len(identities) != Nv:
+                raise ValueError("Accepted candidate identifiers are misaligned")
+            attractor_stats[epoch_name]["attractor_candidates"] = [
+                identities[int(i)] for i in check_idx
+            ]
         # Round-3 (Reviewer B MINOR-3): n=10 cannot support a bare
         # fraction claim — attach a Wilson score interval (Wilson 1927)
         # so the reported proportion carries its sampling uncertainty.
@@ -927,15 +1236,17 @@ def compute_eigenvalues_at_epochs(
             epoch_name, N, H, max_states_per_epoch,
         )
 
-        # Subsample if too many states
-        if N > max_states_per_epoch:
-            indices = torch.randperm(N)[:max_states_per_epoch]
-            h_sub = h_states[indices]
-            x_sub = x_inputs[indices]
-            logger.info("    Subsampled to %d states.", max_states_per_epoch)
-        else:
-            h_sub = h_states
-            x_sub = x_inputs
+        indices = _sample_indices(N, max_states_per_epoch, sampling_seed)
+        h_sub, x_sub = h_states[indices], x_inputs[indices]
+        assert h_sub.shape == x_sub.shape == (len(indices), H)
+        stats = attractor_stats[epoch_name]
+        stats["n_sampled"] = len(indices)
+        stats["selected_state_indices"] = indices.tolist()
+        identities = epoch_data.get(f"{epoch_name}__gate_diag", {}).get(
+            "accepted_candidates",
+        )
+        if identities is not None:
+            stats["selected_candidates"] = [identities[i] for i in indices.tolist()]
 
         N_sub = h_sub.shape[0]
 
@@ -992,17 +1303,12 @@ def compute_eigenvalues_at_epochs(
 
         eigenvalue_results[epoch_name] = epoch_eigvals
 
-        # ── Log summary statistics ────────────────────────────
-        real_parts = np.real(epoch_eigvals.flatten())
-        imag_parts = np.imag(epoch_eigvals.flatten())
-        magnitudes = np.abs(epoch_eigvals.flatten())
-
-        logger.info(
-            "    Eigenvalue stats: |λ|_mean=%.4f, |λ|_max=%.4f, "
-            "Re(λ)_mean=%.4f, Im(λ)_mean=%.4f",
-            np.mean(magnitudes), np.max(magnitudes),
-            np.mean(real_parts), np.mean(imag_parts),
-        )
+        # NOTE (release-audit fix): own-input eigenvalue statistics are
+        # deliberately NOT logged here.  At this point the frozen-input
+        # control has not yet run, so an epoch may still be withheld;
+        # logging its magnitudes would leak unverified spectra into
+        # run.log even when the control later fails.  Magnitudes are
+        # emitted only after the control gate, for controlled epochs.
 
     # ── Round-1 fix (Reviewer B MAJOR-1): frozen-input control ──
     # Re-evaluate every epoch's states under ONE common input (the
@@ -1018,95 +1324,113 @@ def compute_eigenvalues_at_epochs(
     # reported.  Without this, frozen-input spectra of transient states
     # would invite exactly the misreading the control was designed to
     # rule out.
-    frozen_input_stats: Dict[str, Dict[str, float]] = {}
-    if state_epochs:
-        all_x = torch.cat(
-            [x for (_h, x) in state_epochs.values() if x.shape[0] > 0], dim=0,
-        )
-        x_frozen = all_x.median(dim=0).values.to(device)  # (H,)
-        logger.info(
-            "Frozen-input control: re-evaluating spectra under the "
-            "pooled-median e_sensory (input dependence removed); "
-            "states re-gated against the frozen map."
-        )
-        for epoch_name, (h_states_c, _x_inputs_c) in state_epochs.items():
-            N_c = h_states_c.shape[0]
-            if N_c == 0:
-                continue
+    frozen_input_stats: Dict[str, Dict[str, Any]] = {}
+    all_x = torch.cat([x for (_h, x) in state_epochs.values()], dim=0)
+    x_frozen = all_x.median(dim=0).values.to(device)  # (H,)
+    logger.info(
+        "Frozen-input control: re-evaluating spectra under the "
+        "pooled-median e_sensory (input dependence removed); "
+        "states re-gated against the frozen map."
+    )
+    for epoch_name, (h_states_c, _x_inputs_c) in state_epochs.items():
+        N_c = h_states_c.shape[0]
 
-            # Re-check quasi-fixed-point residuals under the frozen map.
-            # Round-3 (B-CRIT-2): the frozen map is a DIFFERENT map from
-            # the one each state's gate was calibrated on, so its
-            # residuals get their OWN GMM+BIC calibration.  The Round-2
-            # code referenced a loop-local fp_threshold here that no
-            # longer existed after the Round-3 per-epoch refactor — a
-            # latent NameError, not a gate.  If the frozen-map residual
-            # distribution shows no bimodal structure the spectrum is
-            # withheld with the recorded reason.
-            res_frozen = []
-            for hi in range(N_c):
-                res_frozen.append(float(_fixed_point_residual(
-                    adapter, h_states_c[hi].to(device), x_frozen,
-                )))
-            res_frozen = np.array(res_frozen)
-            try:
-                frozen_threshold, frozen_diag = _calibrate_fp_threshold(
-                    res_frozen,
-                    context=f"frozen-input {epoch_name}",
-                )
-            except ValueError as exc:
-                logger.warning(
-                    "    [frozen-input] %s: re-gate failed — %s "
-                    "(spectrum withheld).",
-                    epoch_name, exc,
-                )
-                frozen_input_stats[epoch_name] = {
-                    "n_pass": 0, "n_total": int(N_c),
-                    "gate_status": 0.0,
-                }
-                continue
-            keep_mask = res_frozen < frozen_threshold
-            logger.info(
-                "    [frozen-input] %s: %d/%d states pass the residual "
-                "gate under the frozen map (median residual %.4f).",
-                epoch_name, int(keep_mask.sum()), N_c,
-                float(np.median(res_frozen)),
+        # Re-check quasi-fixed-point residuals under the frozen map.
+        # Round-3 (B-CRIT-2): the frozen map is a DIFFERENT map from
+        # the one each state's gate was calibrated on, so its
+        # residuals get their OWN GMM+BIC calibration.  The Round-2
+        # code referenced a loop-local fp_threshold here that no
+        # longer existed after the Round-3 per-epoch refactor — a
+        # latent NameError, not a gate.  If the frozen-map residual
+        # distribution shows no bimodal structure the spectrum is
+        # withheld with the recorded reason.
+        res_frozen = []
+        for hi in range(N_c):
+            res_frozen.append(float(_fixed_point_residual(
+                adapter, h_states_c[hi].to(device), x_frozen,
+            )))
+        res_frozen = np.array(res_frozen)
+        try:
+            frozen_threshold, frozen_diag = _calibrate_fp_threshold(
+                res_frozen,
+                context=f"frozen-input {epoch_name}",
             )
-
-            if keep_mask.sum() < 2:
-                logger.warning(
-                    "    [frozen-input] %s: too few stationary states "
-                    "under the frozen map — spectrum withheld.",
-                    epoch_name,
-                )
-                frozen_input_stats[epoch_name] = {
-                    "n_pass": int(keep_mask.sum()), "n_total": int(N_c),
-                }
-                continue
-
-            h_keep = h_states_c.to(device)[torch.from_numpy(
-                np.nonzero(keep_mask)[0]).to(device)]
-            x_rep = x_frozen.unsqueeze(0).expand(h_keep.shape[0], -1)
-            J_frozen = adapter.compute_jacobian_batch(h_keep, x_rep)
-            if not isinstance(J_frozen, torch.Tensor):
-                J_frozen = torch.from_numpy(np.asarray(J_frozen)).to(
-                    device=h_keep.device, dtype=torch.float32,
-                )
-            eig_frozen = torch.linalg.eigvals(J_frozen)
-            mags_frozen = eig_frozen.abs().flatten()
-            frozen_input_stats[epoch_name] = {
-                "n_pass": int(keep_mask.sum()),
-                "n_total": int(N_c),
-                "mag_mean": float(mags_frozen.mean()),
-                "mag_max": float(mags_frozen.max()),
-                # Round-3 (B-CRIT-2): persist the frozen-map gate
-                # threshold so the re-gating is auditable.
-                "frozen_gate_threshold": float(frozen_threshold),
+        except ValueError as exc:
+            logger.warning(
+                "    [frozen-input] %s: re-gate failed — %s "
+                "(spectrum withheld).",
+                epoch_name, exc,
+            )
+            withheld_entry: Dict[str, Any] = {
+                "status": "withheld",
+                "withheld_reason": "frozen_map_gate_unavailable",
+                "withheld_epochs": [epoch_name],
+                "gate_reason": str(exc),
+                "n_pass": 0, "n_total": int(N_c),
             }
-            logger.info(
-                "    [frozen-input] %s: |λ|_mean=%.4f, |λ|_max=%.4f",
-                epoch_name, float(mags_frozen.mean()), float(mags_frozen.max()),
+            # Residual diagnostics are publishable only when finite.  The
+            # gate rejected this epoch precisely because the residual
+            # array was degenerate — which includes the NaN/Inf case that
+            # ``_calibrate_fp_threshold`` refuses (nonfinite residuals are
+            # why the frozen map has no usable stationary set).  Summarizing
+            # that same array would fabricate NaN/Infinity into the artifact,
+            # so the summaries are omitted (published downstream as an
+            # explicit null) rather than emitted as nonfinite numbers.
+            if np.all(np.isfinite(res_frozen)):
+                withheld_entry.update(
+                    residual_median=float(np.median(res_frozen)),
+                    residual_min=float(res_frozen.min()),
+                    residual_max=float(res_frozen.max()),
+                )
+            frozen_input_stats[epoch_name] = withheld_entry
+            continue
+        keep_mask = _posterior_keep(res_frozen, frozen_threshold, frozen_diag)
+        logger.info(
+            "    [frozen-input] %s: %d/%d states pass the residual "
+            "gate under the frozen map (median residual %.4f).",
+            epoch_name, int(keep_mask.sum()), N_c,
+            float(np.median(res_frozen)),
+        )
+
+        if keep_mask.sum() < 2:
+            logger.warning(
+                "    [frozen-input] %s: too few stationary states "
+                "under the frozen map — spectrum withheld.",
+                epoch_name,
             )
+            frozen_input_stats[epoch_name] = {
+                "status": "withheld",
+                "withheld_reason": "insufficient_stationary_states",
+                "withheld_epochs": [epoch_name],
+                "n_pass": int(keep_mask.sum()), "n_total": int(N_c),
+                "residual_median": float(np.median(res_frozen)),
+            }
+            continue
+
+        h_keep = h_states_c.to(device)[torch.from_numpy(
+            np.nonzero(keep_mask)[0]).to(device)]
+        x_rep = x_frozen.unsqueeze(0).expand(h_keep.shape[0], -1)
+        J_frozen = adapter.compute_jacobian_batch(h_keep, x_rep)
+        if not isinstance(J_frozen, torch.Tensor):
+            J_frozen = torch.from_numpy(np.asarray(J_frozen)).to(
+                device=h_keep.device, dtype=torch.float32,
+            )
+        eig_frozen = torch.linalg.eigvals(J_frozen)
+        mags_frozen = eig_frozen.abs().flatten()
+        frozen_input_stats[epoch_name] = {
+            "status": "ok",
+            "n_pass": int(keep_mask.sum()),
+            "n_total": int(N_c),
+            "mag_mean": float(mags_frozen.mean()),
+            "mag_max": float(mags_frozen.max()),
+            # Round-3 (B-CRIT-2): persist the frozen-map gate
+            # threshold so the re-gating is auditable.
+            "frozen_gate_threshold": float(frozen_threshold),
+        }
+        logger.info(
+            "    [frozen-input] %s: |λ|_mean=%.4f, |λ|_max=%.4f",
+            epoch_name, float(mags_frozen.mean()), float(mags_frozen.max()),
+        )
 
     return eigenvalue_results, attractor_stats, frozen_input_stats
 
@@ -1120,104 +1444,104 @@ def compute_full_system_eigenvalues(
     adapter: FixedPointAdapter,
     dataloader: torch.utils.data.DataLoader,
     device: torch.device,
-    onset_frames: List[int],
+    onset_frames: List[Optional[int]],
     target_class: int = Label.PREWALK.value,
     dt_ms: Optional[float] = None,
     max_states_per_epoch: int = 100,
+    sampling_seed: int = 42,
+    selection_metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, np.ndarray]:
-    """
-    Compute eigenvalues of the full MoR system Jacobian (CF5 fix).
+    """Compute surrogate input singular values; retain the legacy function name.
 
-    Unlike :func:`compute_eigenvalues_at_epochs` which only computes
-    the GRU pathway Jacobian, this function computes the Jacobian of
-    the blended output ``h_out = g_lif * LIF + g_gru * GRU`` with
-    respect to the sensory input, capturing LIF, GRU, and Router
-    contributions.
-
-    Since the Jacobian is (H, F) (non-square), we compute SVD singular
-    values rather than eigenvalues.  The singular values characterize
-    the system's sensitivity to sensory input perturbations.
+    The rectangular dh_out/dx uses LIF surrogate gradients and zero initial
+    recurrent state. These values describe local input sensitivity, not
+    recurrent eigenvalues or attractor stability.
 
     Args:
-        model: Trained NSMoRCore model.
-        adapter: FixedPointAdapter instance.
-        dataloader: DataLoader yielding (X, Y, lengths) tuples.
+        model: Trained NSMoRCore.
+        adapter: Full-system Jacobian adapter.
+        dataloader: Ordered trial loader.
         device: Computation device.
-        onset_frames: Per-trial stimulus onset frame indices.
-        target_class: Label value to filter by.
-        dt_ms: None inherits saved model.dt_ms; an explicit interval must match.
-        max_states_per_epoch: Maximum states to process per epoch.
+        onset_frames: Raw per-trial references (wind onset or visual collision).
+        target_class: Behavioral class to select.
+        dt_ms: Saved cadence or a matching explicit override.
+        max_states_per_epoch: Positive computation cap.
+        sampling_seed: Local sampling seed, independent of global RNG.
+        selection_metadata: Optional output dictionary for actual selection/counts.
 
     Returns:
-        Dictionary mapping epoch name to singular value array (N, min(H,F)).
+        Per-epoch singular values shaped (N, min(H, F)).
+
+    Raises:
+        ValueError: When references or every candidate spectrum are unavailable.
     """
-    logger.info("Computing FULL SYSTEM Jacobian (LIF + GRU + Router)...")
-
     dt_ms = resolve_dt_ms(model, dt_ms)
-
-    epoch_results: Dict[str, np.ndarray] = {}
+    _sample_indices(0, max_states_per_epoch, sampling_seed)
+    candidates: Dict[str, List[Tuple[torch.Tensor, Dict[str, Any]]]] = {
+        name: [] for name in EPOCH_DEFINITIONS
+    }
     model.eval()
-
-    # CF5.2 fix: Do NOT wrap in torch.no_grad() — the Jacobian computation
-    # requires gradient tracking.  Use torch.enable_grad() explicitly to
-    # ensure gradients are computed even if the outer context has no_grad.
     global_idx = 0
-    for batch_idx, batch in enumerate(dataloader):
-        X_batch, _Y_batch, lengths = batch
-        X_batch = X_batch.to(device).contiguous()
-        lengths = lengths.to(device).contiguous()
-        B, T, F_dim = X_batch.shape
-
+    for X_batch, _Y_batch, lengths in dataloader:
+        B, T, F = X_batch.shape
+        assert X_batch.shape == (B, T, 8)
+        assert lengths.shape == (B,)
         for i in range(B):
-            if global_idx >= len(dataloader.dataset):
-                break
-            _, _, label_val = dataloader.dataset.sequences[global_idx]
-            if int(label_val) != target_class:
-                global_idx += 1
-                continue
-
-            length_i = int(lengths[i].item())
-            wind_channel = X_batch[i, :length_i, 1].cpu().numpy()
-            onset_frame = int(np.argmax(wind_channel > 0.5)) if np.any(wind_channel > 0.5) else 0
-
-            for epoch_name, epoch_def in EPOCH_DEFINITIONS.items():
-                offset_ms = epoch_def["offset_ms"]
-                frame_offset = int(offset_ms / dt_ms)
-                centre_frame = onset_frame + frame_offset
-
-                if centre_frame < 0 or centre_frame >= length_i - 1:
-                    continue
-
-                # Use the full model input at this frame
-                X_t = X_batch[i, centre_frame:centre_frame+1, :].unsqueeze(0)  # (1, 1, F)
-                len_t = torch.tensor([1], dtype=torch.int64, device=device)
-
-                try:
-                    # CF5.2: Enable gradients for Jacobian computation
-                    with torch.enable_grad():
-                        J_full, _ = adapter.compute_full_system_jacobian(X_t, len_t)
-                    # J_full: (H, F) — compute SVD singular values
-                    svd = torch.linalg.svd(J_full.detach(), compute_uv=False)
-                    svals = svd.cpu().numpy()
-
-                    if epoch_name not in epoch_results:
-                        epoch_results[epoch_name] = []
-                    epoch_results[epoch_name].append(svals)
-                except Exception as e:
-                    # CF5.2 fix: Log at WARNING level, not DEBUG
-                    logger.warning("  Full Jacobian failed for trial %d epoch %s: %s",
-                                   global_idx, epoch_name, e)
-
+            trial_index = global_idx
             global_idx += 1
+            _, _, label = dataloader.dataset.sequences[trial_index]
+            if int(label) != target_class:
+                continue
+            length = int(lengths[i])
+            reference = _epoch_reference_frame(
+                dataloader.dataset, trial_index, X_batch[i, :length], onset_frames,
+            )
+            for name, definition in EPOCH_DEFINITIONS.items():
+                frame = reference + int(definition["offset_ms"] / dt_ms)
+                if 0 <= frame < length - 1:
+                    x = X_batch[i, frame:frame + 1].unsqueeze(0).detach().cpu()
+                    assert x.shape == (1, 1, F)
+                    candidates[name].append((
+                        x, _trial_identity(dataloader.dataset, trial_index, name, frame),
+                    ))
 
-    # Stack results
     result: Dict[str, np.ndarray] = {}
-    for epoch_name, sval_list in epoch_results.items():
-        if sval_list:
-            result[epoch_name] = np.stack(sval_list, axis=0)  # (N, min(H,F))
-            logger.info("  Epoch '%s': %d full system singular values",
-                        epoch_name, len(sval_list))
-
+    for name, records in candidates.items():
+        indices = _sample_indices(len(records), max_states_per_epoch, sampling_seed)
+        values: List[np.ndarray] = []
+        accepted: List[Dict[str, Any]] = []
+        for index in indices.tolist():
+            x, identity = records[index]
+            try:
+                with torch.enable_grad():
+                    jacobian, _ = adapter.compute_full_system_jacobian(
+                        x.to(device), torch.tensor([1], device=device),
+                    )
+                assert jacobian.shape == (model.hidden_dim, x.shape[-1])
+                singular = torch.linalg.svdvals(jacobian.detach())
+                assert singular.shape == (min(model.hidden_dim, x.shape[-1]),)
+                if not torch.isfinite(singular).all():
+                    raise ValueError("Nonfinite input sensitivity singular values")
+                values.append(singular.cpu().numpy())
+                accepted.append(identity)
+            except Exception as exc:
+                logger.warning("Full-system candidate %s failed: %s",
+                               identity["candidate_id"], exc)
+        if selection_metadata is not None:
+            selection_metadata[name] = {
+                "sampling_seed": sampling_seed, "n_candidates": len(records),
+                "n_sampled": len(indices), "n_accepted": len(values),
+                "n_rejected": len(indices) - len(values),
+                "n_unsampled": len(records) - len(indices),
+                "selected_state_indices": indices.tolist(),
+                "selected_candidates": [records[i][1] for i in indices.tolist()],
+                "accepted_candidates": accepted,
+                "acceptance_rule": "finite_singular_values; not_fixed_point_gated",
+            }
+        if values:
+            result[name] = np.stack(values)
+    if not result:
+        raise ValueError("Full-system input sensitivity unavailable: no valid spectra")
     return result
 
 
@@ -1270,6 +1594,7 @@ def plot_eigenvalue_spectrum(
     eigenvalue_results: Dict[str, np.ndarray],
     output_path: Path,
     analysis_population: Optional[Dict[str, object]] = None,
+    withheld_epochs: Optional[Sequence[str]] = None,
 ) -> None:
     """
     Plot the Jacobian eigenvalue spectrum on the complex plane.
@@ -1279,9 +1604,16 @@ def plot_eigenvalue_spectrum(
     point overlap, with the unit circle reference overlaid.
 
     Args:
-        eigenvalue_results: Dictionary from :func:`compute_eigenvalues_at_epochs`.
+        eigenvalue_results: Dictionary from :func:`compute_eigenvalues_at_epochs`,
+            containing ONLY the controlled (publishable) epochs.
         output_path: Path to save the figure.
+        analysis_population: Descriptive population metadata.
+        withheld_epochs: Epochs withheld by the frozen-input control.  Their
+            panels state the withholding explicitly; no spectrum is drawn.
     """
+    if not any(values.size for values in eigenvalue_results.values()):
+        raise ValueError("GRU eigenvalue spectrum unavailable")
+    withheld = set(withheld_epochs or ())
     setup_lancet_style()
 
     # ── Create figure with [1, 3] layout ──────────────────────
@@ -1292,6 +1624,31 @@ def plot_eigenvalue_spectrum(
 
     for idx, (epoch_name, epoch_def) in enumerate(EPOCH_DEFINITIONS.items()):
         ax = axes[idx]
+
+        if epoch_name in withheld:
+            logger.warning(
+                "Epoch '%s' withheld (frozen-input control failed); "
+                "no spectrum drawn.", epoch_name,
+            )
+            ax.text(
+                0.5, 0.55, "Withheld",
+                transform=ax.transAxes, ha="center", va="center",
+                fontsize=FONT_SIZE_PANEL_LABEL, fontweight="bold",
+                color=AXIS_COLOR,
+            )
+            ax.text(
+                0.5, 0.38,
+                "frozen-input control failed;\nno verified spectrum",
+                transform=ax.transAxes, ha="center", va="center",
+                fontsize=FONT_SIZE_LEGEND, color=AXIS_COLOR,
+            )
+            ax.set_title(
+                f"{panel_labels[idx]}  "
+                f"{epoch_def['label'].replace('onset', 'reference')}",
+                fontsize=FONT_SIZE_PANEL_LABEL, fontweight="bold",
+                color=AXIS_COLOR, loc="left",
+            )
+            continue
 
         if epoch_name not in eigenvalue_results:
             logger.warning("No eigenvalues for epoch '%s', skipping.", epoch_name)
@@ -1431,7 +1788,7 @@ def plot_eigenvalue_spectrum(
 
         # Panel label and epoch title
         ax.set_title(
-            f"{panel_labels[idx]}  {epoch_def['label']}",
+            f"{panel_labels[idx]}  {epoch_def['label'].replace('onset', 'reference')}",
             fontsize=FONT_SIZE_PANEL_LABEL,
             fontweight="bold",
             color=AXIS_COLOR,
@@ -1494,6 +1851,100 @@ def plot_eigenvalue_spectrum(
     plt.close(fig)
 
 
+def plot_withheld_spectrum_notice(
+    output_path: Path,
+    reason: str,
+    analysis_population: Optional[Dict[str, object]] = None,
+) -> None:
+    """Render an explicit withheld-spectra figure instead of an empty file.
+
+    When the frozen-input control fails, the own-input eigenvalues are NOT a
+    publishable spectrum (their map was not verified under a common input),
+    so the figure must say so rather than omit the PNG or plot the unverified
+    points.  The remaining finite diagnostics live in the JSON sidecar.
+    """
+    setup_lancet_style()
+    fig, ax = plt.subplots(1, 1, figsize=(FIG_WIDTH_INCHES, FIG_HEIGHT_INCHES))
+    ax.axis("off")
+    ax.text(
+        0.5, 0.62, "Jacobian spectra WITHHELD",
+        transform=ax.transAxes, ha="center", va="center",
+        fontsize=FONT_SIZE_PANEL_LABEL, fontweight="bold", color=AXIS_COLOR,
+    )
+    ax.text(
+        0.5, 0.42,
+        "The frozen-input control did not verify a quasi-fixed-point\n"
+        "population under a common map; own-input eigenvalues are not\n"
+        "a publishable spectrum and are intentionally not shown.",
+        transform=ax.transAxes, ha="center", va="center",
+        fontsize=FONT_SIZE_AXIS_TITLE, color=AXIS_COLOR,
+    )
+    ax.text(
+        0.5, 0.18, f"reason: {reason}",
+        transform=ax.transAxes, ha="center", va="center",
+        fontsize=FONT_SIZE_LEGEND, color=AXIS_COLOR, wrap=True,
+    )
+    fig.suptitle(
+        "Jacobian Eigenvalue Spectrum — GRU Pathway (frozen-input control failed)",
+        fontsize=14, fontweight="bold", color=AXIS_COLOR, y=0.98,
+    )
+    plt.tight_layout(rect=[0, 0, 1, 0.94])
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(
+        output_path, dpi=DPI, bbox_inches="tight", pad_inches=0.1,
+        metadata={"Description": json.dumps({
+            "spectral_quantity": "withheld",
+            "stability_interpretation": False,
+            "reason": reason,
+            "analysis_population": analysis_population,
+        })},
+    )
+    logger.warning(
+        "Frozen-input control failed — withheld-spectra notice written to %s.",
+        output_path,
+    )
+    plt.close(fig)
+
+
+def plot_singular_value_spectrum(
+    singular_results: Dict[str, np.ndarray],
+    output_path: Path,
+    analysis_population: Optional[Dict[str, object]] = None,
+) -> None:
+    """Plot surrogate input-sensitivity distributions, without a unit circle."""
+    if not any(values.size for values in singular_results.values()):
+        raise ValueError("Input sensitivity singular values unavailable")
+    setup_lancet_style()
+    fig, axes = plt.subplots(1, 3, figsize=(FIG_WIDTH_INCHES, FIG_HEIGHT_INCHES))
+    for ax, (name, definition) in zip(axes, EPOCH_DEFINITIONS.items()):
+        ax.set_xlabel("Input sensitivity singular value (σ)")
+        ax.set_ylabel("Count")
+        ax.set_title(definition["label"].replace("onset", "reference"))
+        values = singular_results.get(name)
+        if values is None or not values.size:
+            ax.text(0.5, 0.5, "Unavailable", transform=ax.transAxes,
+                    ha="center", va="center")
+            continue
+        ax.hist(values.ravel(), bins="auto", color=EIGENVALUE_COLOR,
+                edgecolor=BACKGROUND_COLOR, linewidth=1.0)
+        ax.set_xlim(left=0)
+    fig.suptitle(
+        "Full-system surrogate input sensitivity — singular values\n"
+        "Zero initial recurrent state; no stability interpretation",
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.88])
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(
+        output_path, dpi=DPI, bbox_inches="tight",
+        metadata={"Description": json.dumps({
+            "spectral_quantity": "surrogate_input_singular_values",
+            "stability_interpretation": False,
+            "analysis_population": analysis_population,
+        })},
+    )
+    plt.close(fig)
+
+
 # ═══════════════════════════════════════════════════════════════
 # 7.  Main Analysis Pipeline
 # ═══════════════════════════════════════════════════════════════
@@ -1514,6 +1965,7 @@ def run_jacobian_analysis(
     qc_sealed_nested_prior_sha256: Optional[str] = None,
     trusted_historical_checkpoint_sha256: Optional[str] = None,
     trusted_historical_artifact_sha256: Optional[str] = None,
+    sampling_seed: int = 42,
 ) -> None:
     """
     Run the full Jacobian eigenvalue spectrum analysis.
@@ -1571,136 +2023,252 @@ def run_jacobian_analysis(
         type(adapter).__name__,
     )
 
-    # ── Extract GRU states at epochs (slow-point search) ──────
+    population = population_for_output(dataloader, len(labels))
+    if full_system:
+        selection: Dict[str, Any] = {}
+        summary: Dict[str, Any] = {
+            "status": "unavailable",
+            "spectral_quantity": "surrogate_input_singular_values",
+            "stability_interpretation": False,
+            "recurrent_state": "zero_initial; not_trajectory_conditioned",
+            "analysis_population": population,
+            "target_class": int(target_class), "dt_ms": dt_ms,
+            "sampling_seed": sampling_seed, "max_states_per_epoch": max_states_per_epoch,
+            "analysis_reference_rules": getattr(
+                dataloader.dataset, "analysis_reference_rules", None,
+            ),
+            "spectral_statistics": {}, "selection": selection,
+        }
+        json_path = output_path.with_suffix(".json")
+        try:
+            singular_results = compute_full_system_eigenvalues(
+                model=model, adapter=adapter, dataloader=dataloader,
+                device=device, onset_frames=onset_frames,
+                target_class=target_class, dt_ms=dt_ms,
+                max_states_per_epoch=max_states_per_epoch,
+                sampling_seed=sampling_seed, selection_metadata=selection,
+            )
+            if not any(values.size for values in singular_results.values()):
+                raise ValueError("Full-system input sensitivity unavailable")
+        except ValueError as exc:
+            summary["reason"] = str(exc)
+            json_path.parent.mkdir(parents=True, exist_ok=True)
+            json_path.write_text(
+                json.dumps(summary, indent=2, allow_nan=False),
+                encoding="utf-8",
+            )
+            raise
+        summary["status"] = "ok"
+        summary["spectral_statistics"] = {
+            name: {"singular_mean": float(values.mean()),
+                   "singular_max": float(values.max()),
+                   "n_states": int(values.shape[0])}
+            for name, values in singular_results.items()
+        }
+        plot_singular_value_spectrum(singular_results, output_path, population)
+        json_path.write_text(
+            json.dumps(summary, indent=2, allow_nan=False), encoding="utf-8",
+        )
+        return
+
+    # GRU-only spectra require the actual residual gate; input sensitivity does not.
     epoch_data_full = extract_gru_states_at_epochs(
-        model=model,
-        dataloader=dataloader,
-        device=device,
-        onset_frames=onset_frames,
-        target_class=target_class,
-        dt_ms=dt_ms,
-        adapter=adapter,
+        model=model, dataloader=dataloader, device=device,
+        onset_frames=onset_frames, target_class=target_class,
+        dt_ms=dt_ms, adapter=adapter,
     )
-    # Round-3 (BLK-3A): split per-epoch gate diagnostics from the
-    # state tensors before spectral computation.
-    gate_diagnostics: Dict[str, Dict[str, float]] = {
+    gate_diagnostics = {
         name: val for name, val in epoch_data_full.items()
         if name.endswith("__gate_diag")
     }
-    epoch_data = {
-        name: val for name, val in epoch_data_full.items()
-        if not name.endswith("__gate_diag")
-    }
-
-    # ── Compute eigenvalues ───────────────────────────────────
-    if full_system:
-        # CF5 fix: Compute FULL system Jacobian (LIF + GRU + Router)
-        logger.info("Computing FULL SYSTEM Jacobian (CF5: LIF + GRU + Router)...")
-        eigenvalue_results = compute_full_system_eigenvalues(
-            model=model,
-            adapter=adapter,
-            dataloader=dataloader,
-            device=device,
-            onset_frames=onset_frames,
-            target_class=target_class,
-            dt_ms=dt_ms,
-            max_states_per_epoch=max_states_per_epoch,
+    eigenvalue_results, attractor_stats, frozen_input_stats = (
+        compute_eigenvalues_at_epochs(
+            adapter=adapter, epoch_data=epoch_data_full, device=device,
+            max_states_per_epoch=max_states_per_epoch, sampling_seed=sampling_seed,
         )
-    else:
-        # Default: GRU-only Jacobian (backward compatible)
-        eigenvalue_results, attractor_stats, frozen_input_stats = (
-            compute_eigenvalues_at_epochs(
-                adapter=adapter,
-                epoch_data=epoch_data,
-                device=device,
-                max_states_per_epoch=max_states_per_epoch,
-            )
-        )
+    )
 
-    # ── Log hypothesis verification ───────────────────────────
-    logger.info("-" * 60)
-    if full_system:
-        # Round-1 fix (Reviewer B MAJOR-2): the two spectral objects are
-        # mathematically distinct.  Full-system surrogate-gradient SVD
-        # singular values quantify input sensitivity only; they must NOT
-        # be quoted for unit-circle / line-attractor stability claims.
+    # ── Frozen-input control gate (adversarial release audit) ──
+    # The control exists to separate state-dependence from input-
+    # dependence.  An epoch whose control failed or was withheld has NO
+    # verified spectrum under a common map, so its own-input eigenvalues
+    # must not appear in the JSON, the figure, or run.log.  This gate
+    # therefore filters the published subset to the controlled epochs;
+    # the ALL-failed case is an explicit withholding with an empty
+    # spectral_statistics, and a MIXED case publishes only the
+    # controlled epochs while marking the artifact partial and naming
+    # the withheld epochs (without their spectra).
+    controlled_epochs = [
+        name for name, diag in frozen_input_stats.items()
+        if diag.get("status") == "ok"
+    ]
+    withheld_epochs = [
+        name for name in EPOCH_DEFINITIONS
+        if frozen_input_stats.get(name, {}).get("status") != "ok"
+    ]
+    # Withheld epochs are identified by reason and finite residual
+    # diagnostics only — never by their spectra.
+    withheld_spectra: Dict[str, Dict[str, Any]] = {}
+    for name in withheld_epochs:
+        diag = frozen_input_stats.get(name, {})
+        withheld_spectra[name] = {
+            "withheld_reason": diag.get(
+                "withheld_reason", "frozen_input_control_unavailable",
+            ),
+            "n_pass": int(diag.get("n_pass", 0)),
+            "n_total": int(diag.get("n_total", 0)),
+            "residual_median": diag.get("residual_median"),
+        }
+
+    if not controlled_epochs:
+        json_path = output_path.with_suffix(".json")
+        reason = (
+            "frozen_input_control_failed: no epoch produced a "
+            "quasi-fixed-point population under the pooled-median "
+            "e_sensory map, so own-input eigenvalues are not a "
+            "publishable spectrum."
+        )
+        withheld_summary = {
+            "status": "withheld",
+            "spectral_quantity": "gru_jacobian_eigenvalues_withheld",
+            "spectral_statistics": {},
+            "stability_interpretation": False,
+            "withheld_reason": reason,
+            "controlled_epochs": [],
+            "withheld_epochs": withheld_epochs,
+            "withheld_spectra": withheld_spectra,
+            "analysis_population": population,
+            "target_class": int(target_class),
+            "sampling_seed": sampling_seed,
+            "max_states_per_epoch": max_states_per_epoch,
+            "analysis_reference_rules": getattr(
+                dataloader.dataset, "analysis_reference_rules", None,
+            ),
+            "dt_ms": dt_ms,
+            "epochs": EPOCH_DEFINITIONS,
+            # Honest, finite diagnostics survive the withholding: the
+            # per-epoch frozen-map gate outcome (n_pass/n_total and
+            # residual range) and the own-input gate calibration remain
+            # auditable without publishing a spectrum.
+            "frozen_input_control": frozen_input_stats,
+            "fp_gate_calibration": gate_diagnostics,
+        }
+        plot_withheld_spectrum_notice(output_path, reason, population)
+        with open(json_path, "w") as f:
+            json.dump(withheld_summary, f, indent=2, allow_nan=False)
         logger.warning(
-            "FULL-SYSTEM mode: outputs are surrogate-gradient SVD "
-            "singular values (input sensitivity), NOT exact eigenvalues. "
-            "Do NOT use them for stability or line-attractor conclusions."
+            "Jacobian spectra WITHHELD — frozen-input control passed "
+            "0 epochs; own-input spectral_statistics not published. "
+            "Summary → %s", json_path,
         )
-    logger.info("Hypothesis Verification:")
-    for epoch_name, eigvals in eigenvalue_results.items():
-        if full_system:
-            # Full system: singular values (real, non-negative)
-            svals = eigvals.flatten()
-            logger.info(
-                "  %s: σ_mean=%.4f, σ_max=%.4f, σ_rank(>0.01)=%d",
-                epoch_name, np.mean(svals), np.max(svals),
-                int(np.sum(svals > 0.01)),
-            )
-        else:
-            # GRU-only: complex eigenvalues
-            magnitudes = np.abs(eigvals.flatten())
-            real_parts = np.real(eigvals.flatten())
-            near_unity = np.mean(np.abs(magnitudes - 1.0) < 0.1) * 100
-            near_real_one = np.mean(np.abs(real_parts - 1.0) < 0.1) * 100
+        logger.info("=" * 60)
+        logger.info("Jacobian analysis complete (spectra withheld)!")
+        logger.info("=" * 60)
+        return
 
-            logger.info(
-                "  %s: |λ|_mean=%.4f, %%near|λ|=1: %.1f%%, %%nearRe(λ)=1: %.1f%%",
-                epoch_name, np.mean(magnitudes), near_unity, near_real_one,
-            )
+    # Mixed case: some epochs are controlled, others withheld.  Publish
+    # only the controlled subset and mark the artifact explicitly.
+    partial = bool(withheld_epochs)
+    status = "partial" if partial else "ok"
 
-    # ── Create figure ─────────────────────────────────────────
+    # ── Log GRU spectral statistics (controlled epochs only) ───
+    logger.info(
+        "Hypothesis Verification (controlled epochs only):"
+        if partial else "Hypothesis Verification:",
+    )
+    for epoch_name in controlled_epochs:
+        eigvals = eigenvalue_results[epoch_name]
+        magnitudes = np.abs(eigvals.flatten())
+        real_parts = np.real(eigvals.flatten())
+        logger.info(
+            "  %s: |λ|_mean=%.4f, %%near|λ|=1: %.1f%%, %%nearRe(λ)=1: %.1f%%",
+            epoch_name, np.mean(magnitudes),
+            np.mean(np.abs(magnitudes - 1.0) < 0.1) * 100,
+            np.mean(np.abs(real_parts - 1.0) < 0.1) * 100,
+        )
+    if partial:
+        logger.warning(
+            "Epochs %s were WITHHELD (frozen-input control failed); "
+            "their spectra are excluded from the figure, JSON and "
+            "spectral_statistics.", withheld_epochs,
+        )
+
+    # ── Create figure (controlled epochs only) ────────────────
+    controlled_spectra = {
+        name: eigenvalue_results[name] for name in controlled_epochs
+    }
     plot_eigenvalue_spectrum(
-        eigenvalue_results=eigenvalue_results,
+        eigenvalue_results=controlled_spectra,
         output_path=output_path,
-        analysis_population=population_for_output(dataloader, len(labels)),
+        analysis_population=population,
+        withheld_epochs=withheld_epochs,
     )
 
     # ── Export JSON summary (Round-2 M-2c) ───────────────────
     # The attractor verification and frozen-input control results are
     # persisted next to the figure so spectral conclusions are auditable
-    # against the verification evidence, not just logged.
-    if not full_system:
-        json_path = output_path.with_suffix(".json")
-        epoch_summary: Dict[str, Dict[str, float]] = {}
-        for epoch_name, eigvals in eigenvalue_results.items():
-            magnitudes = np.abs(eigvals.flatten())
-            real_parts = np.real(eigvals.flatten())
-            epoch_summary[epoch_name] = {
-                "mag_mean": float(np.mean(magnitudes)),
-                "mag_max": float(np.max(magnitudes)),
-                "pct_near_unit_circle": float(
-                    np.mean(np.abs(magnitudes - 1.0) < 0.1) * 100
-                ),
-                "pct_near_real_one": float(
-                    np.mean(np.abs(real_parts - 1.0) < 0.1) * 100
-                ),
-                "n_states": int(eigvals.shape[0]),
-                "n_verified_attractors": attractor_stats.get(epoch_name, {}).get("n_verified", 0),
-                "n_tested_attractors": attractor_stats.get(epoch_name, {}).get("n_tested", 0),
-            }
-        summary = {
-            "analysis_population": population_for_output(dataloader, len(labels)),
-            "target_class": int(target_class),
-            "dt_ms": dt_ms,
-            "epochs": EPOCH_DEFINITIONS,
-            "spectral_statistics": epoch_summary,
-            "attractor_verification": attractor_stats,
-            "frozen_input_control": frozen_input_stats,
-            # Round-3 (BLK-3A): per-epoch GMM+BIC gate calibration
-            # evidence — threshold, BIC values, residual quantiles and
-            # accept/reject counts are persisted so the gate is fully
-            # auditable.
-            "fp_gate_calibration": gate_diagnostics,
+    # against the verification evidence, not just logged.  Only the
+    # controlled epochs contribute spectral_statistics.
+    json_path = output_path.with_suffix(".json")
+    epoch_summary: Dict[str, Dict[str, float]] = {}
+    for epoch_name in controlled_epochs:
+        eigvals = eigenvalue_results[epoch_name]
+        magnitudes = np.abs(eigvals.flatten())
+        real_parts = np.real(eigvals.flatten())
+        epoch_summary[epoch_name] = {
+            "mag_mean": float(np.mean(magnitudes)),
+            "mag_max": float(np.max(magnitudes)),
+            "pct_near_unit_circle": float(
+                np.mean(np.abs(magnitudes - 1.0) < 0.1) * 100
+            ),
+            "pct_near_real_one": float(
+                np.mean(np.abs(real_parts - 1.0) < 0.1) * 100
+            ),
+            "n_states": int(eigvals.shape[0]),
+            "n_verified_attractors": attractor_stats.get(epoch_name, {}).get("n_verified", 0),
+            "n_tested_attractors": attractor_stats.get(epoch_name, {}).get("n_tested", 0),
         }
-        with open(json_path, "w") as f:
-            json.dump(summary, f, indent=2)
-        logger.info("JSON summary saved → %s", json_path)
+    summary = {
+        "status": status,
+        "spectral_quantity": "gru_jacobian_eigenvalues",
+        "stability_interpretation": True,
+        "controlled_epochs": controlled_epochs,
+        "withheld_epochs": withheld_epochs,
+        "withheld_spectra": withheld_spectra,
+        "analysis_population": population,
+        "target_class": int(target_class),
+        "sampling_seed": sampling_seed,
+        "max_states_per_epoch": max_states_per_epoch,
+        "analysis_reference_rules": getattr(
+            dataloader.dataset, "analysis_reference_rules", None,
+        ),
+        "dt_ms": dt_ms,
+        "epochs": EPOCH_DEFINITIONS,
+        "spectral_statistics": epoch_summary,
+        "attractor_verification": attractor_stats,
+        "frozen_input_control": frozen_input_stats,
+        # Round-3 (BLK-3A): per-epoch GMM+BIC gate calibration
+        # evidence — threshold, BIC values, residual quantiles and
+        # accept/reject counts are persisted so the gate is fully
+        # auditable.
+        "fp_gate_calibration": gate_diagnostics,
+    }
+    if partial:
+        summary["partial_reason"] = (
+            "frozen_input_control_partial: spectra published only for "
+            f"controlled epochs {controlled_epochs}; withheld epochs "
+            f"{withheld_epochs} carry no verified spectrum under the "
+            "common map."
+        )
+    with open(json_path, "w") as f:
+        json.dump(summary, f, indent=2, allow_nan=False)
+    logger.info("JSON summary saved → %s", json_path)
 
     logger.info("=" * 60)
-    logger.info("Jacobian analysis complete!")
+    logger.info(
+        "Jacobian analysis complete (partial: controlled subset only)!"
+        if partial else "Jacobian analysis complete!"
+    )
     logger.info("=" * 60)
 
 
@@ -1799,8 +2367,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--full_system",
         action="store_true",
         default=False,
-        help="Compute full system Jacobian (LIF + GRU + Router) instead "
-             "of GRU-only.  CF5 fix: captures the complete MoR dynamics.",
+        help="Compute full-system surrogate input sensitivity singular values, "
+             "not recurrent eigenvalues or stability.",
     )
     parser.add_argument(
         "--backend",
@@ -1810,6 +2378,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="GRU Jacobian kernel. jax is ~20x faster on this GPU for "
              "N=32–100, H=64 (falls back to torch if JAX is missing). "
              "Eigenvalues always use torch.linalg.eigvals.",
+    )
+    parser.add_argument(
+        "--sampling_seed", type=int, default=42,
+        help="Local seed for deterministic capped state selection.",
     )
     return parser
 
@@ -1843,6 +2415,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         max_states_per_epoch=args.max_states,
         full_system=args.full_system,
         backend=args.backend,
+        sampling_seed=args.sampling_seed,
     )
 
 

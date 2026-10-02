@@ -17,12 +17,13 @@ model:
   num_gru_layers: 1       # stacked GRU layers
   dropout: 0.1            # dropout in GRU and decoder
 
-  # Physical sampling interval (ms).  All lif_tau_* below are declared
+  # Physical model-grid interval (ms). All lif_tau_* below are declared
   # in PHYSICAL ms and converted internally via alpha = exp(-dt/tau).
-  # Reviewer Round-1 BLOCKER-1: changing the acquisition rate can no
+  # Reviewer Round-1 BLOCKER-1: changing the model-grid interval can no
   # longer silently rescale the biophysics.
-  # CORRECTED: Real acquisition is 250 Hz (4.006 ms median dt), not 100 Hz.
-  dt_ms: 4.0              # frame interval (250 Hz imaging)
+  # Agreed 4 ms (250 Hz) causal previous-source-hold estimates, not observations.
+  # Original-source acquisition diagnostics belong to the actual dataset.
+  dt_ms: 4.0              # model-grid interval; no imaging/hardware timing claim
 
   lif_alpha: 0.9587       # LIF leak factor: 0.9587 keeps physical membrane time constant tau_mem ~95ms invariant when dt_ms is 4.0 (converted from alpha=0.9 at dt=10.0ms: exp(-4.0/94.91))
   lif_threshold: 0.5      # LIF spike threshold
@@ -164,8 +165,9 @@ checkpoint:
 # Window-free unsupervised clustering of MoR routing strategies.
 # See nsmor/analysis/gating_cluster.py for implementation details.
 # Window-free by design. NSMoR is Trial-Start anchored. TTC-50ms is only
-# for MCMC prior 5-D snapshot. Baseline 5700ms is variant for pure-wind
-# via TimeWindowConfig, not universal. Manual windows like [-5700:-500]
+# for MCMC prior 5-D snapshot. The pure-wind 5700ms prepend is synthetic
+# alignment via TimeWindowConfig, not observed baseline data or universal.
+# Manual windows like [-5700:-500]
 # inject human bias and break unsupervised claim.
 cluster_gating:
   n_clusters: 4

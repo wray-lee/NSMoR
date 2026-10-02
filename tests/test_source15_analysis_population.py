@@ -71,14 +71,20 @@ def test_producer_loader_keeps_persisted_split_and_full_corpus_denominator(monke
         "trial_ids": list(range(n)),
     }
     monkeypatch.setattr(Path, "exists", lambda self: True)
-    monkeypatch.setattr(module, "load_dataset_with_fingerprint", lambda path: (source, "f" * 64))
+    def load_compact(
+        path: Path, *, restore_provenance: bool = True, **kwargs: object,
+    ) -> tuple[dict, str]:
+        assert restore_provenance is False
+        return source, "f" * 64
+
+    monkeypatch.setattr(module, "load_dataset_with_fingerprint", load_compact)
     monkeypatch.setattr(module, "validate_dataset_provenance", lambda *args: None)
     monkeypatch.setattr(module, "load_analysis_priors", lambda *args, **kwargs:
                         (source["mcmc_priors"], np.array([1, 3])))
     monkeypatch.setattr(module, "create_optimized_dataloader", lambda dataset, **kwargs:
                         SimpleNamespace(dataset=dataset))
     if phase == "analyze_gating":
-        monkeypatch.setattr(module, "_shared_load_model", lambda *args: SimpleNamespace())
+        monkeypatch.setattr(module, "_shared_load_model", lambda *args: SimpleNamespace(dt_ms=4.))
         loader = module.load_model_and_dataset(Path("model.pth"), Path("dataset.pt"))[1]
     else:
         loader = module.load_dataset(Path("dataset.pt"))[0]
@@ -192,14 +198,327 @@ def test_jacobian_summary_declares_full_corpus_split(tmp_path, monkeypatch):
     monkeypatch.setattr(jacobian, "create_jacobian_adapter", lambda *args, **kwargs: object())
     monkeypatch.setattr(jacobian, "extract_gru_states_at_epochs", lambda **kwargs: {})
     spectra = {name: np.array([[0.9 + 0j]]) for name in jacobian.EPOCH_DEFINITIONS}
+    controlled = {name: {"status": "ok", "n_pass": 1, "n_total": 1}
+                  for name in jacobian.EPOCH_DEFINITIONS}
     monkeypatch.setattr(jacobian, "compute_eigenvalues_at_epochs", lambda **kwargs:
-                        (spectra, {}, {}))
+                        (spectra, {}, controlled))
     monkeypatch.setattr(jacobian, "plot_eigenvalue_spectrum", lambda **kwargs: None)
     output = tmp_path / "jacobian_spectrum.png"
     jacobian.run_jacobian_analysis(Path("checkpoint.pth"), Path("dataset.pt"), output)
     summary = json.loads(output.with_suffix(".json").read_text())
     assert summary["analysis_population"] == population
     assert set(summary["spectral_statistics"]) == set(jacobian.EPOCH_DEFINITIONS)
+
+
+def test_jacobian_spectra_withheld_when_frozen_control_fails(tmp_path, monkeypatch):
+    """A failed frozen-input control must not publish own-input spectra."""
+    from scripts import analyze_jacobian as jacobian
+
+    population = describe_analysis_population(2, [1], range(2),
+                                             validation_scope="nested_outer_validation")
+    data = SimpleNamespace(analysis_population=population)
+    monkeypatch.setattr(jacobian, "load_model_from_checkpoint", lambda *args: SimpleNamespace(dt_ms=4.0))
+    monkeypatch.setattr(jacobian, "load_dataset", lambda *args, **kwargs:
+                        (SimpleNamespace(dataset=data), np.array([1, 1]), [3, 3],
+                         [np.zeros((3, 8)) for _ in range(2)]))
+    monkeypatch.setattr(jacobian, "detect_stimulus_onset_frames", lambda *args, **kwargs: [1, 1])
+    monkeypatch.setattr(jacobian, "create_jacobian_adapter", lambda *args, **kwargs: object())
+    monkeypatch.setattr(jacobian, "extract_gru_states_at_epochs", lambda **kwargs: {})
+    spectra = {name: np.array([[0.9 + 0j]]) for name in jacobian.EPOCH_DEFINITIONS}
+    withheld = {
+        name: {"status": "withheld", "withheld_reason": "frozen_map_gate_unavailable",
+               "n_pass": 0, "n_total": 5, "residual_median": 0.4}
+        for name in jacobian.EPOCH_DEFINITIONS
+    }
+    monkeypatch.setattr(jacobian, "compute_eigenvalues_at_epochs", lambda **kwargs:
+                        (spectra, {}, withheld))
+    rendered: list[str] = []
+    monkeypatch.setattr(jacobian, "plot_eigenvalue_spectrum",
+                        lambda **kwargs: rendered.append("spectrum"))
+    monkeypatch.setattr(jacobian, "plot_withheld_spectrum_notice",
+                        lambda *args, **kwargs: rendered.append("withheld"))
+    output = tmp_path / "jacobian_spectrum.png"
+    jacobian.run_jacobian_analysis(Path("checkpoint.pth"), Path("dataset.pt"), output)
+    summary = json.loads(output.with_suffix(".json").read_text())
+    assert summary["status"] == "withheld"
+    assert summary["spectral_statistics"] == {}
+    # No own-input spectral magnitude leaked into the artifact.
+    assert "mag_mean" not in json.dumps(summary)
+    # Finite diagnostics survive the withholding.
+    assert summary["frozen_input_control"] == withheld
+    assert rendered == ["withheld"]
+    # Every epoch is named as withheld, and none carries a spectrum.
+    assert set(summary["withheld_epochs"]) == set(jacobian.EPOCH_DEFINITIONS)
+    assert summary["controlled_epochs"] == []
+    assert set(summary["withheld_spectra"]) == set(jacobian.EPOCH_DEFINITIONS)
+    assert all("mag_mean" not in entry for entry in summary["withheld_spectra"].values())
+
+
+def _run_jacobian_with_controls(tmp_path, monkeypatch, spectra, frozen_control):
+    """Drive ``run_jacobian_analysis`` with synthetic spectra/control states."""
+    from scripts import analyze_jacobian as jacobian
+
+    population = describe_analysis_population(2, [1], range(2),
+                                             validation_scope="nested_outer_validation")
+    data = SimpleNamespace(analysis_population=population)
+    monkeypatch.setattr(jacobian, "load_model_from_checkpoint", lambda *args: SimpleNamespace(dt_ms=4.0))
+    monkeypatch.setattr(jacobian, "load_dataset", lambda *args, **kwargs:
+                        (SimpleNamespace(dataset=data), np.array([1, 1]), [3, 3],
+                         [np.zeros((3, 8)) for _ in range(2)]))
+    monkeypatch.setattr(jacobian, "detect_stimulus_onset_frames", lambda *args, **kwargs: [1, 1])
+    monkeypatch.setattr(jacobian, "create_jacobian_adapter", lambda *args, **kwargs: object())
+    monkeypatch.setattr(jacobian, "extract_gru_states_at_epochs", lambda **kwargs: {})
+    monkeypatch.setattr(jacobian, "compute_eigenvalues_at_epochs", lambda **kwargs:
+                        (spectra, {}, frozen_control))
+    monkeypatch.setattr(jacobian, "plot_eigenvalue_spectrum", lambda **kwargs: None)
+    monkeypatch.setattr(jacobian, "plot_withheld_spectrum_notice",
+                        lambda *args, **kwargs: None)
+    output = tmp_path / "jacobian_spectrum.png"
+    jacobian.run_jacobian_analysis(Path("checkpoint.pth"), Path("dataset.pt"), output)
+    return json.loads(output.with_suffix(".json").read_text())
+
+
+def test_compute_eigenvalues_does_not_log_magnitudes_before_frozen_gate(
+    monkeypatch, caplog,
+):
+    """The eigenvalue computer must not log magnitudes before the gate.
+
+    ``compute_eigenvalues_at_epochs`` runs BEFORE the frozen-input control
+    decides which epochs are publishable.  Logging own-input magnitudes
+    there leaks unverified spectra into run.log for epochs the control
+    later withholds.
+    """
+    import logging
+
+    import torch
+
+    from scripts import analyze_jacobian as jacobian
+
+    leak_mag = 0.7654321
+
+    class _MockAdapter:
+        def __init__(self) -> None:
+            self._gru_cell = SimpleNamespace(training=True)
+
+        def compute_jacobian_batch(self, h_batch, x_batch):
+            b, h = h_batch.shape
+            return torch.diag(torch.full((h,), leak_mag, dtype=torch.float32)).repeat(b, 1, 1)
+
+        def test_attractor_convergence(self, h, x):
+            return False, 0.0, None
+
+    h_states = torch.zeros(6, 4)
+    x_inputs = torch.zeros(6, 4)
+    epoch_data = {"early": (h_states, x_inputs)}
+
+    monkeypatch.setattr(jacobian, "_fixed_point_residual",
+                        lambda adapter, h, x: 0.2)
+    # Force the frozen-map gate to be unavailable, so the epoch is withheld.
+    monkeypatch.setattr(jacobian, "_calibrate_fp_threshold",
+                        lambda *args, **kwargs: (_ for _ in ()).throw(
+                            ValueError("no bimodal residual distribution")))
+
+    with caplog.at_level(logging.INFO, logger="scripts.analyze_jacobian"):
+        _eigs, _attr, frozen = jacobian.compute_eigenvalues_at_epochs(
+            adapter=_MockAdapter(), epoch_data=epoch_data,
+            device=torch.device("cpu"),
+        )
+
+    assert frozen["early"]["status"] == "withheld"
+    # No own-input magnitude for the withheld epoch reached the log.
+    assert "0.7654" not in caplog.text
+    assert "Eigenvalue stats" not in caplog.text
+
+
+def test_plot_eigenvalue_spectrum_renders_withheld_panel(tmp_path):
+    """The withheld epoch renders a labeled panel, not a spectrum."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    from scripts import analyze_jacobian as jacobian
+
+    controlled = {"early": np.array([[0.9 + 0j]]), "sustained": np.array([[0.8 + 0j]])}
+    out = tmp_path / "jacobian_spectrum.png"
+    try:
+        jacobian.plot_eigenvalue_spectrum(
+            eigenvalue_results=controlled, output_path=out,
+            withheld_epochs=["transient"],
+        )
+    finally:
+        plt.close("all")
+    assert out.exists()
+
+
+# Distinct magnitudes make any leak of a withheld epoch's spectrum detectable.
+_MIXED_SPECTRA = {
+    "early": np.array([[0.1234567 + 0j]]),
+    "transient": np.array([[0.7654321 + 0j]]),   # withheld
+    "sustained": np.array([[0.2222222 + 0j]]),
+}
+_MIXED_CONTROL = {
+    "early": {"status": "ok", "n_pass": 3, "n_total": 5},
+    "transient": {"status": "withheld",
+                  "withheld_reason": "insufficient_stationary_states",
+                  "n_pass": 1, "n_total": 5, "residual_median": 0.31},
+    "sustained": {"status": "ok", "n_pass": 4, "n_total": 5},
+}
+
+
+def test_jacobian_mixed_control_publishes_only_controlled_epochs(tmp_path, monkeypatch):
+    """A partially failed control must publish only the controlled subset."""
+    summary = _run_jacobian_with_controls(
+        tmp_path, monkeypatch, _MIXED_SPECTRA, _MIXED_CONTROL,
+    )
+    assert summary["status"] == "partial"
+    assert set(summary["spectral_statistics"]) == {"early", "sustained"}
+    assert summary["controlled_epochs"] == ["early", "sustained"]
+    assert summary["withheld_epochs"] == ["transient"]
+    # The withheld epoch is named with a truthful reason and finite
+    # diagnostics, but carries NO spectrum of its own.
+    assert set(summary["withheld_spectra"]) == {"transient"}
+    withheld_entry = summary["withheld_spectra"]["transient"]
+    assert withheld_entry["withheld_reason"] == "insufficient_stationary_states"
+    assert withheld_entry["residual_median"] == 0.31
+    assert "mag_mean" not in withheld_entry
+    # The withheld epoch's own-input magnitude never reaches the artifact.
+    assert "0.7654" not in json.dumps(summary)
+
+
+def test_jacobian_mixed_control_does_not_log_withheld_magnitudes(
+    tmp_path, monkeypatch, caplog,
+):
+    """run.log must consume the same controlled subset — no pre-gate leak."""
+    import logging
+
+    with caplog.at_level(logging.INFO, logger="scripts.analyze_jacobian"):
+        _run_jacobian_with_controls(
+            tmp_path, monkeypatch, _MIXED_SPECTRA, _MIXED_CONTROL,
+        )
+    logged = caplog.text
+    # Controlled epochs are logged ...
+    assert "early: |λ|_mean=0.1235" in logged
+    assert "sustained: |λ|_mean=0.2222" in logged
+    # ... the withheld epoch's magnitude is NOT.
+    assert "0.7654" not in logged
+    # The withholding itself is reported.
+    assert "withheld" in logged.lower()
+
+
+def test_jacobian_all_withheld_does_not_log_own_input_magnitudes(
+    tmp_path, monkeypatch, caplog,
+):
+    """All-withheld must stay an explicit withholding with no logged spectra."""
+    import logging
+
+    withheld = {
+        name: {"status": "withheld", "withheld_reason": "frozen_map_gate_unavailable",
+               "n_pass": 0, "n_total": 5, "residual_median": 0.4}
+        for name in _MIXED_SPECTRA
+    }
+    with caplog.at_level(logging.INFO, logger="scripts.analyze_jacobian"):
+        summary = _run_jacobian_with_controls(
+            tmp_path, monkeypatch, _MIXED_SPECTRA, withheld,
+        )
+    assert summary["status"] == "withheld"
+    assert summary["spectral_statistics"] == {}
+    assert "0.7654" not in caplog.text
+    assert "0.1235" not in caplog.text
+    assert "withheld" in caplog.text.lower()
+
+
+def _strict_json_load(text: str):
+    """Parse JSON with RFC-8259 strictness (no NaN/Infinity constants)."""
+    def _reject(token: str):
+        raise AssertionError(f"non-strict JSON token {token!r}")
+
+    return json.loads(text, parse_constant=_reject)
+
+
+def test_jacobian_nonfinite_residuals_publish_strict_json_without_nan(
+    tmp_path, monkeypatch,
+):
+    """Nonfinite frozen-map residuals must never be summarized into the JSON.
+
+    ``_calibrate_fp_threshold`` rejects a residual array containing
+    NaN/Inf, so the epoch is withheld with reason
+    ``frozen_map_gate_unavailable``.  Summarizing that same nonfinite
+    array would emit bare ``NaN``/``Infinity`` tokens into the artifact
+    (rejected by strict RFC-8259 readers).  Drive a real nonfinite
+    residual through ``run_jacobian_analysis`` and require the published
+    JSON to be strict, spectrum-free, and diagnostic-null.
+    """
+    import torch
+
+    from scripts import analyze_jacobian as jacobian
+
+    class _MockAdapter:
+        def __init__(self) -> None:
+            self._gru_cell = SimpleNamespace(training=True)
+
+        def compute_jacobian_batch(self, h_batch, x_batch):
+            b, h = h_batch.shape
+            return torch.diag(
+                torch.full((h,), 0.5, dtype=torch.float32)
+            ).repeat(b, 1, 1)
+
+        def test_attractor_convergence(self, h, x):
+            return False, 0.0, None
+
+    population = describe_analysis_population(
+        2, [1], range(2), validation_scope="nested_outer_validation",
+    )
+    data = SimpleNamespace(analysis_population=population)
+    monkeypatch.setattr(jacobian, "load_model_from_checkpoint",
+                        lambda *args: SimpleNamespace(dt_ms=4.0))
+    monkeypatch.setattr(jacobian, "load_dataset", lambda *args, **kwargs:
+                        (SimpleNamespace(dataset=data), np.array([1, 1]),
+                         [3, 3], [np.zeros((3, 8)) for _ in range(2)]))
+    monkeypatch.setattr(jacobian, "detect_stimulus_onset_frames",
+                        lambda *args, **kwargs: [1, 1])
+    monkeypatch.setattr(jacobian, "create_jacobian_adapter",
+                        lambda *args, **kwargs: _MockAdapter())
+    monkeypatch.setattr(jacobian, "extract_gru_states_at_epochs",
+                        lambda **kwargs: {
+                            "early": (torch.zeros(6, 4), torch.zeros(6, 4)),
+                        })
+    # Every frozen-map residual is nonfinite, so the real
+    # `_calibrate_fp_threshold` rejects the array and withholds the epoch.
+    monkeypatch.setattr(jacobian, "_fixed_point_residual",
+                        lambda adapter, h, x: float("nan"))
+    monkeypatch.setattr(jacobian, "plot_eigenvalue_spectrum",
+                        lambda **kwargs: None)
+    monkeypatch.setattr(jacobian, "plot_withheld_spectrum_notice",
+                        lambda *args, **kwargs: None)
+
+    output = tmp_path / "jacobian_spectrum.png"
+    jacobian.run_jacobian_analysis(
+        Path("checkpoint.pth"), Path("dataset.pt"), output,
+    )
+
+    raw = output.with_suffix(".json").read_text()
+    assert "NaN" not in raw and "Infinity" not in raw
+    summary = _strict_json_load(raw)
+    assert summary["status"] == "withheld"
+    assert summary["spectral_statistics"] == {}
+    assert summary["controlled_epochs"] == []
+
+    entry = summary["withheld_spectra"]["early"]
+    assert entry["withheld_reason"] == "frozen_map_gate_unavailable"
+    # Unavailable residual summaries are explicit null, never a fabricated
+    # finite sentinel and never a nonfinite number.
+    assert entry["residual_median"] is None
+    # Finite counts survive the withholding.
+    assert entry["n_pass"] == 0
+    assert entry["n_total"] == 6
+
+    frozen_entry = summary["frozen_input_control"]["early"]
+    assert frozen_entry["status"] == "withheld"
+    assert frozen_entry["withheld_reason"] == "frozen_map_gate_unavailable"
+    assert "residual_median" not in frozen_entry
+    assert "residual_min" not in frozen_entry
+    assert "residual_max" not in frozen_entry
 
 
 @pytest.mark.parametrize("indices", [[1.5, 3], [True, 3], [1, 1], [-1, 3]])

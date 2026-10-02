@@ -293,6 +293,42 @@ def test_jax_dataset_loader_rejects_reducer_and_false_lineage(tmp_path):
 
 
 @pytest.mark.skipif(not JAX_AVAILABLE, reason="JAX is not installed")
+@pytest.mark.parametrize("saved_dt", [8., True, float("inf"), "4", None])
+def test_jax_resume_rejects_bad_clock_before_model_construction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, saved_dt: object,
+) -> None:
+    """Inspect genuine lineage without initializing a model or running epochs."""
+    import hashlib
+    from nsmor.config_parser import ExperimentConfig
+    from nsmor.jax import train as trainer
+
+    dataset_path = tmp_path / "synthetic.pt"
+    _synthetic_jax_artifact(dataset_path)
+    resume_path = tmp_path / "resume.pth"
+    state = {
+        "checkpoint_type": "jax_development_only",
+        "validation_scope": "diagnostic_global_oof", "is_nested_cv": False,
+        "dataset_source_sha256": hashlib.sha256(dataset_path.read_bytes()).hexdigest(),
+        "mcmc_prior_provenance": "oof_2fold_recording_prefix_grouped_cv",
+        "animal_identity_status": "unverified", "split_seed": 42, "val_split": 0.2,
+        "n_train_recording_prefixes": 3, "n_val_recording_prefixes": 1,
+        "model_state_dict": {"dummy": torch.zeros(1)},
+        "config": {"model": {} if saved_dt is None else {"dt_ms": saved_dt}},
+    }
+    torch.save(state, resume_path)
+
+    def forbidden_constructor(**kwargs: object) -> None:
+        pytest.fail("Bad checkpoint clock reached JAX model construction")
+
+    monkeypatch.setattr(trainer, "NSMoRModel", forbidden_constructor)
+    with pytest.raises(ValueError, match="dt_ms"):
+        trainer.train_jax(ExperimentConfig(), dataset_path=str(dataset_path),
+                          output_dir=str(tmp_path / "out"),
+                          resume_from=str(resume_path))
+    assert not list((tmp_path / "out").iterdir())
+
+
+@pytest.mark.skipif(not JAX_AVAILABLE, reason="JAX is not installed")
 def test_jax_resume_rejects_unbound_checkpoint_before_training(tmp_path, caplog):
     from nsmor.config_parser import ExperimentConfig
     from nsmor.jax.train import train_jax

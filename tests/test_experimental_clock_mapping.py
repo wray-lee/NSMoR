@@ -321,7 +321,8 @@ def test_batched_host_and_strict_etl_guard(tmp_path: Path) -> None:
 def test_mapping_provenance_survives_actual_dataset_save_load(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, prefix: int,
 ) -> None:
-    import torch
+    from nsmor.mcmc_module import MCMCPriorGenerator
+    from nsmor.pipeline.nested_prior import load_dataset_with_fingerprint
     from scripts.prepare_data import prepare_dataset
 
     raw, out = tmp_path / "raw", tmp_path / "out"
@@ -344,13 +345,16 @@ def test_mapping_provenance_survives_actual_dataset_save_load(
         experimental_clock_prefix_manifest=manifest,
     )
     monkeypatch.setattr("scripts.prepare_data.resolve_group_folds", lambda *a, **k: 2)
+    prior = MCMCPriorGenerator()
+    prior.classifier.weight.data.zero_()
+    prior.classifier.bias.data.zero_()
     monkeypatch.setattr(
         "scripts.prepare_data.train_mcmc_cross_fitted",
-        lambda *a, **k: (np.full((1, 4), 0.25), [_UniformPrior()], []),
+        lambda *a, **k: (np.full((1, 4), 0.25), [prior], []),
     )
     destination = tmp_path / "dataset.pt"
     prepare_dataset(out, destination, dt_ms=4.0)
-    saved = torch.load(destination, weights_only=False)
+    saved, _ = load_dataset_with_fingerprint(destination)
     provenance = saved["source_clock_provenance"][0][0]
     assert provenance["source_row_indices"] == list(range(300))
     assert provenance["time_source"] == (

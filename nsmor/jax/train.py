@@ -30,6 +30,7 @@ import torch
 from nsmor.config_parser import ExperimentConfig
 from nsmor.pipeline.grouping import animal_keys_of
 from nsmor.pipeline.nested_prior import load_artifact_bytes
+from nsmor.pipeline.resampling import validate_checkpoint_clock, validate_dt_ms
 from nsmor.jax.dataloader import (
     JAXDataLoader,
     JAXDataset,
@@ -232,6 +233,7 @@ def train_jax(
     # Disable preallocation by default to avoid GPU OOM on shared cards
     os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
+    validate_dt_ms(config.model.dt_ms, name="active config dt_ms")
     epochs = num_epochs if num_epochs is not None else config.training.num_epochs
     bs = batch_size if batch_size is not None else config.training.batch_size
     lr = learning_rate if learning_rate is not None else config.training.learning_rate
@@ -245,7 +247,7 @@ def train_jax(
     logger.info("Output dir: %s | Epochs: %d | Batch size: %d | LR: %.2e", out_path, epochs, bs, lr)
 
     # 1. Load Dataset
-    raw_data = load_nsmor_dataset(dataset_path)
+    raw_data = load_nsmor_dataset(dataset_path, expected_dt_ms=config.model.dt_ms)
     X_seqs = raw_data["X_seqs"]
     Y_seqs = raw_data["Y_seqs"]
     mcmc_priors = raw_data["mcmc_priors"]
@@ -290,6 +292,9 @@ def train_jax(
                 or any(ckpt_th.get(key) != value for key, value in checkpoint_lineage.items())
                 or not isinstance(ckpt_th.get("model_state_dict"), dict)):
             raise ValueError("JAX development checkpoint lacks matching dataset, split, or lineage")
+        validate_checkpoint_clock(
+            ckpt_th, config.model.dt_ms, require_dt_ms=True,
+        )
         resume_weights = ckpt_th["model_state_dict"]
         if not resume_weights or any(not isinstance(key, str) or not isinstance(value, torch.Tensor)
                                      or not torch.isfinite(value).all()
@@ -528,6 +533,7 @@ def train_jax(
             torch_sd = to_torch_state_dict(state.params)
             torch.save({
                 **checkpoint_lineage,
+                "config": config.to_dict(),
                 "model_state_dict": torch_sd,
                 "epoch": ep,
                 "val_loss": val_loss,
@@ -544,6 +550,7 @@ def train_jax(
             torch_sd = to_torch_state_dict(state.params)
             torch.save({
                 **checkpoint_lineage,
+                "config": config.to_dict(),
                 "model_state_dict": torch_sd,
                 "epoch": ep,
                 "val_loss": val_loss,

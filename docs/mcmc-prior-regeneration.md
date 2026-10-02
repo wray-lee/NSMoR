@@ -44,8 +44,8 @@ directly compared as identical datasets:
 Findings from recent audits and their current resolution status:
 
 - **[RESOLVED] Sampling interval mismatch (Audit 1):**
-  *Historical issue*: Hardware acquisition median is 4.01 ms (nominal 250 Hz), but legacy ETL previously ran with `--dt_ms 10.0`. In pure-wind trials, `prepend_frames` was set to 570 frames (2.28 s) instead of 1425 frames (5.7 s), creating an 851-frame (3.41 s) onset misalignment relative to multisensory trials.
-  *Resolution*: Fixed across CLI defaults and ETL functions (`dt_ms=4.0`). All corpora regenerated with 1425 prepended frames and aligned 250 Hz physical cadence.
+  *Historical issue*: The source cadence is approximately 5 ms (inspected firmware nominal, about 200 Hz; the flashed firmware and any emission calibration remain unverified), and the ~4.01 ms legacy figure was a host-arrival batching diagnostic rather than a measured acquisition rate. Legacy ETL previously ran with `--dt_ms 10.0`. In pure-wind trials, `prepend_frames` was set to 570 frames (2.28 s at 4 ms) instead of 1425 frames (5.7 s at 4 ms), creating an 851-frame onset misalignment relative to multisensory trials.
+  *Resolution*: Fixed across CLI defaults and ETL functions (`dt_ms=4.0`). All corpora regenerated with 1425 prepended frames on the aligned 4.0 ms model grid. Switching the model grid from 10.0 ms to 4.0 ms preserves trial duration and does not inflate it by 25%.
 
 - **[RESOLVED] Uncapped sequence length & random crop hazard (Audit 3 & 5):**
   *Historical issue*: Passing `max_seq_len=2400` to `NSMoRDataset` without anchor indices caused random cropping that missed stimulus onset in 88%-95% of crops.

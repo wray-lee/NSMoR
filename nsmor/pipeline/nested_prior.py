@@ -25,12 +25,14 @@ import torch
 
 from nsmor.config import PIPELINE_SEMANTICS_VERSION, FeatureConfig, TimeWindowConfig
 from nsmor.mcmc_module import MCMCPriorGenerator
+from nsmor.pipeline.clock_storage import restore_clock_provenance
 from nsmor.pipeline.grouping import (
     animal_keys_of,
     check_group_disjoint,
     grouped_train_val_split,
     prior_identity_status,
 )
+from nsmor.pipeline.resampling import validate_lazy_artifact_clock
 
 logger = logging.getLogger(__name__)
 
@@ -121,22 +123,72 @@ def compute_source_fingerprint(dataset_path: Union[str, Path]) -> str:
 
 def load_dataset_with_fingerprint(
     dataset_path: Union[str, Path], *, map_location: Any = None,
+    expected_dt_ms: Optional[float] = None,
+    restore_provenance: bool = True,
 ) -> Tuple[Any, str]:
     """Deserialize and fingerprint one immutable source-dataset byte snapshot.
 
     The digest describes precisely the bytes passed to torch.load. A second
     pathname read after deserialization could otherwise identify another valid
-    dataset substituted at the same path.
+    dataset substituted at the same path. ``expected_dt_ms`` binds the loaded
+    record clock to the consuming model/config; it never rewrites the artifact.
+    ``restore_provenance=False`` validates every packed clock record sequentially
+    but retains the original compressed objects and their shared aliases.
     """
     if dataset_path is None:
         raise TypeError("load_dataset_with_fingerprint requires a dataset path")
+    if expected_dt_ms is not None:
+        if (isinstance(expected_dt_ms, (bool, np.bool_))
+                or not isinstance(expected_dt_ms, (int, float, np.integer, np.floating))
+                or not np.isfinite(expected_dt_ms) or expected_dt_ms <= 0):
+            raise ValueError("expected_dt_ms must be a finite positive interval")
     source_bytes = Path(dataset_path).read_bytes()
     digest = hashlib.sha256(source_bytes).hexdigest()
     dataset = load_artifact_bytes(source_bytes, map_location=map_location)
-    # Declared modern sequences must be stored unpadded; every consumer sees
+    del source_bytes
+    if isinstance(dataset, dict):
+        restore_clock_provenance(dataset, materialize=restore_provenance)
+        # Bind a declared lazy model clock to the consumer's expected cadence.
+        # A present-but-null/partial/contradicted declaration fails closed; this
+        # validates only the lazy-clock artifact and never trips the eager
+        # tensor-completeness gate below.
+        validate_lazy_artifact_clock(dataset, expected_dt_ms)
+    # Version 2.2 and held-channel anchors also predate the model-grid contract.
+    # Any grid-era marker requires sidecars; losing them is not genuine legacy.
+    # A modern producer emits the eager tensor namespace (X_seqs/Y_seqs/lengths)
+    # together with its grid clock and source ledgers.  A v2.2-era artifact may
+    # carry the tensors but predates the grid clock and the ledgers, and a
+    # tensor-free lazy artifact (``trial_specs``) may carry source ledgers with
+    # no eager payload at all.  So a ledger is a grid-era marker only alongside
+    # the eager tensor namespace; a grid clock is always one.  (A ``trial_specs``
+    # artifact beside any eager key was already refused by
+    # ``validate_lazy_artifact_clock`` above, so this gate never sees one.)
+    modern_clock = isinstance(dataset, dict) and (
+        "model_dt_ms" in dataset or "model_grid_provenance" in dataset or (
+            any(key in dataset for key in ("X_seqs", "Y_seqs", "lengths"))
+            and any(key in dataset for key in (
+                "labeling_eligibility", "source_clock_provenance",
+            ))
+        )
+    )
+    if modern_clock and any(
+        key not in dataset for key in (
+            "model_dt_ms", "model_grid_provenance", "anchor_frames",
+            "X_seqs", "Y_seqs", "lengths",
+        )
+    ):
+        raise ValueError("Incomplete modern model grid clock/anchor contract")
+    if not modern_clock:
+        logger.warning(
+            "Dataset has no complete modern grid clock contract; cadence remains "
+            "unverified for expected_dt_ms=%s",
+            expected_dt_ms,
+        )
+    # Declared sequences must be stored unpadded; every consumer sees
     # the same frame support before deriving anchors, constructing datasets or scoring.
     if isinstance(dataset, dict) and ("X_seqs" in dataset or "Y_seqs" in dataset) and (
         "lengths" in dataset or "pipeline_semantics_version" in dataset
+        or "model_grid_provenance" in dataset
     ):
         xs, ys, lengths = (dataset.get(key) for key in ("X_seqs", "Y_seqs", "lengths"))
         if not all(isinstance(items, (list, tuple, np.ndarray, torch.Tensor))
@@ -155,6 +207,54 @@ def load_dataset_with_fingerprint(
                 raise ValueError(f"trial {i}: valid length must be a positive nonboolean integer")
             if getattr(xs[i], "shape", None) != (int(length), 8) or getattr(ys[i], "shape", None) != (int(length),):
                 raise ValueError(f"trial {i}: stored X/Y must be unpadded and match declared valid length {length}")
+        # Convert CPU torch.Tensor to numpy for downstream consumers that expect ndarray
+        for key in ("X_seqs", "Y_seqs"):
+            if key in dataset and isinstance(dataset[key], (list, tuple)):
+                dataset[key] = [seq.detach().cpu().numpy() if isinstance(seq, torch.Tensor) else seq
+                                for seq in dataset[key]]
+    if isinstance(dataset, dict) and "model_grid_provenance" in dataset:
+        from nsmor.pipeline.conditions import derive_anchor_frames
+        from nsmor.pipeline.resampling import resolve_model_anchor_frame
+
+        model_dt_ms = dataset["model_dt_ms"]
+        if (isinstance(model_dt_ms, (bool, np.bool_))
+                or not isinstance(model_dt_ms, (int, float, np.integer, np.floating))
+                or not np.isfinite(model_dt_ms) or model_dt_ms <= 0):
+            raise ValueError("model_dt_ms must be a finite positive interval")
+        if expected_dt_ms is not None and not np.isclose(
+                float(model_dt_ms), float(expected_dt_ms), rtol=1e-9, atol=0.):
+            raise ValueError(
+                f"Dataset model_dt_ms={model_dt_ms} conflicts with "
+                f"expected_dt_ms={expected_dt_ms}"
+            )
+        records = dataset["model_grid_provenance"]
+        xs, anchors = dataset.get("X_seqs", []), dataset.get("anchor_frames")
+        if not isinstance(records, (list, tuple)) or len(records) != len(xs):
+            raise ValueError("model_grid_provenance must be aligned with X_seqs")
+        if (not isinstance(anchors, (list, tuple, np.ndarray, torch.Tensor))
+                or getattr(anchors, "ndim", 1) != 1 or len(anchors) != len(xs)):
+            raise ValueError("source anchor_frames must be aligned with X_seqs")
+        if isinstance(anchors, torch.Tensor):
+            anchors = anchors.tolist()
+        legacy = derive_anchor_frames(xs)
+        for i, record in enumerate(records):
+            expected = resolve_model_anchor_frame(record)
+            if not np.isclose(record["dt_ms"], model_dt_ms, rtol=1e-9, atol=0.):
+                raise ValueError(f"trial {i}: grid dt_ms disagrees with model_dt_ms")
+            if (len(xs[i]) != record["model_n"] + record["synthetic_prepend_frames"]
+                    or expected >= len(xs[i])):
+                raise ValueError(f"trial {i}: source anchor/grid disagrees with sequence")
+            if (isinstance(anchors[i], (bool, np.bool_))
+                    or not isinstance(anchors[i], (int, np.integer))
+                    or anchors[i] != expected):
+                raise ValueError(f"trial {i}: source anchor disagrees with stored anchor_frames")
+            if legacy[i] != expected:
+                logger.warning(
+                    "trial %d: source anchor frame %d (%s at %.17g ms) supersedes "
+                    "legacy held-channel anchor %d; physical values unchanged",
+                    i, expected, record["source_anchor_rule"],
+                    record["source_anchor_ms"], legacy[i],
+                )
     return dataset, digest
 
 

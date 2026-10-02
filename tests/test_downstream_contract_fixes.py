@@ -1383,7 +1383,7 @@ def test_phase_f_unmeasured_visual_baseline_stays_null_in_figure_and_summary(
         [response], [0], dt_ms=dt_ms, anchor_frames=[anchor],
     ))
     assert visual["latency"] == {"mean": None, "sem": None, "n": 0}
-    assert visual["peak_velocity"] == {"mean": 0.0, "sem": 0.0, "n": 1}
+    assert visual["peak_velocity"] == {"mean": 0.0, "sem": None, "n": 1}
     assert multisensory["latency"]["mean"] == 500.0
     stats = {"visual_only": visual, "multisensory_ttc_-225ms": multisensory}
     summary_path = tmp_path / "integration.json"
@@ -1447,3 +1447,226 @@ def test_phase_f_all_flat_corpus_exports_unavailable_before_figure(monkeypatch, 
     assert report["baseline_reference"] is None
     assert all(c["latency_to_peak_ms"] == {"mean": None, "sem": None, "n": 0}
                for c in report["conditions"].values())
+
+
+@pytest.mark.parametrize("dt_ms, anchor, length, offset", [
+    (4.0, 1200, 2400, 125), (10.0, 500, 1200, 50),
+])
+def test_visual_only_never_becomes_a_connected_wind_delta_t_point(
+        monkeypatch, tmp_path, dt_ms, anchor, length, offset):
+    """Regression: visual-only data must not be coerced to delta_t=0.0.
+
+    Visual-only trials have no wind onset, so they have no wind delta_t.
+    Before this guard, ``create_integration_figure`` assigned them x=0.0,
+    silently fabricating a wind-at-TTC point and connecting it into the
+    wind response curve, contradicting the JSON contract (delta_t_ms=null)
+    and the psychophysics artifact (n_ttc0=0). The visual-only group may
+    only appear as a separate, disconnected no-wind reference line.
+    """
+    import matplotlib.pyplot as plt
+    from scripts.analyze_integration import create_integration_figure
+
+    response = np.zeros(length, dtype=np.float32)
+    response[anchor + offset] = 25.0
+    visual = compute_condition_statistics(extract_predicted_metrics(
+        [response], [0], dt_ms=dt_ms, anchor_frames=[anchor],
+    ))
+    multisensory = compute_condition_statistics(extract_predicted_metrics(
+        [response], [0], dt_ms=dt_ms, anchor_frames=[anchor],
+    ))
+    assert visual["latency"]["n"] == 1  # measurable: would be a real x=0 candidate
+    assert multisensory["latency"]["mean"] == 500.0
+    stats = {"visual_only": visual, "multisensory_ttc_-225ms": multisensory}
+
+    captured = {}
+
+    def capture(*_args, **_kwargs):
+        axes = plt.gcf().axes
+        captured["x"] = axes[0].lines[0].get_xdata().copy()
+        captured["vigor_x"] = axes[1].lines[0].get_xdata().copy()
+        captured["ref_lines"] = [
+            float(np.asarray(line.get_ydata()).ravel()[0])
+            for axis in axes for line in axis.lines
+            if line.get_label() == "Visual-Only Baseline"
+        ]
+
+    monkeypatch.setattr(plt, "savefig", capture)
+    create_integration_figure(stats, tmp_path / "integration.png")
+
+    # The wind response series contains only the genuine wind delta_t (-225).
+    assert captured["x"].tolist() == [-225.0]
+    assert captured["vigor_x"].tolist() == [-225.0]
+    # No fabricated point at delta_t=0 on either wind panel.
+    assert 0.0 not in captured["x"].tolist()
+    assert 0.0 not in captured["vigor_x"].tolist()
+    # Visual-only survives only as a separate reference line, never connected:
+    # panel A reference = visual latency, panel B reference = visual peak velocity.
+    assert sorted(captured["ref_lines"]) == sorted(
+        [visual["latency"]["mean"], visual["peak_velocity"]["mean"]]
+    )
+
+
+@pytest.mark.parametrize("dt_ms, anchor, length, offset", [
+    (4.0, 1200, 2400, 125), (10.0, 500, 1200, 50),
+])
+def test_wind_only_stays_an_honest_skip_not_a_wind_axis_point(
+        monkeypatch, tmp_path, dt_ms, anchor, length, offset):
+    """Wind-only has wind but no TTC-relative delta_t: explicit skip, no point."""
+    import matplotlib.pyplot as plt
+    from scripts.analyze_integration import create_integration_figure
+
+    response = np.zeros(length, dtype=np.float32)
+    response[anchor + offset] = 25.0
+    wind_only = compute_condition_statistics(extract_predicted_metrics(
+        [response], [0], dt_ms=dt_ms, anchor_frames=[anchor],
+    ))
+    multisensory = compute_condition_statistics(extract_predicted_metrics(
+        [response], [0], dt_ms=dt_ms, anchor_frames=[anchor],
+    ))
+    stats = {"wind_only": wind_only, "multisensory_ttc_-225ms": multisensory}
+
+    captured = {}
+
+    def capture(*_args, **_kwargs):
+        captured["x"] = plt.gcf().axes[0].lines[0].get_xdata().copy()
+
+    monkeypatch.setattr(plt, "savefig", capture)
+    create_integration_figure(stats, tmp_path / "integration.png")
+    assert captured["x"].tolist() == [-225.0]
+
+
+@pytest.mark.parametrize("dt_ms, anchor, length", [
+    (4.0, 1200, 2400), (10.0, 500, 1200),
+])
+def test_wind_response_series_is_sorted_by_delta_t_and_paired(
+        monkeypatch, tmp_path, dt_ms, anchor, length):
+    """Regression: the connected wind curve must be monotone in delta_t.
+
+    Conditions arrive in dictionary insertion order, which reflects how
+    trials were observed, not the physical wind-onset axis. Passing them
+    unsorted (e.g. x = [-261, -308, -373, -225]) makes the connected
+    response curve self-cross. The plotting seam must sort each genuine
+    wind delta_t together with its paired latency/velocity means AND
+    errors, while keeping the visual-only record out of the connected
+    series as a disconnected baseline only.
+
+    Each wind group carries >1 trial so its SEM is a real nonzero value,
+    and the four groups carry distinct latency/velocity SEMs. A bug that
+    permuted only the SEM vectors (leaving x and y correctly sorted)
+    would be invisible to a single-trial n=1/SEM=0 fixture; here the
+    plotted error bars are read back from the real matplotlib
+    ErrorbarContainer and checked for both panels.
+    """
+    import matplotlib.pyplot as plt
+    from scripts.analyze_integration import (
+        create_integration_figure,
+        parse_ttc_condition_delta,
+    )
+
+    def trial(latency_ms, velocity):
+        response = np.zeros(length, dtype=np.float32)
+        response[anchor + int(round(latency_ms / dt_ms))] = velocity
+        return response
+
+    def condition(pairs):
+        responses = [trial(lat, vel) for lat, vel in pairs]
+        return compute_condition_statistics(extract_predicted_metrics(
+            responses, list(range(len(responses))),
+            dt_ms=dt_ms, anchor_frames=[anchor] * len(responses),
+        ))
+
+    # >1 trial per wind group; each group's per-trial spread is chosen so
+    # every group gets a distinct nonzero latency/velocity SEM.
+    groups = {
+        "multisensory_ttc_-261ms": [
+            (900.0, 30.0), (1000.0, 31.0), (1300.0, 33.0), (1600.0, 36.0),
+        ],
+        "multisensory_ttc_-373ms": [
+            (400.0, 10.0), (500.0, 12.0), (600.0, 14.0), (700.0, 16.0),
+        ],
+        "multisensory_ttc_-225ms": [
+            (1000.0, 25.0), (1500.0, 26.0), (1600.0, 27.0), (2100.0, 29.0),
+        ],
+        "multisensory_ttc_-308ms": [
+            (200.0, 20.0), (350.0, 23.0), (550.0, 27.0), (800.0, 32.0),
+        ],
+    }
+    # Out-of-order insertion: observed order is not the delta_t order.
+    stats = {name: condition(pairs) for name, pairs in groups.items()}
+    stats["visual_only"] = condition([(250.0, 12.0), (300.0, 14.0)])
+
+    # The fixture must actually exercise real error bars: every wind group
+    # needs n>1, nonzero SEM, and the groups must differ in SEM and mean.
+    for name in groups:
+        assert stats[name]["latency"]["n"] > 1
+        assert stats[name]["latency"]["sem"] > 0.0
+        assert stats[name]["peak_velocity"]["sem"] > 0.0
+    lat_sems = [stats[n]["latency"]["sem"] for n in groups]
+    vel_sems = [stats[n]["peak_velocity"]["sem"] for n in groups]
+    assert len(set(round(s, 9) for s in lat_sems)) == len(groups)
+    assert len(set(round(s, 9) for s in vel_sems)) == len(groups)
+
+    delta_of = {n: parse_ttc_condition_delta(n) for n in groups}
+    order = sorted(groups, key=lambda n: delta_of[n])
+    exp_x = [delta_of[n] for n in order]
+    exp_lat_y = [stats[n]["latency"]["mean"] for n in order]
+    exp_lat_e = [stats[n]["latency"]["sem"] for n in order]
+    exp_vel_y = [stats[n]["peak_velocity"]["mean"] for n in order]
+    exp_vel_e = [stats[n]["peak_velocity"]["sem"] for n in order]
+
+    captured = {}
+
+    def capture(*_args, **_kwargs):
+        axes = plt.gcf().axes
+
+        def series(axis):
+            # The wind errorbar series is the panel's ErrorbarContainer;
+            # read the plotted data line and the real error-bar segments
+            # (lines[2] is the LineCollection of bar segments).
+            assert len(axis.containers) == 1, "expected one errorbar series"
+            container = axis.containers[0]
+            x = np.asarray(container.lines[0].get_xdata(), dtype=float)
+            y = np.asarray(container.lines[0].get_ydata(), dtype=float)
+            segs = np.asarray(container.lines[2][0].get_segments(), dtype=float)
+            yerr = (segs[:, 1, 1] - segs[:, 0, 1]) / 2.0
+            return x, y, yerr
+
+        captured["latency"] = series(axes[0])
+        captured["velocity"] = series(axes[1])
+        captured["ref_lines"] = sorted(
+            float(np.asarray(line.get_ydata()).ravel()[0])
+            for axis in axes for line in axis.lines
+            if line.get_label() == "Visual-Only Baseline"
+        )
+
+    monkeypatch.setattr(plt, "savefig", capture)
+    create_integration_figure(stats, tmp_path / "integration.png")
+
+    lat_x, lat_y, lat_e = captured["latency"]
+    vel_x, vel_y, vel_e = captured["velocity"]
+
+    # Both panels share the genuine, strictly increasing wind delta_t axis.
+    assert lat_x.tolist() == vel_x.tolist() == exp_x
+    assert np.all(np.diff(lat_x) > 0.0)
+    assert np.all(np.diff(vel_x) > 0.0)
+    # x/y/yerr stay jointly permuted: sorted x carries the matching paired
+    # means and error bars on BOTH panels.
+    assert np.allclose(lat_y, exp_lat_y)
+    assert np.allclose(vel_y, exp_vel_y)
+    assert np.allclose(lat_e, exp_lat_e)
+    assert np.allclose(vel_e, exp_vel_e)
+    # The plotted error bars are the real, distinct, nonzero SEMs.
+    assert np.all(lat_e > 0.0)
+    assert np.all(vel_e > 0.0)
+    assert len(set(np.round(lat_e, 9))) == len(groups)
+    assert len(set(np.round(vel_e, 9))) == len(groups)
+    # No fabricated wind-at-TTC point from the visual-only record.
+    assert 0.0 not in lat_x.tolist() and 0.0 not in vel_x.tolist()
+    # Visual-only survives only as a disconnected baseline reference,
+    # drawn from its own latency/peak-velocity statistics (never connected
+    # to the wind series). Compare against the actual stats to stay
+    # dt-agnostic.
+    vis = stats["visual_only"]
+    assert captured["ref_lines"] == sorted(
+        [vis["latency"]["mean"], vis["peak_velocity"]["mean"]]
+    )
