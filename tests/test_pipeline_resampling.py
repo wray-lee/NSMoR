@@ -591,6 +591,9 @@ def test_model_free_consumers_reject_broken_clock_contract(
 def test_jax_training_ingestion_rejects_consumer_clock_mismatch(
     tmp_path: Path,
 ) -> None:
+    pytest.importorskip("jax", exc_type=ImportError)
+    pytest.importorskip("flax", exc_type=ImportError)
+    pytest.importorskip("optax", exc_type=ImportError)
     from nsmor.config_parser import ExperimentConfig
     from nsmor.jax.train import train_jax
 
@@ -604,6 +607,9 @@ def test_jax_training_ingestion_rejects_consumer_clock_mismatch(
 
 
 def test_jax_loader_rejects_consumer_clock_mismatch(tmp_path: Path) -> None:
+    pytest.importorskip("jax", exc_type=ImportError)
+    pytest.importorskip("flax", exc_type=ImportError)
+    pytest.importorskip("optax", exc_type=ImportError)
     from nsmor.jax.dataloader import load_nsmor_dataset
 
     path = tmp_path / "clock.pt"

@@ -267,6 +267,9 @@ def test_training_consumers_request_compact_validation(
         raise LoadedCompact
 
     if consumer == "jax":
+        pytest.importorskip("jax", exc_type=ImportError)
+        pytest.importorskip("flax", exc_type=ImportError)
+        pytest.importorskip("optax", exc_type=ImportError)
         from nsmor.jax import dataloader
         monkeypatch.setattr(dataloader, "load_dataset_with_fingerprint", compact_load)
         with pytest.raises(LoadedCompact):
