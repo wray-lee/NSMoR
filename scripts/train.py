@@ -134,7 +134,1120 @@ _PROVENANCE_KEYS = frozenset({
     "mcmc_prior_provenance",
     "animal_identity_status",
     "best_val_loss",
+    # Epoch-boundary recovery state (see the recovery helpers below).  These
+    # ride the same pop-then-patch seam so nsmor/checkpoint.py stays untouched.
+    "recovery_state_version",
+    "epochs_without_improvement",
+    "training_history",
+    "history_start_epoch",
+    "numpy_rng_state",
 })
+
+# A current-schema checkpoint CLAIMS exact continuation, so these canonical
+# state blocks must all be present (the recovery payload's counter / history /
+# axis / NumPy MT19937 state are validated separately in
+# ``_restore_recovery_state``).  The canonical loader tolerates an absent
+# optimizer / scheduler; a current-schema payload that omits one would resume
+# with a fresh optimizer or restarted schedule, so presence is enforced here.
+_CURRENT_SCHEMA_REQUIRED_KEYS = (
+    "model_state_dict",
+    "optimizer_state_dict",
+    "scheduler_state_dict",
+    "rng_state",
+)
+
+# A non-empty ``scheduler_state_dict`` is NOT enough.  ``LRScheduler.load_state_dict``
+# SILENTLY MERGES whatever mapping it is given: it never resets to defaults and
+# never validates the key set, so a truncated or arbitrary mapping loads without
+# error while retaining the freshly-built scheduler's defaults.  The real
+# producer is ``CosineAnnealingLR`` (built at train.py:~4019 for phase 1 and in
+# ``_build_phase2_optimizer_scheduler`` for phase 2).  ``LRScheduler.state_dict``
+# serializes every ``__dict__`` entry except the optimizer, so the EXACT key set
+# is the production schema of the pinned torch: ``T_max`` / ``eta_min`` (the
+# cosine endpoints), ``base_lrs`` / ``last_epoch`` / ``_last_lr`` (the per-group
+# base rates, the step position, and the cached last LR), plus ``_step_count``,
+# ``_get_lr_called_within_step`` and ``_is_initial`` (the torch-2.x step-state
+# flags that decide which ``get_lr`` branch runs).  A resume that loads only a
+# subset (e.g. ``{"last_epoch": 1}``) keeps the fresh ``base_lrs`` / ``T_max``
+# and silently anneals the wrong schedule, so the complete key/value STRUCTURE
+# is required for an exact continuation.  ``verbose`` is NOT part of this
+# version's state (torch 2.14.0+cu132); an extra key is a foreign schema and
+# fails closed too.
+_SCHEDULER_STATE_REQUIRED_KEYS = (
+    "T_max", "_get_lr_called_within_step", "_is_initial", "_last_lr",
+    "_step_count", "base_lrs", "eta_min", "last_epoch",
+)
+_SCHEDULER_STATE_INT_KEYS = ("T_max", "last_epoch", "_step_count")
+_SCHEDULER_STATE_LIST_KEYS = ("base_lrs", "_last_lr")
+_SCHEDULER_STATE_BOOL_KEYS = ("_get_lr_called_within_step", "_is_initial")
+
+
+def _is_real_number(value: Any) -> bool:
+    """True for a FINITE numeric scalar (``bool`` excluded — not a scheduler rate).
+
+    ``NaN`` / ``Inf`` are rejected here, not tolerated: the producer's
+    ``CosineAnnealingLR`` is built with finite endpoints (``eta_min=1e-6``,
+    finite group rates), so a non-finite rate is never a real continuation.
+    ``load_state_dict`` would merge it verbatim onto the optimizer's
+    ``group["lr"]``, where it poisons every subsequent update and the terminal
+    checkpoint instead of failing loudly.
+    """
+    if isinstance(value, bool) or not isinstance(
+        value, (int, float, np.integer, np.floating)
+    ):
+        return False
+    return math.isfinite(float(value))
+
+
+def _require_complete_scheduler_state(
+    sched_sd: Any, ckpt_path: Path, opt_group_count: int,
+) -> None:
+    """Fail closed unless *sched_sd* is the COMPLETE ``CosineAnnealingLR`` state.
+
+    ``LRScheduler.load_state_dict`` silently merges a partial mapping, so mere
+    non-emptiness cannot distinguish a full schedule state from a damaged one
+    that would resume with the freshly-built scheduler's defaults.  This checks
+    the producer's load-bearing key/value structure (see
+    ``_SCHEDULER_STATE_REQUIRED_KEYS``); it is scoped to the current schema and
+    to the ``CosineAnnealingLR`` the trainer actually builds, not a generic
+    scheduler framework.
+
+    The per-group rate sequences must also have exactly ``opt_group_count``
+    entries — the number of param groups the SAME checkpoint's
+    ``optimizer_state_dict`` records.  ``CosineAnnealingLR._update_lr`` zips
+    ``values`` against ``optimizer.param_groups`` with ``strict=True`` but only
+    after ``get_lr`` has already built ``values`` from ``base_lrs``, so a
+    one-element ``base_lrs`` with a two-group optimizer would be truncated to
+    the first group: the LIF group's LR would never be annealed while the run
+    still claimed an exact continuation.
+    """
+    missing = [k for k in _SCHEDULER_STATE_REQUIRED_KEYS if k not in sched_sd]
+    if missing:
+        raise ValueError(
+            f"Resume checkpoint {ckpt_path} scheduler_state_dict is missing "
+            f"required CosineAnnealingLR fields {missing}; a partial mapping "
+            "would silently merge with fresh defaults (fail closed)."
+        )
+    extra = sorted(set(sched_sd) - set(_SCHEDULER_STATE_REQUIRED_KEYS))
+    if extra:
+        raise ValueError(
+            f"Resume checkpoint {ckpt_path} scheduler_state_dict carries "
+            f"unexpected fields {extra} for the pinned torch "
+            f"{torch.__version__} CosineAnnealingLR schema; fail closed."
+        )
+    for key in _SCHEDULER_STATE_BOOL_KEYS:
+        value = sched_sd[key]
+        if not isinstance(value, bool):
+            raise ValueError(
+                f"Resume checkpoint {ckpt_path} scheduler_state_dict[{key!r}] is "
+                f"not a bool ({type(value).__name__}); fail closed."
+            )
+    for key in _SCHEDULER_STATE_INT_KEYS:
+        value = sched_sd[key]
+        if not isinstance(value, (int, np.integer)) or isinstance(value, bool):
+            raise ValueError(
+                f"Resume checkpoint {ckpt_path} scheduler_state_dict[{key!r}] is "
+                f"not an integer ({type(value).__name__}); fail closed."
+            )
+    if sched_sd["T_max"] < 1:
+        raise ValueError(
+            f"Resume checkpoint {ckpt_path} scheduler_state_dict['T_max'] is "
+            f"{sched_sd['T_max']}; the producer clamps the horizon to >= 1 "
+            "(CosineAnnealingLR is built as max(1, num_epochs - ...)), so a "
+            "non-positive T_max is not a real continuation (fail closed)."
+        )
+    if sched_sd["last_epoch"] < -1:
+        raise ValueError(
+            f"Resume checkpoint {ckpt_path} scheduler_state_dict['last_epoch'] "
+            f"is {sched_sd['last_epoch']}; the producer never steps before the "
+            "initial -1 position (fail closed)."
+        )
+    if sched_sd["_step_count"] < 0:
+        raise ValueError(
+            f"Resume checkpoint {ckpt_path} scheduler_state_dict['_step_count'] "
+            f"is {sched_sd['_step_count']}; a negative step count is not a real "
+            "continuation (fail closed)."
+        )
+    if sched_sd["_step_count"] != sched_sd["last_epoch"] + 1:
+        raise ValueError(
+            f"Resume checkpoint {ckpt_path} scheduler_state_dict['_step_count'] "
+            f"is {sched_sd['_step_count']} but last_epoch is "
+            f"{sched_sd['last_epoch']}; the production scheduler increments both "
+            "once per step (fail closed)."
+        )
+    if not _is_real_number(sched_sd["eta_min"]):
+        raise ValueError(
+            f"Resume checkpoint {ckpt_path} scheduler_state_dict['eta_min'] is "
+            f"not a finite number ({type(sched_sd['eta_min']).__name__}); "
+            "fail closed."
+        )
+    lengths = set()
+    for key in _SCHEDULER_STATE_LIST_KEYS:
+        value = sched_sd[key]
+        if not isinstance(value, (list, tuple)) or not value:
+            raise ValueError(
+                f"Resume checkpoint {ckpt_path} scheduler_state_dict[{key!r}] is "
+                f"not a non-empty sequence ({type(value).__name__}); fail closed."
+            )
+        if not all(_is_real_number(v) for v in value):
+            raise ValueError(
+                f"Resume checkpoint {ckpt_path} scheduler_state_dict[{key!r}] "
+                "contains a non-finite or non-numeric entry; fail closed."
+            )
+        lengths.add(len(value))
+    if len(lengths) != 1:
+        raise ValueError(
+            f"Resume checkpoint {ckpt_path} scheduler_state_dict base_lrs/_last_lr "
+            "have mismatched group counts; fail closed."
+        )
+    if next(iter(lengths)) != opt_group_count:
+        raise ValueError(
+            f"Resume checkpoint {ckpt_path} scheduler_state_dict base_lrs/_last_lr "
+            f"have {next(iter(lengths))} entries but optimizer_state_dict records "
+            f"{opt_group_count} param_groups; the extra group(s) would never be "
+            "annealed (fail closed)."
+        )
+
+
+# ── Epoch-boundary recovery state ─────────────────────────────
+# A resumed run must CONTINUE, not restart, the counters that shape its own
+# trajectory.  The early-stopping counter and the accumulated loss history
+# are read/advanced every epoch but were previously re-initialised after the
+# resume block, so a SIGKILL/OOM restart silently reset patience and lost
+# the plotted history.  They ride the provenance seam above (popped before
+# the frozen save_checkpoint, patched into the on-disk state) so
+# nsmor/checkpoint.py keeps its storage contract.
+#
+# Bump RECOVERY_STATE_VERSION when the schema or its continuation semantics
+# change: a checkpoint stamped with a different version is not trusted for
+# exact continuation, and the run says so loudly instead of silently
+# restarting the counters.
+#
+# v2 semantics (reviewer repair): the diagnostic histories are persisted in
+# FULL — one value per executed epoch, in order, positionally aligned across
+# ``train_loss`` and ``val_loss``.  A non-finite scalar diagnostic (NaN/Inf
+# from an unstable epoch) is written AS-IS, never dropped or coerced, so the
+# epoch axis never collapses and a resumed run can keep appending.  A gap
+# ``None`` marks an epoch at which a series was not recorded (e.g. no
+# validation); it occupies its epoch slot so the axis stays aligned.
+# ``history_start_epoch`` records the true 0-based epoch of entry 0, so a
+# resume from a LEGACY checkpoint (unknown history) starts its axis at the
+# resume epoch rather than falsely redrawing it from epoch 1.  The
+# early-stopping counter is a property of the finite-validation series ONLY
+# and is kept as an independent control value; it is never inferred from the
+# diagnostic completeness.
+RECOVERY_STATE_VERSION = 2
+
+
+def _encode_numpy_rng_state(state: tuple) -> Dict[str, Any]:
+    """Encode ``np.random.get_state()`` as JSON-safe scalars + one tensor.
+
+    The legacy MT19937 key array (624 uint32) rides as a torch tensor, which
+    the restricted decoder (``load_artifact_bytes``) already admits; the
+    scalar fields are plain ints/floats.  ``np.random.set_state`` reproduces
+    this stream exactly — the modern ``Generator`` has no equivalent
+    serialisable form.  Storing NumPy state matters only for the deprecated
+    legacy random crop; the anchor-aligned crop is deterministic, so the
+    stream is frozen across epochs and this is a no-op there.  It is
+    persisted anyway so recovery does not depend on which crop path runs.
+    """
+    name, keys, pos, has_gauss, cached = state
+    # ``.clone()`` detaches from the live MT19937 buffer: ``ascontiguousarray``
+    # may return the same array, and ``from_numpy`` would then alias state that
+    # the next ``np.random`` call mutates before this is serialized.
+    keys_tensor = torch.from_numpy(
+        np.ascontiguousarray(keys, dtype=np.uint32)
+    ).clone()
+    # Shape/dtype contract of the persisted MT19937 key array.  A silent
+    # change here (e.g. a different NumPy build handing back a shorter
+    # state) would produce a checkpoint whose RNG stream cannot be
+    # restored; assert loudly instead.
+    assert keys_tensor.dtype == torch.uint32, keys_tensor.dtype
+    assert keys_tensor.shape == (624,), keys_tensor.shape
+    assert keys_tensor.device.type == "cpu", keys_tensor.device
+    return {
+        "bit_generator": str(name),
+        "keys": keys_tensor,
+        "pos": int(pos),
+        "has_gauss": int(has_gauss),
+        "cached_gaussian": float(cached),
+    }
+
+
+def _decode_numpy_rng_state(record: Any) -> tuple:
+    """Validate and rebuild an ``np.random.get_state()`` tuple, else raise.
+
+    A current-schema ``numpy_rng_state`` is REQUIRED recovery state: if it is
+    absent or malformed the resumed NumPy stream cannot be reproduced, so the
+    run must fail closed BEFORE executing any epoch rather than silently
+    reseeding a different stream (independent reviews R2 / B-1).  Every field
+    is checked against the exact legacy MT19937 schema — a fractional or
+    boolean ``pos``/``has_gauss``, a string/bool ``cached_gaussian``, a
+    non-``MT19937`` bit generator, or a wrongly shaped/dtyped key array is
+    rejected outright and NEVER coerced with ``int()``/``float()``.
+    """
+    if not isinstance(record, dict):
+        raise ValueError(
+            f"numpy_rng_state is not a mapping ({type(record).__name__})"
+        )
+    if record.get("bit_generator") != "MT19937":
+        raise ValueError(
+            f"numpy_rng_state bit_generator={record.get('bit_generator')!r} "
+            "is not the supported 'MT19937'"
+        )
+    keys = record.get("keys")
+    if not isinstance(keys, torch.Tensor):
+        raise ValueError(
+            f"numpy_rng_state keys is not a tensor ({type(keys).__name__})"
+        )
+    if keys.dtype != torch.uint32:
+        raise ValueError(f"numpy_rng_state keys dtype={keys.dtype} is not uint32")
+    if keys.shape != (624,):
+        raise ValueError(
+            f"numpy_rng_state keys shape={tuple(keys.shape)} is not (624,)"
+        )
+    if keys.device.type != "cpu":
+        raise ValueError(
+            f"numpy_rng_state keys device={keys.device} is not CPU"
+        )
+    pos = record.get("pos")
+    if isinstance(pos, bool) or not isinstance(pos, (int, np.integer)):
+        raise ValueError(f"numpy_rng_state pos={pos!r} is not an integer")
+    if not (0 <= int(pos) <= 624):
+        raise ValueError(f"numpy_rng_state pos={pos!r} is outside [0, 624]")
+    has_gauss = record.get("has_gauss")
+    if isinstance(has_gauss, bool) or not isinstance(has_gauss, (int, np.integer)):
+        raise ValueError(
+            f"numpy_rng_state has_gauss={has_gauss!r} is not an integer"
+        )
+    if int(has_gauss) not in (0, 1):
+        raise ValueError(
+            f"numpy_rng_state has_gauss={has_gauss!r} is not 0 or 1"
+        )
+    cached = record.get("cached_gaussian")
+    if isinstance(cached, bool) or not isinstance(
+        cached, (int, float, np.integer, np.floating)
+    ):
+        raise ValueError(
+            f"numpy_rng_state cached_gaussian={cached!r} is not numeric"
+        )
+    if not math.isfinite(float(cached)):
+        raise ValueError(
+            f"numpy_rng_state cached_gaussian={cached!r} is not finite"
+        )
+    return (
+        "MT19937", keys.numpy().astype(np.uint32),
+        int(pos), int(has_gauss), float(cached),
+    )
+
+
+def _require_complete_current_schema(
+    ckpt: Dict[str, Any], ckpt_path: Path,
+) -> None:
+    """Fail closed on an INCOMPLETE current-schema continuation payload.
+
+    A checkpoint stamped with the current ``recovery_state_version`` claims to
+    carry the full epoch-boundary continuation state, so a resume treats it as
+    exactly reproducible.  A current-schema payload MISSING any required state
+    — model weights, optimizer moments, scheduler, Torch RNG — is damaged
+    required state, not a legacy gap: the canonical loader tolerates a missing
+    ``optimizer_state_dict`` / ``scheduler_state_dict`` (it restores only what
+    is present), which would silently resume with a FRESH optimizer (zero
+    moments) or a restarted LR schedule while still claiming an exact
+    continuation.  Missing, explicitly ``None``, or otherwise malformed
+    required state therefore fails closed here, BEFORE any update or terminal
+    save.
+
+    Scope is deliberately narrow: the presence and shape (not the numerical
+    content) of the four canonical keys is checked, plus the recovery payload
+    the current schema also promises (counter / history / axis / NumPy MT19937
+    state, validated in ``_restore_recovery_state``).  LEGACY / version-
+    mismatched checkpoints keep their limited fallback and are not examined
+    here.
+    """
+    if ckpt.get("recovery_state_version") != RECOVERY_STATE_VERSION:
+        return
+    missing = [k for k in _CURRENT_SCHEMA_REQUIRED_KEYS if k not in ckpt]
+    if missing:
+        raise ValueError(
+            f"Resume checkpoint {ckpt_path} is current-schema "
+            f"(recovery_state_version={RECOVERY_STATE_VERSION}) but is "
+            f"missing required continuation state {missing}; damaged state, "
+            "not a legacy gap (fail closed)."
+        )
+    none_keys = [k for k in _CURRENT_SCHEMA_REQUIRED_KEYS if ckpt[k] is None]
+    if none_keys:
+        raise ValueError(
+            f"Resume checkpoint {ckpt_path} records an explicit None for "
+            f"required continuation state {none_keys}; fail closed."
+        )
+    model_sd = ckpt["model_state_dict"]
+    if not isinstance(model_sd, dict) or not model_sd:
+        raise ValueError(
+            f"Resume checkpoint {ckpt_path} model_state_dict is not a "
+            f"non-empty mapping ({type(model_sd).__name__}); fail closed."
+        )
+    opt_sd = ckpt["optimizer_state_dict"]
+    if not isinstance(opt_sd, dict) or not opt_sd:
+        raise ValueError(
+            f"Resume checkpoint {ckpt_path} optimizer_state_dict is not a "
+            f"non-empty mapping ({type(opt_sd).__name__}); a fresh optimizer "
+            "would silently discard the saved moments (fail closed)."
+        )
+    opt_groups = opt_sd.get("param_groups")
+    if not isinstance(opt_groups, (list, tuple)) or not opt_groups:
+        raise ValueError(
+            f"Resume checkpoint {ckpt_path} optimizer_state_dict has no "
+            f"non-empty param_groups ({type(opt_groups).__name__}); the "
+            "scheduler's per-group rates cannot be bound to the optimizer "
+            "state (fail closed)."
+        )
+    sched_sd = ckpt["scheduler_state_dict"]
+    if not isinstance(sched_sd, dict) or not sched_sd:
+        raise ValueError(
+            f"Resume checkpoint {ckpt_path} scheduler_state_dict is not a "
+            f"non-empty mapping ({type(sched_sd).__name__}); a restarted LR "
+            "schedule is not an exact continuation (fail closed)."
+        )
+    # Non-emptiness is NOT sufficient: ``load_state_dict`` merges silently, so
+    # a partial/arbitrary mapping would resume on the fresh scheduler's
+    # defaults.  Require the complete CosineAnnealingLR structure, with the
+    # per-group rate sequences matching the optimizer state's actual group
+    # count.
+    _require_complete_scheduler_state(sched_sd, ckpt_path, len(opt_groups))
+    rng_state = ckpt["rng_state"]
+    if not isinstance(rng_state, torch.Tensor) or rng_state.dtype != torch.uint8:
+        raise ValueError(
+            f"Resume checkpoint {ckpt_path} rng_state is not a uint8 tensor "
+            f"({type(rng_state).__name__}); fail closed."
+        )
+
+
+def _is_epoch_value(value: Any) -> bool:
+    """True when *value* is a recorded scalar (finite OR non-finite NaN/Inf).
+
+    Non-finite scalars ARE recorded epochs — an unstable epoch produced a
+    real NaN/Inf diagnostic — so they are distinguished from a gap (``None``
+    or a missing entry) and never treated as structural damage.
+    """
+    return isinstance(value, (int, float, np.integer, np.floating))
+
+
+def _terminal_diagnostic_value(
+    parent_value: Any,
+    history_tail: Any,
+    *,
+    series: str,
+    ckpt_path: Path,
+) -> Optional[float]:
+    """Resolve one terminal diagnostic (``train_loss`` / ``val_loss``).
+
+    A zero-update finalization reports the LAST EXECUTED epoch's diagnostics.
+    Two sources describe that epoch in the parent checkpoint:
+
+    * ``parent_value`` — the scalar the parent recorded at the TOP level
+      (``train_loss`` / ``val_loss``).  Absent (``None``) when the parent
+      recorded no observation for that series.
+    * ``history_tail`` — the final position of the restored history series:
+      a recorded scalar, ``None`` (an executed-but-unobserved GAP), or absent.
+
+    A recorded scalar WINS.  The parent's own observation must never be
+    replaced by a ``None`` gap (that would discard a measured loss and make
+    the finalized checkpoint claim a value the run did not measure).  A
+    legitimate gap is therefore NOT a contradiction — it is filled from the
+    other source.  When BOTH sources record a scalar they describe the same
+    epoch and must agree; a disagreement is a structurally inconsistent
+    parent and fails closed.  A malformed (non-scalar, non-gap) value fails
+    closed.  ``NaN``/``Inf`` pass through verbatim — a non-finite epoch is a
+    genuine recorded result, not a gap — and two ``NaN`` scalars count as
+    equal.  When neither source has a value the result is ``None`` (an
+    explicit unobserved value; the caller maps it to its own placeholder),
+    never a fabricated ``0``.
+    """
+    if parent_value is None:
+        parent_scalar: Optional[float] = None
+    elif _is_epoch_value(parent_value) and not isinstance(parent_value, bool):
+        parent_scalar = float(parent_value)
+    else:
+        raise ValueError(
+            f"Resume checkpoint {ckpt_path} records a non-scalar top-level "
+            f"{series}={parent_value!r}; a terminal finalization cannot "
+            "inherit a malformed diagnostic (fail closed)."
+        )
+
+    if history_tail is None:
+        history_scalar: Optional[float] = None
+    elif _is_epoch_value(history_tail) and not isinstance(history_tail, bool):
+        history_scalar = float(history_tail)
+    else:
+        raise ValueError(
+            f"Resume checkpoint {ckpt_path} history tail {series}="
+            f"{history_tail!r} is neither a scalar nor a gap; fail closed."
+        )
+
+    if parent_scalar is not None and history_scalar is not None:
+        _agree = (
+            math.isnan(parent_scalar) and math.isnan(history_scalar)
+        ) or parent_scalar == history_scalar
+        if not _agree:
+            raise ValueError(
+                f"Resume checkpoint {ckpt_path} records {series}="
+                f"{parent_scalar!r} but its history tail is "
+                f"{history_scalar!r}; the parent's own diagnostics disagree "
+                "(fail closed)."
+            )
+        return parent_scalar
+    if parent_scalar is not None:
+        return parent_scalar
+    return history_scalar
+
+
+def _terminal_train_diagnostic(
+    ckpt: Dict[str, Any],
+    history_tail: Any,
+    *,
+    ckpt_path: Path,
+) -> Optional[float]:
+    """Resolve the terminal TRAIN diagnostic, honouring the legacy ``loss`` field.
+
+    The epoch train loss is recorded at the top level as ``train_loss``.  A
+    LEGACY / older writer may instead carry only the independent ``loss``
+    scalar (the step-level value ``save_checkpoint`` has always written).  A
+    MISSING ``train_loss`` is therefore not the same as a ``None`` one:
+
+    * ``train_loss`` ABSENT — no top-level train observation was recorded;
+      the independent ``loss`` field, if present, IS the train diagnostic and
+      must be kept (it is never discarded in favour of a gap).
+    * ``train_loss`` PRESENT and ``None`` — the parent explicitly declared an
+      unobserved train position; the legacy ``loss`` is NOT substituted for
+      it (an absent field and an explicit gap are distinct).
+
+    The chosen source then goes through ``_terminal_diagnostic_value`` so a
+    recorded scalar still wins over a legitimate history gap, a malformed
+    value fails closed, and ``NaN``/``Inf`` pass through verbatim.
+    """
+    if "train_loss" in ckpt:
+        source = ckpt["train_loss"]
+    else:
+        source = ckpt.get("loss")
+    return _terminal_diagnostic_value(
+        source, history_tail, series="train_loss", ckpt_path=ckpt_path,
+    )
+
+
+def _recovery_state_kwargs(
+    epochs_without_improvement: int,
+    history: Dict[str, List[Any]],
+    history_start_epoch: int,
+) -> Dict[str, Any]:
+    """Extra-metadata kwargs carrying the epoch-boundary recovery state.
+
+    The diagnostic histories are persisted in FULL and IN ORDER, one entry
+    per executed epoch, so a restart preserves the same epoch axis an
+    uninterrupted run would have.  A non-finite scalar diagnostic (NaN/Inf
+    from an unstable epoch) is written AS-IS — it is a genuine result and
+    coercing it to zero or dropping it would fabricate a history the run
+    never produced and collapse the epoch positions of every later value.
+
+    Both series are written on the SAME epoch axis and stay the same length,
+    but a position is not always an observation: an executed epoch with no
+    validation loader records ``None`` at that validation-history position
+    (the producer writes the gap explicitly rather than inventing a value).
+    A ``None`` therefore means "this epoch executed, but no validation was
+    observed here" — it is NOT the same as an unknown legacy position, which
+    is simply absent because the prehistory was never recorded.  A reader
+    keeps the epoch slot for either case rather than shortening the axis, and
+    a no-validation position does not count toward the patience horizon.
+
+    ``history_start_epoch`` is the true 0-based epoch index of
+    ``training_history`` entry 0.  It is 0 for a fresh run, and equals the
+    resume point for a LEGACY resume whose history was unknown: a legacy
+    checkpoint completed at epoch 146 yields a first recorded entry for
+    epoch 146 (not epoch 0), so the axis is never redrawn from epoch 1.
+
+    ``epochs_without_improvement`` is persisted verbatim.  It counts only
+    FINITE non-improving validation epochs (the training loop increments it
+    behind ``math.isfinite(val_loss)``), so it is independent of how many
+    diagnostic epochs were recorded and of how many were non-finite.
+    """
+    return {
+        "recovery_state_version": RECOVERY_STATE_VERSION,
+        "epochs_without_improvement": int(epochs_without_improvement),
+        "training_history": {key: list(v) for key, v in history.items()},
+        "history_start_epoch": int(history_start_epoch),
+        "numpy_rng_state": _encode_numpy_rng_state(np.random.get_state()),
+    }
+
+
+def _restore_recovery_state(
+    ckpt: Dict[str, Any], resume_path: Path, *, resume_epoch: int,
+) -> Tuple[int, Dict[str, List[Any]], Optional[tuple], int]:
+    """Recover epoch-boundary state from a resume checkpoint.
+
+    Returns ``(epochs_without_improvement, history, numpy_rng_state,
+    history_start_epoch)``, where ``history_start_epoch`` is the true 0-based
+    epoch index of ``history`` entry 0.
+
+    Semantics, in order:
+
+    * **Legacy / missing** (no ``recovery_state_version``): the checkpoint
+      predates recovery persistence.  The counter and history are unknown, so
+      they are re-initialised fresh and a warning says exact continuation is
+      not claimed.  The history is EMPTY and its start epoch is *resume_epoch*
+      — the run resumes at epoch ``resume_epoch`` and its first recorded entry
+      belongs to that epoch, never to epoch 0 (a legacy checkpoint completed at
+      epoch 146 must not be drawn as if it began at epoch 1).
+    * **Version mismatch**: the checkpoint was written by a different
+      recovery schema; its counter/history semantics cannot be trusted, so the
+      same fresh initialisation applies, loudly.
+    * **Current version (v2)**: the FULL recorded histories are restored
+      positionally, gaps (``None``) included.  A non-finite scalar is a real
+      recorded epoch and is preserved AS-IS — it is never dropped or coerced
+      to zero, and later epochs keep their positions.  ``history_start_epoch``
+      (written alongside) plus the series length must match the checkpoint's
+      completed-epoch count (``epoch + 1``); a disagreement is structural
+      corruption and fails closed.
+    * **Structurally malformed payload** (bad counter, wrong keys, non-scalar
+      entries, offset mismatch): corruption, not a legacy gap — fail closed.
+    """
+    version = ckpt.get("recovery_state_version")
+    if version is None:
+        logger.warning(
+            "Resume checkpoint %s has no recovery_state_version (legacy); "
+            "epochs_without_improvement/history restart from scratch — "
+            "patience and plotted history are NOT continued.  The history "
+            "recorded from here starts at epoch %d, not epoch 0.",
+            resume_path, resume_epoch,
+        )
+        return 0, {"train_loss": [], "val_loss": []}, None, int(resume_epoch)
+    if isinstance(version, bool) or not isinstance(version, (int, np.integer)):
+        raise ValueError(
+            f"Resume checkpoint {resume_path} has invalid "
+            f"recovery_state_version={version!r}; fail closed."
+        )
+    if int(version) != RECOVERY_STATE_VERSION:
+        logger.warning(
+            "Resume checkpoint %s carries recovery_state_version=%r, this "
+            "code writes %d; counter/history restart from scratch.  The "
+            "history recorded from here starts at epoch %d, not epoch 0.",
+            resume_path, version, RECOVERY_STATE_VERSION, resume_epoch,
+        )
+        return 0, {"train_loss": [], "val_loss": []}, None, int(resume_epoch)
+
+    raw_ewi = ckpt.get("epochs_without_improvement")
+    if (
+        isinstance(raw_ewi, bool)
+        or not isinstance(raw_ewi, (int, np.integer))
+        or raw_ewi < 0
+    ):
+        raise ValueError(
+            f"Resume checkpoint {resume_path} has invalid "
+            f"epochs_without_improvement={raw_ewi!r}; fail closed."
+        )
+    raw_history = ckpt.get("training_history")
+    if (
+        not isinstance(raw_history, dict)
+        or set(raw_history) != {"train_loss", "val_loss"}
+    ):
+        bad_keys = (
+            sorted(raw_history) if isinstance(raw_history, dict) else raw_history
+        )
+        raise ValueError(
+            f"Resume checkpoint {resume_path} has invalid training_history "
+            f"keys {bad_keys!r}; fail closed."
+        )
+    history: Dict[str, List[Any]] = {}
+    for key, values in raw_history.items():
+        if not isinstance(values, (list, tuple)):
+            raise ValueError(
+                f"Resume checkpoint {resume_path} training_history[{key!r}] "
+                f"is not a sequence ({type(values).__name__}); fail closed."
+            )
+        for pos, value in enumerate(values):
+            if value is None or _is_epoch_value(value):
+                continue
+            raise ValueError(
+                f"Resume checkpoint {resume_path} training_history[{key!r}]"
+                f"[{pos}] is not a scalar epoch value ({value!r}); fail closed."
+            )
+        # NaN/Inf survive verbatim; only the container is copied.  No
+        # finite-prefix truncation, so every later epoch keeps its position.
+        history[key] = list(values)
+
+    # ``train_loss`` and ``val_loss`` share one epoch axis (the loss plot
+    # indexes both against ``range(1, len(train_loss)+1)``), so a mismatch
+    # between their lengths would misalign the curves.  The writer keeps them
+    # equal; a foreign payload that does not is structurally invalid.
+    if len(history["train_loss"]) != len(history["val_loss"]):
+        raise ValueError(
+            f"Resume checkpoint {resume_path} history series have unequal "
+            f"lengths (train_loss={len(history['train_loss'])}, "
+            f"val_loss={len(history['val_loss'])}); the shared epoch axis is "
+            "invalid, fail closed."
+        )
+
+    # ``history_start_epoch`` is the true 0-based epoch index of entry 0.
+    # Together with the series length it must account for exactly the epochs
+    # this checkpoint completed (``resume_epoch``): otherwise the recorded
+    # axis is not the real one and a resume would mis-position every value
+    # (a legacy checkpoint resumed at epoch 146 must record its first entry
+    # as epoch 146, never epoch 0).
+    raw_start = ckpt.get("history_start_epoch")
+    if isinstance(raw_start, bool) or not isinstance(raw_start, (int, np.integer)):
+        raise ValueError(
+            f"Resume checkpoint {resume_path} has invalid history_start_epoch="
+            f"{raw_start!r}; fail closed."
+        )
+    history_start_epoch = int(raw_start)
+    if history_start_epoch < 0 or history_start_epoch > resume_epoch:
+        raise ValueError(
+            f"Resume checkpoint {resume_path} history_start_epoch="
+            f"{history_start_epoch} is outside [0, {resume_epoch}]; fail closed."
+        )
+    if history_start_epoch + len(history["train_loss"]) != resume_epoch:
+        raise ValueError(
+            f"Resume checkpoint {resume_path} history covers epochs "
+            f"[{history_start_epoch}, "
+            f"{history_start_epoch + len(history['train_loss'])}) but the "
+            f"checkpoint completed {resume_epoch} epoch(s); fail closed."
+        )
+
+    # The early-stopping counter counts FINITE non-improving validation
+    # epochs (the loop's increment is guarded by ``math.isfinite``).  It is an
+    # INDEPENDENT control value, so the upper bound must not be the number of
+    # KNOWN-finite val entries alone: a ``None`` slot is a DECLARED GAP of
+    # unknown finiteness — that epoch may have been finite and counted — so it
+    # is a POSSIBLE patience opportunity.  Only an explicitly non-finite scalar
+    # (NaN/Inf) is a KNOWN non-finite epoch that definitely did not count.
+    # Bound = known-finite + unknown(None).  This keeps a true counter
+    # restorable (repro: resume_epoch=3, val=[0.1, None, None], patience=2) while
+    # still rejecting a counter that exceeds every epoch that could have counted.
+    known_finite = 0
+    unknown_slots = 0
+    for v in history["val_loss"]:
+        if v is None:
+            unknown_slots += 1
+        elif _is_epoch_value(v) and math.isfinite(float(v)):
+            known_finite += 1
+        # else: NaN/Inf -> known non-finite, cannot have incremented patience.
+    max_possible_patience = known_finite + unknown_slots
+    if int(raw_ewi) > max_possible_patience:
+        raise ValueError(
+            f"Resume checkpoint {resume_path} epochs_without_improvement="
+            f"{int(raw_ewi)} exceeds the number of validation epochs that "
+            f"could have counted ({max_possible_patience} = {known_finite} "
+            f"finite + {unknown_slots} unknown); counter/history inconsistent, "
+            "fail closed."
+        )
+
+    # Current-schema recovery REQUIRES a reproducible NumPy stream.  A
+    # missing or malformed ``numpy_rng_state`` is damaged required state, not
+    # a legacy gap, so it fails closed here — before the loop runs an epoch —
+    # rather than silently reseeding a different stream (reviews R2 / B-1).
+    # Legacy / version-mismatch checkpoints returned above keep their
+    # warn-and-reset compatibility.
+    np_state = _decode_numpy_rng_state(ckpt.get("numpy_rng_state"))
+    return int(raw_ewi), history, np_state, history_start_epoch
+
+
+def _resolved_loader_workers(
+    train_loader: torch.utils.data.DataLoader,
+    val_loader: Optional[torch.utils.data.DataLoader],
+) -> Dict[str, Optional[int]]:
+    """The ACTUAL worker count of each resolved loader.
+
+    ``num_workers=-1`` auto-scales by dataset size, so the requested value in
+    the config and the resolved value on the built loader can differ (and train
+    and val can differ from each other).  The segment record stores the resolved
+    value for BOTH loaders so an audit judges what actually ran, not what was
+    asked for.  With no val loader the val count is ``None`` (explicitly
+    absent), never a substituted 0.
+    """
+    return {
+        "num_workers": int(getattr(train_loader, "num_workers", 0)),
+        "val_num_workers": (
+            int(getattr(val_loader, "num_workers", 0))
+            if val_loader is not None else None
+        ),
+    }
+
+
+def _require_reliable_recovery_loaders(
+    train_loader: torch.utils.data.DataLoader,
+    val_loader: Optional[torch.utils.data.DataLoader],
+    *,
+    checkpoint_interval: int,
+) -> None:
+    """Fail closed when a RELIABLE-recovery cadence cannot load with zero workers.
+
+    Reliable recovery is the cadence-one regime: ``checkpoint_interval == 1``
+    is what makes a checkpoint an exact epoch boundary of a run whose
+    trajectory is claimed reproducible.  That claim requires ZERO-WORKER
+    loading.  With ``num_workers > 0`` (and especially ``persistent_workers``)
+    the loader iterator owns multiprocessing worker state — the RNG stream and
+    the live iterator's consumption position — that is neither captured in the
+    checkpoint nor reconstructable from it.  An uninterrupted persistent
+    iterator and a newly constructed resumed iterator therefore consume
+    DIFFERENT global RNG histories, so a resume silently diverges even when no
+    worker-side randomness is present (independent same-budget model/backprop
+    probe: workers0 exact equality, persistent workers1 divergence).  Restoring
+    only the parent's RNG state cannot make a new iterator equivalent to the
+    existing persistent one.
+
+    The requirement is tied to the CADENCE, not to ``--resume``:
+
+    - ``checkpoint_interval == 1`` — reliable mode, whether fresh or resumed.
+      The ACTUAL resolved train/val loaders must have zero workers, else the
+      run is refused before any epoch.
+    - ``checkpoint_interval != 1`` — the prior interval-10 behavior.  That
+      cadence makes no exact-continuation claim (an interrupted interval-10
+      run can only be continued as a fresh zero-worker segment), so no worker
+      count is constrained and existing runs keep working unchanged.
+
+    The guard never reconfigures the loader silently (that would change the
+    user's scientific controls) and never claims an equivalence the
+    configuration cannot provide.  ``val_loader`` is included for completeness
+    of the refusal message; validation does not advance the training
+    trajectory.
+    """
+    if int(checkpoint_interval) != 1:
+        return
+    resolved = {"train": int(getattr(train_loader, "num_workers", 0))}
+    if val_loader is not None:
+        resolved["val"] = int(getattr(val_loader, "num_workers", 0))
+    nonzero = {name: n for name, n in resolved.items() if n > 0}
+    if nonzero:
+        persistent = getattr(train_loader, "persistent_workers", False)
+        raise ValueError(
+            "Reliable epoch-boundary recovery (checkpoint_interval=1) "
+            f"requires zero-worker data loading, but the resolved loaders have "
+            f"{nonzero} worker(s) (persistent_workers={persistent}).  With "
+            "workers>0 the loader iterator's RNG/consumption state is not "
+            "captured in the checkpoint, so a restart would silently diverge "
+            "from an uninterrupted run.  Set training.num_workers=0 in the "
+            "reliable run's config (persistent_workers is inactive at zero "
+            "workers and need not be changed), or use a non-reliable cadence "
+            "such as checkpoint_interval=10.  Fail closed rather than claim "
+            "continuity this configuration cannot provide."
+        )
+
+
+def _checkpoint_lineage_identity(payload: bytes, path: Path) -> Dict[str, Any]:
+    """Immutable identity of a resume checkpoint from its already-read bytes.
+
+    The digest is taken over *payload* — the exact bytes the run resumed
+    from — never a fresh read of the mutable *path*.  Re-reading would open
+    a TOCTOU window in which the file is swapped between the lineage check
+    and the segment record, binding the segment to bytes that were never
+    loaded.  *path* is recorded for provenance only.
+    """
+    assert isinstance(payload, (bytes, bytearray)), type(payload)
+    return {
+        "path": str(Path(path).resolve()),
+        "sha256": hashlib.sha256(payload).hexdigest(),
+        "size_bytes": len(payload),
+    }
+
+
+def _parent_training_controls(
+    peek: Dict[str, Any], resume_path: Path,
+) -> Optional[Dict[str, Any]]:
+    """The parent checkpoint's ``config.training`` controls, or ``None`` if legacy.
+
+    The parent's epoch budget, seed and checkpoint cadence are recorded under
+    ``peek['config']['training']`` (the dict ``save_checkpoint`` wrote), NOT
+    at the checkpoint top level.  Reading the active run's config for these
+    would mislabel the parent's lineage whenever the two differ.
+
+    Returns ``None`` only when the parent genuinely carries no ``config``
+    (a legacy checkpoint): the caller then reports the controls as unknown.
+    A ``config`` that is present but structurally malformed fails closed.
+    """
+    if "config" not in peek:
+        logger.warning(
+            "Resume checkpoint %s has no recorded config; parent training "
+            "controls are unknown and recorded as null (not substituted "
+            "from the active run).", resume_path,
+        )
+        return None
+    parent_config = peek["config"]
+    if not isinstance(parent_config, dict):
+        raise ValueError(
+            f"Resume checkpoint {resume_path} config is not a mapping "
+            f"({type(parent_config).__name__}); fail closed."
+        )
+    if "training" not in parent_config:
+        logger.warning(
+            "Resume checkpoint %s config has no training section; parent "
+            "training controls are unknown and recorded as null (not "
+            "substituted from the active run).", resume_path,
+        )
+        return None
+    training = parent_config["training"]
+    if not isinstance(training, dict):
+        raise ValueError(
+            f"Resume checkpoint {resume_path} config.training is not a "
+            f"mapping ({type(training).__name__}); fail closed."
+        )
+    return training
+
+
+def _segment_loader_controls(
+    config: ExperimentConfig,
+    parent_training: Optional[Dict[str, Any]],
+    resolved: Optional[Dict[str, Optional[int]]] = None,
+) -> Dict[str, Any]:
+    """Loader controls a downstream audit needs to judge recovery fidelity.
+
+    Records the active run's REQUESTED worker controls, the ACTUAL RESOLVED
+    loader worker counts (``resolved`` — ``num_workers=-1`` auto-scales, so the
+    request and the resolution can differ), and the parent's requested
+    controls, and states truthfully whether the reliable zero-worker
+    requirement applies to THIS segment.  Reliable mode is the cadence-one
+    regime (``checkpoint_interval == 1``); a non-reliable cadence makes no
+    exact-continuation claim, so the requirement is not asserted for it even
+    when workers happen to be zero.  A legacy parent that predates these
+    fields records ``None`` (unknown) rather than the active value.
+    """
+    def _parent_int(key: str) -> Optional[int]:
+        if not parent_training or key not in parent_training:
+            return None
+        value = parent_training[key]
+        if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+            return None
+        return int(value)
+
+    def _parent_bool(key: str) -> Optional[bool]:
+        # ``persistent_workers`` is a bool in the parent's config; decode it
+        # explicitly so a legitimate ``True`` is recorded as True, not dropped
+        # to None by an int-only decoder.
+        if not parent_training or key not in parent_training:
+            return None
+        value = parent_training[key]
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, np.integer)) and value in (0, 1):
+            return bool(value)
+        return None
+
+    reliable = int(config.training.checkpoint_interval) == 1
+    resolved = resolved or {}
+    return {
+        "requested_num_workers": int(config.training.num_workers),
+        "requested_persistent_workers": bool(config.training.persistent_workers),
+        "resolved_num_workers": (
+            int(resolved["num_workers"]) if "num_workers" in resolved else None
+        ),
+        "resolved_val_num_workers": (
+            int(resolved["val_num_workers"])
+            if resolved.get("val_num_workers") is not None else None
+        ),
+        "parent_num_workers": _parent_int("num_workers"),
+        "parent_persistent_workers": _parent_bool("persistent_workers"),
+        # Reliable exact continuation is only supported with zero workers and
+        # is only CLAIMED at cadence one; a nonzero parent->zero active change
+        # is NOT established as trajectory-equivalent to the parent's original
+        # execution.
+        "reliable_mode": reliable,
+        "reliable_zero_worker_required": reliable,
+        "legacy_worker_equivalence_established": False,
+    }
+
+
+def _segment_provenance(
+    peek: Optional[Dict[str, Any]],
+    config: ExperimentConfig,
+    *,
+    resumed: bool,
+    resume_path: Optional[Path] = None,
+    resolved_workers: Optional[Dict[str, Optional[int]]] = None,
+) -> Dict[str, Any]:
+    """Data/prior controls a downstream audit needs to compare segments.
+
+    On a restart the parent controls (epoch budget, seed, checkpoint cadence)
+    are read from the parent checkpoint's already-decoded *peek*, specifically
+    ``peek['config']['training']`` — never from the active run config, which
+    may differ and would silently mislabel the lineage.  The active run's own
+    controls are recorded separately under ``current_segment_controls`` so the
+    two are never confused.  Data/prior fields come from the parent's decoded
+    top level.  Never re-reads the resume path and never reads formal
+    DATA/NEST artifacts.
+
+    Fail closed: a malformed parent control fails the segment; a genuinely
+    legacy parent (no ``config``) records the controls as ``null``/unknown
+    rather than substituting the active run's values.
+    """
+    provenance: Dict[str, Any] = {
+        "original_num_epochs": None,
+        "random_seed": None,
+        "dataset_path": None,
+        "dataset_source_sha256": None,
+        "nested_prior_artifact": None,
+        "nested_prior_artifact_sha256": None,
+        "nested_prior_fingerprint": None,
+        "nested_split_seed": None,
+        "nested_val_split": None,
+        "is_nested_cv": None,
+        "validation_scope": None,
+        "animal_identity_status": None,
+        "mcmc_prior_provenance": None,
+        "checkpoint_interval": None,
+    }
+    if not resumed:
+        provenance["original_num_epochs"] = int(config.training.num_epochs)
+        provenance["random_seed"] = int(config.training.random_seed)
+        provenance["checkpoint_interval"] = int(config.training.checkpoint_interval)
+        provenance["current_segment_controls"] = {
+            "num_epochs": int(config.training.num_epochs),
+            "random_seed": int(config.training.random_seed),
+            "checkpoint_interval": int(config.training.checkpoint_interval),
+            "loader_controls": _segment_loader_controls(
+                config, None, resolved_workers,
+            ),
+        }
+        return provenance
+
+    if peek is None:
+        raise ValueError(
+            "Cannot record segment provenance: the resume checkpoint's "
+            "decoded controls are unavailable. Refusing to substitute the "
+            "active run's controls (which may differ from the parent's); "
+            "fail closed."
+        )
+    if resume_path is None:
+        raise ValueError(
+            "Cannot record segment provenance for a resume without the "
+            "resume checkpoint path; fail closed."
+        )
+
+    # Data/prior fields live at the parent checkpoint's top level.
+    for key in provenance:
+        if key in peek:
+            provenance[key] = peek[key]
+
+    training = _parent_training_controls(peek, resume_path)
+    if training is not None:
+        for record_key, config_key in (
+            ("original_num_epochs", "num_epochs"),
+            ("random_seed", "random_seed"),
+            ("checkpoint_interval", "checkpoint_interval"),
+        ):
+            if config_key not in training:
+                # Legacy parent config predating this control: report
+                # unknown, never the active run's value.
+                logger.warning(
+                    "Resume checkpoint %s config.training lacks %r; parent "
+                    "control recorded as null.", resume_path, config_key,
+                )
+                continue
+            value = training[config_key]
+            if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+                raise ValueError(
+                    f"Resume checkpoint {resume_path} config.training"
+                    f"[{config_key!r}]={value!r} is not an integer; fail closed."
+                )
+            provenance[record_key] = int(value)
+
+    provenance["current_segment_controls"] = {
+        "num_epochs": int(config.training.num_epochs),
+        "random_seed": int(config.training.random_seed),
+        "checkpoint_interval": int(config.training.checkpoint_interval),
+        "loader_controls": _segment_loader_controls(
+            config, training, resolved_workers,
+        ),
+    }
+    return provenance
+
+
+def _write_segment_record(
+    output_dir: Path,
+    *,
+    parent: Optional[Dict[str, Any]],
+    config: ExperimentConfig,
+    parent_peek: Optional[Dict[str, Any]],
+    start_epoch: int,
+    resumed: bool,
+    resume_path: Optional[Path] = None,
+    resolved_workers: Optional[Dict[str, Optional[int]]] = None,
+) -> Path:
+    """Write one immutable restart-segment record; never overwrite a prior one.
+
+    Each invocation claims the next free ``segment_XXXX.json`` so prior
+    segments — and their distinct parent identities — survive every restart,
+    giving a downstream audit the full chain of who continued from which
+    bytes, under which data/prior controls, at which epoch.
+
+    Crash-atomicity is scoped to PROCESS death (SIGKILL / OOM / crash): the
+    payload is written to a unique temp file in the SAME directory, flushed +
+    fsynced, then ``os.link``ed into the final name.  The link fails with
+    ``FileExistsError`` if the name is already taken (immutable,
+    non-overwrite), so a SIGKILL mid-write leaves only an orphaned ``.tmp``
+    that no later invocation treats as a completed segment.  This mirrors the
+    temp+fsync discipline of :func:`_atomic_save_checkpoint`.
+
+    POWER-LOSS durability is NOT claimed: the containing directory is not
+    fsynced (``os.link`` only makes the name visible in the page cache), so a
+    machine power-cut shortly after the link could lose the directory entry
+    even though the file contents were synced.  That is acceptable here —
+    the segment record is an audit trail, and a missing trailing segment
+    under-claims rather than fabricates lineage.  The ``.tmp`` is unlinked
+    after the link regardless, so no completed record is ever truncated.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    base_record = {
+        "segment_index": None,  # patched per attempt once a slot is claimed
+        "written_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "resumed": resumed,
+        "starting_epoch": int(start_epoch),
+        "parent_checkpoint": parent,
+        "config_sha256": hashlib.sha256(
+            json.dumps(config.to_dict(), sort_keys=True, default=str).encode()
+        ).hexdigest(),
+        "provenance": _segment_provenance(
+            parent_peek, config, resumed=resumed, resume_path=resume_path,
+            resolved_workers=resolved_workers,
+        ),
+    }
+    # Serialize once BEFORE claiming a slot so a serialization failure
+    # cannot strand a claimed-but-empty final name.
+    json.dumps(base_record, indent=2, allow_nan=False)
+
+    index = 0
+    while True:
+        record = dict(base_record, segment_index=index)
+        record_path = output_dir / f"segment_{index:04d}.json"
+        payload = json.dumps(record, indent=2, allow_nan=False).encode("utf-8")
+        # A FRESH temp inode per attempt (never reused across links: a hard
+        # link shares the inode, so rewriting a linked temp would corrupt an
+        # already-published segment).  Write+fsync the FULL payload, then
+        # link it into the final name atomically.  A SIGKILL at any point
+        # leaves only an orphaned ``.tmp`` — never a truncated
+        # ``segment_XXXX.json``.
+        tmp_path = output_dir / f".segment_{os.getpid()}_{time.time_ns()}.tmp"
+        fd = os.open(tmp_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+        except BaseException:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise
+        try:
+            os.link(tmp_path, record_path)
+        except FileExistsError:
+            index += 1
+            continue
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+        break
+    return record_path
 
 
 def _atomic_save_checkpoint(**kwargs) -> Path:
@@ -585,6 +1698,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
              "the loss. 0 disables.  Removes tracking-artifact frames whose "
              "huge |y| (>1e6 cm/s) otherwise dominate the masked MSE.",
     )
+    parser.add_argument(
+        "--persistence_skip",
+        type=float,
+        default=None,
+        help="Fixed causal persistence skip scalar k in [0, 1]. 0 disables (default). "
+             "Restricted to normalize_targets=False and target_clip_cm_s=0.0.",
+    )
 
     # ── Checkpointing ─────────────────────────────────────────
     parser.add_argument(
@@ -662,6 +1782,9 @@ def build_config(argv: Optional[Sequence[str]] = None) -> Tuple[ExperimentConfig
         config.training.normalize_targets = args.normalize_targets
     if getattr(args, "target_clip_cm_s", None) is not None:
         config.training.target_clip_cm_s = args.target_clip_cm_s
+    if getattr(args, "persistence_skip", None) is not None:
+        config.model.persistence_skip = args.persistence_skip
+    config.validate()
     if args.freeze is not None:
         config.finetune.freeze_modules = args.freeze
     if args.resume is not None:
@@ -731,6 +1854,7 @@ def build_model(config: ExperimentConfig) -> NSMoRCore:
         gru_neuromod_gain=config.model.gru_neuromod_gain,
         sensory_noise_std=config.model.sensory_noise_std,
         lif_tbptt_steps=config.model.lif_tbptt_steps,
+        persistence_skip=config.model.persistence_skip,
     )
     param_count = sum(p.numel() for p in model.parameters())
     logger.info("Model initialized — %s parameters", f"{param_count:,}")
@@ -2799,6 +3923,7 @@ def sweep_escape_sensitivity(
 def plot_loss_curve(
     history: Dict[str, List[float]],
     output_dir: Path,
+    history_start_epoch: int = 0,
 ) -> Path:
     """
     Plot train/val loss curves and save to disk.
@@ -2806,16 +3931,29 @@ def plot_loss_curve(
     Args:
         history: Dictionary with ``"train_loss"`` and ``"val_loss"`` lists.
         output_dir: Directory to save the figure.
+        history_start_epoch: True 0-based epoch of ``history`` entry 0.  A
+            legacy resume starts its recorded history at its resume epoch, so
+            the x-axis begins there rather than falsely at epoch 1.
 
     Returns:
         Path to the saved PNG file.
     """
     fig, ax = plt.subplots(figsize=(7, 4), dpi=150)
 
-    epochs = range(1, len(history["train_loss"]) + 1)
+    first = history_start_epoch + 1  # 1-based label of the first entry
+    epochs = range(first, first + len(history["train_loss"]))
     ax.plot(epochs, history["train_loss"], label="Train Loss", linewidth=1.5)
-    if history["val_loss"]:
-        ax.plot(epochs, history["val_loss"], label="Val Loss", linewidth=1.5)
+    # A ``None`` slot is an epoch with no observed validation diagnostic (no
+    # validation loader, or a declared gap).  It is plotted as ``nan`` so
+    # matplotlib BREAKS the line at that position (a native masked gap): the
+    # curve must neither be drawn through an unobserved epoch nor silently
+    # CONNECT across it, and dropping the point would also collapse the
+    # position of every later value.  Recorded non-finite diagnostics are
+    # left as-is for matplotlib's own handling.
+    val_values = [
+        float("nan") if v is None else v for v in history["val_loss"]
+    ]
+    ax.plot(epochs, val_values, label="Val Loss", linewidth=1.5)
 
     ax.set_xlabel("Epoch")
     ax.set_ylabel("Loss")
@@ -2834,6 +3972,35 @@ def plot_loss_curve(
 # ═══════════════════════════════════════════════════════════════
 # 7.  Main Train Function
 # ═══════════════════════════════════════════════════════════════
+
+def _recovery_terminal(
+    patience: int,
+    epochs_without_improvement: int,
+    *,
+    two_phase: bool,
+    current_phase: int,
+    num_epochs: int,
+    phase1_epochs: Optional[int],
+) -> bool:
+    """The early-stopping stop predicate, shared by the loop and a resume.
+
+    ``train`` applies this at every completed-epoch boundary.  A resumed
+    checkpoint was published at such a boundary but BEFORE the decision was
+    evaluated, so the resume must evaluate the same predicate before it
+    executes any epoch.  Both call sites pass the same values the loop sees at
+    the boundary, so the phase-1 exemption and the phase-boundary counter
+    reset (which happens before this is consulted) behave identically.
+    """
+    return (
+        patience > 0
+        and epochs_without_improvement >= patience
+        and not (
+            two_phase
+            and current_phase == 1
+            and num_epochs > (phase1_epochs or 0)
+        )
+    )
+
 
 def train(
     config: ExperimentConfig,
@@ -2900,6 +4067,7 @@ def train(
         ValueError: If no training data is provided (loader is None).
         FileExistsError: If a fresh run would reuse an existing best checkpoint.
     """
+    config.validate()
     if require_nested_validation and nested_prior_artifact is None:
         raise ValueError(
             "Scored validation requires a nested prior artifact; global OOF "
@@ -3041,6 +4209,19 @@ def train(
             "Training DataLoader is None.  "
             "Wire build_dataloaders() to the real data pipeline."
         )
+
+    # Reliable epoch-boundary recovery is the cadence-one regime and is scoped
+    # to zero-worker loading.  The actual RESOLVED loaders are checked (auto
+    # num_workers=-1 may resolve to >0 on a large dataset), and an unsupported
+    # configuration fails closed BEFORE any epoch — the guard is inside
+    # train() so no producer path can bypass it.  The check is tied to
+    # checkpoint_interval==1, so it applies to a fresh reliable run AND to a
+    # resume, while the prior interval-10 behavior is unchanged.
+    _require_reliable_recovery_loaders(
+        train_loader, val_loader,
+        checkpoint_interval=config.training.checkpoint_interval,
+    )
+    _resolved_workers = _resolved_loader_workers(train_loader, val_loader)
 
     # Ticket #16: stimulus condition metadata for routing auxiliary loss
     train_is_pure_wind = getattr(getattr(train_loader, "dataset", None), "is_pure_wind", None)
@@ -3251,6 +4432,11 @@ def train(
     # ── Resume from checkpoint ────────────────────────────────
     start_epoch = 0
     best_val_loss = float("inf")
+    # Set when a validated current-schema parent lands EXACTLY on the original
+    # total budget (``start_epoch == num_epochs``): the resumed run has zero
+    # updates left, so it finalizes at the parent's saved executed epoch.
+    # See the equality branch below.
+    _terminal_at_total_budget = False
 
     if config.checkpoint.resume_from is not None:
         ckpt_path = Path(config.checkpoint.resume_from)
@@ -3267,6 +4453,12 @@ def train(
         resume_payload = ckpt_path.read_bytes()
         ckpt_peek = load_artifact_bytes(resume_payload, map_location="cpu")
         validate_checkpoint_clock(ckpt_peek, model.dt_ms, require_dt_ms=True)
+        # A current-schema parent claims an exact continuation, so its full
+        # canonical state must be present before anything restores from it.
+        # This runs FIRST in the resume preflight (before any epoch or any
+        # terminal save) and only constrains the current schema; a legacy /
+        # version-mismatched parent keeps its limited fallback.
+        _require_complete_current_schema(ckpt_peek, ckpt_path)
 
         # ── Fail-closed nested resume validation ──
         # Checkpoint provenance vs active run configuration:
@@ -3378,12 +4570,85 @@ def train(
                 ckpt_path,
             )
         start_epoch = ckpt_peek.get("epoch", -1) + 1
-        if start_epoch >= config.training.num_epochs:
+        if start_epoch > config.training.num_epochs:
+            # The parent overshot the run's own total budget.  This is NOT
+            # budget exhaustion: the active config would shorten a longer
+            # parent run, and its weights come from epochs this budget never
+            # authorized, so it fails closed (unchanged).
             raise ValueError(
                 f"Cannot resume checkpoint {ckpt_path} at epoch {start_epoch}: "
-                f"target num_epochs ({config.training.num_epochs}) <= start_epoch ({start_epoch}); "
-                "no remaining epochs to train (fail closed on validation provenance)."
+                f"start_epoch ({start_epoch}) exceeds target num_epochs "
+                f"({config.training.num_epochs}); no remaining epochs to train "
+                "(fail closed on validation provenance)."
             )
+        if start_epoch == config.training.num_epochs:
+            # ── Completed parent AT the original total budget ─────
+            # ``start_epoch == num_epochs`` is a COMPLETED run of exactly this
+            # budget, not an error: the loop has no remaining updates
+            # (``range(num_epochs, num_epochs)`` is empty) and the parent
+            # checkpoint is the run's own terminal epoch.  This is the
+            # publication-crash window — the periodic checkpoint is written
+            # BEFORE the stop check, so a process killed in that window leaves
+            # a parent equal to the uninterrupted final state.  Refusing it
+            # loses a completed run that needs no further work.  Equality with
+            # the active budget is checked against the PARENT's own recorded
+            # total budget below, because the budget is immutable across a
+            # continuation and a longer parent run can land on the same index.
+            #
+            # Accepting it is deliberately NARROW.  Only the CURRENT recovery
+            # schema is eligible: a legacy / version-mismatch parent has an
+            # UNKNOWN counter and history (the reader resets them with a
+            # warning), so it cannot be validated as a completed run and still
+            # fails closed.  The counter/history/axis consistency, the
+            # patience bound and the required MT19937 state are all validated
+            # by ``_restore_recovery_state`` below, which is the FIRST thing
+            # the terminal path runs — a corrupt current-schema or inconsistent
+            # lineage parent raises there, before any finalization.
+            if ckpt_peek.get("recovery_state_version") != RECOVERY_STATE_VERSION:
+                raise ValueError(
+                    f"Cannot resume checkpoint {ckpt_path} at epoch "
+                    f"{start_epoch} == target num_epochs "
+                    f"({config.training.num_epochs}) with recovery_state_version="
+                    f"{ckpt_peek.get('recovery_state_version')!r}: a legacy or "
+                    "version-mismatched parent has an UNKNOWN patience counter "
+                    "and history, so a completed run cannot be validated; "
+                    "resume it under its own original budget (fail closed)."
+                )
+            # Equality with the ACTIVE budget is not sufficient: the total
+            # budget is IMMUTABLE across a continuation, so the parent must be
+            # shown to have completed under THIS budget.  A parent run under a
+            # longer budget can coincidentally land on the active budget's
+            # final epoch (parent 6 epochs, active 3, parent checkpoint at
+            # index 2); finalizing that here would stamp the segment with a
+            # total budget the parent never ran under and truncate a longer
+            # authorized run.  The parent's recorded
+            # ``config.training.num_epochs`` is therefore required to be a
+            # KNOWN strict positive integer equal to the active budget;
+            # unknown, missing, malformed (bool / non-integer) or unequal
+            # values fail closed BEFORE any finalization.
+            _parent_training = _parent_training_controls(ckpt_peek, ckpt_path)
+            _parent_num_epochs = (
+                _parent_training.get("num_epochs")
+                if _parent_training is not None else None
+            )
+            _parent_budget_known = (
+                not isinstance(_parent_num_epochs, bool)
+                and isinstance(_parent_num_epochs, (int, np.integer))
+                and int(_parent_num_epochs) > 0
+            )
+            if not _parent_budget_known or int(_parent_num_epochs) != int(
+                config.training.num_epochs
+            ):
+                raise ValueError(
+                    f"Cannot resume checkpoint {ckpt_path} at epoch "
+                    f"{start_epoch} == target num_epochs "
+                    f"({config.training.num_epochs}): the parent's original "
+                    f"total budget is {_parent_num_epochs!r}, which must be a "
+                    "known strict positive integer equal to this run's "
+                    "num_epochs. A completed run is finalizable only under its "
+                    "OWN original total budget (fail closed)."
+                )
+            _terminal_at_total_budget = True
         if two_phase and ckpt_peek.get("training_phase") != (1 if start_epoch <= phase1_epochs else 2):
             raise ValueError(
                 f"Resume checkpoint {ckpt_path} has missing or inconsistent training_phase "
@@ -3419,8 +4684,19 @@ def train(
         #     builder) BEFORE restoring so load_state_dict can rehydrate
         #     the saved Adam moments and scheduling instead of silently
         #     resetting them via a second in-loop transition.
+        # A phase-1→2 boundary that IS the total budget (``phase1_epochs ==
+        # num_epochs``) is not a crossing for a completed run: the phase-2
+        # transition would have happened at the FIRST epoch of phase 2, which
+        # this run never executes.  Treating it as a crossing would discard the
+        # phase-1 best checkpoint and leave a budget-terminal resume with no
+        # best model.  A ``phase1_epochs`` beyond the budget is a configuration
+        # error and still fails closed at the two-phase validation below.
+        _crosses_boundary = (
+            two_phase
+            and start_epoch == phase1_epochs
+            and not _terminal_at_total_budget
+        )
         _landing_phase2 = two_phase and start_epoch > phase1_epochs
-        _crosses_boundary = two_phase and start_epoch == phase1_epochs
 
         # Capture and validate every best candidate before any state restoration.
         # Reconciliation below uses these same bytes; never reread a mutable path.
@@ -3631,7 +4907,11 @@ def train(
     logger.info("Starting training for %d epochs", config.training.num_epochs)
     logger.info("=" * 60)
 
-    history = {"train_loss": [], "val_loss": []}
+    # Diagnostic series are positionally aligned on the epoch axis.  Values
+    # are finite OR non-finite scalars (a NaN/Inf epoch is a real result);
+    # ``None`` marks an epoch at which the series recorded nothing (e.g. no
+    # validation), so the axis stays intact.
+    history: Dict[str, List[Any]] = {"train_loss": [], "val_loss": []}
     train_loss: float = float("nan")
     val_loss: float = float("nan")
 
@@ -3641,11 +4921,157 @@ def train(
     )
     epochs_without_improvement = 0
 
+    # ── Epoch-boundary recovery (resume) ─────────────────────
+    # The counter and history above must CONTINUE across a restart, not
+    # restart.  Restore them from the resume checkpoint's recovery seam.
+    # This runs AFTER the resume block so a corrupt payload fails closed
+    # before any training, and BEFORE the loop so the first resumed epoch
+    # already sees the accumulated patience and history.  The NumPy stream
+    # is restored here too — it is read only inside the (anchor-aligned,
+    # epoch-independent) data crop, so its exact restore point does not
+    # perturb the model stream.
+    #
+    # A phase-1→2 boundary-crossing resume keeps HISTORY (the loss curve is
+    # a property of the whole run, and the uninterrupted trajectory appends
+    # across the boundary) but resets ONLY the early-stop counter — exactly
+    # as the in-loop transition does.  See the boundary reset after this
+    # block.
+    # ``history_start_epoch`` is the true 0-based epoch of ``history`` entry
+    # 0.  Fresh runs start at 0; a legacy resume starts at its resume epoch
+    # because the parent's earlier history is unknown (never redrawn as 1).
+    history_start_epoch = 0
+    # Set when the restored state is ALREADY terminal (patience exhausted at
+    # the resumed epoch).  Consumed after the loop to finalize without an
+    # epoch.  See the terminal decision below.
+    _terminal_on_resume = False
+    if config.checkpoint.resume_from is not None:
+        _ewi, _history, _np_state, history_start_epoch = _restore_recovery_state(
+            ckpt_peek, ckpt_path, resume_epoch=start_epoch,
+        )
+        epochs_without_improvement = 0 if _crosses_boundary else _ewi
+        history = _history
+        if _np_state is not None:
+            np.random.set_state(_np_state)
+        # ── Terminal decision BEFORE any resumed epoch ────────────
+        # The checkpoint is published at a completed-epoch boundary, BEFORE
+        # the early-stop check for that epoch.  A process that dies in that
+        # window leaves a checkpoint whose restored counter has already
+        # reached the patience horizon: the uninterrupted run would have
+        # stopped there and never executed another epoch.  The resumed run
+        # must therefore apply the SAME stop predicate before training, or it
+        # executes epochs the uninterrupted run never did (the resumed
+        # trajectory diverges and the counter/history grow past the terminal
+        # state).  A later improving validation cannot restart an exhausted
+        # horizon — that would re-open a decision the original run had
+        # already closed.
+        #
+        # The predicate is shared with the in-loop check (same exemption and
+        # same phase reset), so a phase-1 exemption, a phase-boundary
+        # counter reset and a phase-2 exhaustion all behave exactly as they
+        # do at an epoch boundary inside the loop.  A boundary-crossing
+        # resume resets the counter above, so it is never terminal here.
+        _patience_terminal = _recovery_terminal(
+            early_stopping_patience,
+            epochs_without_improvement,
+            two_phase=two_phase,
+            current_phase=current_phase,
+            num_epochs=config.training.num_epochs,
+            phase1_epochs=phase1_epochs,
+        )
+        if _patience_terminal:
+            logger.info(
+                "Resumed checkpoint %s already exhausted early stopping "
+                "(epochs_without_improvement=%d >= patience=%d at completed "
+                "epoch %d); finalizing without executing a further epoch.",
+                ckpt_path, epochs_without_improvement,
+                early_stopping_patience, start_epoch,
+            )
+        if _terminal_at_total_budget:
+            # The parent completed the run's own total budget: the loop below
+            # would iterate over ``range(num_epochs, num_epochs)`` — an EMPTY
+            # range — so there are no updates left to perform whatever the
+            # patience counter says (it may be disabled, or simply never
+            # exhausted).  Terminal on the BUDGET alone, not on patience.
+            logger.info(
+                "Resumed checkpoint %s completed the original total budget "
+                "(epoch %d of %d); finalizing at the saved executed epoch "
+                "without executing a further epoch "
+                "(epochs_without_improvement=%d, patience=%d).",
+                ckpt_path, start_epoch, config.training.num_epochs,
+                epochs_without_improvement, early_stopping_patience,
+            )
+        if _patience_terminal or _terminal_at_total_budget:
+            _terminal_on_resume = True
+            # Finalization below reports the LAST EXECUTED epoch's diagnostics.
+            # The loop never runs, so nothing would overwrite the ``nan``
+            # placeholders (which would claim a loss the run never measured).
+            # Take the parent's recorded value from EITHER source — its own
+            # top-level scalar or the restored history tail — preferring a
+            # recorded scalar and treating a ``None`` gap as fillable, not as
+            # a contradiction.  A recorded parent scalar is NEVER discarded in
+            # favour of a gap.  ``train_loss`` keeps its ``nan`` placeholder
+            # only when NEITHER source has a value (unobserved); ``val_loss``
+            # uses ``inf`` for that case so the final checkpoint serializes an
+            # explicit ``None`` rather than a fabricated finite value.  The
+            # train diagnostic also honours the independent legacy ``loss``
+            # field when ``train_loss`` is ABSENT (see
+            # ``_terminal_train_diagnostic``); an explicit ``train_loss=None``
+            # is NOT substituted by it.
+            _term_train = _terminal_train_diagnostic(
+                ckpt_peek,
+                history["train_loss"][-1] if history["train_loss"] else None,
+                ckpt_path=ckpt_path,
+            )
+            train_loss = _term_train if _term_train is not None else None
+            _term_val = _terminal_diagnostic_value(
+                ckpt_peek.get("val_loss"),
+                history["val_loss"][-1] if history["val_loss"] else None,
+                series="val_loss", ckpt_path=ckpt_path,
+            )
+            val_loss = _term_val if _term_val is not None else float("inf")
+
+    # ── Restart-segment lineage record ────────────────────────
+    # One immutable record per invocation, written once training is
+    # committed to (all preflight validation has passed) and before the
+    # loop, so the segment survives a later SIGKILL/OOM.  A resume records
+    # its parent checkpoint's EXACT resumed bytes (the same ``resume_payload``
+    # the run loaded and lineage-checked — never a re-read of the mutable
+    # path); a fresh run records parent=None.  Prior segments are never
+    # touched.
+    _segment_parent = (
+        _checkpoint_lineage_identity(resume_payload, ckpt_path)
+        if config.checkpoint.resume_from is not None else None
+    )
+    _write_segment_record(
+        output_dir,
+        parent=_segment_parent,
+        config=config,
+        parent_peek=ckpt_peek if config.checkpoint.resume_from is not None else None,
+        start_epoch=start_epoch,
+        resumed=config.checkpoint.resume_from is not None,
+        resume_path=ckpt_path if config.checkpoint.resume_from is not None else None,
+        resolved_workers=_resolved_workers,
+    )
+
     # ── Bio-loss warmup schedule ─────────────────────────────
     warmup_epochs = config.loss.warmup_epochs
 
     epoch = start_epoch - 1
     for epoch in range(start_epoch, config.training.num_epochs):
+        if _terminal_on_resume:
+            # The restored counter was already terminal at the resumed epoch:
+            # the original run stopped there, so no epoch may execute.  The
+            # decision is re-checked against the phase state the transition
+            # would have produced, so a phase-1 exemption / boundary reset
+            # behaves as it does in the loop.
+            #
+            # ``for`` binds the loop variable BEFORE the body runs, so without
+            # this restore the finalization below would report ``start_epoch``
+            # — an epoch this process never executed.  The last EXECUTED epoch
+            # is the parent's (``start_epoch - 1``), which is what the
+            # uninterrupted run's terminal checkpoint records.
+            epoch = start_epoch - 1
+            break
         t0 = time.time()
 
         # ── Phase transition (Hybrid Funnel) ──────────────────
@@ -3819,6 +5245,15 @@ def train(
                 routing_aux_margin=config.loss.routing_aux_margin,
             )
             history["val_loss"].append(val_loss)
+        else:
+            # No validation loader: the epoch was still EXECUTED, so its
+            # position on the shared epoch axis must exist.  ``None`` records
+            # an unobserved diagnostic — not a finite value (which would
+            # fabricate a patience opportunity) and not NaN/Inf (which would
+            # claim a measured non-finite loss).  The counter increments only
+            # behind ``math.isfinite(val_loss)`` and val_loss stays ``inf``
+            # here, so patience does not advance on an unvalidated epoch.
+            history["val_loss"].append(None)
 
         elapsed = time.time() - t0
         logger.info(
@@ -3886,6 +5321,9 @@ def train(
                 **({"dataset_source_binding": dataset_source_binding} if dataset_source_binding != "sha256_bound" else {}),
                 mcmc_prior_train_serve_consistency=mcmc_prior_consistency,
                 best_val_loss=float(best_val_loss),
+                **_recovery_state_kwargs(
+                    epochs_without_improvement, history, history_start_epoch,
+                ),
                 **nested_provenance,
             )
             generated_checkpoint_shas[best_path] = hashlib.sha256(
@@ -3917,15 +5355,24 @@ def train(
                 **({"dataset_source_binding": dataset_source_binding} if dataset_source_binding != "sha256_bound" else {}),
                 mcmc_prior_train_serve_consistency=mcmc_prior_consistency,
                 best_val_loss=float(best_val_loss),
+                **_recovery_state_kwargs(
+                    epochs_without_improvement, history, history_start_epoch,
+                ),
                 **nested_provenance,
             )
             logger.info("Saved periodic checkpoint: %s", epoch_path)
 
         # ── Early stopping check ─────────────────────────────
-        if (
-            early_stopping_patience > 0
-            and not (two_phase and current_phase == 1 and config.training.num_epochs > phase1_epochs)
-            and epochs_without_improvement >= early_stopping_patience
+        # The SAME predicate a resume consults before its first epoch, so the
+        # decision is identical whether it is reached inside the loop or
+        # restored at a publication boundary.
+        if _recovery_terminal(
+            early_stopping_patience,
+            epochs_without_improvement,
+            two_phase=two_phase,
+            current_phase=current_phase,
+            num_epochs=config.training.num_epochs,
+            phase1_epochs=phase1_epochs,
         ):
             logger.info(
                 "Early stopping triggered: val_loss did not improve for %d epochs "
@@ -3957,6 +5404,9 @@ def train(
         **({"dataset_source_binding": dataset_source_binding} if dataset_source_binding != "sha256_bound" else {}),
         mcmc_prior_train_serve_consistency=mcmc_prior_consistency,
         best_val_loss=float(best_val_loss),
+        **_recovery_state_kwargs(
+            epochs_without_improvement, history, history_start_epoch,
+        ),
         **nested_provenance,
     )
     generated_checkpoint_shas[final_path] = hashlib.sha256(
@@ -3970,7 +5420,7 @@ def train(
     logger.info("=" * 60)
 
     # ── Plot loss curve ──────────────────────────────────────────
-    loss_curve_path = plot_loss_curve(history, output_dir)
+    loss_curve_path = plot_loss_curve(history, output_dir, history_start_epoch)
     logger.info("Loss curve saved: %s", loss_curve_path)
 
     # ── Evaluate best model on validation set ────────────────────
@@ -4086,6 +5536,9 @@ def train(
         "metrics": metrics,
         "eval_provenance": eval_provenance,
         "history": history,
+        # True 0-based epoch of history entry 0 (0 for a fresh run; the
+        # resume epoch for a legacy resume whose earlier history is unknown).
+        "history_start_epoch": history_start_epoch,
         # Nested-prior provenance (empty artifact / is_nested_cv False =
         # legacy run).  Mirrors what every checkpoint carries.
         "nested_prior_artifact": nested_provenance["nested_prior_artifact"],

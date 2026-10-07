@@ -45,8 +45,10 @@ validator).
   acceptance `experimental_unresolved`; uninterrupted determinism `false`. No
   final scientific/clock validation is claimed.
 
-Frozen root files (`checkpoint.py`, `model_utils.py`, `model_nsmor_core.py`,
-`loss.py`) remain protected and HEAD-identical. The accepted dataset/nested pins
+Root files (`checkpoint.py`, `model_utils.py`, `model_nsmor_core.py`, `loss.py`)
+were HEAD-identical in that accepted delivery. Current core optimization follows
+the [controlled-change policy](nsmor/BOUNDARY.md#controlled-core-change-protocol);
+canonical loader/checkpoint contracts remain protected. The accepted dataset/nested pins
 and clock repairs are unchanged; dataset `nsmor_dataset.pt` (`b1bd5578...`, strict
 dt 4 ms, finite 2,304 sequences, 58,156,483 frames, 2,432 eligible trials, 128
 unlabeled anchors, 46,873,366 source rows, 2,304×4 priors, 1,872/432 split, 52/12

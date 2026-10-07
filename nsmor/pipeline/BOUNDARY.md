@@ -2,7 +2,7 @@
 
 ## Status: 🔓 SAFE TO EXTEND & MAINTAIN
 
-This directory handles **data ingestion, feature extraction, labeling, and collation**. Modules here convert raw sensory logs into standardized PyTorch tensors for the frozen core model.
+This directory handles **data ingestion, feature extraction, labeling, and collation**. Modules here convert raw sensory logs into standardized PyTorch tensors for the controlled core model.
 
 ---
 

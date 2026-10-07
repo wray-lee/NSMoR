@@ -14,6 +14,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from nsmor.pipeline.nested_prior import load_artifact_bytes
+
 _DT_MS = 10.0
 _FRAMES = 400
 
@@ -180,8 +182,6 @@ def test_fold_count_is_resolved_not_hardcoded(
 
 def test_provenance_records_prefix_grouping(tmp_path_factory) -> None:
     """The artifact identifies prefix grouping and unverified animal identity."""
-    import torch
-
     from scripts.prepare_data import prepare_dataset
 
     raw_dir = tmp_path_factory.mktemp("raw_prov")
@@ -189,7 +189,7 @@ def test_provenance_records_prefix_grouping(tmp_path_factory) -> None:
     out = tmp_path_factory.mktemp("out_prov") / "ds.pt"
     prepare_dataset(raw_dir=raw_dir, output_path=out, random_seed=42)
 
-    saved = torch.load(out, weights_only=False)
+    saved = load_artifact_bytes(out.read_bytes())
     assert saved["mcmc_prior_provenance"].endswith("recording_prefix_grouped_cv")
     assert saved["animal_identity_status"] == "unverified"
 

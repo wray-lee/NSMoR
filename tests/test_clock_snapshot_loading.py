@@ -10,11 +10,14 @@ bytes return identical public data.
 """
 from __future__ import annotations
 
+import builtins
 import hashlib
+import io
 import json
 import pickle
 import sys
-from pathlib import Path
+import types
+from pathlib import Path, PosixPath
 from typing import Tuple
 
 import numpy as np
@@ -22,10 +25,25 @@ import pandas as pd
 import pytest
 import torch
 
+from nsmor.config import FeatureConfig
+from nsmor.lazy_dataloader import NSMoRLazyDataset
+from nsmor.pipeline.io import ClockAwareLazyDataset, _SourceKinematics
+from nsmor.pipeline.nested_prior import load_artifact_bytes
 from scripts.pre_load_adapt import adapt_cercus_to_nsmor
 
 N_FRAMES = 300
 STIMULUS_FRAME = 200
+
+
+class _AmbientOnlyUnlisted:
+    """Module-level, picklable, and deliberately absent from the test list."""
+
+
+class _GeneratedReducer:
+    """A picklable reducer outside the list; must never execute on load."""
+
+    def __reduce__(self):
+        return eval, ("raise AssertionError('reducer executed')",)
 
 
 def _write_raw_pair(raw: Path) -> Tuple[Path, Path]:
@@ -82,6 +100,82 @@ def _produce_metadata(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     )
     prepare_metadata.main()
     return metadata_path, out
+
+
+# Restricted allowlist for test-authored, trusted in-memory wrappers only.  It
+# is applied under the process-global ``safe_globals`` context (the registry
+# ``load_artifact_bytes`` also restores), never as a production allowlist.  The
+# warm entries (``_SourceKinematics``, pandas/numpy/pathlib) are present only
+# because a *read* wrapper holds live pandas frames; the cold entry set is the
+# four classes alone.  See ``_warm_payload_globals``.
+_TEST_LOCAL_SAFE_GLOBALS = [
+    ClockAwareLazyDataset, NSMoRLazyDataset, FeatureConfig, _SourceKinematics,
+    types.SimpleNamespace, PosixPath, builtins.getattr, builtins.slice,
+    np.ndarray, np.dtype,
+    (np._core if hasattr(np, "_core") else np.core).multiarray._reconstruct,
+    pd.DataFrame, pd.Index, pd.RangeIndex, pd.StringDtype, pd.arrays.StringArray,
+    pd.core.indexes.base._new_Index, pd.core.internals.managers.BlockManager,
+    pd._libs.arrays.__pyx_unpickle_NDArrayBacked,
+    pd._libs.internals._unpickle_block,
+    np.dtypes.Float64DType, np.dtypes.Int64DType, np.dtypes.ObjectDType,
+]
+
+
+def _warm_payload_globals(obj: object) -> list[str]:
+    """Statically scan *obj*'s pickle for unlisted globals (no deserialize)."""
+    buffer = io.BytesIO()
+    torch.save(obj, buffer)
+    return torch.serialization.get_unsafe_globals_in_checkpoint(
+        io.BytesIO(buffer.getvalue())
+    )
+
+
+def _restricted_roundtrip(obj: object) -> object:
+    """Round-trip *obj* through a restricted unpickler under a test-local list.
+
+    A cold wrapper pickles only its four class globals; a wrapper that already
+    read an item embeds the live pandas frames and ``_SourceKinematics`` of a
+    warm worker.  Both are covered; any global outside the list fails closed.
+    """
+    buffer = io.BytesIO()
+    torch.save(obj, buffer)
+    previous = torch.serialization.get_safe_globals()
+    torch.serialization.clear_safe_globals()
+    try:
+        with torch.serialization.safe_globals(_TEST_LOCAL_SAFE_GLOBALS):
+            return torch.load(io.BytesIO(buffer.getvalue()), weights_only=True)
+    finally:
+        torch.serialization.clear_safe_globals()
+        torch.serialization.add_safe_globals(previous)
+
+
+def test_restricted_roundtrip_rejects_ambient_only_unlisted_class() -> None:
+    """The test-local list wins: an ambient-only class must still be refused."""
+    previous = torch.serialization.get_safe_globals()
+    torch.serialization.add_safe_globals([_AmbientOnlyUnlisted])
+    try:
+        with pytest.raises(pickle.UnpicklingError):
+            _restricted_roundtrip(_AmbientOnlyUnlisted())
+    finally:
+        torch.serialization.clear_safe_globals()
+        torch.serialization.add_safe_globals(previous)
+
+
+def test_restricted_roundtrip_rejects_malicious_reducer() -> None:
+    """A reducer outside the list is refused before it can execute."""
+    with pytest.raises((pickle.UnpicklingError, ValueError)):
+        _restricted_roundtrip(_GeneratedReducer())
+
+
+def test_restricted_roundtrip_restores_registry_on_success_and_failure() -> None:
+    """The ambient registry is restored exactly after both success and error."""
+    previous = torch.serialization.get_safe_globals()
+    restored = _restricted_roundtrip({"payload": torch.arange(3)})
+    assert restored["payload"].shape == (3,)
+    assert torch.serialization.get_safe_globals() == previous
+    with pytest.raises((pickle.UnpicklingError, ValueError)):
+        _restricted_roundtrip(_GeneratedReducer())
+    assert torch.serialization.get_safe_globals() == previous
 
 
 def test_load_csv_snapshot_parses_clock_pair_from_stream(tmp_path: Path) -> None:
@@ -223,19 +317,37 @@ def test_captured_sources_repeated_reads_use_bound_revision(
 def test_clock_aware_dataset_pickle_roundtrip(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The wrapper survives a pickle round-trip and still replays a clock pair."""
-    from nsmor.pipeline.io import ClockAwareLazyDataset
+    """The wrapper survives a pickle round-trip and still replays a clock pair.
 
+    Covers the cold payload (no item read yet) and the warm payload a worker
+    pickles after it has served items — the live pandas frames and
+    ``_SourceKinematics`` a forked loader carries.
+    """
     metadata_path, _ = _produce_metadata(tmp_path, monkeypatch)
-    dataset = ClockAwareLazyDataset(str(metadata_path))
-    X_ref, Y_ref, length_ref = dataset[0]
 
-    restored = pickle.loads(pickle.dumps(dataset))
-    assert len(restored) == len(dataset)
-    X, Y, length = restored[0]
-    assert length == length_ref
+    cold = ClockAwareLazyDataset(str(metadata_path))
+    assert set(_warm_payload_globals(cold)) == {
+        "builtins.getattr", "nsmor.config.FeatureConfig",
+        "nsmor.lazy_dataloader.NSMoRLazyDataset",
+        "nsmor.pipeline.io.ClockAwareLazyDataset",
+    }
+    cold_restored = _restricted_roundtrip(cold)
+    X_ref, Y_ref, length_ref = cold[0]
+    X, Y, length = cold_restored[0]
+    assert len(cold_restored) == len(cold) and length == length_ref
     np.testing.assert_allclose(X.numpy(), X_ref.numpy())
     np.testing.assert_allclose(Y.numpy(), Y_ref.numpy())
+
+    warm = ClockAwareLazyDataset(str(metadata_path))
+    X_warm, Y_warm, length_warm = warm[0]
+    assert set(_warm_payload_globals(warm)) >= {
+        "pandas.DataFrame", "nsmor.pipeline.io._SourceKinematics",
+    }
+    warm_restored = _restricted_roundtrip(warm)
+    X2, Y2, length2 = warm_restored[0]
+    assert length2 == length_warm
+    np.testing.assert_allclose(X2.numpy(), X_warm.numpy())
+    np.testing.assert_allclose(Y2.numpy(), Y_warm.numpy())
 
 
 def test_prepare_metadata_accepts_clock_stamped_pair(
@@ -249,7 +361,7 @@ def test_prepare_metadata_accepts_clock_stamped_pair(
     )
 
     metadata_path, out = _produce_metadata(tmp_path, monkeypatch)
-    metadata = torch.load(metadata_path, weights_only=False)
+    metadata = load_artifact_bytes(metadata_path.read_bytes())
     spec = metadata["trial_specs"][0]
     pair = spec["source_pairs"][0]
     assert pair["kinematics_sha256"] == hashlib.sha256(
@@ -309,7 +421,7 @@ def test_convert_metadata_to_etl_replays_clock_pair(
     output_path = tmp_path / "etl.pt"
     converter.main(["--input", str(metadata_path), "--output", str(output_path)])
 
-    saved = torch.load(output_path, weights_only=False)
+    saved = load_artifact_bytes(output_path.read_bytes())
     assert saved["lengths"] == [N_FRAMES]
     direct = extract_trial_data(
         load_and_concat_sessions(

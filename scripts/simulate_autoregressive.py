@@ -414,6 +414,13 @@ def run_autoregressive_trial(
     Returns:
         TrialResult with all per-frame trajectories.
     """
+    if getattr(model, "persistence_skip", 0.0) > 0.0:
+        raise ValueError(
+            f"Autoregressive simulation does not support nonzero persistence_skip "
+            f"(got {model.persistence_skip}). "
+            "Nonzero k is restricted to open-loop prediction."
+        )
+
     dt_ms = resolve_dt_ms(model, dt_ms)
 
     # ── Generate stimulus ────────────────────────────────────
@@ -920,6 +927,12 @@ def main() -> None:
 
     # ── Load model ───────────────────────────────────────────
     model = load_model_from_checkpoint(Path(args.checkpoint), device)
+    if getattr(model, "persistence_skip", 0.0) > 0.0:
+        raise ValueError(
+            f"Autoregressive simulation CLI does not support nonzero persistence_skip "
+            f"(got {model.persistence_skip}). "
+            "Nonzero k is restricted to open-loop prediction."
+        )
     args.dt_ms = resolve_dt_ms(model, args.dt_ms)
 
     # ── Synthetic prior (legacy CLI name retained) ────────────

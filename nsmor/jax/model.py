@@ -35,6 +35,24 @@ if TYPE_CHECKING:
 # Biophysical Helper Functions & Decay Computations
 # ===============================================================
 
+def validate_lengths(lengths: Any, batch_size: int, timesteps: int) -> None:
+    """Validate nonzero-skip lengths on the host before JIT or integer casts.
+
+    Shape/dtype checks also run under tracing. Direct JIT callers must perform
+    this host preflight themselves: tracer values cannot be range-checked here.
+    Supported training and analysis wrappers perform the host check.
+    """
+    assert lengths.shape == (batch_size,), (
+        f"Expected lengths ({batch_size},), got {lengths.shape}"
+    )
+    if not np.issubdtype(lengths.dtype, np.integer):
+        raise ValueError("lengths must have an integer, nonboolean dtype")
+    if not isinstance(lengths, jax.core.Tracer):
+        values = np.asarray(lengths)
+        if not np.all((values >= 0) & (values <= timesteps)):
+            raise ValueError(f"lengths must satisfy 0 <= lengths <= T={timesteps}")
+
+
 def compute_decay_factor(tau_ms: float, dt_ms: float) -> float:
     """Compute per-timestep exponential decay factor alpha = exp(-dt / tau)."""
     if tau_ms <= 0.0:
@@ -157,8 +175,16 @@ class NSMoRModel(nn.Module):
     gru_neuromod_gain: float = 0.0
     dropout_rate: float = 0.1
     sensory_noise_std: float = 0.0
+    persistence_skip: float = 0.0
 
     def setup(self) -> None:
+        if (
+            isinstance(self.persistence_skip, bool)
+            or not isinstance(self.persistence_skip, (int, float))
+            or not math.isfinite(self.persistence_skip)
+            or not 0.0 <= self.persistence_skip <= 1.0
+        ):
+            raise ValueError("persistence_skip must be a finite scalar in [0, 1]")
         self.sensory_encoder = SensoryEncoderJAX(
             hidden_dim=self.hidden_dim,
             sensory_noise_std=self.sensory_noise_std,
@@ -246,6 +272,11 @@ class NSMoRModel(nn.Module):
         dt = self.dt_ms
 
         assert D == self.sensory_dim + self.mcmc_dim, f"Expected dim {self.sensory_dim + self.mcmc_dim}, got {D}"
+
+        if self.persistence_skip != 0.0:
+            if self.sensory_dim < 3:
+                raise ValueError("Nonzero persistence_skip requires sensory_dim >= 3")
+            validate_lengths(lengths, B, T)
 
         sensory_x = x[:, :, :self.sensory_dim]
         mcmc_prior = x[:, :, self.sensory_dim:]
@@ -433,6 +464,12 @@ class NSMoRModel(nn.Module):
         # 6. DirectionHead Decoding
         h_fused = g_lif * out_lif + g_gru * out_gru
         y_pred = self.direction_head(h_fused, deterministic=deterministic)  # (B, T)
+
+        if self.persistence_skip != 0.0:
+            v_lag = x[:, :, 2]
+            mask_bt = jnp.arange(T)[None, :] < lengths[:, None]
+            assert v_lag.shape == mask_bt.shape == (B, T)
+            y_pred = y_pred + self.persistence_skip * jnp.where(mask_bt, v_lag, 0.0)
 
         # MINOR-5 fix: Output shape assertions
         assert y_pred.shape == (B, T), f"y_pred shape {y_pred.shape} != ({B}, {T})"

@@ -11,13 +11,16 @@ synthetic.
 """
 from __future__ import annotations
 
+import builtins
 import copy
 import io
 import json
 import logging
 import math
+import pickle
 import sys
-from pathlib import Path
+import types
+from pathlib import Path, PosixPath
 from unittest.mock import patch
 
 import numpy as np
@@ -25,9 +28,18 @@ import pandas as pd
 import pytest
 import torch
 
+from nsmor.config import FeatureConfig
 from nsmor.data_extractor import _compute_pure_wind_prepend_frames
-from nsmor.pipeline.io import ClockAwareLazyDataset, extract_trial_data
-from nsmor.pipeline.nested_prior import load_dataset_with_fingerprint
+from nsmor.lazy_dataloader import NSMoRLazyDataset
+from nsmor.pipeline.io import (
+    ClockAwareLazyDataset,
+    _SourceKinematics,
+    extract_trial_data,
+)
+from nsmor.pipeline.nested_prior import (
+    load_artifact_bytes,
+    load_dataset_with_fingerprint,
+)
 from nsmor.pipeline.resampling import (
     LAZY_MODEL_CLOCK_SCHEMA,
     build_lazy_model_clock_contract,
@@ -44,6 +56,17 @@ MODEL_DT_MS = 4.0
 LV_RATIO_MS = 120.0
 # Collision at lv / tan(init/2) = 1716 ms, inside a 600-frame (~3 s) trial.
 INIT_DEG = 8.0
+
+
+class _AmbientOnlyUnlisted:
+    """Module-level, picklable, and deliberately absent from the test list."""
+
+
+class _GeneratedReducer:
+    """A picklable reducer outside the list; must never execute on load."""
+
+    def __reduce__(self):
+        return eval, ("raise AssertionError('reducer executed')",)
 
 
 def _write_session(
@@ -136,8 +159,85 @@ def _produce_metadata(
 
 
 def _spec(metadata_path: Path, index: int = 0) -> dict:
-    metadata = torch.load(metadata_path, weights_only=False)
+    metadata = load_artifact_bytes(metadata_path.read_bytes())
     return metadata["trial_specs"][index]
+
+
+# Restricted allowlist for test-authored, trusted in-memory wrappers only.  It
+# is applied under the process-global ``safe_globals`` context (the registry
+# ``load_artifact_bytes`` also restores), never as a production allowlist.  The
+# warm entries (``_SourceKinematics``, pandas/numpy/pathlib) are present only
+# because a *read* wrapper holds live pandas frames; the cold entry set is the
+# four classes alone.  See ``_warm_payload_globals``.
+_TEST_LOCAL_SAFE_GLOBALS = [
+    ClockAwareLazyDataset, NSMoRLazyDataset, FeatureConfig, _SourceKinematics,
+    types.SimpleNamespace, PosixPath, builtins.getattr, builtins.slice,
+    np.ndarray, np.dtype,
+    (np._core if hasattr(np, "_core") else np.core).multiarray._reconstruct,
+    pd.DataFrame, pd.Index, pd.RangeIndex, pd.StringDtype, pd.arrays.StringArray,
+    pd.core.indexes.base._new_Index, pd.core.internals.managers.BlockManager,
+    pd._libs.arrays.__pyx_unpickle_NDArrayBacked,
+    pd._libs.internals._unpickle_block,
+    np.dtypes.Float64DType, np.dtypes.Int64DType, np.dtypes.ObjectDType,
+]
+
+
+def _warm_payload_globals(obj: object) -> list[str]:
+    """Statically scan *obj*'s pickle for unlisted globals (no deserialize)."""
+    buffer = io.BytesIO()
+    torch.save(obj, buffer)
+    return torch.serialization.get_unsafe_globals_in_checkpoint(
+        io.BytesIO(buffer.getvalue())
+    )
+
+
+def _restricted_roundtrip(obj: object) -> object:
+    """Round-trip *obj* through a restricted unpickler under a test-local list.
+
+    The list accepts both the cold class set and the warm payload a worker
+    pickles after serving an item (live pandas frames, ``_SourceKinematics``).
+    Any global outside ``_TEST_LOCAL_SAFE_GLOBALS`` still fails closed, and the
+    ambient registry is restored exactly on both success and failure.
+    """
+    buffer = io.BytesIO()
+    torch.save(obj, buffer)
+    previous = torch.serialization.get_safe_globals()
+    torch.serialization.clear_safe_globals()
+    try:
+        with torch.serialization.safe_globals(_TEST_LOCAL_SAFE_GLOBALS):
+            return torch.load(io.BytesIO(buffer.getvalue()), weights_only=True)
+    finally:
+        torch.serialization.clear_safe_globals()
+        torch.serialization.add_safe_globals(previous)
+
+
+def test_restricted_roundtrip_rejects_ambient_only_unlisted_class() -> None:
+    """The test-local list wins: an ambient-only class must still be refused."""
+    previous = torch.serialization.get_safe_globals()
+    torch.serialization.add_safe_globals([_AmbientOnlyUnlisted])
+    try:
+        with pytest.raises(pickle.UnpicklingError):
+            _restricted_roundtrip(_AmbientOnlyUnlisted())
+    finally:
+        torch.serialization.clear_safe_globals()
+        torch.serialization.add_safe_globals(previous)
+
+
+def test_restricted_roundtrip_rejects_malicious_reducer() -> None:
+    """A reducer outside the list is refused before it can execute."""
+    with pytest.raises((pickle.UnpicklingError, ValueError)):
+        _restricted_roundtrip(_GeneratedReducer())
+
+
+def test_restricted_roundtrip_restores_registry_on_success_and_failure() -> None:
+    """The ambient registry is restored exactly after both success and error."""
+    previous = torch.serialization.get_safe_globals()
+    restored = _restricted_roundtrip({"payload": torch.arange(3)})
+    assert restored["payload"].shape == (3,)
+    assert torch.serialization.get_safe_globals() == previous
+    with pytest.raises((pickle.UnpicklingError, ValueError)):
+        _restricted_roundtrip(_GeneratedReducer())
+    assert torch.serialization.get_safe_globals() == previous
 
 
 # ── 1. source cadence → model grid, end to end ────────────────────────
@@ -230,7 +330,7 @@ def test_converter_emits_complete_eager_contract_and_binds_clock(
     output_path = tmp_path / "etl.pt"
     convert_main(["--input", str(metadata_path), "--output", str(output_path)])
 
-    saved = torch.load(output_path, weights_only=False)
+    saved = load_artifact_bytes(output_path.read_bytes())
     assert saved["model_dt_ms"] == MODEL_DT_MS
     records = saved["model_grid_provenance"]
     assert len(records) == len(saved["X_seqs"]) == 2
@@ -258,7 +358,7 @@ def test_converter_output_rejects_a_cropped_array(
     output_path = tmp_path / "etl.pt"
     convert_main(["--input", str(metadata_path), "--output", str(output_path)])
 
-    saved = torch.load(output_path, weights_only=False)
+    saved = load_artifact_bytes(output_path.read_bytes())
     saved["X_seqs"][0] = saved["X_seqs"][0][: len(saved["X_seqs"][0]) - 1]
     cropped = tmp_path / "cropped.pt"
     torch.save(saved, cropped)
@@ -279,7 +379,7 @@ def test_converter_saves_full_model_grid_sequence_not_cropped(
     output_path = tmp_path / "etl.pt"
     convert_main(["--input", str(metadata_path), "--output", str(output_path)])
 
-    saved = torch.load(output_path, weights_only=False)
+    saved = load_artifact_bytes(output_path.read_bytes())
     record = saved["model_grid_provenance"][0]
     assert record["synthetic_prepend_frames"] == 1425
     assert len(saved["X_seqs"][0]) == record["model_n"] + 1425 > 2400
@@ -296,7 +396,7 @@ def test_legacy_markerless_metadata_is_unverified_not_stamped(
     raw = tmp_path / "raw"
     _write_session(raw, "visual_session", n_frames=600, looming=True)
     metadata_path = _produce_metadata(tmp_path, monkeypatch, raw)
-    metadata = torch.load(metadata_path, weights_only=False)
+    metadata = load_artifact_bytes(metadata_path.read_bytes())
     metadata.pop("lazy_model_clock_contract")
     # Genuine legacy metadata predates the per-spec flag too; a leftover flag
     # would contradict the now-absent declaration and must fail closed.
@@ -416,21 +516,35 @@ def test_train_lazy_seam_yields_model_grid_arrays(
 def test_enhanced_dataset_pickle_roundtrip(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The resolved model-clock contract survives pickle and replays identically."""
-    import pickle
+    """The resolved model-clock contract survives pickle and replays identically.
 
+    Covers both the cold payload (before any item read) and the warm payload a
+    forked worker pickles after it has served items.
+    """
     raw = tmp_path / "raw"
     _write_session(raw, "visual_session", n_frames=600, looming=True)
     metadata_path = _produce_metadata(tmp_path, monkeypatch, raw)
-    dataset = ClockAwareLazyDataset(str(metadata_path), dt_ms=MODEL_DT_MS)
-    X_ref, Y_ref, length_ref = dataset[0]
 
-    restored = pickle.loads(pickle.dumps(dataset))
-    assert restored.uses_model_grid is True
-    X, Y, length = restored[0]
+    cold = ClockAwareLazyDataset(str(metadata_path), dt_ms=MODEL_DT_MS)
+    cold_restored = _restricted_roundtrip(cold)
+    assert cold_restored.uses_model_grid is True
+    X_ref, Y_ref, length_ref = cold[0]
+    X, Y, length = cold_restored[0]
     assert length == length_ref
     np.testing.assert_allclose(X.numpy(), X_ref.numpy())
     np.testing.assert_allclose(Y.numpy(), Y_ref.numpy())
+
+    warm = ClockAwareLazyDataset(str(metadata_path), dt_ms=MODEL_DT_MS)
+    X_warm, Y_warm, length_warm = warm[0]
+    assert set(_warm_payload_globals(warm)) >= {
+        "pandas.DataFrame", "nsmor.pipeline.io._SourceKinematics",
+    }
+    warm_restored = _restricted_roundtrip(warm)
+    assert warm_restored.uses_model_grid is True
+    X2, Y2, length2 = warm_restored[0]
+    assert length2 == length_warm
+    np.testing.assert_allclose(X2.numpy(), X_warm.numpy())
+    np.testing.assert_allclose(Y2.numpy(), Y_warm.numpy())
 
 
 # ── 8. restricted-loader seam binds the declared lazy clock ───────────
@@ -453,7 +567,7 @@ def test_restricted_loader_rejects_partial_lazy_contract(
     raw = tmp_path / "raw"
     _write_session(raw, "wind_session", n_frames=600, wind_from=50)
     metadata_path = _produce_metadata(tmp_path, monkeypatch, raw)
-    metadata = torch.load(metadata_path, weights_only=False)
+    metadata = load_artifact_bytes(metadata_path.read_bytes())
     metadata["lazy_model_clock_contract"].pop("resampler")  # partial declaration
     partial = tmp_path / "partial.pt"
     torch.save(metadata, partial)
@@ -468,7 +582,7 @@ def test_present_null_lazy_contract_fails_closed(
     raw = tmp_path / "raw"
     _write_session(raw, "wind_session", n_frames=600, wind_from=50)
     metadata_path = _produce_metadata(tmp_path, monkeypatch, raw)
-    metadata = torch.load(metadata_path, weights_only=False)
+    metadata = load_artifact_bytes(metadata_path.read_bytes())
     metadata["lazy_model_clock_contract"] = None
     nulled = tmp_path / "null.pt"
     torch.save(metadata, nulled)
@@ -486,7 +600,7 @@ def test_contradictory_per_spec_flag_fails_closed(
     raw = tmp_path / "raw"
     _write_session(raw, "wind_session", n_frames=600, wind_from=50)
     metadata_path = _produce_metadata(tmp_path, monkeypatch, raw)
-    metadata = torch.load(metadata_path, weights_only=False)
+    metadata = load_artifact_bytes(metadata_path.read_bytes())
     metadata["trial_specs"][0]["lazy_model_clock"] = flag
     mixed = tmp_path / "mixed.pt"
     torch.save(metadata, mixed)
@@ -508,7 +622,7 @@ def test_missing_source_pair_refused_at_dataset_and_converter(
     _write_session(raw, "dup", trial_id=0, n_frames=100, declare_start=False,
                    subdir="dup_b", start_ms=300 * SOURCE_DT_MS + 5.0)
     metadata_path = _produce_metadata(tmp_path, monkeypatch, raw)
-    metadata = torch.load(metadata_path, weights_only=False)
+    metadata = load_artifact_bytes(metadata_path.read_bytes())
     spec = metadata["trial_specs"][0]
     assert spec["n_frames"] == 400 and len(spec["source_pairs"]) == 2
 
@@ -547,7 +661,7 @@ def _construct(
     if seam == "metadata_path":
         return ClockAwareLazyDataset(str(path), dt_ms=dt_ms)
     return ClockAwareLazyDataset(
-        str(path), metadata=torch.load(path, weights_only=False), dt_ms=dt_ms,
+        str(path), metadata=load_artifact_bytes(path.read_bytes()), dt_ms=dt_ms,
     )
 
 
@@ -563,7 +677,7 @@ def _two_pair_metadata(
                    declare_start=False, subdir="dup_b",
                    start_ms=first_frames * SOURCE_DT_MS + 5.0)
     metadata_path = _produce_metadata(tmp_path, monkeypatch, raw)
-    metadata = torch.load(metadata_path, weights_only=False)
+    metadata = load_artifact_bytes(metadata_path.read_bytes())
     spec = metadata["trial_specs"][0]
     assert spec["n_frames"] == first_frames + second_frames
     assert len(spec["source_pairs"]) == 2
@@ -654,7 +768,7 @@ def test_declared_lazy_artifact_rejects_partial_eager_marker(
     raw = tmp_path / "raw"
     _write_session(raw, "visual_session", n_frames=600, looming=True)
     metadata_path = _produce_metadata(tmp_path, monkeypatch, raw)
-    metadata = torch.load(metadata_path, weights_only=False)
+    metadata = load_artifact_bytes(metadata_path.read_bytes())
     if key == "X_seqs":
         metadata[key] = [np.zeros((600, 8), dtype=np.float32)]
     elif key == "Y_seqs":
@@ -685,7 +799,7 @@ def _complete_eager_artifact(
     metadata_path = _produce_metadata(tmp_path, monkeypatch, raw)
     output_path = tmp_path / "eager.pt"
     convert_main(["--input", str(metadata_path), "--output", str(output_path)])
-    eager = torch.load(output_path, weights_only=False)
+    eager = load_artifact_bytes(output_path.read_bytes())
     eager["Y_seqs"][0][-1] = y_value  # divergent from the CSV's observed 0.1
     path = tmp_path / "eager_divergent.pt"
     torch.save(eager, path)
@@ -703,11 +817,11 @@ def test_declared_lazy_artifact_rejects_complete_eager_namespace(
     seam may silently prefer one and serve divergent values.
     """
     eager_path = _complete_eager_artifact(tmp_path, monkeypatch, y_value=9.0)
-    eager = torch.load(eager_path, weights_only=False)
+    eager = load_artifact_bytes(eager_path.read_bytes())
     raw = tmp_path / "raw2"
     _write_session(raw, "wind_session", n_frames=600, wind_from=50)
-    lazy_meta = torch.load(
-        _produce_metadata(tmp_path, monkeypatch, raw), weights_only=False,
+    lazy_meta = load_artifact_bytes(
+        _produce_metadata(tmp_path, monkeypatch, raw).read_bytes(),
     )
     mixed = dict(eager)
     mixed.update(lazy_meta)  # lazy contract + trial_specs + provenance
@@ -721,7 +835,7 @@ def test_declared_lazy_artifact_rejects_complete_eager_namespace(
     mixed_path = tmp_path / "complete_mix.pt"
     torch.save(mixed, mixed_path)
     # Assert the on-disk bytes still carry the divergent eager target.
-    reloaded = torch.load(mixed_path, weights_only=False)
+    reloaded = load_artifact_bytes(mixed_path.read_bytes())
     assert float(reloaded["Y_seqs"][0][-1]) == 9.0
     with pytest.raises(ValueError):
         _construct(seam, mixed_path)
@@ -736,11 +850,11 @@ def test_declared_lazy_complete_eager_mix_refused_by_converter_no_output(
     from scripts.convert_metadata_to_etl import main as convert_main
 
     eager_path = _complete_eager_artifact(tmp_path, monkeypatch, y_value=9.0)
-    eager = torch.load(eager_path, weights_only=False)
+    eager = load_artifact_bytes(eager_path.read_bytes())
     raw = tmp_path / "raw2"
     _write_session(raw, "wind_session", n_frames=600, wind_from=50)
-    lazy_meta = torch.load(
-        _produce_metadata(tmp_path, monkeypatch, raw), weights_only=False,
+    lazy_meta = load_artifact_bytes(
+        _produce_metadata(tmp_path, monkeypatch, raw).read_bytes(),
     )
     mixed = dict(eager)
     mixed.update(lazy_meta)
@@ -770,7 +884,7 @@ def _markerless_lazy_metadata(
     raw = tmp_path / "legacy_raw"
     _write_session(raw, "wind_session", n_frames=600, wind_from=50)
     metadata_path = _produce_metadata(tmp_path, monkeypatch, raw)
-    metadata = torch.load(metadata_path, weights_only=False)
+    metadata = load_artifact_bytes(metadata_path.read_bytes())
     metadata.pop("lazy_model_clock_contract")
     for spec in metadata["trial_specs"]:
         spec.pop("lazy_model_clock", None)
@@ -788,9 +902,9 @@ def _eager_and_markerless(
     metadata_path = _produce_metadata(tmp_path, monkeypatch, raw)
     eager_path = tmp_path / "eager.pt"
     convert_main(["--input", str(metadata_path), "--output", str(eager_path)])
-    eager = torch.load(eager_path, weights_only=False)
+    eager = load_artifact_bytes(eager_path.read_bytes())
     eager["Y_seqs"][0][-1] = 9.0  # diverges from the source CSV's observed 0.1
-    lazy_meta = torch.load(metadata_path, weights_only=False)
+    lazy_meta = load_artifact_bytes(metadata_path.read_bytes())
     lazy_meta.pop("lazy_model_clock_contract")
     for spec in lazy_meta["trial_specs"]:
         spec.pop("lazy_model_clock", None)
@@ -829,7 +943,7 @@ def test_markerless_complete_eager_hybrid_is_refused(
     mixed_path = tmp_path / "markerless_hybrid.pt"
     torch.save(mixed, mixed_path)
     # The on-disk bytes still carry both representations, not a rewritten one.
-    reloaded = torch.load(mixed_path, weights_only=False)
+    reloaded = load_artifact_bytes(mixed_path.read_bytes())
     _assert_hybrid_payload_intact(reloaded, kinematics)
     with pytest.raises(ValueError):
         _construct(seam, mixed_path)
@@ -871,7 +985,7 @@ def test_markerless_hybrid_with_all_four_markers_absent_is_refused(
     assert float(pd.read_csv(kinematics)["velocity"].iloc[-1]) == 0.1
     mixed_path = tmp_path / "markerless_four.pt"
     torch.save(mixed, mixed_path)
-    reloaded = torch.load(mixed_path, weights_only=False)
+    reloaded = load_artifact_bytes(mixed_path.read_bytes())
     assert float(reloaded["Y_seqs"][0][-1]) == 9.0
     assert "trial_specs" in reloaded
     with pytest.raises(ValueError):
@@ -994,7 +1108,7 @@ def test_eager_artifact_with_inert_lineage_specs_stays_loadable(
     metadata_path = _produce_metadata(tmp_path, monkeypatch, raw)
     eager_path = tmp_path / "eager.pt"
     convert_main(["--input", str(metadata_path), "--output", str(eager_path)])
-    eager = torch.load(eager_path, weights_only=False)
+    eager = load_artifact_bytes(eager_path.read_bytes())
     assert "trial_specs" not in eager  # the converter publishes eager-only
     eager["trial_specs"] = [
         {"session_id": s, "trial_id": t, "source_pairs": [f"raw_{i}"]}
@@ -1079,7 +1193,7 @@ def test_markerless_nested_source_hybrid_is_refused(
     mixed_path = tmp_path / f"nested_source_hybrid_{partial}.pt"
     torch.save(mixed, mixed_path)
     _assert_nested_source_hybrid_intact(
-        torch.load(mixed_path, weights_only=False), kinematics)
+        load_artifact_bytes(mixed_path.read_bytes()), kinematics)
     with pytest.raises(ValueError):
         _construct(seam, mixed_path)
     with pytest.raises(ValueError):
@@ -1120,7 +1234,7 @@ def test_eager_artifact_with_nested_lineage_stubs_stays_loadable(
     metadata_path = _produce_metadata(tmp_path, monkeypatch, raw)
     eager_path = tmp_path / "eager.pt"
     convert_main(["--input", str(metadata_path), "--output", str(eager_path)])
-    eager = torch.load(eager_path, weights_only=False)
+    eager = load_artifact_bytes(eager_path.read_bytes())
     eager["trial_specs"] = [
         {"session_id": s, "trial_id": t, "source_pairs": [f"raw_{i}", f"raw_{i}b"]}
         for i, (s, t) in enumerate(zip(eager["session_ids"], eager["trial_ids"]))
@@ -1226,7 +1340,7 @@ def test_constructor_reads_metadata_path_exactly_once(
     _write_session(raw, "wind_session", n_frames=600, wind_from=50)
     metadata_path = _produce_metadata(tmp_path, monkeypatch, raw)
 
-    served = torch.load(metadata_path, weights_only=False)
+    served = load_artifact_bytes(metadata_path.read_bytes())
     replacement = copy.deepcopy(served)
     for spec in replacement["trial_specs"]:
         spec["session_id"] = "replacement_session_1"
@@ -1264,9 +1378,9 @@ def test_constructor_rejects_mixed_capture_without_a_second_read(
     _write_session(raw, "wind_session", n_frames=600, wind_from=50)
     metadata_path = _produce_metadata(tmp_path, monkeypatch, raw)
 
-    invalid = torch.load(metadata_path, weights_only=False)
+    invalid = load_artifact_bytes(metadata_path.read_bytes())
     invalid["model_dt_ms"] = MODEL_DT_MS  # raw specs + partial eager marker
-    valid = torch.load(metadata_path, weights_only=False)
+    valid = load_artifact_bytes(metadata_path.read_bytes())
 
     race_path = tmp_path / "race.pt"
     torch.save(invalid, race_path)
@@ -1303,7 +1417,7 @@ def test_eager_only_artifact_without_trial_specs_still_loads(
     metadata_path = _produce_metadata(tmp_path, monkeypatch, raw)
     output_path = tmp_path / "etl.pt"
     convert_main(["--input", str(metadata_path), "--output", str(output_path)])
-    eager = torch.load(output_path, weights_only=False)
+    eager = load_artifact_bytes(output_path.read_bytes())
     assert "trial_specs" not in eager
     dataset, _ = load_dataset_with_fingerprint(output_path, expected_dt_ms=MODEL_DT_MS)
     assert len(dataset["X_seqs"]) == 1

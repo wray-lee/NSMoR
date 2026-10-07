@@ -16,6 +16,7 @@ Python::
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
@@ -99,6 +100,19 @@ class ModelConfig:
     # Detach LIF state every N timesteps to cap gradient path length.
     # 0 disables (full BPTT — risky for long sequences).
     lif_tbptt_steps: int = 64
+
+    # Fixed observed-history residual; zero preserves historical predictions.
+    persistence_skip: float = 0.0
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.persistence_skip, bool)
+            or not isinstance(self.persistence_skip, (int, float))
+            or not math.isfinite(self.persistence_skip)
+        ):
+            raise ValueError("persistence_skip must be a finite scalar in [0, 1]")
+        if not 0.0 <= self.persistence_skip <= 1.0:
+            raise ValueError("persistence_skip must be in [0, 1]")
 
 
 @dataclass
@@ -434,7 +448,21 @@ class ExperimentConfig:
         if "cluster_gating" in raw:
             cfg.cluster_gating = _update_dataclass(cfg.cluster_gating, raw["cluster_gating"])
 
+        cfg.validate()
         return cfg
+
+    def validate(self) -> None:
+        """Reject unsupported residual-decoder configurations before side effects."""
+        self.model.__post_init__()
+        if self.model.persistence_skip != 0.0:
+            if (
+                self.training.normalize_targets is not False
+                or self.training.target_clip_cm_s != 0.0
+            ):
+                raise ValueError(
+                    "persistence_skip requires physical unnormalized and unclipped "
+                    "mode (normalize_targets=False, target_clip_cm_s=0)."
+                )
 
     # ── Serialisation ────────────────────────────────────────
 

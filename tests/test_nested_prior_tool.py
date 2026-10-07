@@ -17,7 +17,7 @@ from nsmor.config import (
     MCMCTrainingConfig,
     PIPELINE_SEMANTICS_VERSION,
 )
-from nsmor.pipeline.nested_prior import load_nested_prior_split
+from nsmor.pipeline.nested_prior import load_artifact_bytes, load_nested_prior_split
 from scripts.evaluate_nested_prior import (
     compute_source_fingerprint,
     generate_nested_priors,
@@ -429,7 +429,7 @@ def test_cli_generation_and_overwrite_protection(tmp_path: Path):
     out_file = out_dir / "nested_split_seed77.pt"
     assert out_file.exists()
 
-    result = torch.load(out_file, weights_only=False)
+    result = load_artifact_bytes(out_file.read_bytes())
     assert "nested_priors" in result
     assert "train_priors" in result
     assert "val_priors" in result
@@ -507,7 +507,7 @@ def test_snapshot_persistence_or_sequence_error_fails_closed(tmp_path: Path, seq
         prepare_data.prepare_dataset(raw_dir, out_path, random_seed=42)
         save_spy.assert_called_once()
 
-    saved = torch.load(out_path, weights_only=False)
+    saved = load_artifact_bytes(out_path.read_bytes())
     n_seqs = len(saved["X_seqs"])
     assert n_seqs == sequence_spy.call_count == 32
     expected_ids = [(directory.name, trial_id)

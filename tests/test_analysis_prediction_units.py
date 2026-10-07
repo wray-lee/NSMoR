@@ -20,6 +20,7 @@ from nsmor.analysis import prediction_units
 from nsmor.config import PIPELINE_SEMANTICS_VERSION
 from nsmor.model_nsmor_core import NSMoRCore
 from nsmor.model_utils import load_model_from_checkpoint as canonical_load
+from nsmor.pipeline.nested_prior import load_artifact_bytes
 
 
 def _diagnostic_lineage(dataset_path):
@@ -829,7 +830,7 @@ def test_phase_d_loader_marks_derived_reference_rules_and_exact_crop(tmp_path, m
             assert reference['original_reference_frame'] == 0
     # The processed dataset stores derived anchors. A recorded frame-zero
     # fallback with no physical event still cannot support a time origin.
-    saved = torch.load(dataset_path, weights_only=False)
+    saved = load_artifact_bytes(dataset_path.read_bytes())
     saved['anchor_frames'] = [200, 3000, 0]
     torch.save(saved, dataset_path)
     recorded, _, _ = lesion.load_dataset(dataset_path, batch_size=2, max_seq_len=max_seq_len)
@@ -1253,6 +1254,118 @@ def test_jacobian_calibration_caller_matches_fitted_gmm() -> None:
         jacobian._posterior_keep(probes, threshold, diag),
         gm.predict_proba(np.log(probes)[:, None])[:, lo] > 0.5,
     )
+
+
+@pytest.mark.parametrize(
+    'seed,scale,n',
+    [(42, 0.4, 128), (42, 0.5, 200)],
+)
+def test_jacobian_unimodal_tail_stretch_is_withheld(
+    seed: int, scale: float, n: int,
+) -> None:
+    """Round-4 #1: BIC mixture preference alone is not evidence of two modes.
+
+    ``exp(-6 + Exp(scale))`` is a single log-density mode, yet a second
+    component stretches one tail and raises ΔBIC above 10.  The gate must
+    not declare two quasi-fixed-point subpopulations here.
+    """
+    from sklearn.mixture import GaussianMixture
+    from scripts import analyze_jacobian as jacobian
+
+    rng = np.random.default_rng(seed)
+    residuals = np.exp(-6.0 + rng.exponential(scale, n))
+    # Confirm the supplied data really does pass the ΔBIC criterion, so
+    # this test fails on the old behaviour and proves the fix.
+    gm = GaussianMixture(2, random_state=42).fit(np.log(residuals)[:, None])
+    gm1 = GaussianMixture(1, random_state=42).fit(np.log(residuals)[:, None])
+    assert gm1.bic(np.log(residuals)[:, None]) - gm.bic(
+        np.log(residuals)[:, None]
+    ) > 10.0
+    with pytest.raises(ValueError, match='FITTED DENSITY'):
+        jacobian._calibrate_fp_threshold(residuals)
+
+
+def test_jacobian_degenerate_component_is_withheld() -> None:
+    """Round-4 #2: an unsupported point-mass component is not a subpopulation."""
+    from scripts import analyze_jacobian as jacobian
+
+    rng = np.random.default_rng(42)
+    unsupported = np.r_[np.exp(rng.normal(-5.0, 0.2, 128)), np.exp(-12.0)]
+    point_mass = np.exp(np.r_[[-10.0], np.linspace(-3.01, -2.99, 19)])
+    for candidate in (unsupported, point_mass):
+        with pytest.raises(ValueError, match='DEGENERATE'):
+            jacobian._calibrate_fp_threshold(candidate)
+
+
+def test_jacobian_density_mode_count_matches_structure() -> None:
+    """Round-4: the density-mode counter is a real structure test."""
+    from scripts import analyze_jacobian as jacobian
+
+    # Two well-separated, equally weighted components -> two interior modes.
+    assert jacobian._fitted_density_mode_count(-5.0, 0.2, 0.5, -3.0, 0.2, 0.5) == 2
+    # Narrow, widely separated components are resolved by scale-aware grid.
+    assert jacobian._fitted_density_mode_count(-100.0, 0.01, 0.5, 0.0, 0.01, 0.5) == 2
+    # Separation 765 counterexample cases
+    assert jacobian._fitted_density_mode_count(0.0, 0.1, 0.5, 765.0, 0.1, 0.5) == 2
+    assert jacobian._fitted_density_mode_count(0.0, 0.01, 0.5, 765.0, 0.01, 0.5) == 2
+    # Concrete narrow separated mixture parameters:
+    assert (
+        jacobian._fitted_density_mode_count(
+            0.6745945468, 0.1302761059, 0.5, 20.3873394026, 0.1693216743, 0.5
+        )
+        == 2
+    )
+    assert (
+        jacobian._fitted_density_mode_count(
+            np.float32(0.6745945468),
+            np.float32(0.1302761059),
+            np.float32(0.5),
+            np.float32(20.3873394026),
+            np.float32(0.1693216743),
+            np.float32(0.5),
+        )
+        == 2
+    )
+    # Coincident components fuse into a single mode regardless of weights.
+    assert jacobian._fitted_density_mode_count(-5.0, 0.3, 0.999, -5.0, 0.3, 0.001) == 1
+    assert jacobian._fitted_density_mode_count(0.0, 0.1, 0.5, 0.0, 1.0, 0.5) == 1
+    with pytest.raises(ValueError):
+        jacobian._fitted_density_mode_count(np.nan, 0.2, 0.5, -3.0, 0.2, 0.5)
+
+
+@pytest.mark.parametrize(
+    'loc_hi,n_hi',
+    [(-1.0, 50), (0.0, 100)],
+)
+def test_jacobian_widely_separated_supported_mixture_is_accepted(
+    loc_hi: float, n_hi: int,
+) -> None:
+    """Supported widely separated synthetic residuals pass GMM mode detection."""
+    from scripts import analyze_jacobian as jacobian
+
+    rng = np.random.default_rng(42)
+    n_lo = 150 if n_hi == 50 else 100
+    residuals = np.exp(
+        np.r_[rng.normal(-5.0, 0.2, n_lo), rng.normal(loc_hi, 0.2, n_hi)]
+    )
+    threshold, diag = jacobian._calibrate_fp_threshold(residuals)
+    assert diag['fitted_density_modes'] == 2
+    assert diag['low_component_support'] >= jacobian.FP_MIN_COMPONENT_SUPPORT
+    assert diag['high_component_support'] >= jacobian.FP_MIN_COMPONENT_SUPPORT
+    assert np.isfinite(threshold) and threshold > 0.0
+
+
+def test_jacobian_supported_bimodal_mixture_is_accepted() -> None:
+    """Round-4 positive control: a genuinely supported bimodal mixture passes."""
+    from scripts import analyze_jacobian as jacobian
+
+    rng = np.random.default_rng(42)
+    residuals = np.exp(np.r_[rng.normal(-5.3, 0.2, 150), rng.normal(-3.9, 0.4, 50)])
+    threshold, diag = jacobian._calibrate_fp_threshold(residuals)
+    assert diag['fitted_density_modes'] >= 2
+    assert diag['low_component_support'] >= jacobian.FP_MIN_COMPONENT_SUPPORT
+    assert diag['high_component_support'] >= jacobian.FP_MIN_COMPONENT_SUPPORT
+    assert np.isfinite(threshold) and threshold > 0.0
 
 
 class _JacobianProbeModel(torch.nn.Module):

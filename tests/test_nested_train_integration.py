@@ -28,6 +28,7 @@ from nsmor.config import PIPELINE_SEMANTICS_VERSION, FeatureConfig
 from nsmor.pipeline.grouping import animal_of as _animal_of
 from nsmor.pipeline.nested_prior import (
     compute_source_fingerprint,
+    load_artifact_bytes,
     load_nested_prior_split,
 )
 
@@ -229,7 +230,7 @@ def test_nested_artifact_exact_splits_and_feature_channels(tmp_path: Path) -> No
     from scripts.train import build_dataloaders
 
     ds_path = _make_canonical_dataset(tmp_path)
-    dataset = torch.load(ds_path, weights_only=False)
+    dataset = load_artifact_bytes(ds_path.read_bytes())
     art = _make_nested_artifact(ds_path, dataset)
     art_path = _save_artifact(tmp_path, art)
     train_idx = np.asarray(art["train_indices"], dtype=np.int64)
@@ -290,7 +291,7 @@ def test_target_stats_use_nested_train_indices(tmp_path: Path) -> None:
     from scripts.train import compute_target_stats
 
     ds_path = _make_canonical_dataset(tmp_path)
-    dataset = torch.load(ds_path, weights_only=False)
+    dataset = load_artifact_bytes(ds_path.read_bytes())
     art = _make_nested_artifact(ds_path, dataset)
     art_path = _save_artifact(tmp_path, art)
     config = _make_config(tmp_path, normalize_targets=True)
@@ -319,7 +320,7 @@ def test_end_to_end_generate_nested_priors_then_train_seam(tmp_path: Path) -> No
     from scripts.train import build_dataloaders
 
     ds_path = _make_canonical_dataset(tmp_path)
-    dataset = torch.load(ds_path, weights_only=False)
+    dataset = load_artifact_bytes(ds_path.read_bytes())
     result = generate_nested_priors(
         dataset,
         split_seed=3,
@@ -354,7 +355,7 @@ def test_end_to_end_generate_nested_priors_then_train_seam(tmp_path: Path) -> No
 
 def test_wrong_fingerprint_refused(tmp_path: Path) -> None:
     ds_path = _make_canonical_dataset(tmp_path)
-    dataset = torch.load(ds_path, weights_only=False)
+    dataset = load_artifact_bytes(ds_path.read_bytes())
     art = _make_nested_artifact(ds_path, dataset, fingerprint="0" * 64)
     art_path = _save_artifact(tmp_path, art)
     with pytest.raises(ValueError, match="fingerprint mismatch"):
@@ -369,7 +370,7 @@ def test_lying_split_metadata_refused(tmp_path: Path) -> None:
     persisted partition must be refused — metadata must not be echoed
     as truth (Reviewer B-3: split_seed=999, val_split=0.99 accepted)."""
     ds_path = _make_canonical_dataset(tmp_path)
-    dataset = torch.load(ds_path, weights_only=False)
+    dataset = load_artifact_bytes(ds_path.read_bytes())
     art = _make_nested_artifact(ds_path, dataset, split_seed=3, val_split=0.2)
     # Persisted partition comes from (3, 0.2); the sidecar now claims
     # a completely different protocol.
@@ -384,7 +385,7 @@ def test_lying_realized_counts_refused(tmp_path: Path) -> None:
     """A sidecar claiming an unrealizable realized trial fraction /
     split sizes must be refused (counts are recomputed from indices)."""
     ds_path = _make_canonical_dataset(tmp_path)
-    dataset = torch.load(ds_path, weights_only=False)
+    dataset = load_artifact_bytes(ds_path.read_bytes())
     art = _make_nested_artifact(ds_path, dataset, split_seed=3, val_split=0.2)
     art["val_trial_fraction"] = 0.99  # persisted indices say otherwise
     art["n_train"] = 1
@@ -398,7 +399,7 @@ def test_honest_artifact_reports_realized_fraction(tmp_path: Path) -> None:
     distinguishing the animal-level val_split request from the realized
     trial fraction."""
     ds_path = _make_canonical_dataset(tmp_path)
-    dataset = torch.load(ds_path, weights_only=False)
+    dataset = load_artifact_bytes(ds_path.read_bytes())
     art = _make_nested_artifact(ds_path, dataset, split_seed=3, val_split=0.2)
     art_path = _save_artifact(tmp_path, art)
     _tr, _va, _p, info = load_nested_prior_split(
@@ -422,7 +423,7 @@ def test_nonfinite_targets_refused(tmp_path: Path) -> None:
     from scripts.train import assert_finite_targets
 
     ds_path = _make_canonical_dataset(tmp_path)
-    dataset = torch.load(ds_path, weights_only=False)
+    dataset = load_artifact_bytes(ds_path.read_bytes())
     Y = [np.asarray(y).copy() for y in dataset["Y_seqs"]]
     Y[3] = Y[3].copy()
     Y[3][2] = np.nan
@@ -440,7 +441,7 @@ def test_nested_provenance_in_checkpoint_and_metrics(tmp_path: Path) -> None:
     from scripts.train import train
 
     ds_path = _make_canonical_dataset(tmp_path)
-    dataset = torch.load(ds_path, weights_only=False)
+    dataset = load_artifact_bytes(ds_path.read_bytes())
     art = _make_nested_artifact(ds_path, dataset)
     art_path = _save_artifact(tmp_path, art)
     config = _make_config(tmp_path)
@@ -458,7 +459,7 @@ def test_nested_provenance_in_checkpoint_and_metrics(tmp_path: Path) -> None:
     assert results["mcmc_prior_provenance"].startswith("nested_outer_seed")
 
     out = Path(config.checkpoint.output_dir)
-    ckpt = torch.load(out / "final_model.pth", weights_only=False)
+    ckpt = load_artifact_bytes((out / "final_model.pth").read_bytes())
     for key in (
         "nested_prior_artifact",
         "nested_prior_fingerprint",
@@ -483,7 +484,7 @@ def test_nested_provenance_in_checkpoint_and_metrics(tmp_path: Path) -> None:
         "nested_split_seed": art["split_seed"],
         "nested_val_split": art["val_split"],
     }
-    best_ckpt = torch.load(out / "best_model.pth", weights_only=False)
+    best_ckpt = load_artifact_bytes((out / "best_model.pth").read_bytes())
     for record in (results, ckpt, best_ckpt, metrics):
         for key, expected in expected_lineage.items():
             assert record[key] == expected, f"lineage mismatch for {key}"
@@ -502,8 +503,8 @@ def test_legacy_run_marks_not_nested(tmp_path: Path) -> None:
     assert results["mcmc_prior_provenance"] == "oof_5fold_recording_prefix_grouped_cv"
     assert results["animal_identity_status"] == "unverified"
     assert results["validation_scope"] == "diagnostic_global_oof"
-    ckpt = torch.load(
-        Path(config.checkpoint.output_dir) / "final_model.pth", weights_only=False
+    ckpt = load_artifact_bytes(
+        (Path(config.checkpoint.output_dir) / "final_model.pth").read_bytes()
     )
     assert ckpt["is_nested_cv"] is False
     assert "nested_prior_fingerprint" in ckpt
@@ -511,7 +512,7 @@ def test_legacy_run_marks_not_nested(tmp_path: Path) -> None:
 
 def test_empty_fingerprint_refused(tmp_path: Path) -> None:
     ds_path = _make_canonical_dataset(tmp_path)
-    dataset = torch.load(ds_path, weights_only=False)
+    dataset = load_artifact_bytes(ds_path.read_bytes())
     art = _make_nested_artifact(ds_path, dataset, fingerprint="")
     art_path = _save_artifact(tmp_path, art)
     with pytest.raises(ValueError, match="64-char SHA-256"):
@@ -524,7 +525,7 @@ def test_fingerprint_of_different_dataset_refused(tmp_path: Path) -> None:
     ds_b_dir = tmp_path / "b"
     ds_b_dir.mkdir()
     ds_b = _make_canonical_dataset(ds_b_dir, seed=8)
-    dataset_a = torch.load(ds_a, weights_only=False)
+    dataset_a = load_artifact_bytes(ds_a.read_bytes())
     art = _make_nested_artifact(ds_a, dataset_a)
     art_path = _save_artifact(tmp_path, art)
     with pytest.raises(ValueError, match="fingerprint mismatch"):
@@ -533,7 +534,7 @@ def test_fingerprint_of_different_dataset_refused(tmp_path: Path) -> None:
 
 def test_overlapping_indices_refused(tmp_path: Path) -> None:
     ds_path = _make_canonical_dataset(tmp_path)
-    dataset = torch.load(ds_path, weights_only=False)
+    dataset = load_artifact_bytes(ds_path.read_bytes())
     train_idx, val_idx = _animal_disjoint_split(list(dataset["session_ids"]))
     bad_val = np.concatenate([val_idx, train_idx[:1]])
     bad_train = train_idx[1:]
@@ -547,7 +548,7 @@ def test_overlapping_indices_refused(tmp_path: Path) -> None:
 
 def test_out_of_range_indices_refused(tmp_path: Path) -> None:
     ds_path = _make_canonical_dataset(tmp_path)
-    dataset = torch.load(ds_path, weights_only=False)
+    dataset = load_artifact_bytes(ds_path.read_bytes())
     train_idx, val_idx = _animal_disjoint_split(list(dataset["session_ids"]))
     bad_train = train_idx.copy()
     bad_train[0] = _N_TOTAL + 5
@@ -561,7 +562,7 @@ def test_out_of_range_indices_refused(tmp_path: Path) -> None:
 
 def test_non_partition_indices_refused(tmp_path: Path) -> None:
     ds_path = _make_canonical_dataset(tmp_path)
-    dataset = torch.load(ds_path, weights_only=False)
+    dataset = load_artifact_bytes(ds_path.read_bytes())
     train_idx, val_idx = _animal_disjoint_split(list(dataset["session_ids"]))
     art = _make_nested_artifact(
         ds_path,
@@ -578,7 +579,7 @@ def test_non_partition_indices_refused(tmp_path: Path) -> None:
 def test_animal_overlap_refused(tmp_path: Path) -> None:
     """A partition that still leaks an animal across sides must be refused."""
     ds_path = _make_canonical_dataset(tmp_path)
-    dataset = torch.load(ds_path, weights_only=False)
+    dataset = load_artifact_bytes(ds_path.read_bytes())
     session_ids = list(dataset["session_ids"])
     train_idx, val_idx = _animal_disjoint_split(session_ids)
     # Guarantee a leak: move ONE trial of a val animal into train and one
@@ -602,7 +603,7 @@ def test_animal_overlap_refused(tmp_path: Path) -> None:
 
 def test_bad_prior_dim_refused(tmp_path: Path) -> None:
     ds_path = _make_canonical_dataset(tmp_path)
-    dataset = torch.load(ds_path, weights_only=False)
+    dataset = load_artifact_bytes(ds_path.read_bytes())
     rng = np.random.RandomState(0)
     art = _make_nested_artifact(
         ds_path, dataset, nested_priors=rng.rand(_N_TOTAL, 3), include_sidecars=False
@@ -614,7 +615,7 @@ def test_bad_prior_dim_refused(tmp_path: Path) -> None:
 
 def test_non_simplex_priors_refused(tmp_path: Path) -> None:
     ds_path = _make_canonical_dataset(tmp_path)
-    dataset = torch.load(ds_path, weights_only=False)
+    dataset = load_artifact_bytes(ds_path.read_bytes())
     bad = np.full((_N_TOTAL, _MCMC), 0.5)
     art = _make_nested_artifact(
         ds_path, dataset, nested_priors=bad, include_sidecars=False
@@ -626,7 +627,7 @@ def test_non_simplex_priors_refused(tmp_path: Path) -> None:
 
 def test_negative_priors_refused(tmp_path: Path) -> None:
     ds_path = _make_canonical_dataset(tmp_path)
-    dataset = torch.load(ds_path, weights_only=False)
+    dataset = load_artifact_bytes(ds_path.read_bytes())
     bad = np.full((_N_TOTAL, _MCMC), 0.25)
     bad[0, 0] = -0.5
     bad[0, 1] = 1.25
@@ -640,7 +641,7 @@ def test_negative_priors_refused(tmp_path: Path) -> None:
 
 def test_pipeline_version_mismatch_refused(tmp_path: Path) -> None:
     ds_path = _make_canonical_dataset(tmp_path)
-    dataset = torch.load(ds_path, weights_only=False)
+    dataset = load_artifact_bytes(ds_path.read_bytes())
     art = _make_nested_artifact(
         ds_path, dataset, pipeline_version="0.0.0-not-a-version"
     )
@@ -651,7 +652,7 @@ def test_pipeline_version_mismatch_refused(tmp_path: Path) -> None:
 
 def test_not_nested_flag_refused(tmp_path: Path) -> None:
     ds_path = _make_canonical_dataset(tmp_path)
-    dataset = torch.load(ds_path, weights_only=False)
+    dataset = load_artifact_bytes(ds_path.read_bytes())
     art = _make_nested_artifact(ds_path, dataset, is_nested_cv=False)
     art_path = _save_artifact(tmp_path, art)
     with pytest.raises(ValueError, match="is_nested_cv"):
@@ -660,7 +661,7 @@ def test_not_nested_flag_refused(tmp_path: Path) -> None:
 
 def test_missing_sidecar_misalignment_refused(tmp_path: Path) -> None:
     ds_path = _make_canonical_dataset(tmp_path)
-    dataset = torch.load(ds_path, weights_only=False)
+    dataset = load_artifact_bytes(ds_path.read_bytes())
     art = _make_nested_artifact(ds_path, dataset)
     # Keep rows a valid simplex so only the alignment check can fire.
     n_train = int(np.asarray(art["train_indices"]).size)
@@ -675,7 +676,7 @@ def test_missing_sidecar_misalignment_refused(tmp_path: Path) -> None:
 
 def test_missing_session_ids_refused(tmp_path: Path) -> None:
     ds_path = _make_canonical_dataset(tmp_path)
-    dataset = torch.load(ds_path, weights_only=False)
+    dataset = load_artifact_bytes(ds_path.read_bytes())
     art = _make_nested_artifact(ds_path, dataset)
     art_path = _save_artifact(tmp_path, art)
     with pytest.raises(ValueError, match="session_ids"):
@@ -684,7 +685,7 @@ def test_missing_session_ids_refused(tmp_path: Path) -> None:
 
 def test_missing_required_key_refused(tmp_path: Path) -> None:
     ds_path = _make_canonical_dataset(tmp_path)
-    dataset = torch.load(ds_path, weights_only=False)
+    dataset = load_artifact_bytes(ds_path.read_bytes())
     art = _make_nested_artifact(ds_path, dataset)
     del art["val_indices"]
     art_path = _save_artifact(tmp_path, art)
@@ -697,7 +698,7 @@ def test_build_dataloaders_refuses_bad_artifact(tmp_path: Path) -> None:
     from scripts.train import build_dataloaders
 
     ds_path = _make_canonical_dataset(tmp_path)
-    dataset = torch.load(ds_path, weights_only=False)
+    dataset = load_artifact_bytes(ds_path.read_bytes())
     art = _make_nested_artifact(ds_path, dataset, fingerprint="1" * 64)
     art_path = _save_artifact(tmp_path, art)
     config = _make_config(tmp_path)
@@ -722,7 +723,7 @@ def test_legacy_default_unchanged(tmp_path: Path) -> None:
     from nsmor.pipeline.grouping import grouped_train_val_split
 
     ds_path = _make_canonical_dataset(tmp_path)
-    dataset = torch.load(ds_path, weights_only=False)
+    dataset = load_artifact_bytes(ds_path.read_bytes())
     config = _make_config(tmp_path)
 
     train_loader, val_loader = build_dataloaders(
@@ -784,7 +785,7 @@ def test_resume_missing_checkpoint_refused(tmp_path: Path) -> None:
     from scripts.train import train
 
     ds_path = _make_canonical_dataset(tmp_path)
-    dataset = torch.load(ds_path, weights_only=False)
+    dataset = load_artifact_bytes(ds_path.read_bytes())
     art = _make_nested_artifact(ds_path, dataset)
     art_path = _save_artifact(tmp_path, art)
     config = _make_config(tmp_path)
@@ -803,7 +804,7 @@ def test_resume_mode_mismatch_refused(tmp_path: Path) -> None:
     from scripts.train import train
 
     ds_path = _make_canonical_dataset(tmp_path)
-    dataset = torch.load(ds_path, weights_only=False)
+    dataset = load_artifact_bytes(ds_path.read_bytes())
     art = _make_nested_artifact(ds_path, dataset)
     art_path = _save_artifact(tmp_path, art)
 
@@ -852,7 +853,7 @@ def test_resume_mismatched_artifact_refused(tmp_path: Path) -> None:
     from scripts.train import train
 
     ds_path = _make_canonical_dataset(tmp_path)
-    dataset = torch.load(ds_path, weights_only=False)
+    dataset = load_artifact_bytes(ds_path.read_bytes())
     art1 = _make_nested_artifact(ds_path, dataset, split_seed=3)
     art1_path = _save_artifact(tmp_path, art1, name="art1.pt")
 
@@ -887,7 +888,7 @@ def test_resume_changed_dataset_or_fingerprint_refused(tmp_path: Path) -> None:
     from scripts.train import train
 
     ds1_path = _make_canonical_dataset(tmp_path / "ds1", seed=7)
-    dataset1 = torch.load(ds1_path, weights_only=False)
+    dataset1 = load_artifact_bytes(ds1_path.read_bytes())
     art1 = _make_nested_artifact(ds1_path, dataset1, split_seed=3)
     art1_path = _save_artifact(tmp_path, art1, name="art1.pt")
 
@@ -902,7 +903,7 @@ def test_resume_changed_dataset_or_fingerprint_refused(tmp_path: Path) -> None:
 
     # Tamper with fingerprint in checkpoint or pass an artifact with changed source
     ds2_path = _make_canonical_dataset(tmp_path / "ds2", seed=8)
-    dataset2 = torch.load(ds2_path, weights_only=False)
+    dataset2 = load_artifact_bytes(ds2_path.read_bytes())
     art2 = _make_nested_artifact(ds2_path, dataset2, split_seed=3)
     art2_path = _save_artifact(tmp_path, art2, name="art1.pt")  # same filename!
 
@@ -923,7 +924,7 @@ def test_resume_changed_split_refused(tmp_path: Path) -> None:
     from scripts.train import train
 
     ds_path = _make_canonical_dataset(tmp_path)
-    dataset = torch.load(ds_path, weights_only=False)
+    dataset = load_artifact_bytes(ds_path.read_bytes())
     art = _make_nested_artifact(ds_path, dataset, split_seed=3, val_split=0.2)
     art_path = _save_artifact(tmp_path, art)
 
@@ -937,7 +938,7 @@ def test_resume_changed_split_refused(tmp_path: Path) -> None:
     ckpt_path = Path(config1.checkpoint.output_dir) / "final_model.pth"
 
     # Mutate checkpoint's recorded split_seed
-    ckpt_data = torch.load(ckpt_path, weights_only=False)
+    ckpt_data = load_artifact_bytes(ckpt_path.read_bytes())
     ckpt_data["nested_split_seed"] = 999
     torch.save(ckpt_data, ckpt_path)
 
@@ -958,7 +959,7 @@ def test_resume_preserves_best_validation_score_and_checkpoint(tmp_path: Path) -
     from scripts.train import train
 
     ds_path = _make_canonical_dataset(tmp_path)
-    dataset = torch.load(ds_path, weights_only=False)
+    dataset = load_artifact_bytes(ds_path.read_bytes())
     art = _make_nested_artifact(ds_path, dataset, split_seed=3, val_split=0.2)
     art_path = _save_artifact(tmp_path, art)
 
@@ -977,7 +978,7 @@ def test_resume_preserves_best_validation_score_and_checkpoint(tmp_path: Path) -
 
     # Artificially set best_val_loss in checkpoint to a very low value (e.g. 0.001)
     # to test that resume doesn't overwrite it when epoch 2 val_loss is higher.
-    ckpt1_data = torch.load(best_ckpt_1, weights_only=False)
+    ckpt1_data = load_artifact_bytes(best_ckpt_1.read_bytes())
     ckpt1_data["loss"] = 0.001
     ckpt1_data["val_loss"] = 0.001
     ckpt1_data["best_val_loss"] = 0.001

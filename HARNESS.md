@@ -47,9 +47,9 @@ The harness consists of 5 tightly integrated governance layers:
 
 1. **Root Protocol Layer (`AGENTS.md`)**: Specifies subagent roles, rights, state transitions, and approval gates.
 2. **Session Guidance Layer (`CLAUDE.md`)**: Controls LLM CLI behavior, coding idioms, PEP 8 standards, and prompt directives.
-3. **Hierarchical Boundary Matrix (`BOUNDARY.md`)**: Enforces directory-level immutability rules:
+3. **Hierarchical Boundary Matrix (`BOUNDARY.md`)**: Defines directory-level change controls:
    - Root (`/BOUNDARY.md`): Git identity and architecture layout.
-   - Core (`nsmor/BOUNDARY.md`): Frozen PyTorch mathematical core (`NSMoRCore`, `BioJointLoss`).
+   - Core (`nsmor/BOUNDARY.md`): Controlled mathematical core changes for `NSMoRCore` and `BioJointLoss`.
    - Pipeline (`nsmor/pipeline/BOUNDARY.md`): Data ingestion and feature extraction contracts.
    - Sandbox (`nsmor/analysis/BOUNDARY.md`): Free-form dynamical systems analysis tools.
 4. **State Machine & Watchdog Layer (`HARNESS.md`)**: Defines lifecycle execution, failure handling, and double-blind verification loops.
@@ -88,7 +88,7 @@ The tester agent (`nsmor_tester`) acts as the final gatekeeper before Git commit
 2. **Data Pipeline Reset**: Standardizes test inputs (`make load && make data` or synthetic fixtures).
 3. **Smoke & Stability Gate**: Executes `python scripts/train.py --config config/default.yaml --epochs 1 --output_dir runs/test` and checks for zero `NaN`/`Inf` tensor values.
 4. **Regression Gate**: Executes complete pytest suite (`pytest tests/ -v`).
-5. **Commit Gate**: Performs interactive squash/rebase if needed and injects `Approved-by: Reviewer #2` in commit footers under identity `wray-lee <i@wray7.top>`.
+5. **Commit Gate**: Performs explicit-path staging only after all gates pass and injects `Approved-by: Reviewer #2` in commit footers under identity `wray-lee <i@wray7.top>`. Never use blanket staging (`git add .` or `git add -A`).
 
 ---
 
@@ -96,7 +96,7 @@ The tester agent (`nsmor_tester`) acts as the final gatekeeper before Git commit
 
 - **Loop Interception**: If Developer and Reviewer reach a 3-turn rejection loop, the Orchestrator interrupts to request human intervention or explicit scope adjustment.
 - **Numerical Overflow**: Any `NaN` or `Inf` immediately aborts the pipeline stage, triggering an automatic roll-back and sending log diagnostics back to `nsmor_developer`.
-- **Boundary Violation**: Unsanctioned attempts to modify frozen core files (`nsmor/model_nsmor_core.py`, `nsmor/loss.py`) without prior user authorization trigger hard failure.
+- **Boundary violation**: Editing a core module outside the normative controlled-change protocol in `nsmor/BOUNDARY.md` triggers failure. Core edits within a user-authorized scope are permitted and require two independent `ACCEPT` reviews and the stated tests.
 
 ---
 

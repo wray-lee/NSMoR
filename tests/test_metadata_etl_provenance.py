@@ -31,6 +31,7 @@ from nsmor.config import (
     PIPELINE_SEMANTICS_VERSION,
 )
 from nsmor.model_utils import validate_dataset_provenance
+from nsmor.pipeline.nested_prior import load_artifact_bytes
 from scripts.convert_metadata_to_etl import (
     main as convert_main,
     populate_etl_provenance_and_conditions,
@@ -235,7 +236,7 @@ def test_actual_producer_metadata_converts_from_direct_cli(tmp_path: Path, monke
         cwd=tmp_path, capture_output=True, text=True, timeout=60,
     )
     assert run.returncode == 0, run.stderr
-    converted = torch.load(output_path, weights_only=False)
+    converted = load_artifact_bytes(output_path.read_bytes())
     validate_dataset_provenance(converted, output_path)
     assert len(converted["X_seqs"]) == 2
     assert converted["mcmc_priors"].shape == (2, DEFAULT_FEATURE.mcmc_dim)
@@ -322,7 +323,7 @@ def test_convert_metadata_to_etl_cli_e2e(tmp_path: Path):
     assert etl_path.exists()
 
     # Load converted dataset
-    etl_data = torch.load(etl_path, weights_only=False)
+    etl_data = load_artifact_bytes(etl_path.read_bytes())
 
     # 1. Provenance Gate
     validate_dataset_provenance(etl_data, etl_path)
@@ -372,7 +373,7 @@ def _source10_produce(raw_dir, metadata_path, monkeypatch):
     monkeypatch.setattr(sys, 'argv', ['prepare_metadata.py', '--raw_dir', str(raw_dir),
                                       '--output', str(metadata_path)])
     prepare_metadata.main()
-    return torch.load(metadata_path, weights_only=False), priors
+    return load_artifact_bytes(metadata_path.read_bytes()), priors
 
 
 @pytest.mark.parametrize('dt_ms,lengths,anchor,onset,step', [
@@ -420,7 +421,7 @@ def test_split_trial_replays_all_source_pairs_at_both_cadences(
     assert le == lengths[0] and Xe.shape == (lengths[0], 8)
 
     convert_main(['--input', str(metadata_path), '--output', str(output_path)])
-    saved = torch.load(output_path, weights_only=False)
+    saved = load_artifact_bytes(output_path.read_bytes())
     validate_dataset_provenance(saved, output_path)
     assert metadata["animal_identity_status"] == saved["animal_identity_status"] == "unverified"
     assert saved["mcmc_prior_provenance"].endswith("recording_prefix_grouped_cv")
@@ -483,7 +484,7 @@ def test_same_bare_filenames_in_distinct_sessions_do_not_share_cache(tmp_path, m
     np.testing.assert_allclose(lazy[1][1], 0.2)
 
     convert_main(['--input', str(metadata_path), '--output', str(output_path)])
-    saved = torch.load(output_path, weights_only=False)
+    saved = load_artifact_bytes(output_path.read_bytes())
     validate_dataset_provenance(saved, output_path)
     assert saved['lengths'].tolist() == [300, 300]
     assert list(zip(saved['session_ids'], saved['trial_ids'])) == [
@@ -528,7 +529,7 @@ def test_converter_uses_one_decoded_snapshot_after_same_size_path_swap(tmp_path,
         return captured
     monkeypatch.setattr(converter, 'load_artifact_bytes', swap_after_decode)
     converter.main(['--input', str(metadata_path), '--output', str(output_path)])
-    saved = torch.load(output_path, weights_only=False)
+    saved = load_artifact_bytes(output_path.read_bytes())
     validate_dataset_provenance(saved, output_path)
     assert saved['session_ids'] == ['animalA_session_1', 'animalB_session_1']
     assert saved['trial_ids'] == [11, 12]
@@ -730,7 +731,7 @@ def test_source12_etl_path_swap_at_publication_claims_captured_revision(tmp_path
     monkeypatch.setattr(converter.os, 'replace', swap_on_publication)
     converter.main(['--input', str(metadata_path), '--output', str(output_path)])
     assert published
-    saved = torch.load(output_path, weights_only=False)
+    saved = load_artifact_bytes(output_path.read_bytes())
     validate_dataset_provenance(saved, output_path)
     np.testing.assert_allclose(saved['Y_seqs'][0], 0.1)
     revision = saved['raw_input_revision']
@@ -770,7 +771,7 @@ def test_source12_metadata_path_swap_at_publication_claims_captured_revision(
     monkeypatch.setattr(prepare_metadata.os, 'replace', swap_on_publication)
     prepare_metadata.main()
     assert published
-    saved = torch.load(metadata_path, weights_only=False)
+    saved = load_artifact_bytes(metadata_path.read_bytes())
     revision = saved['raw_input_revision']
     assert revision['claim'] == 'SHA-256 of captured CSV bytes; paths are labels, not a live-path guarantee'
     assert revision['source_pairs'][0]['kinematics_sha256'] == expected

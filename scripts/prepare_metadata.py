@@ -51,6 +51,7 @@ from nsmor.pipeline.io import (
 from nsmor.pipeline.resampling import build_lazy_model_clock_contract
 from nsmor.pipeline.labeling import (
     assign_ground_truth_labels,
+    has_stimulus_anchor,
     labeling_funnel_summary,
 )
 
@@ -287,6 +288,39 @@ def main() -> None:
     labeled_trials = assign_ground_truth_labels(trials, return_funnel=True)
     logger.info("Labeled %d trials.", len(labeled_trials))
 
+    # Round-4: trials dropped for missing/invalid chronology must be
+    # recorded in the eligibility ledger rather than silently omitted.
+    # A trial with no finite ``stimulus_onset`` anchor (absent event, or
+    # a NaN/Inf timestamp) is unavailable evidence — it must never be
+    # fabricated into a behavioural class.  This mirrors prepare_data's
+    # ``labeling_eligibility`` ledger without regenerating pinned data.
+    labeled_by_key = {
+        (str(info["session_id"]), int(info["trial_id"])): info["label"].name
+        for info in labeled_trials
+    }
+    labeling_eligibility: List[Dict[str, Any]] = []
+    for trial in trials:
+        key = (str(trial["session_id"]), int(trial["trial_id"]))
+        anchored = has_stimulus_anchor(trial["event_types"], trial["event_times"])
+        if (key in labeled_by_key) != anchored:
+            raise ValueError(f"Unaccounted labeling outcome: {key}")
+        labeling_eligibility.append({
+            "session_id": key[0],
+            "trial_id": key[1],
+            "status": (
+                "labeled" if key in labeled_by_key
+                else "unavailable_no_stimulus_anchor"
+            ),
+            "label": labeled_by_key.get(key),
+        })
+    n_unavailable = sum(
+        row["status"] != "labeled" for row in labeling_eligibility
+    )
+    logger.info(
+        "Label eligibility: %d extracted, %d labeled, %d unavailable",
+        len(trials), len(labeled_trials), n_unavailable,
+    )
+
     funnel = labeling_funnel_summary(labeled_trials)
     logger.info("Labeling elimination funnel: %s", funnel)
 
@@ -464,6 +498,7 @@ def main() -> None:
         "is_pure_wind": np.array(
             [spec["is_pure_wind"] for spec in trial_specs], dtype=bool
         ),
+        "labeling_eligibility": labeling_eligibility,
     }
 
     for pair in all_source_pairs:

@@ -114,7 +114,7 @@ Output: jacobians [N, H, H]  — Jacobian for each state
 
 ## Import Pattern
 
-Always import from frozen core — never copy:
+Always import from the controlled core modules — never copy:
 
 ```python
 from nsmor.model_nsmor_core import NSMoRCore

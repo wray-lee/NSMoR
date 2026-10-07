@@ -112,7 +112,7 @@ $$\mathbf{s}_{\text{TTC-50ms}} = [v_{\text{vis}}, l/v \text{ ratio}, \text{wind\
 
 ## 5. Invariants & Non-Negotiable Constraints
 
-1. **Frozen Mathematical Core**: `nsmor/model_nsmor_core.py` and `nsmor/loss.py` are strictly frozen. Modifications require explicit user override.
+1. **Controlled Mathematical Core**: `nsmor/model_nsmor_core.py` and `nsmor/loss.py` may change within a user-authorized optimization or correctness scope. The normative protocol in `nsmor/BOUNDARY.md` requires two independent `ACCEPT` reviews, focused and complete regression, numerical safety, and backward-compatibility evidence.
 2. **Git Author Identity**: Commits MUST be created under `wray-lee <i@wray7.top>` (verified GitHub primary email).
 3. **Sampling-Rate Invariance**: Physical time constants (`lif_tau_syn`, `lif_rel_refract_ms`) must be rescaled automatically via $\alpha = \exp(-\Delta t / \tau)$.
 4. **Statistical Standard**: Multi-condition evaluations must calculate Cohen's $d$, use Holm-Bonferroni FWER corrections, and report Wilcoxon+Hodges-Lehmann metrics.

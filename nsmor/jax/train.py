@@ -42,6 +42,7 @@ from nsmor.jax.model import (
     NSMoRModel,
     load_from_torch_state_dict,
     to_torch_state_dict,
+    validate_lengths,
 )
 
 logger = logging.getLogger("nsmor.jax.train")
@@ -230,6 +231,8 @@ def train_jax(
         Summary with validation_scope="diagnostic_global_oof". Validation
         scores use globally cross-fitted priors and are development diagnostics.
     """
+    # JAXExperimentConfig shares these fields but has no validate method.
+    ExperimentConfig.validate(config)
     # Disable preallocation by default to avoid GPU OOM on shared cards
     os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
@@ -365,6 +368,7 @@ def train_jax(
         gru_neuromod_gain=config.model.gru_neuromod_gain,
         dropout_rate=config.model.dropout,
         sensory_noise_std=getattr(config.model, "sensory_noise_std", 0.0),
+        persistence_skip=float(getattr(config.model, "persistence_skip", 0.0)),
     )
 
     rng = jax.random.PRNGKey(config.training.random_seed)
@@ -478,6 +482,8 @@ def train_jax(
 
         # Training epoch
         for x_b, y_b, l_b in train_loader:
+            if config.model.persistence_skip != 0.0:
+                validate_lengths(l_b, x_b.shape[0], x_b.shape[1])
             state, step_metrics = train_step(state, x_b, y_b, l_b)
             train_losses.append(step_metrics["loss"])
             train_mses.append(step_metrics["mse"])
@@ -492,6 +498,8 @@ def train_jax(
         val_spks = []
 
         for x_v, y_v, l_v in val_loader:
+            if config.model.persistence_skip != 0.0:
+                validate_lengths(l_v, x_v.shape[0], x_v.shape[1])
             v_metrics = eval_step(state.params, x_v, y_v, l_v)
             val_losses.append(v_metrics["loss"])
             val_mses.append(v_metrics["mse"])

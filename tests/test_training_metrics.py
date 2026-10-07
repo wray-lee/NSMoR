@@ -24,6 +24,8 @@ import numpy as np
 import pytest
 import torch
 
+from nsmor.pipeline.nested_prior import load_artifact_bytes
+
 _SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 
 
@@ -381,7 +383,7 @@ def test_post_training_sweep_accepts_metadata_and_legacy_batches(tmp_path, monke
     monkeypatch.setattr(mod, "_VAL_SPLIT", 0.5)
     ds_path = tmp_path / "synthetic.pt"
     _make_synthetic_dataset(ds_path)
-    dataset = torch.load(ds_path, weights_only=False)
+    dataset = load_artifact_bytes(ds_path.read_bytes())
     dataset["session_ids"] = [f"animal{i}_session_1" for i in range(6)]
     for i in range(6):
         n = 6 + i
@@ -411,7 +413,7 @@ def test_post_training_sweep_accepts_metadata_and_legacy_batches(tmp_path, monke
             assert not module.training and not torch.is_grad_enabled()
             assert not pred.requires_grad
             assert any(p.requires_grad for p in module.backend.parameters())
-            best = torch.load(best_path, map_location="cpu", weights_only=False)
+            best = load_artifact_bytes((best_path).read_bytes(), map_location="cpu")
             for name, param in module.named_parameters():
                 assert torch.equal(param.detach().cpu(), best["model_state_dict"][name])
             observations.append(True)
@@ -452,10 +454,10 @@ def test_post_training_sweep_accepts_metadata_and_legacy_batches(tmp_path, monke
 
         assert len(result["history"]["train_loss"]) == len(result["history"]["val_loss"]) == 1
         assert result["eval_provenance"] == "best"
-        final = torch.load(output_dir / "final_model.pth", map_location="cpu", weights_only=False)
+        final = load_artifact_bytes((output_dir / "final_model.pth").read_bytes(), map_location="cpu")
         metrics = json.loads((output_dir / "metrics.json").read_text())
-        best = torch.load(output_dir / "best_model.pth", map_location="cpu", weights_only=False)
-        periodic = torch.load(output_dir / "epoch_1.pth", map_location="cpu", weights_only=False)
+        best = load_artifact_bytes((output_dir / "best_model.pth").read_bytes(), map_location="cpu")
+        periodic = load_artifact_bytes((output_dir / "epoch_1.pth").read_bytes(), map_location="cpu")
         for record in (best, periodic, final, metrics, result, result["metrics"]):
             assert record["is_nested_cv"] is False
             assert record["nested_prior_artifact_sha256"] == ""
@@ -489,7 +491,7 @@ def test_nested_prior_normalization_uses_loaded_split_after_valid_same_path_swap
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     ds_path = tmp_path / "synthetic.pt"
     _make_synthetic_dataset(ds_path)
-    dataset = torch.load(ds_path, weights_only=False)
+    dataset = load_artifact_bytes(ds_path.read_bytes())
     dataset["session_ids"] = [f"animal{i}_session_1" for i in range(6)]
     dataset["Y_seqs"] = [np.full(12, value, dtype=np.float32)
                          for value in (90.0, 1.0, 2.0, 3.0, 4.0, 5.0)]
@@ -556,11 +558,11 @@ def test_nested_prior_normalization_uses_loaded_split_after_valid_same_path_swap
     np.testing.assert_array_equal(idx_b, artifacts[1][0])
     assert mean_b == pytest.approx(20.0)
     assert mean_b != pytest.approx(mean_a)
-    saved = torch.load(tmp_path / "run" / "best_model.pth", map_location="cpu",
-                       weights_only=False)
+    saved = load_artifact_bytes(
+        (tmp_path / "run" / "best_model.pth").read_bytes(), map_location="cpu")
     assert saved["target_mean"] == pytest.approx(mean_a)
-    final = torch.load(tmp_path / "run" / "final_model.pth", map_location="cpu",
-                       weights_only=False)
+    final = load_artifact_bytes(
+        (tmp_path / "run" / "final_model.pth").read_bytes(), map_location="cpu")
     assert final["target_mean"] == pytest.approx(mean_a)
     assert saved["nested_split_seed"] == 42
     assert saved["nested_prior_artifact_sha256"] == digest_a
@@ -578,7 +580,7 @@ def test_nested_prior_digest_uses_loaded_bytes_when_sidecar_changes_before_recor
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     ds_path = tmp_path / "synthetic.pt"
     _make_synthetic_dataset(ds_path)
-    dataset = torch.load(ds_path, weights_only=False)
+    dataset = load_artifact_bytes(ds_path.read_bytes())
     sessions = [f"animal{i}_session_1" for i in range(6)]
     dataset["session_ids"] = sessions
     torch.save(dataset, ds_path)
@@ -615,7 +617,7 @@ def test_nested_prior_digest_uses_loaded_bytes_when_sidecar_changes_before_recor
     cfg.training.num_workers = 0
     result = mod.train(cfg, dataset_path=str(ds_path), nested_prior_artifact=str(artifact_path))
     assert hashlib.sha256(artifact_path.read_bytes()).hexdigest() != loaded_digest
-    saved = torch.load(output_dir / "best_model.pth", map_location="cpu", weights_only=False)
+    saved = load_artifact_bytes((output_dir / "best_model.pth").read_bytes(), map_location="cpu")
     assert result["nested_prior_artifact_sha256"] == saved["nested_prior_artifact_sha256"] == loaded_digest
     model = load_model_from_checkpoint(output_dir / "best_model.pth", torch.device("cpu"))
     with pytest.raises(ValueError, match="Nested artifact SHA-256 mismatch"):
@@ -635,7 +637,7 @@ def test_nested_prior_content_digest_binds_checkpoints_and_analysis_inputs(tmp_p
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     ds_path = tmp_path / "synthetic.pt"
     _make_synthetic_dataset(ds_path)
-    dataset = torch.load(ds_path, weights_only=False)
+    dataset = load_artifact_bytes(ds_path.read_bytes())
     session_ids = [f"animal{i}_session_1" for i in range(6)]
     dataset["session_ids"] = session_ids
     torch.save(dataset, ds_path)
@@ -671,7 +673,7 @@ def test_nested_prior_content_digest_binds_checkpoints_and_analysis_inputs(tmp_p
         require_nested_validation=True,
     )
     checkpoints = [
-        torch.load(output_dir / name, map_location="cpu", weights_only=False)
+        load_artifact_bytes((output_dir / name).read_bytes(), map_location="cpu")
         for name in ("best_model.pth", "epoch_1.pth", "final_model.pth")
     ]
     metrics = json.loads((output_dir / "metrics.json").read_text())
@@ -730,8 +732,8 @@ def test_nested_prior_content_digest_binds_checkpoints_and_analysis_inputs(tmp_p
     current_cfg.training.num_workers = 0
     mod.train(current_cfg, dataset_path=str(ds_path),
               nested_prior_artifact=str(artifact_path))
-    current_resume = torch.load(current_dir / "epoch_1.pth", map_location="cpu",
-                                weights_only=False)
+    current_resume = load_artifact_bytes(
+        (current_dir / "epoch_1.pth").read_bytes(), map_location="cpu")
     assert current_resume["nested_prior_artifact_sha256"] == current_digest
     torch.save(saved, current_dir / "best_model.pth")
     candidate_cfg = _tiny_config(mod, tmp_path / "blocked_best")
@@ -765,7 +767,7 @@ def test_resume_past_phase_boundary_restores_state(tmp_path, monkeypatch):
 
     ckpt_path = run1 / "epoch_1.pth"
     assert ckpt_path.exists()
-    saved = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    saved = load_artifact_bytes((ckpt_path).read_bytes(), map_location="cpu")
 
     # Run 2: resume from the epoch-1 checkpoint — start_epoch=1 >=
     # phase1_epochs=1, so training resumes directly at the boundary.
@@ -779,7 +781,7 @@ def test_resume_past_phase_boundary_restores_state(tmp_path, monkeypatch):
     # (two param groups named non_lif/lif — the in-loop transition ran).
     final_path = (run2 / "best_model.pth") if (run2 / "best_model.pth").exists() \
         else (run2 / "epoch_2.pth")
-    final = torch.load(final_path, map_location="cpu", weights_only=False)
+    final = load_artifact_bytes((final_path).read_bytes(), map_location="cpu")
     groups = final["optimizer_state_dict"]["param_groups"]
     names = [g.get("name") for g in groups]
     assert names == ["non_lif", "lif"], (
@@ -803,7 +805,7 @@ def test_resume_within_phase2_preserves_optimizer_state(tmp_path, monkeypatch):
     mod.train(cfg, phase1_epochs=1)
     ckpt_path = run1 / "epoch_2.pth"
     assert ckpt_path.exists()
-    saved = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    saved = load_artifact_bytes((ckpt_path).read_bytes(), map_location="cpu")
     saved_names = [g.get("name") for g in saved["optimizer_state_dict"]["param_groups"]]
     assert saved_names == ["non_lif", "lif"], saved_names
     saved_steps = sorted(int(s["step"]) for s in saved["optimizer_state_dict"]["state"].values())
@@ -814,7 +816,7 @@ def test_resume_within_phase2_preserves_optimizer_state(tmp_path, monkeypatch):
     summary = mod.train(cfg2, phase1_epochs=1)
     assert summary is not None
     final_path = (run2 / "best_model.pth") if (run2 / "best_model.pth").exists() else (run2 / "epoch_4.pth")
-    final = torch.load(final_path, map_location="cpu", weights_only=False)
+    final = load_artifact_bytes((final_path).read_bytes(), map_location="cpu")
     final_names = [g.get("name") for g in final["optimizer_state_dict"]["param_groups"]]
     assert final_names == ["non_lif", "lif"], final_names
     final_steps = sorted(int(s["step"]) for s in final["optimizer_state_dict"]["state"].values())
@@ -843,7 +845,7 @@ def test_resume_within_phase_preserves_optimizer_state(tmp_path, monkeypatch):
 
     ckpt_path = run1 / "epoch_1.pth"
     assert ckpt_path.exists()
-    saved = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    saved = load_artifact_bytes((ckpt_path).read_bytes(), map_location="cpu")
     saved_steps = sorted(
         int(s["step"]) for s in saved["optimizer_state_dict"]["state"].values()
     )
@@ -858,7 +860,7 @@ def test_resume_within_phase_preserves_optimizer_state(tmp_path, monkeypatch):
 
     final_path = (run2 / "best_model.pth") if (run2 / "best_model.pth").exists() \
         else (run2 / "epoch_2.pth")
-    final = torch.load(final_path, map_location="cpu", weights_only=False)
+    final = load_artifact_bytes((final_path).read_bytes(), map_location="cpu")
     groups = final["optimizer_state_dict"]["param_groups"]
     # Single-group frontend optimizer preserved (not replaced by anything).
     assert len(groups) == 1
@@ -950,7 +952,7 @@ def _nested_source_replacement_case(tmp_path):
 
     dataset_path = tmp_path / "source.pt"
     _make_synthetic_dataset(dataset_path)
-    source_a = torch.load(dataset_path, weights_only=False)
+    source_a = load_artifact_bytes(dataset_path.read_bytes())
     source_a["session_ids"] = [f"animal{i}_session_1" for i in range(6)]
     source_a["Y_seqs"] = [np.linspace(-3.0, 7.0, 12, dtype=np.float32) + i
                           for i in range(6)]
@@ -1083,7 +1085,7 @@ def test_source_snapshot_normalization_and_checkpoint_lineage_stay_honest(
     assert not np.isclose(mean_a, mean_b)
     reads = _replace_loaded_source(monkeypatch, dataset_path, bytes_a, bytes_b)
     result = mod.train(cfg, dataset_path=str(dataset_path), nested_prior_artifact=str(artifact_path))
-    checkpoints = [torch.load(output_dir / name, map_location="cpu", weights_only=False)
+    checkpoints = [load_artifact_bytes((output_dir / name).read_bytes(), map_location="cpu")
                    for name in ("best_model.pth", "epoch_1.pth", "final_model.pth")]
     metrics = json.loads((output_dir / "metrics.json").read_text())
     assert len(reads) == 1
@@ -1112,7 +1114,7 @@ def test_nonnested_train_uses_loaded_targets_and_source_digest_after_same_path_s
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     dataset_path = tmp_path / "dataset.pt"
     _make_synthetic_dataset(dataset_path)
-    source_a = torch.load(dataset_path, weights_only=False)
+    source_a = load_artifact_bytes(dataset_path.read_bytes())
     source_b = dict(source_a, Y_seqs=[y + 30.0 for y in source_a["Y_seqs"]],
                     mcmc_priors=np.roll(source_a["mcmc_priors"], 1, axis=1))
     bytes_a = dataset_path.read_bytes()
@@ -1146,7 +1148,7 @@ def test_nonnested_train_uses_loaded_targets_and_source_digest_after_same_path_s
     assert len(expected) == 2
     assert hashlib.sha256(dataset_path.read_bytes()).hexdigest() != digest_a
     for name in ("best_model.pth", "epoch_1.pth", "final_model.pth"):
-        saved = torch.load(tmp_path / "run" / name, weights_only=False)
+        saved = load_artifact_bytes((tmp_path / "run" / name).read_bytes())
         assert saved["target_mean"] == pytest.approx(expected[0])
         assert saved["target_std"] == pytest.approx(expected[1])
         assert saved["dataset_source_sha256"] == digest_a
@@ -1226,7 +1228,7 @@ def test_modern_training_rejects_unusable_recording_prefix_identities(tmp_path, 
     mod = _load_train_module()
     path = tmp_path / "synthetic.pt"
     _make_synthetic_dataset(path)
-    dataset = torch.load(path, weights_only=False)
+    dataset = load_artifact_bytes(path.read_bytes())
     if session_ids is None:
         dataset.pop("session_ids")
     else:
@@ -1259,7 +1261,7 @@ def test_modern_digestless_resume_cannot_downgrade_to_historical_binding(
     assert result["animal_identity_status"] == "unverified"
     assert result["validation_scope"] == "diagnostic_global_oof"
     attacked = source_dir / ("epoch_1.pth" if checkpoint_kind == "resume" else "best_model.pth")
-    checkpoint = torch.load(attacked, weights_only=False)
+    checkpoint = load_artifact_bytes(attacked.read_bytes())
     checkpoint.pop("dataset_source_sha256")
     if binding is not None:
         checkpoint["dataset_source_binding"] = binding

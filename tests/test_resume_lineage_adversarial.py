@@ -23,7 +23,10 @@ import torch
 from nsmor.config import PIPELINE_SEMANTICS_VERSION, FeatureConfig
 from nsmor.config_parser import ExperimentConfig
 from nsmor.pipeline.grouping import animal_of as _animal_of
-from nsmor.pipeline.nested_prior import compute_source_fingerprint
+from nsmor.pipeline.nested_prior import (
+    compute_source_fingerprint,
+    load_artifact_bytes,
+)
 from scripts.train import train
 
 _HIDDEN = 16
@@ -74,7 +77,7 @@ def _make_dataset(tmp_path: Path, seed: int = 42) -> Path:
 def _make_nested_artifact(ds_path: Path, split_seed: int = 3, val_split: float = 0.25) -> Path:
     from nsmor.pipeline.grouping import grouped_train_val_split
 
-    ds = torch.load(ds_path, weights_only=False)
+    ds = load_artifact_bytes(ds_path.read_bytes())
     session_ids = ds["session_ids"]
     n_total = len(session_ids)
     train_idx, val_idx = grouped_train_val_split(session_ids, n_total, val_split=val_split, random_seed=split_seed)
@@ -139,7 +142,7 @@ def test_resume_renamed_periodic_checkpoint_does_not_trust_loss(tmp_path: Path):
     epoch1_ckpt = tmp_path / "run1" / "epoch_1.pth"
 
     # Strip val_loss metadata, leave only train loss in ckpt['loss'] = 0.01
-    ckpt_data = torch.load(epoch1_ckpt, weights_only=False)
+    ckpt_data = load_artifact_bytes(epoch1_ckpt.read_bytes())
     ckpt_data.pop("val_loss", None)
     ckpt_data.pop("best_val_loss", None)
     ckpt_data["loss"] = 0.01  # small train loss
@@ -176,7 +179,7 @@ def test_resume_missing_provenance_keys_refused(tmp_path: Path):
     train(c1, dataset_path=str(ds_path), nested_prior_artifact=str(art_path))
     ckpt_path = tmp_path / "run1" / "epoch_1.pth"
 
-    ckpt_data = torch.load(ckpt_path, weights_only=False)
+    ckpt_data = load_artifact_bytes(ckpt_path.read_bytes())
     ckpt_data.pop("nested_prior_artifact", None)  # delete mandatory key
     torch.save(ckpt_data, ckpt_path)
 
@@ -215,7 +218,7 @@ def test_resume_wrong_destination_best_model_refused(tmp_path: Path):
     run2_dir = tmp_path / "run2"
     run2_dir.mkdir(parents=True)
     wrong_dest_best = run2_dir / "best_model.pth"
-    wrong_data = torch.load(tmp_path / "run1" / "best_model.pth", weights_only=False)
+    wrong_data = load_artifact_bytes((tmp_path / "run1" / "best_model.pth").read_bytes())
     wrong_data["nested_split_seed"] = 999  # wrong split seed in destination
     torch.save(wrong_data, wrong_dest_best)
 
@@ -262,8 +265,8 @@ def test_resume_preserves_actual_best_weights_not_periodic_weights(tmp_path: Pat
     with mock.patch("scripts.train.validate", side_effect=_mock_validate):
         train(c1, dataset_path=str(ds_path), nested_prior_artifact=str(art_path))
 
-    best1 = torch.load(run1_dir / "best_model.pth", weights_only=False)
-    epoch2 = torch.load(run1_dir / "epoch_2.pth", weights_only=False)
+    best1 = load_artifact_bytes((run1_dir / "best_model.pth").read_bytes())
+    epoch2 = load_artifact_bytes((run1_dir / "epoch_2.pth").read_bytes())
 
     # Prove weights differ
     p_best = next(iter(best1["model_state_dict"].values()))
@@ -279,7 +282,7 @@ def test_resume_preserves_actual_best_weights_not_periodic_weights(tmp_path: Pat
         res2 = train(c2, dataset_path=str(ds_path), nested_prior_artifact=str(art_path))
 
     # Output best_model.pth must match historical best (0.5) across ALL state tensors, NOT epoch_2
-    res2_best = torch.load(run2_dir / "best_model.pth", weights_only=False)
+    res2_best = load_artifact_bytes((run2_dir / "best_model.pth").read_bytes())
     mismatched_best = [
         k for k, v in best1["model_state_dict"].items()
         if not torch.equal(v, res2_best["model_state_dict"][k])
@@ -308,7 +311,7 @@ def test_resume_destination_periodic_weights_refused(tmp_path: Path) -> None:
     with mock.patch("scripts.train.validate", side_effect=[0.5, 0.8]):
         train(c1, dataset_path=str(ds_path), nested_prior_artifact=str(art_path))
 
-    epoch2 = torch.load(run1_dir / "epoch_2.pth", weights_only=False)
+    epoch2 = load_artifact_bytes((run1_dir / "epoch_2.pth").read_bytes())
     assert epoch2["best_val_loss"] == pytest.approx(0.5)
     assert epoch2["val_loss"] == pytest.approx(0.8)
 
@@ -331,7 +334,7 @@ def test_resume_destination_nonfinite_metrics_refused(tmp_path: Path) -> None:
     c1 = _make_config(run1_dir, epochs=1)
     train(c1, dataset_path=str(ds_path), nested_prior_artifact=str(art_path))
 
-    best1 = torch.load(run1_dir / "best_model.pth", weights_only=False)
+    best1 = load_artifact_bytes((run1_dir / "best_model.pth").read_bytes())
     best1["val_loss"] = float("nan")
     best1["best_val_loss"] = float("nan")
 
@@ -345,18 +348,33 @@ def test_resume_destination_nonfinite_metrics_refused(tmp_path: Path) -> None:
 
 
 def test_resume_no_remaining_epochs_refused(tmp_path: Path) -> None:
-    """Resuming when target num_epochs <= start_epoch must fail closed."""
+    """A parent OVERSHOOTING the target budget must fail closed.
+
+    This test predates the original-total-budget boundary repair, when
+    ``start_epoch >= num_epochs`` was refused wholesale.  The budget-EQUALITY
+    case (``start_epoch == num_epochs``) is now a supported zero-update
+    finalization for a VALIDATED current-schema parent, so the case this test
+    actually describes — a parent whose completed epochs EXCEED the active
+    target — is expressed as an overshoot: a 3-epoch parent resumed under a
+    2-epoch target.  The refusal is unchanged; only the epoch arithmetic that
+    reaches it moved from ``>=`` to ``>``.
+
+    The equality acceptance itself is covered by
+    ``test_epoch_recovery.py::test_real_publication_crash_at_total_budget_finalizes_saved_state``
+    (valid parent) and ``..._legacy_parent_at_total_budget_still_fails_closed``
+    (unvalidatable parent).
+    """
     ds_path = _make_dataset(tmp_path)
     art_path = _make_nested_artifact(ds_path, split_seed=3)
 
     run1_dir = tmp_path / "run1"
-    c1 = _make_config(run1_dir, epochs=2)
+    c1 = _make_config(run1_dir, epochs=3)
     train(c1, dataset_path=str(ds_path), nested_prior_artifact=str(art_path))
 
     run2_dir = tmp_path / "run2"
-    # Target epochs=2, but epoch_2.pth resumes at start_epoch=2 (0 remaining epochs)
-    c2 = _make_config(run2_dir, epochs=2, resume=str(run1_dir / "epoch_2.pth"))
-    with pytest.raises(ValueError, match="no remaining epochs to train|fail closed"):
+    # Target epochs=2, but epoch_3.pth resumes at start_epoch=3 (overshoots).
+    c2 = _make_config(run2_dir, epochs=2, resume=str(run1_dir / "epoch_3.pth"))
+    with pytest.raises(ValueError, match="exceeds target num_epochs|fail closed"):
         train(c2, dataset_path=str(ds_path), nested_prior_artifact=str(art_path))
 
 
@@ -370,13 +388,13 @@ def test_resume_destination_worse_reconciled_with_better_source(tmp_path: Path) 
     with mock.patch("scripts.train.validate", side_effect=[0.5, 0.8]):
         train(c1, dataset_path=str(ds_path), nested_prior_artifact=str(art_path))
 
-    best1 = torch.load(run1_dir / "best_model.pth", weights_only=False)
+    best1 = load_artifact_bytes((run1_dir / "best_model.pth").read_bytes())
     assert best1["best_val_loss"] == pytest.approx(0.5)
 
     # Pre-populate run2 with a genuine best_model.pth having worse val_loss (1.2)
     run2_dir = tmp_path / "run2"
     run2_dir.mkdir(parents=True)
-    worse_best = torch.load(run1_dir / "best_model.pth", weights_only=False)
+    worse_best = load_artifact_bytes((run1_dir / "best_model.pth").read_bytes())
     worse_best["val_loss"] = 1.2
     worse_best["best_val_loss"] = 1.2
     torch.save(worse_best, run2_dir / "best_model.pth")
@@ -387,7 +405,7 @@ def test_resume_destination_worse_reconciled_with_better_source(tmp_path: Path) 
         res2 = train(c2, dataset_path=str(ds_path), nested_prior_artifact=str(art_path))
 
     assert res2["best_val_loss"] == pytest.approx(0.5)
-    selected = torch.load(run2_dir / "best_model.pth", weights_only=False)
+    selected = load_artifact_bytes((run2_dir / "best_model.pth").read_bytes())
     mismatched = [
         k for k, v in best1["model_state_dict"].items()
         if not torch.equal(v, selected["model_state_dict"][k])
@@ -409,7 +427,7 @@ def test_resume_destination_worse_refuses_silent_degradation_without_source(tmp_
     # Pre-populate run2 with a worse best_model.pth
     run2_dir = tmp_path / "run2"
     run2_dir.mkdir(parents=True)
-    worse_best = torch.load(run1_dir / "best_model.pth", weights_only=False)
+    worse_best = load_artifact_bytes((run1_dir / "best_model.pth").read_bytes())
     worse_best["val_loss"] = 1.2
     worse_best["best_val_loss"] = 1.2
     torch.save(worse_best, run2_dir / "best_model.pth")
@@ -446,7 +464,7 @@ def test_resume_nan_val_split_refused(tmp_path: Path) -> None:
     c1 = _make_config(run1_dir, epochs=1)
     train(c1, dataset_path=str(ds_path), nested_prior_artifact=str(art_path))
 
-    ckpt = torch.load(run1_dir / "epoch_1.pth", weights_only=False)
+    ckpt = load_artifact_bytes((run1_dir / "epoch_1.pth").read_bytes())
     ckpt["nested_val_split"] = float("nan")
     corrupt_path = run1_dir / "corrupt_val_split.pth"
     torch.save(ckpt, corrupt_path)
@@ -465,7 +483,7 @@ def test_resume_fractional_split_seed_refused(tmp_path: Path) -> None:
     c1 = _make_config(run1_dir, epochs=1)
     train(c1, dataset_path=str(ds_path), nested_prior_artifact=str(art_path))
 
-    ckpt = torch.load(run1_dir / "epoch_1.pth", weights_only=False)
+    ckpt = load_artifact_bytes((run1_dir / "epoch_1.pth").read_bytes())
     ckpt["nested_split_seed"] = 3.5
     corrupt_path = run1_dir / "fractional_seed.pth"
     torch.save(ckpt, corrupt_path)

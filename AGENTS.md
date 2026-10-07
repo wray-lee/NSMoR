@@ -21,7 +21,7 @@ The NSMoR harness defines three specialized roles (plus an optional Orchestrator
 
 | Agent Role | Subagent Slug | Primary Responsibility | Permissions & Scope |
 | :--- | :--- | :--- | :--- |
-| **Developer** | `nsmor_developer` | Refactoring, feature implementation, PyTorch modeling, analysis tools. | Read/Write code in editable zones (`scripts/`, `nsmor/analysis/`, `nsmor/pipeline/`). **Core frozen code (`nsmor/model_nsmor_core.py`, `nsmor/loss.py`) requires user override.** |
+| **Developer** | `nsmor_developer` | Refactoring, feature implementation, PyTorch modeling, analysis tools. | Read/Write code in editable zones and explicitly scoped core modules. Core changes require the controlled-change protocol in `nsmor/BOUNDARY.md`. |
 | **Reviewer (#2)** | `nsmor_reviewer` | Double-blind peer review across biological plausibility, mathematical stability, and statistical rigor. | Read-only code access. Must issue explicit `**ACCEPT**` or `**REJECT**` with structured critiques. *Prohibited from writing fix code directly.* |
 | **Tester** | `nsmor_tester` | Physical smoke testing, pipeline reset, numerical stability interception, regression testing, and Git release. | Run pipeline/tests (`pytest`, `train.py --epochs 1`, analysis scripts), perform data resets, execute Git commit/push upon zero-error gate pass. |
 | **Orchestrator** | `orchestrator` (skill) | Loop engine coordinating DEV→REVIEW→TEST→COMMIT state machine. | Dispatches tasks, merges feedback, enforces watchdog timeouts. See `.claude/skills/orchestrator/SKILL.md`. |
@@ -67,6 +67,7 @@ Every substantive code modification or refactoring must traverse the strict 4-st
 
 4. **Phase 4: Release & Commit (`nsmor_tester`)**
    - Squashes local iterations via `git rebase -i` if multiple commits exist.
+   - Stages only explicitly reviewed paths; never uses blanket staging (`git add .` or `git add -A`).
    - Enforces structured commit message with footer `Approved-by: Reviewer #2`.
    - Performs `git commit` and `git push`.
 
@@ -78,7 +79,7 @@ Agents must strictly respect path-level boundary declarations (`BOUNDARY.md`):
 
 | Path / Module | Status | Boundary File | Constraints |
 | :--- | :--- | :--- | :--- |
-| `nsmor/model_nsmor_core.py`, `nsmor/loss.py` | 🔒 **FROZEN** | `nsmor/BOUNDARY.md` | Core tensor math & loss function. Modification requires explicit user override. |
+| `nsmor/model_nsmor_core.py`, `nsmor/loss.py` | 🔐 **CONTROLLED** | `nsmor/BOUNDARY.md` | User-authorized optimization/correctness changes require two independent `ACCEPT` reviews, focused/full regression, numerical checks, and compatibility evidence. |
 | `nsmor/pipeline/` | 🔓 **EDITABLE** | `nsmor/pipeline/BOUNDARY.md` | Data ingestion, kinematics, feature collation. Backward compatibility required. |
 | `nsmor/analysis/` | 🔓 **SANDBOX** | `nsmor/analysis/BOUNDARY.md` | Fixed-point finders, Jacobian computations, dynamical manifolds. Free to extend. |
 | `scripts/` | 🔓 **EDITABLE** | — | Training, simulation, and evaluation entry points. Must preserve interface contracts. |

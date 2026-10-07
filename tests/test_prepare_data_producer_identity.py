@@ -19,12 +19,9 @@ import pytest
 import torch
 
 from nsmor.config import PIPELINE_SEMANTICS_VERSION, FeatureConfig, TimeWindowConfig
+from nsmor.mcmc_module import MCMCPriorGenerator
+from nsmor.pipeline.nested_prior import load_artifact_bytes
 from scripts.prepare_data import prepare_dataset
-
-
-class _FakeMCMCModel:
-    def predict_proba(self, x):
-        return np.full((len(x), 4), 0.25, dtype=np.float64)
 
 
 def test_prepare_data_producer_preserves_retained_identity(tmp_path: Path):
@@ -89,7 +86,7 @@ def test_prepare_data_producer_preserves_retained_identity(tmp_path: Path):
     ):
         mock_mcmc.return_value = (
             np.full((3, 4), 0.25, dtype=np.float64),
-            [_FakeMCMCModel()],
+            [MCMCPriorGenerator()],
             [],
         )
         prepare_dataset(
@@ -100,7 +97,7 @@ def test_prepare_data_producer_preserves_retained_identity(tmp_path: Path):
         )
 
     assert out_dataset.exists()
-    ds = torch.load(out_dataset, weights_only=False)
+    ds = load_artifact_bytes(out_dataset.read_bytes())
 
     assert "trial_ids" in ds, "dataset must persist 'trial_ids'"
     assert "session_ids" in ds, "dataset must persist 'session_ids'"
@@ -168,7 +165,7 @@ def test_prepare_data_corrupt_ttc_refused(tmp_path: Path):
     ):
         mock_mcmc.return_value = (
             np.full((1, 4), 0.25, dtype=np.float64),
-            [_FakeMCMCModel()],
+            [MCMCPriorGenerator()],
             [],
         )
         with pytest.raises(ValueError, match="fail closed|Corrupt|Non-finite"):
@@ -282,7 +279,7 @@ def test_prepare_data_sequence_failure_or_valid_alignment(tmp_path: Path, sequen
         mock.patch("scripts.prepare_data.extract_trial_sequence", side_effect=_mock_extract) as sequence_spy,
         mock.patch("scripts.prepare_data.torch.save", wraps=torch.save) as save_spy,
     ):
-        mock_mcmc.return_value = (priors, [_FakeMCMCModel()], [])
+        mock_mcmc.return_value = (priors, [MCMCPriorGenerator()], [])
         if sequence_error:
             with pytest.raises(ValueError, match="Simulated corrupt kinematics in trial 202") as error:
                 prepare_dataset(raw_dir, out_dataset, dt_ms=dt_ms, random_seed=42)
@@ -301,7 +298,7 @@ def test_prepare_data_sequence_failure_or_valid_alignment(tmp_path: Path, sequen
         prepare_dataset(raw_dir, out_dataset, dt_ms=dt_ms, random_seed=42)
         save_spy.assert_called_once()
 
-    ds = torch.load(out_dataset, weights_only=False)
+    ds = load_artifact_bytes(out_dataset.read_bytes())
     np.testing.assert_array_equal(ds["trial_ids"], trial_ids)
     assert list(ds["session_ids"]) == [sess_dir.name] * 2
     np.testing.assert_array_equal(ds["target_ttc_ms"], [0.0, -119.0])
@@ -364,7 +361,7 @@ def test_prepare_data_bool_ttc_refused(tmp_path: Path):
     ):
         mock_mcmc.return_value = (
             np.full((1, 4), 0.25, dtype=np.float64),
-            [_FakeMCMCModel()],
+            [MCMCPriorGenerator()],
             [],
         )
         with pytest.raises(ValueError, match="Boolean target_ttc_ms|fail closed"):
@@ -428,7 +425,7 @@ def test_prepare_data_malformed_details_refused(tmp_path: Path):
     ):
         mock_mcmc.return_value = (
             np.full((1, 4), 0.25, dtype=np.float64),
-            [_FakeMCMCModel()],
+            [MCMCPriorGenerator()],
             [],
         )
         with pytest.raises(ValueError, match="Malformed non-empty event details"):
@@ -492,7 +489,7 @@ def test_prepare_data_all_missing_ttc_persists_float_array_shape_n(tmp_path: Pat
     ):
         mock_mcmc.return_value = (
             np.full((2, 4), 0.25, dtype=np.float64),
-            [_FakeMCMCModel()],
+            [MCMCPriorGenerator()],
             [],
         )
         prepare_dataset(
@@ -502,7 +499,7 @@ def test_prepare_data_all_missing_ttc_persists_float_array_shape_n(tmp_path: Pat
             random_seed=42,
         )
 
-    ds = torch.load(out_dataset, weights_only=False)
+    ds = load_artifact_bytes(out_dataset.read_bytes())
     assert "target_ttc_ms" in ds
     assert isinstance(ds["target_ttc_ms"], np.ndarray)
     assert ds["target_ttc_ms"].shape == (2,)
@@ -567,7 +564,7 @@ def test_prepare_data_distinguishable_multi_trial_content_and_ttc(tmp_path: Path
     ):
         mock_mcmc.return_value = (
             np.full((3, 4), 0.25, dtype=np.float64),
-            [_FakeMCMCModel()],
+            [MCMCPriorGenerator()],
             [],
         )
         prepare_dataset(
@@ -577,7 +574,7 @@ def test_prepare_data_distinguishable_multi_trial_content_and_ttc(tmp_path: Path
             random_seed=42,
         )
 
-    ds = torch.load(out_dataset, weights_only=False)
+    ds = load_artifact_bytes(out_dataset.read_bytes())
     assert np.array_equal(ds["trial_ids"], np.array(trial_ids, dtype=np.int64))
     assert np.allclose(ds["target_ttc_ms"], np.array(ttcs, dtype=np.float64))
     # Verify each trial's X_seq/Y_seq carries distinct trace corresponding to that trial
@@ -650,7 +647,7 @@ def test_declared_trial_kinematics_completeness_at_production_boundary(
     output = tmp_path / "processed" / f"{producer}.pt"
     monkeypatch.setattr(module, "resolve_group_folds", lambda *args, **kwargs: 2)
     prior_fit = mock.Mock(return_value=(
-        np.full((2, 4), 0.25, dtype=np.float64), [_FakeMCMCModel()], [],
+        np.full((2, 4), 0.25, dtype=np.float64), [MCMCPriorGenerator()], [],
     ))
     monkeypatch.setattr(module, "train_mcmc_cross_fitted", prior_fit)
 
@@ -671,7 +668,7 @@ def test_declared_trial_kinematics_completeness_at_production_boundary(
     else:
         run()
         prior_fit.assert_called_once()
-        saved = torch.load(output, weights_only=False)
+        saved = load_artifact_bytes(output.read_bytes())
         assert list(zip(saved["session_ids"], saved["trial_ids"])) == [
             (sessions[0], 11), (sessions[1], 12),
         ]

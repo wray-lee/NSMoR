@@ -1,0 +1,117 @@
+# NSMoR — epoch-recovery OPT-IN profile (NEW runs)
+#
+# For a NEW run that wants per-epoch checkpoints and reliable recovery from
+# the start.  It differs from config/default.yaml in exactly two ACTIVE
+# controls:
+#   training.checkpoint_interval: 1    (periodic epoch_N.pth every epoch)
+#   training.num_workers: 0            (reliable recovery scope)
+#
+# Reliable epoch-boundary recovery is the cadence-one regime and is only
+# supported with ZERO workers: with workers>0 the loader iterator's
+# RNG/consumption state is not captured in the checkpoint, so a restart
+# silently diverges from an uninterrupted run.  A cadence-one run (fresh or
+# resumed) whose resolved loaders have workers>0 is refused before any epoch.
+# See docs/epoch-recovery.md.
+#
+# training.persistent_workers below is set to `false` for documentation only:
+# it is INACTIVE at num_workers=0 (the loader factory only passes it when
+# workers>0).  It is not a scientific control of this profile and need not be
+# changed when copying the parent's resolved config.
+#
+# Fresh run (this profile):
+#   python scripts/train.py --config config/epoch_recovery.yaml \
+#       --output_dir runs/<new_run_name> --nested_prior_artifact <nested.pt>
+#
+# Resume an EXISTING run (e.g. the interrupted k1.0 arm): do NOT use this
+# template — it would replace the parent's total epoch budget and scientific
+# controls.  Copy the PARENT's resolved config, then make the SAME two edits
+# above: set checkpoint_interval=1 (or pass --checkpoint_interval 1) and
+# num_workers=0.  Leave persistent_workers/prefetch_factor as the parent had
+# them (inactive at zero workers).  Write to a FRESH segment output so the
+# parent's best/final/receipts are kept:
+#   python scripts/train.py --config <parent_resolved_config.yaml> \
+#       --output_dir runs/<parent>_resume_<n> \
+#       --resume runs/<parent>/epoch_N.pth \
+#       --checkpoint_interval 1 \
+#       --nested_prior_artifact <nested.pt>
+# (num_epochs is the TOTAL budget; no batch-level resume.)
+#
+# Generated from config/default.yaml; regenerate if that file changes.
+model:
+  sensory_dim: 4
+  mcmc_dim: 4
+  hidden_dim: 64
+  num_gru_layers: 1
+  dropout: 0.1
+  dt_ms: 4.0
+  lif_alpha: 0.9587
+  lif_threshold: 0.5
+  lif_beta: 2.0
+  lif_tbptt_steps: 32
+  lif_tau_syn: 5.0
+  lif_tau_w: 100.0
+  lif_b_adapt: 0.5
+  lif_lateral_inhibition: 0.1
+  lif_inhib_tau_ms: 50.0
+  lif_rel_refract_ms: 20.0
+  sensory_noise_std: 0.01
+training:
+  learning_rate: 0.0005
+  weight_decay: 0.0001
+  num_epochs: 150
+  batch_size: 128
+  grad_clip_norm: 1.0
+  log_interval: 10
+  checkpoint_interval: 1
+  early_stopping_patience: 20
+  random_seed: 42
+  max_seq_len: 2400
+  lr_warmup_epochs: 0
+  normalize_targets: false
+  target_clip_cm_s: 0
+  num_workers: 0
+  pin_memory: true
+  persistent_workers: false
+  prefetch_factor: 2
+loss:
+  reduction: mean
+  target_rate: 0.05
+  lambda_reg: 0.2
+  lambda_energy: 0.001
+  lambda_sparse: 0.005
+  lambda_jerk: 0.005
+  lambda_routing_aux: 0.0
+  routing_aux_margin: 0.024
+  jerk_threshold: 0.1
+  warmup_epochs: 20
+data:
+  train_kinematics:
+  - data/session_0/kinematics.csv
+  - data/session_1/kinematics.csv
+  train_events:
+  - data/session_0/events.csv
+  - data/session_1/events.csv
+  val_kinematics:
+  - data/val/kinematics.csv
+  val_events:
+  - data/val/events.csv
+  test_kinematics: []
+  test_events: []
+finetune:
+  freeze_modules: []
+  unfreeze_after_epoch: 10
+checkpoint:
+  output_dir: runs/default
+  resume_from: null
+cluster_gating:
+  n_clusters: 4
+  n_clusters_range:
+  - 2
+  - 3
+  - 4
+  - 5
+  random_state: 42
+  use_umap: true
+  fingerprint_dim: 16
+  entropy_bins: 20
+  interp_length: 200

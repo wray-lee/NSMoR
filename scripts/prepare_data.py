@@ -87,6 +87,7 @@ from nsmor.pipeline.grouping import animal_keys_of, resolve_group_folds
 from nsmor.pipeline.io import EVENT_COLUMNS, KINEMATICS_COLUMNS
 from nsmor.pipeline.labeling import (
     assign_ground_truth_labels,
+    has_stimulus_anchor,
     labeling_funnel_summary,
 )
 from nsmor.pipeline.io import extract_trial_data, load_and_concat_sessions
@@ -1151,7 +1152,12 @@ def prepare_dataset(
             raise ValueError(f"Duplicate loaded trial identity: {key}")
         loaded_keys.add(key)
         item = labeled_keys.get(key)
-        has_onset = bool(np.any(trial["event_types"] == "stimulus_onset"))
+        # Round-4: presence of the event NAME is not enough — a matched
+        # anchor with a NaN/Inf timestamp is corrupt chronology and must
+        # be unavailable, matching assign_ground_truth_labels' fail-closed
+        # skip.  Using find_event_time (via has_stimulus_anchor) keeps the
+        # ledger and the labeler from disagreeing on the same trial.
+        has_onset = has_stimulus_anchor(trial["event_types"], trial["event_times"])
         if (item is not None) != has_onset:
             raise ValueError(f"Unaccounted labeling outcome: {key}")
         labeling_eligibility.append({

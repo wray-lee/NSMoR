@@ -18,7 +18,7 @@ from nsmor.pipeline.grouping import grouped_train_val_split, animal_keys_of
 from nsmor.pipeline.nested_prior import (
     compute_source_fingerprint, load_artifact_bytes, load_dataset_with_fingerprint,
     load_nested_prior_split,
-)
+)  # load_artifact_bytes: restricted decode for test-authored fixtures
 from nsmor.analysis.prediction_units import load_model_from_checkpoint, prediction_to_physical
 
 
@@ -288,7 +288,7 @@ def test_analysis_rejects_valid_swap_during_load_even_if_path_hashes_match(
     model = load_model_from_checkpoint(checkpoint, torch.device("cpu"))
     bound_digest = payload["nested_prior_artifact_sha256"]
     original_bytes = artifact_path.read_bytes()
-    saved = torch.load(artifact_path, weights_only=False)
+    saved = load_artifact_bytes(artifact_path.read_bytes())
     replacement = np.tile([0.0, 0.0, 0.0, 1.0], (len(original), 1))
     changed = dict(saved, nested_priors=replacement,
                    train_priors=replacement[saved["train_indices"]],
@@ -327,7 +327,7 @@ def test_same_path_valid_artifact_replacement_refused(nested_inputs, tmp_path):
     dataset, artifact, _, checkpoint, _, _, _, payload = nested_inputs
     model = load_model_from_checkpoint(checkpoint, torch.device("cpu"))
     original_hash = payload["nested_prior_artifact_sha256"]
-    original_sidecar = torch.load(artifact, weights_only=False)
+    original_sidecar = load_artifact_bytes(artifact.read_bytes())
     legacy_ckpt = tmp_path / "v4_nested.pth"
     torch.save({k: v for k, v in payload.items() if k != "nested_prior_artifact_sha256"}, legacy_ckpt)
     v4_model = load_model_from_checkpoint(legacy_ckpt, torch.device("cpu"))
@@ -355,7 +355,7 @@ def test_legacy_nested_shared_seam_rejects_compatible_replacement(nested_inputs,
     from nsmor.analysis.analysis_priors import load_analysis_priors
 
     dataset_path, artifact, _, _, dataset, original, _, payload = nested_inputs
-    saved = torch.load(artifact, weights_only=False)
+    saved = load_artifact_bytes(artifact.read_bytes())
     replacement = np.tile([0.0, 0.0, 0.0, 1.0], (len(original), 1))
     torch.save(dict(saved, nested_priors=replacement,
                     train_priors=replacement[saved["train_indices"]],
@@ -433,7 +433,7 @@ def test_checkpoint_snapshot_binds_weights_units_and_downstream_priors(
     priors_b, val_b = load_analysis_priors(dataset, dataset_path, model=model_b,
                                            loaded_source_fingerprint=base["nested_prior_fingerprint"])
     np.testing.assert_allclose(priors_b, np.tile([0.0, 0.0, 0.0, 1.0], (len(priors_a), 1)))
-    np.testing.assert_array_equal(val_b, torch.load(artifact_b, weights_only=False)["val_indices"])
+    np.testing.assert_array_equal(val_b, load_artifact_bytes(artifact_b.read_bytes())["val_indices"])
     assert model_b.hidden_dim == 6 and model_b.dt_ms == dt_b
     assert all(p.requires_grad for p in model_b.frontend.sensory_encoder.parameters())
     assert not model_b.training
@@ -572,7 +572,7 @@ def test_each_analysis_rejects_source_dataset_replacement(
     digest_b = hashlib.sha256(bytes_b).hexdigest()
     assert digest_a != digest_b
     assert not np.array_equal(source_a["Y_seqs"], source_b["Y_seqs"])
-    sidecar = torch.load(artifact_path, weights_only=False)
+    sidecar = load_artifact_bytes(artifact_path.read_bytes())
     sidecar["source_fingerprint"] = digest_b
     torch.save(sidecar, artifact_path)
     torch.save(dict(payload, nested_prior_fingerprint=digest_b, dataset_source_sha256=digest_b,

@@ -102,6 +102,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Path to checkpoint (.pth or JAX state) to resume from.",
     )
+    parser.add_argument(
+        "--persistence_skip",
+        type=float,
+        default=None,
+        help="Fixed causal persistence skip scalar k in [0, 1]. 0 disables (default). "
+             "Restricted to normalize_targets=False and target_clip_cm_s=0.0.",
+    )
     return parser
 
 
@@ -114,6 +121,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         config = ExperimentConfig.from_yaml(args.config)
     else:
         config = ExperimentConfig()
+
+    if args.persistence_skip is not None:
+        config.model.persistence_skip = args.persistence_skip
+    config.validate()
 
     out_dir = Path(args.output_dir or config.checkpoint.output_dir)
     logger = setup_logging(out_dir)

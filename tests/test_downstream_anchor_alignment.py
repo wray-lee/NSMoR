@@ -18,9 +18,10 @@ import numpy as np
 import pytest
 import torch
 
-from nsmor.config import DEFAULT_FEATURE, FeatureConfig
+from nsmor.config import DEFAULT_FEATURE, PIPELINE_SEMANTICS_VERSION, FeatureConfig
 from nsmor.nsmor_dataloader import NSMoRDataset
 from nsmor.pipeline.conditions import derive_anchor_frames
+from nsmor.pipeline.nested_prior import load_artifact_bytes
 from scripts.analyze_dynamics import load_dataset as load_dynamics_ds
 from scripts.analyze_gating import load_model_and_dataset as load_gating_ds
 from scripts.analyze_integration import (
@@ -38,6 +39,60 @@ from scripts.simulate_psychophysics import (
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SUBSET_SMALL_PATH = REPO_ROOT / "data" / "processed" / "nsmor_subset_small.pt"
+
+
+# =========================================================================
+# 0. Synthetic lesion fixtures (source-identity contract)
+# =========================================================================
+
+_ANCHOR_FRAME = 300
+_N_FRAMES = 600
+
+
+def _write_lesion_dataset(
+    path: Path, *,
+    trial_ids: List[int] | None,
+    session_ids: List[str] | None = None,
+) -> Path:
+    """Write a synthetic ``nsmor_dataset.pt`` for the lesion source-ID contract.
+
+    The geometry is anchored: each trial carries a genuine visual-angle peak at
+    ``_ANCHOR_FRAME`` so a recorded ``anchor_frames`` entry is a real reference,
+    not a silent fallback.  ``trial_ids=None`` omits the source-ID ledger while
+    keeping ``stimulus_conditions``, which is exactly the historical artifact
+    shape the loader must refuse.
+    """
+    n = len(trial_ids) if trial_ids is not None else 2
+    if session_ids is None:
+        session_ids = [f"0.7cricket_001_20260101_0000{i}_session_1" for i in range(n)]
+    rng = np.random.RandomState(11)
+    X_seqs = [rng.randn(_N_FRAMES, 8).astype(np.float32) for _ in range(n)]
+    for x in X_seqs:
+        x[:, 4:] = 0.0  # zero the MCMC-prior channels; priors come from the ledger
+        x[_ANCHOR_FRAME, 0] = 90.0  # genuine anchored visual-angle peak
+    Y_seqs = [rng.randn(_N_FRAMES).astype(np.float32) for _ in range(n)]
+    priors = np.abs(rng.randn(n, 4).astype(np.float32)) + 0.1
+    priors /= priors.sum(axis=1, keepdims=True)
+    dataset = {
+        "X_seqs": X_seqs,
+        "Y_seqs": Y_seqs,
+        "labels": np.zeros(n, dtype=np.int64),
+        "lengths": np.full(n, _N_FRAMES, dtype=np.int64),
+        "anchor_frames": [_ANCHOR_FRAME] * n,
+        "anchor_rules": ["stimulus_onset"] * n,
+        "mcmc_priors": priors,
+        "feature_config": DEFAULT_FEATURE,
+        "pipeline_semantics_version": PIPELINE_SEMANTICS_VERSION,
+        "mcmc_prior_provenance": "oof_5fold_recording_prefix_grouped_cv",
+        "animal_identity_status": "unverified",
+        "session_ids": np.array(session_ids, dtype=object),
+        "stimulus_conditions": np.array(["visual_only"] * n, dtype=object),
+    }
+    if trial_ids is not None:
+        dataset["trial_ids"] = np.array(trial_ids, dtype=np.int64)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(dataset, path)
+    return path
 
 
 # =========================================================================
@@ -298,7 +353,7 @@ def test_all_six_loaders_on_real_small_dataset():
     mock_ckpt = Path("nonexistent_ckpt.pt")
     # load_model_and_dataset loads dataset first after loading model;
     # verify dataset loading directly through NSMoRDataset with anchor_frames
-    data = torch.load(SUBSET_SMALL_PATH, weights_only=False)
+    data = load_artifact_bytes(SUBSET_SMALL_PATH.read_bytes())
     assert "anchor_frames" in data
     assert len(data["anchor_frames"]) == len(data["X_seqs"])
 
@@ -321,12 +376,23 @@ def test_all_six_loaders_on_real_small_dataset():
     assert loader_jac.dataset.anchor_frames is not None
 
     # 5. Lesion loader
-    loader_les, labels_les, lengths_les = load_lesion_ds(
-        SUBSET_SMALL_PATH, batch_size=16, max_seq_len=2400, pre_anchor_frames=1200
-    )
-    assert loader_les.dataset.max_seq_len == 2400
-    assert loader_les.dataset.pre_anchor_frames == 1200
-    assert loader_les.dataset.anchor_frames is not None
+    # This historical artifact declares stimulus_conditions but predates the
+    # source trial-ID ledger.  The loader's existing source-identity guard
+    # (scripts/simulate_lesion.py:228-247, committed 63118a71) refuses it so an
+    # analysis cannot silently key rows by positional index.  Assert the exact
+    # current error AND the schema itself, so the expectation cannot be an
+    # arbitrary string: a future artifact that genuinely carries valid IDs must
+    # instead load, which the positive control below proves.
+    assert "trial_ids" not in data
+    assert "stimulus_conditions" in data
+    assert len(data["session_ids"]) == len(data["X_seqs"])
+    with pytest.raises(
+        ValueError,
+        match="modern dataset requires source trial_ids aligned with all trials",
+    ):
+        load_lesion_ds(
+            SUBSET_SMALL_PATH, batch_size=16, max_seq_len=2400, pre_anchor_frames=1200
+        )
 
     # 6. Psychophysics validation loader
     device = torch.device("cpu")
@@ -441,4 +507,67 @@ def test_ttc0_missing_metadata_fails_closed():
 
     with pytest.raises(ValueError, match="No multisensory TTC=0ms trials found"):
         find_multisensory_ttc0(X_val, lengths_val, dt_ms=4.0)
+
+
+# =========================================================================
+# 7. Lesion Source-Identity Contract (positive control + fail-closed guards)
+# =========================================================================
+
+def test_lesion_loader_preserves_source_identity_and_geometry(tmp_path: Path) -> None:
+    """A dataset with aligned integer trial_ids loads with identity + geometry.
+
+    Positive control for the fail-closed guard: genuine synthetic session IDs
+    and unique source trial IDs are restored in order, and each recorded anchor
+    resolves to a real cropped reference frame.
+    """
+    trial_ids = [0, 1, 2]
+    session_ids = [
+        "0.7cricket_001_20260101_0000_session_1",
+        "0.7cricket_001_20260101_0000_session_1",
+        "0.8cricket_002_20260102_0000_session_1",
+    ]
+    dataset_path = _write_lesion_dataset(
+        tmp_path / "lesion.pt", trial_ids=trial_ids, session_ids=session_ids,
+    )
+
+    dataloader, labels, lengths = load_lesion_ds(
+        dataset_path, batch_size=2, max_seq_len=2400, pre_anchor_frames=1200,
+    )
+    dataset = dataloader.dataset
+    trials = dataset.analysis_reference_trials
+
+    assert len(trials) == len(trial_ids) == len(labels) == len(lengths)
+    # Source identity and order are restored exactly.
+    assert [t["row_index"] for t in trials] == [0, 1, 2]
+    assert [t["source_trial_id"] for t in trials] == trial_ids
+    assert [t["session_id"] for t in trials] == session_ids
+    # Genuine anchored geometry: anchor inside crop, reference at pre_anchor.
+    for trial in trials:
+        assert trial["crop_start_frame"] == 0
+        assert trial["crop_end_frame"] == _N_FRAMES
+        assert trial["cropped_length"] == _N_FRAMES
+        assert trial["original_reference_frame"] == _ANCHOR_FRAME
+        assert trial["cropped_reference_frame"] == _ANCHOR_FRAME
+        assert trial["reference_status"] == "recorded_reference_rule_available"
+    assert dataset.cropped_reference_frames == [_ANCHOR_FRAME] * 3
+
+
+def test_lesion_loader_rejects_missing_and_duplicate_source_ids(tmp_path: Path) -> None:
+    """A declared-condition artifact without valid source IDs must fail closed."""
+    # Missing ledger: stimulus_conditions present, trial_ids absent.
+    missing = _write_lesion_dataset(tmp_path / "missing.pt", trial_ids=None)
+    with pytest.raises(
+        ValueError,
+        match="modern dataset requires source trial_ids aligned with all trials",
+    ):
+        load_lesion_ds(missing, batch_size=2)
+
+    # Duplicate (session_id, trial_id) pairs are refused.
+    duplicate = _write_lesion_dataset(
+        tmp_path / "duplicate.pt",
+        trial_ids=[0, 0],
+        session_ids=["0.7cricket_001_20260101_0000_session_1"] * 2,
+    )
+    with pytest.raises(ValueError, match="duplicate \\(session_id, source trial_id\\)"):
+        load_lesion_ds(duplicate, batch_size=2)
 

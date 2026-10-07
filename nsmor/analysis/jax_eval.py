@@ -90,6 +90,19 @@ class JAXEvalWrapper:
 
         lif = model.lif_cell
         backend = model.backend
+        k = float(getattr(model, "persistence_skip", 0.0))
+        if k != 0.0:
+            for consumer in (model, backend):
+                if (
+                    getattr(consumer, "target_mean", 0.0) != 0.0
+                    or getattr(consumer, "target_std", 1.0) != 1.0
+                    or getattr(consumer, "target_clip_cm_s", 0.0) != 0.0
+                ):
+                    raise ValueError(
+                        "JAXEvalWrapper: persistence_skip requires physical "
+                        "unnormalized and unclipped mode."
+                    )
+
         inhib_tau = (
             float(getattr(lif, "_inhib_tau_ms", 50.0))
             if lif.lateral_inhibition > 0.0
@@ -117,6 +130,7 @@ class JAXEvalWrapper:
             # anyway so the wrapper stays faithful if that ever changes.
             dropout_rate=float(getattr(model.direction_head.net[2], "p", 0.1)),
             sensory_noise_std=float(model.sensory_encoder.noise_std),
+            persistence_skip=k,
         )
         params = load_from_torch_state_dict(jax_model, model.state_dict())
         wrapper = cls(
@@ -128,6 +142,7 @@ class JAXEvalWrapper:
             sensory_dim=model.sensory_dim,
             mcmc_dim=model.mcmc_dim,
         )
+        wrapper.persistence_skip = k
         for key, default in (('target_mean', 0.0), ('target_std', 1.0), ('target_clip_cm_s', 0.0)):
             setattr(wrapper, key, getattr(model, key, default))
         return wrapper
@@ -188,6 +203,30 @@ class JAXEvalWrapper:
                 "JAXEvalWrapper has no states= carry; use --backend torch "
                 "for autoregressive rollout"
             )
+
+        B, T, D = X_batch.shape
+        assert D == self.sensory_dim + self.mcmc_dim
+        if getattr(self, "persistence_skip", 0.0) != 0.0:
+            if self.sensory_dim < 3:
+                raise ValueError("Nonzero persistence_skip requires sensory_dim >= 3")
+            assert lengths.shape == (B,), (
+                f"Expected lengths ({B},), got {lengths.shape}"
+            )
+            l_np = lengths.detach().cpu().numpy()
+            if not np.issubdtype(l_np.dtype, np.integer):
+                raise ValueError("lengths must have an integer, nonboolean dtype")
+            if not np.all((l_np >= 0) & (l_np <= T)):
+                raise ValueError(f"lengths must satisfy 0 <= lengths <= T={T}")
+            target_mean = getattr(self, "target_mean", 0.0)
+            target_std = getattr(self, "target_std", 1.0)
+            target_clip = getattr(self, "target_clip_cm_s", 0.0)
+            if target_mean != 0.0 or target_std != 1.0 or target_clip != 0.0:
+                raise ValueError(
+                    "persistence_skip requires physical unnormalized/unclipped "
+                    f"mode (got k={self.persistence_skip}), with restored "
+                    f"target_mean={target_mean}, target_std={target_std}, "
+                    f"target_clip_cm_s={target_clip}."
+                )
 
         device = X_batch.device
         x_j = jnp.asarray(X_batch.detach().cpu().numpy())

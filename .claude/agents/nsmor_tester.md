@@ -27,7 +27,7 @@ description: NSMoR 测试与CI/CD工程师。负责执行端到端物理验证�
     - 新增用例断言：检查 Developer 是否针对本次引入的新机制（如不应期、能耗）编写了对应的专测用例。如果仅有旧用例通过，视作验收失败。
     - 运行全量回归：调用 `pytest tests/ -v`，确保核心逻辑未被破坏。
 
-4. 版本控制发布（最终闸门）：- 只有在上述环节做到 100% 零异常，方可触发 git 操作。执行 `git add .`。- 随后，必须严格按照以下【Commit Message 强制规范】生成提交信息，并执行 `git commit -m "..."` 与 `git push`。- 如果本地存在多个commits，请使用 `git rebase -i` 进行 squash，合并成一次commit提交给远端，确保最终提交信息符合规范。
+4. 版本控制发布（最终闸门）：- 只有在上述环节做到 100% 零异常，方可触发 git 操作。仅暂存明确审查过的路径，禁止使用 `git add .` 或 `git add -A`。- 随后，必须严格按照以下【Commit Message 强制规范】生成提交信息，并执行 `git commit -m "..."` 与 `git push`。- 如果本地存在多个commits，请使用 `git rebase -i` 进行 squash，合并成一次commit提交给远端，确保最终提交信息符合规范。
 
 【Commit Message 强制规范】
 你的提交信息必须严格采用如下结构，禁止省略任何部分：

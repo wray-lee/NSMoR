@@ -1,10 +1,13 @@
-# BOUNDARY — `nsmor/` (Frozen Core)
+# BOUNDARY — `nsmor/` (Controlled Core)
 
-## Status: 🔒 FROZEN
+## Status: 🔐 CONTROLLED
 
-This directory contains the **mathematical and architectural core** of NSMoR. All modules here are mathematically verified and stable.
+This directory contains the mathematical and architectural core of NSMoR. Core
+modules may evolve for scoped optimization or a correctness fix, subject to the
+controlled-change protocol below.
 
-**Modifications require explicit user override.** Do not modify without direct instruction.
+Unscoped rewrites, contract-breaking edits, and changes that bypass review or
+testing are not permitted.
 
 ---
 
@@ -165,10 +168,9 @@ features retain the onset rule. Earlier reference counts (36 visual-only and
 retention change. This correction belongs to the unapproved v6 candidate and
 requires a fresh source seal and independent source review. `CONTEXT.md`'s
 "looming begins at trial start" describes the original reference condition;
-the clock contract above also covers delayed and negative looming onsets. The
-root `BOUNDARY.md` freeze remains in force, with the user's explicit override
-limited here to this extractor correction; `model_nsmor_core.py` and `loss.py`
-remain frozen.
+the clock contract above also covers delayed and negative looming onsets. Core
+model and loss changes follow this controlled boundary; this extractor
+correction does not grant permission to alter unrelated modules.
 
 ---
 
@@ -194,10 +196,37 @@ remain frozen.
 
 ---
 
-## Override Protocol
+## Controlled Core-Change Protocol
 
-To modify frozen core files:
+This section is the normative policy; other governance files summarize it.
+On 2026-10-04 the user authorized replacing the permanent core freeze with
+this policy for continued core optimization. User task authorization persists
+across turns and covers necessary core fixes within its stated scope.
 
-1. State the specific change needed.
-2. Explain why it cannot be done in `nsmor/analysis/` or `scripts/`.
-3. Wait for explicit user approval before proceeding.
+1. Declare the core files, behavior, tensor contracts, compatibility
+   requirements, and experiment scope before editing. Routine implementation
+   details within a user-authorized task do not require repeated approval.
+2. Use authorization from the user or an existing task scope they authorized.
+   Agent-to-agent agreement does not grant user authorization. A new scope must
+   respect any explicit restrictions on loss, loaders, or experiment design.
+3. Obtain two independent source reviews of the actual diff before integration
+   testing. Both reviewers must report `ACCEPT` independently. Focused developer
+   tests and reviewer reproductions may run while preparing that review.
+4. Preserve shape assertions, units, causal inputs, gradients/state behavior,
+   imports, and checkpoint compatibility. Run focused tests and the complete
+   regression suite (`pytest tests/`) with restricted artifact loading, plus
+   applicable numerical/integration checks. Do not silently exclude failures
+   or unsafe fixtures; repair them and report any unavailable gate.
+5. Preserve protected evidence and infrastructure unless the user separately
+   authorizes a change: canonical loaders and data contracts; formal DATA/NEST
+   artifacts, dataset/prior/split pins, existing checkpoints and receipts;
+   finalized baseline outputs; and paths explicitly protected by the user.
+   Never read, traverse, hash, modify, delete, or stage the protected paths
+   `nested-acceptance-4843c3c3935a4020a246f21d2d93383d.json`,
+   `nested-acceptance-4843c3c3935a4020a246f21d2d93383.json`, or `tmp0f3g8lkx/`.
+
+The active [optimization protocol](../docs/model-optimization-protocol-20261004.md)
+continues to govern the declared candidate set, data/split pins, unchanged loss
+and loaders, scoring family, and release gates. This policy does not amend that
+experiment retrospectively. Core changes within authorized scope are permitted;
+changes outside that scope or bypassing review/testing violate this boundary.

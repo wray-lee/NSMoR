@@ -29,6 +29,7 @@ import torch
 
 from nsmor.config import PIPELINE_SEMANTICS_VERSION, FeatureConfig
 from nsmor.pipeline.grouping import animal_of as _animal_of
+from nsmor.pipeline.nested_prior import load_artifact_bytes
 
 
 def _checkpoint_shas(*paths: Path) -> tuple[str, ...]:
@@ -150,7 +151,7 @@ def test_best_checkpoint_always_written(tmp_path: Path) -> None:
     best_path = Path(config.checkpoint.output_dir) / "best_model.pth"
     assert best_path.exists(), "best_model.pth was not written"
 
-    ckpt = torch.load(best_path, weights_only=False)
+    ckpt = load_artifact_bytes(best_path.read_bytes())
     assert "model_state_dict" in ckpt
     assert "val_loss" in ckpt
     assert np.isfinite(ckpt["val_loss"]), (
@@ -210,7 +211,7 @@ def test_fresh_train_rejects_existing_best_before_model_or_output_writes(
     assert set(output_dir.iterdir()) == {best_path, metrics_path}
     assert best_path.read_bytes() == sentinel_bytes
     assert metrics_path.read_bytes() == metrics_sentinel
-    saved_weights = torch.load(best_path, weights_only=False)["model_state_dict"]
+    saved_weights = load_artifact_bytes(best_path.read_bytes())["model_state_dict"]
     assert saved_weights.keys() == stale_weights.keys()
     for key, expected in stale_weights.items():
         assert torch.equal(saved_weights[key], expected), f"stale weight {key} was changed"
@@ -320,7 +321,7 @@ def test_target_stats_split_matches_dataloader(tmp_path: Path) -> None:
 
     ds_path = _make_synthetic_dataset(tmp_path)
     config = _make_config(tmp_path, epochs=1, normalize_targets=True)
-    dataset = torch.load(ds_path, weights_only=False)
+    dataset = load_artifact_bytes(ds_path.read_bytes())
     session_arr = np.asarray(dataset["session_ids"])
     animal_arr = np.array([_animal_of(s) for s in session_arr], dtype=object)
     all_sessions = set(np.unique(session_arr).tolist())
@@ -488,7 +489,7 @@ def test_provenance_single_phase(tmp_path: Path) -> None:
     for name in ("best_model.pth", "final_model.pth"):
         ckpt_path = output_dir / name
         assert ckpt_path.exists(), f"{name} not found"
-        ckpt = torch.load(ckpt_path, weights_only=False)
+        ckpt = load_artifact_bytes(ckpt_path.read_bytes())
         _assert_provenance_fields(
             ckpt,
             name,
@@ -531,7 +532,7 @@ def test_provenance_two_phase(tmp_path: Path) -> None:
     # Phase 1 periodic checkpoint (epoch 1)
     epoch1_ckpt_path = output_dir / "epoch_1.pth"
     assert epoch1_ckpt_path.exists(), "epoch_1.pth not found for phase-1 check"
-    epoch1_ckpt = torch.load(epoch1_ckpt_path, weights_only=False)
+    epoch1_ckpt = load_artifact_bytes(epoch1_ckpt_path.read_bytes())
     _assert_provenance_fields(
         epoch1_ckpt,
         "epoch_1.pth",
@@ -542,7 +543,7 @@ def test_provenance_two_phase(tmp_path: Path) -> None:
     # Final checkpoint must be phase 2
     final_path = output_dir / "final_model.pth"
     assert final_path.exists(), "final_model.pth not found"
-    final_ckpt = torch.load(final_path, weights_only=False)
+    final_ckpt = load_artifact_bytes(final_path.read_bytes())
     _assert_provenance_fields(
         final_ckpt,
         "final_model.pth",
@@ -567,7 +568,7 @@ def test_two_phase_patience_and_best_checkpoint_are_phase_local(tmp_path: Path) 
     assert results["history"]["val_loss"] == [0.1, 0.2, 0.3, 4.0, 5.0]
     assert results["best_val_loss"] == pytest.approx(4.0)
     assert results["eval_provenance"] == "best"
-    best = torch.load(Path(config.checkpoint.output_dir) / "best_model.pth", weights_only=False)
+    best = load_artifact_bytes((Path(config.checkpoint.output_dir) / "best_model.pth").read_bytes())
     assert (best["training_phase"], best["epoch"], best["val_loss"]) == (2, 3, 4.0)
 
 
@@ -586,8 +587,8 @@ def test_resume_phase1_boundary_ignores_later_phase2_best(tmp_path: Path) -> Non
 
     source_dir = Path(source.checkpoint.output_dir)
     periodic = source_dir / "epoch_3.pth"
-    assert torch.load(periodic, weights_only=False)["best_val_loss"] == pytest.approx(0.1)
-    assert torch.load(source_dir / "best_model.pth", weights_only=False)["training_phase"] == 2
+    assert load_artifact_bytes(periodic.read_bytes())["best_val_loss"] == pytest.approx(0.1)
+    assert load_artifact_bytes((source_dir / "best_model.pth").read_bytes())["training_phase"] == 2
 
     resumed = _make_config(tmp_path, epochs=7, warmup_epochs=0)
     resumed.checkpoint.output_dir = str(tmp_path / "resume_boundary")
@@ -600,8 +601,12 @@ def test_resume_phase1_boundary_ignores_later_phase2_best(tmp_path: Path) -> Non
         result = train(resumed, phase1_epochs=3, dataset_path=str(ds),
                        trusted_historical_checkpoint_sha256=_checkpoint_shas(periodic))
 
-    assert result["history"]["val_loss"] == [6.0, 7.0]
-    best = torch.load(Path(resumed.checkpoint.output_dir) / "best_model.pth", weights_only=False)
+    # Epoch-boundary recovery (Task #25): the loss curve is a property of the
+    # WHOLE run.  The uninterrupted trajectory appends across the phase-1→2
+    # boundary, so the resumed run must too; only the early-stop counter and
+    # best_val_loss are phase-local.  Phase-1 history is therefore preserved.
+    assert result["history"]["val_loss"] == [0.1, 0.2, 0.3, 6.0, 7.0]
+    best = load_artifact_bytes((Path(resumed.checkpoint.output_dir) / "best_model.pth").read_bytes())
     assert (best["training_phase"], best["epoch"], best["val_loss"]) == (2, 3, 6.0)
 
 def test_resume_phase2_discards_phase1_companion(tmp_path: Path) -> None:
@@ -618,8 +623,8 @@ def test_resume_phase2_discards_phase1_companion(tmp_path: Path) -> None:
 
     source_dir = Path(source.checkpoint.output_dir)
     periodic = source_dir / "epoch_3.pth"
-    assert torch.load(periodic, weights_only=False)["best_val_loss"] == pytest.approx(4.0)
-    torch.save(torch.load(source_dir / "epoch_1.pth", weights_only=False), source_dir / "best_model.pth")
+    assert load_artifact_bytes(periodic.read_bytes())["best_val_loss"] == pytest.approx(4.0)
+    torch.save(load_artifact_bytes((source_dir / "epoch_1.pth").read_bytes()), source_dir / "best_model.pth")
 
     resumed = _make_config(tmp_path, epochs=4, warmup_epochs=0)
     resumed.checkpoint.output_dir = str(tmp_path / "resume_phase2")
@@ -631,7 +636,7 @@ def test_resume_phase2_discards_phase1_companion(tmp_path: Path) -> None:
         result = train(resumed, phase1_epochs=1, dataset_path=str(ds),
                        trusted_historical_checkpoint_sha256=_checkpoint_shas(periodic))
 
-    best = torch.load(Path(resumed.checkpoint.output_dir) / "best_model.pth", weights_only=False)
+    best = load_artifact_bytes((Path(resumed.checkpoint.output_dir) / "best_model.pth").read_bytes())
     assert (best["training_phase"], best["epoch"], best["val_loss"]) == (2, 2, 4.0)
     assert result["best_val_loss"] == pytest.approx(4.0)
 
@@ -647,7 +652,7 @@ def test_resume_phase2_preserves_same_phase_best(tmp_path: Path) -> None:
     ):
         train(source, phase1_epochs=1, dataset_path=str(ds))
     source_dir = Path(source.checkpoint.output_dir)
-    old_best = torch.load(source_dir / "best_model.pth", weights_only=False)
+    old_best = load_artifact_bytes((source_dir / "best_model.pth").read_bytes())
     assert (old_best["training_phase"], old_best["val_loss"]) == (2, 4.0)
 
     resumed = _make_config(tmp_path, epochs=4, warmup_epochs=0)
@@ -661,13 +666,13 @@ def test_resume_phase2_preserves_same_phase_best(tmp_path: Path) -> None:
                        trusted_historical_checkpoint_sha256=_checkpoint_shas(
                            source_dir / "epoch_3.pth", source_dir / "best_model.pth"))
 
-    best = torch.load(Path(resumed.checkpoint.output_dir) / "best_model.pth", weights_only=False)
+    best = load_artifact_bytes((Path(resumed.checkpoint.output_dir) / "best_model.pth").read_bytes())
     assert (best["training_phase"], best["epoch"], best["val_loss"]) == (2, 1, 4.0)
     assert all(torch.equal(v, best["model_state_dict"][k]) for k, v in old_best["model_state_dict"].items())
     assert result["best_val_loss"] == pytest.approx(4.0)
 
     # A claimed same-phase best must have matching weights in at least one candidate.
-    claimed = torch.load(source_dir / "epoch_3.pth", weights_only=False)
+    claimed = load_artifact_bytes((source_dir / "epoch_3.pth").read_bytes())
     claimed["best_val_loss"] = 3.0
     altered = source_dir / "epoch_3_claimed.pth"
     torch.save(claimed, altered)
@@ -682,7 +687,7 @@ def test_resume_phase2_preserves_same_phase_best(tmp_path: Path) -> None:
         train(resumed, phase1_epochs=1, dataset_path=str(ds),
               trusted_historical_checkpoint_sha256=_checkpoint_shas(
                   altered, source_dir / "best_model.pth", destination / "best_model.pth"))
-    assert torch.load(destination / "best_model.pth", weights_only=False)["val_loss"] == 5.0
+    assert load_artifact_bytes((destination / "best_model.pth").read_bytes())["val_loss"] == 5.0
 
 def test_early_stopped_final_epoch_resumes_at_next_epoch(tmp_path: Path) -> None:
     from scripts.train import train
@@ -695,7 +700,7 @@ def test_early_stopped_final_epoch_resumes_at_next_epoch(tmp_path: Path) -> None
 
     assert len(result["history"]["val_loss"]) == 5
     final_path = Path(source.checkpoint.output_dir) / "final_model.pth"
-    final = torch.load(final_path, weights_only=False)
+    final = load_artifact_bytes(final_path.read_bytes())
     assert (final["training_phase"], final["epoch"]) == (2, 4)
 
     resumed = _make_config(tmp_path, epochs=6, warmup_epochs=0)
@@ -722,7 +727,7 @@ def test_early_stopped_final_epoch_resumes_at_next_epoch(tmp_path: Path) -> None
     first_key = next(iter(prior_state["state"]))
     assert torch.equal(restored[0]["state"][first_key]["exp_avg"].cpu(), prior_state["state"][first_key]["exp_avg"])
     assert [g["lr"] for g in restored[0]["param_groups"]] == [g["lr"] for g in prior_state["param_groups"]]
-    resumed_final = torch.load(Path(resumed.checkpoint.output_dir) / "final_model.pth", weights_only=False)
+    resumed_final = load_artifact_bytes((Path(resumed.checkpoint.output_dir) / "final_model.pth").read_bytes())
     assert resumed_final["epoch"] == 5
     assert resumed_final["scheduler_state_dict"]["last_epoch"] == final["scheduler_state_dict"]["last_epoch"] + 1
 
@@ -740,7 +745,7 @@ def test_resume_earlier_phase1_uses_own_certified_best(tmp_path: Path) -> None:
 
     source_dir = Path(source.checkpoint.output_dir)
     periodic = source_dir / "epoch_1.pth"
-    assert torch.load(source_dir / "best_model.pth", weights_only=False)["training_phase"] == 2
+    assert load_artifact_bytes((source_dir / "best_model.pth").read_bytes())["training_phase"] == 2
     resumed = _make_config(tmp_path, epochs=3, warmup_epochs=0)
     resumed.checkpoint.output_dir = str(tmp_path / "resume_phase1_early")
     resumed.checkpoint.resume_from = str(periodic)
@@ -751,7 +756,7 @@ def test_resume_earlier_phase1_uses_own_certified_best(tmp_path: Path) -> None:
         result = train(resumed, phase1_epochs=3, dataset_path=str(ds),
                        trusted_historical_checkpoint_sha256=_checkpoint_shas(periodic))
 
-    best = torch.load(Path(resumed.checkpoint.output_dir) / "best_model.pth", weights_only=False)
+    best = load_artifact_bytes((Path(resumed.checkpoint.output_dir) / "best_model.pth").read_bytes())
     assert (best["training_phase"], best["epoch"], best["val_loss"]) == (1, 0, 0.1)
     assert result["best_val_loss"] == pytest.approx(0.1)
 
@@ -769,9 +774,9 @@ def test_resume_earlier_phase1_refuses_missing_same_phase_best(tmp_path: Path) -
 
     source_dir = Path(source.checkpoint.output_dir)
     periodic = source_dir / "epoch_2.pth"
-    saved = torch.load(periodic, weights_only=False)
+    saved = load_artifact_bytes(periodic.read_bytes())
     assert (saved["training_phase"], saved["val_loss"], saved["best_val_loss"]) == (1, 0.2, 0.1)
-    assert torch.load(source_dir / "best_model.pth", weights_only=False)["training_phase"] == 2
+    assert load_artifact_bytes((source_dir / "best_model.pth").read_bytes())["training_phase"] == 2
     resumed = _make_config(tmp_path, epochs=3, warmup_epochs=0)
     resumed.checkpoint.output_dir = str(tmp_path / "resume_phase1_missing")
     resumed.checkpoint.resume_from = str(periodic)
@@ -803,7 +808,7 @@ def test_provenance_with_normalization(tmp_path: Path) -> None:
     output_dir = Path(config.checkpoint.output_dir)
     best_path = output_dir / "best_model.pth"
     assert best_path.exists(), "best_model.pth not found"
-    ckpt = torch.load(best_path, weights_only=False)
+    ckpt = load_artifact_bytes(best_path.read_bytes())
 
     _assert_provenance_fields(
         ckpt,
@@ -830,7 +835,7 @@ def test_provenance_mcmc_prior_train_serve_consistency(
     from scripts.train import train
 
     ds_path = _make_synthetic_dataset(tmp_path)
-    data = torch.load(ds_path, weights_only=False)
+    data = load_artifact_bytes(ds_path.read_bytes())
     dummy_consistency = {
         "argmax_agreement": 0.95,
         "mean_total_variation_distance": 0.05,
@@ -844,7 +849,7 @@ def test_provenance_mcmc_prior_train_serve_consistency(
     train(config, lambda_reg=0.01, dataset_path=ds_path_str)
 
     output_dir = Path(config.checkpoint.output_dir)
-    ckpt = torch.load(output_dir / "best_model.pth", weights_only=False)
+    ckpt = load_artifact_bytes((output_dir / "best_model.pth").read_bytes())
     assert "mcmc_prior_train_serve_consistency" in ckpt
     assert ckpt["mcmc_prior_train_serve_consistency"] == dummy_consistency
 
@@ -1054,7 +1059,7 @@ def test_split_cross_verification_dry(tmp_path: Path) -> None:
     )
 
     ds_path = _make_synthetic_dataset(tmp_path)
-    dataset = torch.load(ds_path, weights_only=False)
+    dataset = load_artifact_bytes(ds_path.read_bytes())
     n_total = len(dataset["X_seqs"])
 
     config = _make_config(tmp_path, epochs=1, normalize_targets=True)
@@ -1110,7 +1115,7 @@ def test_resume_within_phase1(tmp_path: Path) -> None:
     ckpt_path = output_dir / "epoch_5.pth"
     assert ckpt_path.exists(), "epoch_5.pth was not saved"
 
-    ckpt = torch.load(ckpt_path, weights_only=False)
+    ckpt = load_artifact_bytes(ckpt_path.read_bytes())
     assert ckpt["epoch"] == 4  # 0-indexed, 5th epoch completed
     assert ckpt["training_phase"] == 1
 
@@ -1133,7 +1138,7 @@ def test_resume_within_phase1(tmp_path: Path) -> None:
     final_path = resume_output_dir / "final_model.pth"
     assert final_path.exists(), "final_model.pth was not written after resume"
 
-    final_ckpt = torch.load(final_path, weights_only=False)
+    final_ckpt = load_artifact_bytes(final_path.read_bytes())
     assert final_ckpt["epoch"] == 6  # 0-indexed, 7 total epochs
 
 
@@ -1159,7 +1164,7 @@ def test_resume_boundary_landing(tmp_path: Path) -> None:
     ckpt_path = output_dir / "epoch_10.pth"
     assert ckpt_path.exists(), "epoch_10.pth was not saved"
 
-    ckpt = torch.load(ckpt_path, weights_only=False)
+    ckpt = load_artifact_bytes(ckpt_path.read_bytes())
     assert ckpt["epoch"] == 9  # 0-indexed, 10th epoch
     assert ckpt["training_phase"] == 1
     assert len(ckpt["optimizer_state_dict"]["param_groups"]) == 1
@@ -1199,7 +1204,7 @@ def test_resume_boundary_landing(tmp_path: Path) -> None:
     # Check final checkpoint
     final_path = resume_output_dir / "final_model.pth"
     assert final_path.exists()
-    final_ckpt = torch.load(final_path, weights_only=False)
+    final_ckpt = load_artifact_bytes(final_path.read_bytes())
     assert len(final_ckpt["optimizer_state_dict"]["param_groups"]) == 2
     assert final_ckpt["training_phase"] == 2
 
@@ -1226,7 +1231,7 @@ def test_resume_mid_phase2(tmp_path: Path) -> None:
     ckpt_path = output_dir / "epoch_15.pth"
     assert ckpt_path.exists(), "epoch_15.pth was not saved"
 
-    ckpt = torch.load(ckpt_path, weights_only=False)
+    ckpt = load_artifact_bytes(ckpt_path.read_bytes())
     assert ckpt["epoch"] == 14  # 0-indexed, 15th epoch
     assert ckpt["training_phase"] == 2
     assert len(ckpt["optimizer_state_dict"]["param_groups"]) == 2
@@ -1280,7 +1285,7 @@ def test_resume_mid_phase2(tmp_path: Path) -> None:
     assert np.isfinite(results_resume["best_val_loss"])
     final_path = resume_output_dir / "final_model.pth"
     assert final_path.exists()
-    final_ckpt = torch.load(final_path, weights_only=False)
+    final_ckpt = load_artifact_bytes(final_path.read_bytes())
     assert final_ckpt["epoch"] == 16  # 0-indexed, 17 total epochs
     assert final_ckpt["training_phase"] == 2
     assert len(final_ckpt["optimizer_state_dict"]["param_groups"]) == 2
@@ -1416,7 +1421,7 @@ def test_resume_never_falls_back_to_training_loss_as_best_val_loss(tmp_path: Pat
     assert epoch1_ckpt.exists()
 
     # Strip validation loss keys from checkpoint so it only carries train loss in ckpt['loss']
-    ckpt_data = torch.load(epoch1_ckpt, weights_only=False)
+    ckpt_data = load_artifact_bytes(epoch1_ckpt.read_bytes())
     ckpt_data.pop("val_loss", None)
     ckpt_data.pop("best_val_loss", None)
     ckpt_data["loss"] = 0.05  # train loss is very small (0.05)
@@ -1449,7 +1454,7 @@ def test_nonnested_resume_and_best_reject_changed_bytes_at_same_path(tmp_path: P
     train(cfg_a, dataset_path=str(ds_path))
     run_a = Path(cfg_a.checkpoint.output_dir)
     digest_a = hashlib.sha256(ds_path.read_bytes()).hexdigest()
-    source_b = torch.load(ds_path, weights_only=False)
+    source_b = load_artifact_bytes(ds_path.read_bytes())
     source_b["Y_seqs"] = [y + 4.0 for y in source_b["Y_seqs"]]
     source_b["mcmc_priors"] = np.roll(source_b["mcmc_priors"], 1, axis=1)
     torch.save(source_b, ds_path)
@@ -1468,10 +1473,10 @@ def test_nonnested_resume_and_best_reject_changed_bytes_at_same_path(tmp_path: P
     cfg_b.checkpoint.output_dir = str(tmp_path / "run_b")
     train(cfg_b, dataset_path=str(ds_path))
     run_b = Path(cfg_b.checkpoint.output_dir)
-    assert torch.load(run_b / "epoch_1.pth", weights_only=False)["dataset_source_sha256"] == digest_b
+    assert load_artifact_bytes((run_b / "epoch_1.pth").read_bytes())["dataset_source_sha256"] == digest_b
     # A same-path old best can have finite, plausible validation metadata.
     # It still cannot rank against B's current checkpoints.
-    torch.save(torch.load(run_a / "best_model.pth", weights_only=False), run_b / "best_model.pth")
+    torch.save(load_artifact_bytes((run_a / "best_model.pth").read_bytes()), run_b / "best_model.pth")
     resume = _make_config(tmp_path, epochs=2, warmup_epochs=0)
     resume.checkpoint.output_dir = str(tmp_path / "blocked_companion")
     resume.checkpoint.resume_from = str(run_b / "epoch_1.pth")
@@ -1494,7 +1499,7 @@ def test_legacy_digestless_resume_keeps_historical_source_unbound(tmp_path: Path
     run_dir = Path(first.checkpoint.output_dir)
     for name in ("epoch_1.pth", "best_model.pth"):
         path = run_dir / name
-        old = torch.load(path, weights_only=False)
+        old = load_artifact_bytes(path.read_bytes())
         del old["dataset_source_sha256"]
         torch.save(old, path)
     resumed = _make_config(tmp_path, epochs=2, warmup_epochs=0)
@@ -1505,7 +1510,7 @@ def test_legacy_digestless_resume_keeps_historical_source_unbound(tmp_path: Path
           trusted_historical_checkpoint_sha256=_checkpoint_shas(
               run_dir / "epoch_1.pth", run_dir / "best_model.pth"))
     final = Path(resumed.checkpoint.output_dir) / "final_model.pth"
-    saved = torch.load(final, weights_only=False)
+    saved = load_artifact_bytes(final.read_bytes())
     assert saved["dataset_source_sha256"] == hashlib.sha256(ds_path.read_bytes()).hexdigest()
     assert saved["dataset_source_binding"] == "legacy_resume_unbound"
     metrics = json.loads((Path(resumed.checkpoint.output_dir) / "metrics.json").read_text())
@@ -1727,7 +1732,9 @@ def test_final_evaluation_rejects_replaced_clock_before_state_mutation(
         captured.update(model=kwargs["model"], optimizer=kwargs["optimizer"])
         return 1., {}
 
-    def replace_clock(history: dict, output_dir: Path) -> Path:
+    def replace_clock(
+        history: dict, output_dir: Path, history_start_epoch: int = 0,
+    ) -> Path:
         path = output_dir / candidate
         state = load_artifact_bytes(path.read_bytes(), map_location="cpu")
         if violation == "clock":

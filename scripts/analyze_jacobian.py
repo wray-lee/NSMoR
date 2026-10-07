@@ -163,6 +163,102 @@ FP_GMM_RANDOM_SEED: int = 42
 # so the gate can never talk itself into accepting transients).
 FP_RESIDUAL_THRESHOLD_CAP: float = 0.3
 
+# ── Component support / structure guards (Round-4) ─────────────
+# A BIC preference for two components is NECESSARY but not SUFFICIENT
+# evidence of two distinct subpopulations.  Two failure modes survive
+# the ΔBIC gate on synthetic data:
+#   * a skewed UNIMODAL log-residual distribution, where the second
+#     component buys likelihood by stretching one tail (ΔBIC ≈ 32–63 on
+#     exp(-6 + Exp(0.4/0.5)) with a single fitted density mode), and
+#   * a DEGENERATE fit, where one component collapses onto a near-empty
+#     point mass (weight 1/129, σ_log ≈ 0.001) and absorbs an outlier.
+# The structure of the fitted DENSITY, plus the support of both
+# components, must therefore be checked before the boundary is used.
+FP_MIN_COMPONENT_SUPPORT: int = 5
+"""Minimum effective sample size (``round(weight * n)``) required for
+each fitted mixture component.  A component backed by fewer candidates
+is a point-mass/outlier artefact, not a subpopulation."""
+FP_MIN_COMPONENT_SIGMA_LOG: float = 0.01
+"""Minimum fitted log-space component standard deviation.  A narrower
+component is a degenerate spike, not a resolvable cluster."""
+FP_MIN_DENSITY_MODES: int = 2
+"""Minimum number of strict interior local maxima the fitted density
+must exhibit before it counts as bimodal."""
+
+
+def _fitted_density_mode_count(
+    mu_lo: float,
+    sigma_lo: float,
+    weight_lo: float,
+    mu_hi: float,
+    sigma_hi: float,
+    weight_hi: float,
+    grid_points: int = 1001,
+) -> int:
+    """Count interior local maxima of the fitted two-component density.
+
+    Round-4 fix: the gate previously treated ``ΔBIC > 10`` alone as proof
+    of bimodality.  On a skewed unimodal log-residual distribution the
+    second component can raise the likelihood without creating a second
+    mode, and on a degenerate fit the extra component is a point mass.
+    Both leave the fitted *density* unimodal.  This evaluates the weighted
+    mixture on a closed grid spanning both components and counts strict
+    interior local maxima, so "bimodal" is established from the density
+    shape rather than from the component count.
+
+    Args:
+        mu_lo: Log-space mean of the low-residual component.
+        sigma_lo: Log-space standard deviation of the low component.
+        weight_lo: Mixing weight of the low component.
+        mu_hi: Log-space mean of the high-residual component.
+        sigma_hi: Log-space standard deviation of the high component.
+        weight_hi: Mixing weight of the high component.
+        grid_points: Number of evaluation points on the closed grid.
+
+    Returns:
+        Number of strict interior local maxima (0, 1, or 2 for a
+        two-component fit).
+
+    Raises:
+        ValueError: If any parameter is non-finite or a scale/weight is
+            non-positive.
+    """
+    values = (mu_lo, sigma_lo, weight_lo, mu_hi, sigma_hi, weight_hi)
+    if not all(np.isfinite(value) for value in values):
+        raise ValueError("non-finite component parameters for mode count")
+    if sigma_lo <= 0.0 or sigma_hi <= 0.0 or weight_lo <= 0.0 or weight_hi <= 0.0:
+        raise ValueError("invalid component scale or weight for mode count")
+
+    m1, s1 = (float(mu_lo), float(sigma_lo)) if mu_lo <= mu_hi else (float(mu_hi), float(sigma_hi))
+    m2, s2 = (float(mu_hi), float(sigma_hi)) if mu_lo <= mu_hi else (float(mu_lo), float(sigma_lo))
+    w1 = float(weight_lo) if mu_lo <= mu_hi else float(weight_hi)
+    w2 = float(weight_hi) if mu_lo <= mu_hi else float(weight_lo)
+
+    n_comp = max(201, (grid_points // 4) | 1)
+    n_mid = max(101, (grid_points // 8) | 1)
+    pts = [
+        np.linspace(m1 - 4.5 * s1, m1 + 4.5 * s1, n_comp),
+        np.linspace(m2 - 4.5 * s2, m2 + 4.5 * s2, n_comp),
+    ]
+    if m2 > m1:
+        pts.append(np.linspace(m1, m2, n_mid))
+    raw = np.sort(np.concatenate(pts))
+    eps = min(s1, s2) * 1e-4
+    grid = raw[np.r_[True, np.diff(raw) > eps]]
+
+    density = (
+        w1 / s1 * np.exp(-0.5 * ((grid - m1) / s1) ** 2)
+        + w2 / s2 * np.exp(-0.5 * ((grid - m2) / s2) ** 2)
+    )
+    # Condense consecutive flat plateaus so peak detection is invariant to equal adjacent floats
+    condensed = density[np.r_[True, np.diff(density) != 0.0]]
+    if len(condensed) < 3:
+        return 0
+    interior = condensed[1:-1]
+    return int(np.count_nonzero(
+        (interior > condensed[:-2]) & (interior > condensed[2:])
+    ))
+
 
 def _calibrate_fp_threshold(
     residuals: np.ndarray,
@@ -187,7 +283,10 @@ def _calibrate_fp_threshold(
         ValueError: If fewer than 4 residuals are supplied, or BIC
             favours ONE component (no distinct quasi-stationary
             subpopulation exists in this state space), or the fitted
-            boundary exceeds ``FP_RESIDUAL_THRESHOLD_CAP``.
+            two-component mixture is degenerate (a component with
+            insufficient support or near-zero log-variance), or the
+            fitted DENSITY is not bimodal, or the fitted boundary
+            exceeds ``FP_RESIDUAL_THRESHOLD_CAP``.
     """
     from sklearn.mixture import GaussianMixture
 
@@ -238,21 +337,70 @@ def _calibrate_fp_threshold(
     means = gm2.means_.ravel()
     lo_idx, hi_idx = int(np.argmin(means)), int(np.argmax(means))
     w_lo = float(gm2.weights_[lo_idx])
+    w_hi = float(gm2.weights_[hi_idx])
     diag["low_component_weight"] = w_lo
+    diag["high_component_weight"] = w_hi
+
+    # ── Round-4: component support guard ────────────────────────
+    # A component backed by a handful of points (or a near-zero-variance
+    # spike) is an outlier/point-mass artefact, not a subpopulation.  It
+    # must not license a "two-population" gate however large its ΔBIC.
+    support_lo = int(round(w_lo * r.size))
+    support_hi = int(round(w_hi * r.size))
+    sigma_lo_log = float(np.sqrt(gm2.covariances_[lo_idx, 0, 0]))
+    sigma_hi_log = float(np.sqrt(gm2.covariances_[hi_idx, 0, 0]))
+    diag["low_component_support"] = support_lo
+    diag["high_component_support"] = support_hi
+    diag["low_sigma_log"] = sigma_lo_log
+    diag["high_sigma_log"] = sigma_hi_log
+    if (
+        support_lo < FP_MIN_COMPONENT_SUPPORT
+        or support_hi < FP_MIN_COMPONENT_SUPPORT
+        or sigma_lo_log < FP_MIN_COMPONENT_SIGMA_LOG
+        or sigma_hi_log < FP_MIN_COMPONENT_SIGMA_LOG
+    ):
+        raise ValueError(
+            f"[{context}] two-component fit is DEGENERATE: a component "
+            f"lacks support (support_lo={support_lo}, support_hi={support_hi}, "
+            f"need >= {FP_MIN_COMPONENT_SUPPORT}; sigma_log=("
+            f"{sigma_lo_log:.4g}, {sigma_hi_log:.4g}), need >= "
+            f"{FP_MIN_COMPONENT_SIGMA_LOG}).  One component is a point mass / "
+            f"outlier artefact, so there is NO evidence for two distinct "
+            f"quasi-fixed-point subpopulations; eigenvalue spectra here cannot "
+            f"support stability claims."
+        )
+
+    # ── Round-4: density-structure guard ────────────────────────
+    # BIC preference for two components is not itself evidence of two
+    # modes: a skewed unimodal distribution can absorb a tail-stretching
+    # second component (ΔBIC ≈ 32–63 with a single fitted mode).  The
+    # fitted DENSITY must actually be bimodal.
+    n_modes = _fitted_density_mode_count(
+        float(means[lo_idx]), sigma_lo_log, w_lo,
+        float(means[hi_idx]), sigma_hi_log, w_hi,
+    )
+    diag["fitted_density_modes"] = n_modes
+    if n_modes < FP_MIN_DENSITY_MODES:
+        raise ValueError(
+            f"[{context}] BIC prefers two components (delta={bic1 - bic2:.1f}) "
+            f"but the FITTED DENSITY has {n_modes} interior mode(s), not "
+            f"{FP_MIN_DENSITY_MODES}: the extra component stretched one tail "
+            f"of a unimodal distribution rather than separating a distinct "
+            f"subpopulation.  BIC preference alone is not evidence of two "
+            f"modes; no quasi-fixed-point population can be claimed here."
+        )
 
     # Boundary where the posterior of the LOW component equals 0.5:
     # solve log N(x|mu_lo,s_lo) + log w_lo == log N(x|mu_hi,s_hi) + log w_hi.
     mu_lo, mu_hi = float(means[lo_idx]), float(means[hi_idx])
-    s_lo = float(np.sqrt(gm2.covariances_[lo_idx, 0, 0]))
-    s_hi = float(np.sqrt(gm2.covariances_[hi_idx, 0, 0]))
+    s_lo = sigma_lo_log
+    s_hi = sigma_hi_log
     boundary_log = _gmm_posterior_half_boundary_log(
-        mu_lo, s_lo, w_lo, mu_hi, s_hi, float(gm2.weights_[hi_idx]), context,
+        mu_lo, s_lo, w_lo, mu_hi, s_hi, w_hi, context,
     )
 
     diag.update(
         low_mean_log=mu_lo, high_mean_log=mu_hi,
-        low_sigma_log=s_lo, high_sigma_log=s_hi,
-        high_component_weight=float(gm2.weights_[hi_idx]),
     )
     threshold = float(np.exp(boundary_log))
     diag["fp_threshold"] = threshold

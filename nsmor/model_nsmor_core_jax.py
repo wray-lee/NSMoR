@@ -87,6 +87,7 @@ if JAX_AVAILABLE:
             self.mcmc_dim = model.mcmc_dim
             self.hidden_dim = model.hidden_dim
             self.dt_ms = model.dt_ms
+            self.persistence_skip = float(getattr(model, "persistence_skip", 0.0))
 
             # 2. Frontend parameters
             fe = model.frontend
@@ -403,6 +404,14 @@ if JAX_AVAILABLE:
             h_relu = jax.nn.relu(h_norm)
             y_pred = (h_relu @ params.dh_lin_w.T + params.dh_lin_b).squeeze(-1)
 
+            if params.persistence_skip != 0.0:
+                v_lag = sensory_x[:, :, 2]
+                mask_bt = (t_idx < lengths[None, :]).T
+                assert v_lag.shape == mask_bt.shape == (B, T)
+                y_pred = y_pred + params.persistence_skip * jnp.where(
+                    mask_bt, v_lag, 0.0,
+                )
+
             return (
                 y_pred, effective_gates, natural_gates,
                 lif_potentials, lif_spikes, lif_thresholds,
@@ -451,6 +460,9 @@ class NSMoRCoreJAX:
         self.mcmc_dim = self.torch_model.mcmc_dim
         self.hidden_dim = self.torch_model.hidden_dim
         self.dt_ms = self.torch_model.dt_ms
+        self.persistence_skip = float(
+            getattr(self.torch_model, "persistence_skip", 0.0)
+        )
 
         # Submodule aliases matching PyTorch API
         self.sensory_encoder = self.torch_model.sensory_encoder
@@ -510,6 +522,29 @@ class NSMoRCoreJAX:
         input_is_torch = isinstance(X_batch, torch.Tensor)
         device = X_batch.device if input_is_torch else None
 
+        if self.persistence_skip != 0.0:
+            B, T, D_in = X_batch.shape
+            assert D_in == self.sensory_dim + self.mcmc_dim
+            if self.sensory_dim < 3:
+                raise ValueError("Nonzero persistence_skip requires sensory_dim >= 3")
+            l_host = np.asarray(_to_numpy(lengths))
+            assert l_host.shape == (B,), f"Expected lengths ({B},), got {l_host.shape}"
+            if not np.issubdtype(l_host.dtype, np.integer):
+                raise ValueError("lengths must have an integer, nonboolean dtype")
+            if not np.all((l_host >= 0) & (l_host <= T)):
+                raise ValueError(f"lengths must satisfy 0 <= lengths <= T={T}")
+            for consumer in (self.torch_model, self.torch_model.backend):
+                if (
+                    getattr(consumer, "target_mean", 0.0) != 0.0
+                    or getattr(consumer, "target_std", 1.0) != 1.0
+                    or getattr(consumer, "target_clip_cm_s", 0.0) != 0.0
+                ):
+                    raise ValueError(
+                        "persistence_skip requires physical unnormalized/unclipped "
+                        "mode"
+                    )
+
+        # Fallback validation must precede its integer cast too.
         # Fallback to PyTorch directly if JAX is unavailable
         if not self.use_jax:
             X_torch = _to_torch(X_batch)

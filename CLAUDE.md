@@ -29,7 +29,7 @@ Designed for **white-box dynamical systems analysis**: expose routing gates, mem
     ```python
     assert tensor.shape == (B, T, H), f"Expected (B={B}, T={T}, H={H}), got {tensor.shape}"
     ```
-3. **Modular Design & Immutability:** Core mathematical code (`nsmor/model_nsmor_core.py`, `nsmor/loss.py`) is **frozen**. Modifications require explicit user override.
+3. **Modular Design & Controlled Changes:** Core mathematical code (`nsmor/model_nsmor_core.py`, `nsmor/loss.py`) may change within a user-authorized optimization or correctness scope. Follow the normative protocol in `nsmor/BOUNDARY.md`: two independent `ACCEPT` reviews, focused and complete regression tests, numerical safety checks, and backward-compatibility evidence. Existing task authorization covers necessary core changes without repeated approval.
 4. **Statistical Rigor:** Multi-condition comparisons must calculate effect sizes (Cohen's $d$) and adjusted p-values (FDR/Bonferroni).
 5. **Code Style:** PEP 8 (88-char limit), `from __future__ import annotations`, Google-style docstrings.
 
@@ -39,7 +39,8 @@ Designed for **white-box dynamical systems analysis**: expose routing gates, mem
 
 | Directory / Module | Status | Permission & Boundary File | Notes |
 | :--- | :--- | :--- | :--- |
-| `nsmor/` (Root Core) | **Frozen** | 🔒 `nsmor/BOUNDARY.md` | Frozen core architecture & loss — requires explicit user override |
+| `model_nsmor_core.py`, `loss.py` | **Controlled** | 🔐 `nsmor/BOUNDARY.md` | Core changes within user-authorized scope require two independent reviews and complete tests |
+| Other `nsmor/` root infrastructure | **Protected** | `nsmor/BOUNDARY.md` | Canonical loaders and data/checkpoint contracts need separately scoped authorization |
 | `nsmor/pipeline/` | **Extend** | 🔓 `nsmor/pipeline/BOUNDARY.md` | Data ingestion, feature extraction, dataloader factory |
 | `nsmor/analysis/` | **Sandbox** | 🔓 `nsmor/analysis/BOUNDARY.md` | Fixed-point analysis, Jacobians, dynamical manifolds, UQ |
 | `scripts/` | **Editable** | — | Training, simulation, analysis scripts |
@@ -67,10 +68,10 @@ Release Commit <── Pass Gate ── Tester (nsmor_tester) <── Fix Propos
 
 ## AI Directives — Critical Constraints
 
-1. **NEVER rewrite `nsmor/model_nsmor_core.py`** when asked to build analysis scripts, training pipelines, or testing infrastructure. This module is stable and frozen.
-2. **NEVER rewrite `nsmor/loss.py`** when asked to add new features or analysis tools. The loss function is mathematically verified and frozen.
+1. **Do not rewrite core modules wholesale** when asked to build analysis scripts, training pipelines, or testing infrastructure. `nsmor/model_nsmor_core.py` and `nsmor/loss.py` may be modified when the task explicitly scopes a core change and the controlled-change protocol is followed.
+2. **Do not rewrite the loss module wholesale** when asked to add new features or analysis tools. `nsmor/loss.py` may be modified for a declared optimization or correctness change, with its own focused tests and independent review.
 3. **ALWAYS check `BOUNDARY.md` files** in subdirectories before modifying code:
-    - `nsmor/BOUNDARY.md` — Frozen core (requires explicit override)
+    - `nsmor/BOUNDARY.md` — controlled core-change protocol and contracts
     - `nsmor/pipeline/BOUNDARY.md` — Data pipeline (safe to extend)
     - `nsmor/analysis/BOUNDARY.md` — Analysis sandbox (free to modify)
 4. **ALWAYS preserve tensor shape assertions** when refactoring. Do not remove `assert` statements in `forward()` methods.
@@ -79,7 +80,7 @@ Release Commit <── Pass Gate ── Tester (nsmor_tester) <── Fix Propos
 ### When Building New Analysis Tools
 
 1. Create new files in `nsmor/analysis/` — do NOT add to `nsmor/` root.
-2. Import from frozen core modules — do NOT copy code:
+2. Import from the controlled core modules — do NOT copy code:
     ```python
     from nsmor.model_nsmor_core import NSMoRCore
     from nsmor.loss import BioJointLoss

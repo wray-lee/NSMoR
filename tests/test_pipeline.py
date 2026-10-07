@@ -40,8 +40,11 @@ from nsmor.pipeline.io import (
     load_kinematics_csv,
 )
 from nsmor.pipeline.kinematics import demirror_prediction, mirror_to_right
+from nsmor.pipeline.nested_prior import load_artifact_bytes
 from nsmor.pipeline.labeling import (
+    _check_sustained_speed,
     assign_ground_truth_labels,
+    check_prewalk_window,
     labeling_funnel_summary,
 )
 from nsmor.data_extractor import (
@@ -626,7 +629,7 @@ def test_converter_refuses_overlapping_replayed_pair(tmp_path: Path, monkeypatch
     # Bind the changed synthetic bytes to isolate the temporal invariant from
     # the independent raw-input digest gate.
     from hashlib import sha256
-    saved = torch.load(metadata, weights_only=False)
+    saved = load_artifact_bytes(metadata.read_bytes())
     for spec in saved["trial_specs"]:
         for source in spec["source_pairs"]:
             if Path(source["session_dir"]) / source["kinematics_file"] == second[0]:
@@ -827,6 +830,184 @@ class TestLabeling:
             "event_times": np.array([onset_ms]),
         }])[0]["label"]
         assert label == Label.PRE_ACTIVE
+
+    @staticmethod
+    def _trial(time_ms: np.ndarray, velocity: np.ndarray,
+               onset_ms: float = 2000.0) -> dict:
+        return {
+            "session_id": "s", "trial_id": 0,
+            "time_ms": time_ms, "velocity": velocity,
+            "event_types": np.array(["stimulus_onset"]),
+            "event_times": np.array([onset_ms]),
+        }
+
+    def test_truncated_sustained_window_is_not_a_response(self) -> None:
+        """Round-4 #3: 3 post-onset frames cannot certify a 250-ms response.
+
+        A trial whose recording ends 8 ms after onset must not be labelled
+        ESCAPE/PREWALK off the frames that happen to remain — the missing
+        evidence is unavailable, so the trial is a non-responder.
+        """
+        time_ms = np.array([2000.0, 2004.0, 2008.0])
+        velocity = np.array([8.0, 8.0, 8.0])
+        label = assign_ground_truth_labels(
+            [self._trial(time_ms, velocity)],
+        )[0]["label"]
+        assert label == Label.NO_RESPONSE
+
+    def test_short_tail_after_response_is_not_sustained(self) -> None:
+        """Round-4 #3: dt10 trial ending at 2110 with response at 2100/2110."""
+        time_ms = np.arange(0.0, 2111.0, 10.0)
+        velocity = np.full_like(time_ms, 1.5)
+        velocity[time_ms >= 2100.0] = 8.0
+        label = assign_ground_truth_labels(
+            [self._trial(time_ms, velocity)],
+        )[0]["label"]
+        # Non-responder: no sustained 250-ms window exists before the end.
+        assert label == Label.PRE_ACTIVE
+
+    def test_later_anchor_within_latency_is_still_found(self) -> None:
+        """Round-4 #4: a short early burst must not suppress a genuine response.
+
+        The first two-frame anchor's sustained window fails, but a fully
+        covered response 190 ms after onset must still be found.  Adding
+        the short early burst therefore must not change PREWALK to
+        PRE_ACTIVE.
+        """
+        time_ms = np.arange(0.0, 2700.0, 10.0)
+        velocity = np.full_like(time_ms, 1.5)
+        velocity[(time_ms >= 2190.0) & (time_ms < 2540.0)] = 8.0
+        base_label = assign_ground_truth_labels(
+            [self._trial(time_ms, velocity)],
+        )[0]["label"]
+        assert base_label == Label.PREWALK
+
+        with_burst = velocity.copy()
+        with_burst[(time_ms >= 2000.0) & (time_ms < 2020.0)] = 8.0
+        assert assign_ground_truth_labels(
+            [self._trial(time_ms, with_burst)],
+        )[0]["label"] == Label.PREWALK
+
+    def test_prewalk_coverage_is_not_inferred_from_the_window(self) -> None:
+        """Round-4 #5: two sparse baseline samples cannot establish cadence.
+
+        An otherwise dt=4 ms trial with only two high-speed baseline
+        samples (900 ms apart) must not fabricate sufficient pre-window
+        coverage from the sparse window itself.
+        """
+        for hi in (1000.0, 1100.0):
+            time_ms = np.concatenate([
+                np.array([hi, 1900.0]),
+                np.arange(2000.0, 2400.0, 4.0),
+            ])
+            velocity = np.zeros_like(time_ms)
+            velocity[(time_ms == hi) | (time_ms == 1900.0)] = 8.0
+            assert not check_prewalk_window(
+                velocity, time_ms, 2000.0, 1000.0, 1.0, 0.5,
+                min_coverage=0.5,
+            )
+
+    def test_nonfinite_event_anchor_is_unavailable(self) -> None:
+        """Round-4 #6: NaN/Inf anchors must not become behavioural classes."""
+        from nsmor.pipeline.labeling import find_event_time
+
+        time_ms = np.arange(0.0, 3000.0, 10.0)
+        velocity = np.full_like(time_ms, 1.5)
+        for bad in (float("nan"), float("inf")):
+            assert find_event_time(
+                np.array(["stimulus_onset"]), np.array([bad]), "stimulus_onset",
+            ) is None
+            trial = self._trial(time_ms, velocity)
+            trial["event_times"] = np.array([bad])
+            assert assign_ground_truth_labels([trial]) == []
+
+    def test_sustained_speed_sparse_and_truncated_probes_rejected(self) -> None:
+        """Round-4 sustained-coverage gate: fail closed on sparse or gapped timelines."""
+        # Probe 1: Evidence spans only 100 ms of the required 250 ms duration.
+        assert not _check_sustained_speed(
+            velocity=np.array([8.0, 8.0]),
+            time_ms=np.array([2000.0, 2100.0]),
+            start_ms=2000.0,
+            duration_ms=250.0,
+            threshold=5.0,
+            min_fraction=0.5,
+            max_latency_ms=200.0,
+            anchor_min_frames=2,
+            min_coverage=0.5,
+        )
+
+        # Probe 2: Only 4-8 ms contiguous evidence followed by a 244 ms hole.
+        assert not _check_sustained_speed(
+            velocity=np.array([8.0, 8.0, 8.0]),
+            time_ms=np.array([2000.0, 2004.0, 2248.0]),
+            start_ms=2000.0,
+            duration_ms=250.0,
+            threshold=5.0,
+            min_fraction=0.5,
+            max_latency_ms=200.0,
+            anchor_min_frames=2,
+            min_coverage=0.5,
+        )
+
+        # Probe 3 (Reviewer A/B Round-4 major): 130-ms and 140-ms truncated windows rejected.
+        for span_end in (2131.0, 2141.0):
+            t_trunc = np.arange(2000.0, span_end, 10.0)
+            v_trunc = np.full(t_trunc.shape, 8.0)
+            assert not _check_sustained_speed(
+                velocity=v_trunc,
+                time_ms=t_trunc,
+                start_ms=2000.0,
+                duration_ms=250.0,
+                threshold=5.0,
+                min_fraction=0.5,
+                max_latency_ms=200.0,
+                anchor_min_frames=2,
+                min_coverage=0.5,
+            )
+
+        # Clean control (dt=10 ms regular sampling, full 250 ms coverage).
+        ctrl_times_10 = np.arange(0.0, 3000.0, 10.0)
+        ctrl_vel_10 = np.full_like(ctrl_times_10, 0.1)
+        ctrl_vel_10[(ctrl_times_10 >= 2050.0) & (ctrl_times_10 < 2350.0)] = 8.0
+        assert _check_sustained_speed(
+            velocity=ctrl_vel_10,
+            time_ms=ctrl_times_10,
+            start_ms=2000.0,
+            duration_ms=250.0,
+            threshold=5.0,
+            min_fraction=0.5,
+            max_latency_ms=200.0,
+            anchor_min_frames=2,
+            min_coverage=0.5,
+        )
+
+        # Clean control (dt=4 ms regular sampling, full 250 ms coverage).
+        ctrl_times_4 = np.arange(0.0, 3000.0, 4.0)
+        ctrl_vel_4 = np.full_like(ctrl_times_4, 0.1)
+        ctrl_vel_4[(ctrl_times_4 >= 2050.0) & (ctrl_times_4 < 2350.0)] = 8.0
+        assert _check_sustained_speed(
+            velocity=ctrl_vel_4,
+            time_ms=ctrl_times_4,
+            start_ms=2000.0,
+            duration_ms=250.0,
+            threshold=5.0,
+            min_fraction=0.5,
+            max_latency_ms=200.0,
+            anchor_min_frames=2,
+            min_coverage=0.5,
+        )
+
+        # End-to-end labeling integration: sparse and truncated probes are non-responders.
+        trial_p1 = self._trial(np.array([2000.0, 2100.0]), np.array([8.0, 8.0]))
+        assert assign_ground_truth_labels([trial_p1])[0]["label"] == Label.NO_RESPONSE
+        trial_p2 = self._trial(
+            np.array([2000.0, 2004.0, 2248.0]), np.array([8.0, 8.0, 8.0]),
+        )
+        assert assign_ground_truth_labels([trial_p2])[0]["label"] == Label.NO_RESPONSE
+        for span_end in (2131.0, 2141.0):
+            t_trunc = np.arange(2000.0, span_end, 10.0)
+            v_trunc = np.full(t_trunc.shape, 8.0)
+            assert assign_ground_truth_labels([self._trial(t_trunc, v_trunc)])[0]["label"] == Label.NO_RESPONSE
 
 
 class TestSnapshotExtraction:
@@ -1645,7 +1826,7 @@ def test_label_audit_metadata_round_trips_through_artifact(
 
     output = tmp_path / "dataset.pt"
     prepare_dataset(raw_dir=raw_dir, output_path=output, random_seed=42)
-    dataset = torch.load(output, weights_only=False)
+    dataset = load_artifact_bytes(output.read_bytes())
 
     assert dataset["labeling_funnel"] == expected_funnel
     assert dataset["labeling_funnel_retention"] == expected_retention
@@ -1970,7 +2151,7 @@ def test_float32_noninteger_lv_survives_both_producers(
 
     output = tmp_path / f"{producer}.pt"
     run(output)
-    saved = torch.load(output, weights_only=False)
+    saved = load_artifact_bytes(output.read_bytes())
     assert (session_id, 5) in list(zip(saved["session_ids"], saved["trial_ids"]))
     if producer == "metadata":
         assert saved["snapshot_anchor_rules"].count("looming_collision") == 1
@@ -2086,7 +2267,7 @@ def test_metadata_valid_trials_keep_prior_rows(
         "prepare_metadata.py", "--raw_dir", str(raw_dir), "--output", str(output),
     ])
     prepare_metadata.main()
-    metadata = torch.load(output, weights_only=False)
+    metadata = load_artifact_bytes(output.read_bytes())
 
     expected = [(directory.name, trial_id)
                 for directory in sorted(raw_dir.iterdir()) for trial_id in range(5)]

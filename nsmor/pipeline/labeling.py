@@ -23,6 +23,21 @@ import numpy as np
 
 from nsmor.config import DEFAULT_THRESHOLD, Label, ThresholdConfig
 
+# ──────────────────────────────────────────────────────────────
+# Sustained-window coverage (Round-4)
+# ──────────────────────────────────────────────────────────────
+
+SUSTAINED_MIN_COVERAGE: float = 0.5
+"""Minimum fraction of the required sustained duration that must be
+spanned by recorded frames for the anchored window to be evaluable.
+
+Round-4 fix: the previous sustained check divided by whatever frames
+happened to remain, so a trial whose recording ended a few frames after
+response initiation certified a 250-ms response from 3 frames
+(2000/2004/2008 ms).  A window that covers less than half of the
+required duration is missing/truncated evidence and must be unavailable,
+not a positive response."""
+
 
 # ──────────────────────────────────────────────────────────────
 # Event lookup helpers
@@ -36,18 +51,49 @@ def find_event_time(
     """
     Return the timestamp of the first occurrence of *event_name*.
 
+    Round-4 fix: a matched anchor whose timestamp is non-finite
+    (NaN/Inf) is corrupt chronology, not a valid event.  It is reported
+    as unavailable (``None``) so every caller fails closed instead of
+    computing comparisons against NaN/Inf (which silently produced
+    ``NO_RESPONSE``/``PRE_ACTIVE`` labels).
+
     Args:
         event_types: 1-D array of event type strings.
         event_times: 1-D array of corresponding timestamps (ms).
         event_name: The event type to search for.
 
     Returns:
-        Timestamp in ms, or ``None`` if the event is absent.
+        Timestamp in ms, or ``None`` if the event is absent or its
+        timestamp is non-finite.
     """
     mask = event_types == event_name
     if not np.any(mask):
         return None
-    return float(event_times[mask][0])
+    timestamp = float(event_times[mask][0])
+    if not np.isfinite(timestamp):
+        return None
+    return timestamp
+
+
+def has_stimulus_anchor(
+    event_types: np.ndarray,
+    event_times: np.ndarray,
+) -> bool:
+    """Return whether a finite ``stimulus_onset`` anchor is present.
+
+    Round-4 fail-closed helper for eligibility ledgers: a trial with no
+    ``stimulus_onset`` event, or with one whose timestamp is non-finite
+    (NaN/Inf), has no valid chronology and must be recorded as
+    unavailable rather than fabricated into a behavioural class.
+
+    Args:
+        event_types: 1-D array of event type strings.
+        event_times: 1-D array of corresponding timestamps (ms).
+
+    Returns:
+        ``True`` only when a finite ``stimulus_onset`` timestamp exists.
+    """
+    return find_event_time(event_types, event_times, "stimulus_onset") is not None
 
 
 # ──────────────────────────────────────────────────────────────
@@ -64,6 +110,7 @@ def _check_sustained_speed(
     max_latency_ms: float = 200.0,
     hard_end_ms: Optional[float] = None,
     anchor_min_frames: int = 2,
+    min_coverage: float = SUSTAINED_MIN_COVERAGE,
 ) -> bool:
     """
     Check if velocity remains above threshold for a sustained period.
@@ -119,14 +166,46 @@ def _check_sustained_speed(
             keep pre-stimulus checks strictly pre-stimulus.
         anchor_min_frames: Minimum consecutive above-threshold frames
             required to establish the response anchor (Round-2 MAJOR-C).
+        min_coverage: Minimum fraction of *duration_ms* that must be
+            spanned by recorded frames for an anchored window to be
+            evaluable (Round-4).  A window covering less than this is
+            missing/truncated evidence, so the response is unavailable
+            rather than certified from whatever few frames remain.
 
     Returns:
         True if an above-threshold response initiates within
         *max_latency_ms* and remains above threshold for at least
         ``min_fraction`` of the subsequent *duration_ms* (evaluated
         entirely before *hard_end_ms* when given).
+
+    Round-4 fix: the previous version anchored on the FIRST qualifying
+    frame and divided by whatever frames remained, so a recording that
+    ended 3 frames after response initiation (e.g. onset 2000 ms, frames
+    at 2000/2004/2008 ms) certified a 250-ms sustained response from 8 ms
+    of evidence.  Two root causes are repaired here:
+
+    1. **Coverage.**  The anchored window must span at least
+       *min_coverage* of *duration_ms*; a truncated/missing tail makes
+       the response unavailable.
+    2. **Anchor search.**  When the first qualifying anchor's window is
+       not fully covered, later anchors WITHIN the latency bound are
+       still searched, so a genuine response at 190 ms latency is not
+       discarded because a short burst at 0 ms failed the coverage test.
+       Anchor selection and window boundaries stay strict: only frames
+       before *hard_end_ms* are eligible, and the window still ends at
+       the earliest of ``anchor_t + duration_ms`` and *hard_end_ms*.
     """
     abs_v = np.abs(velocity)
+    if abs_v.size == 0 or time_ms.size == 0 or duration_ms <= 0.0:
+        return False
+
+    distinct_times = np.unique(time_ms)
+    if distinct_times.size < 2 or not np.all(np.isfinite(distinct_times)):
+        return False
+    cadence = float(np.median(np.diff(distinct_times)))
+    if not np.isfinite(cadence) or cadence <= 0.0:
+        return False
+
     search_end = start_ms + max_latency_ms
     if hard_end_ms is not None:
         search_end = min(search_end, hard_end_ms)
@@ -137,11 +216,17 @@ def _check_sustained_speed(
     if above_idx.size == 0:
         return False
 
+    nominal_frames = round(duration_ms / cadence) + 1
+
     # Anchor at response initiation, demanding minimal continuity so a
     # single-frame glitch cannot define the window (Reviewer A MAJOR-C).
     # Round-3 (Reviewer B MINOR-4): anchor_min_frames is configuration-
     # owned, not a function-local magic number.
-    anchor_i: Optional[int] = None
+    # Round-4: iterate over candidate anchors and evaluate the sustained
+    # window at each.  A candidate whose window is truncated (the trial
+    # ends before the response is demonstrated) does not commit the
+    # trial; a later qualifying anchor within the latency bound is still
+    # tested, so an early short burst cannot suppress a genuine response.
     for i in above_idx:
         run = 1
         j = i + 1
@@ -150,27 +235,51 @@ def _check_sustained_speed(
             and (hard_end_ms is None or time_ms[j] < hard_end_ms)
             and abs_v[j] > threshold
             and time_ms[j] - time_ms[i] < max_latency_ms
+            and (time_ms[j] - time_ms[j - 1] <= cadence * 1.5 + 1e-9)
         ):
             run += 1
             j += 1
-        if run >= anchor_min_frames:
-            anchor_i = int(i)
-            break
-    if anchor_i is None:
-        return False
+        if run < anchor_min_frames:
+            continue
 
-    # Truncate the evaluation window at the hard boundary so no
-    # post-boundary frame contaminates a pre-boundary criterion.
-    anchor_t = time_ms[anchor_i]
-    end_ms = anchor_t + duration_ms
-    if hard_end_ms is not None:
-        end_ms = min(end_ms, hard_end_ms)
-    win_mask = (time_ms >= anchor_t) & (time_ms < end_ms)
-    n_frames = int(win_mask.sum())
-    if n_frames == 0:
-        return False
-    above = int(np.sum(abs_v[win_mask] > threshold))
-    return (above / n_frames) >= min_fraction
+        # A candidate whose evaluation window ends before the required
+        # duration (either by hard_end_ms or by the recorded timeline
+        # ceasing prematurely) cannot certify a sustained event.
+        anchor_t = time_ms[i]
+        end_ms = anchor_t + duration_ms
+        if hard_end_ms is not None and end_ms > hard_end_ms:
+            continue
+        win_mask = (time_ms >= anchor_t) & (time_ms < end_ms)
+        n_frames = int(win_mask.sum())
+        if n_frames < anchor_min_frames:
+            continue
+
+        # Coverage guard: the anchored window must span at least
+        # *min_coverage* of the required duration.  The nominal frame
+        # count follows from the trial's own cadence over the full
+        # timeline, never from the candidate window itself.
+        if nominal_frames < 1 or (n_frames / nominal_frames) < min_coverage:
+            continue
+
+        times_win = np.sort(time_ms[win_mask])
+        evidence_span_ms = float(times_win[-1] - anchor_t)
+        if (evidence_span_ms / duration_ms) < min_coverage:
+            continue
+
+        # Endpoint guard: the recorded evaluation window must not end
+        # before the required duration has elapsed.
+        if (end_ms - times_win[-1]) > cadence * 1.5 + 1e-9:
+            continue
+
+        # Temporal-gap guard: a window whose recorded frames leave
+        # a hole larger than the nominal cadence is not contiguous evidence.
+        if np.any(np.diff(times_win) > cadence * 1.5 + 1e-9):
+            continue
+
+        above = int(np.sum(abs_v[win_mask] > threshold))
+        if (above / n_frames) >= min_fraction:
+            return True
+    return False
 
 
 # ──────────────────────────────────────────────────────────────
@@ -221,6 +330,11 @@ def check_prewalk_window(
         min_coverage: Minimum fraction of the nominal window that must
             be populated by recorded frames; sparser baselines fail
             conservatively (cannot demonstrate sustained walking).
+            Round-4: the nominal frame count is derived from the trial's
+            own cadence (median gap over the full recorded timeline),
+            never from the candidate window itself, and a temporal gap
+            larger than the cadence invalidates the window as
+            non-contiguous evidence.
 
     Returns:
         True if the trial shows sustained pre-stimulus locomotion.
@@ -231,17 +345,31 @@ def check_prewalk_window(
     n_frames = int(win_mask.sum())
 
     # Coverage guard: a nearly empty window cannot support the claim.
-    # The nominal frame count follows from the observed sampling
-    # interval (median inter-frame gap inside the window).
+    # The nominal frame count follows from the TRIAL's own cadence,
+    # estimated from the FULL recorded timeline rather than from the
+    # candidate window itself.  Deriving cadence from the window let two
+    # high-speed samples 900 ms apart masquerade as a dense cadence and
+    # fabricate sufficient coverage (Round-4).  When the trial's cadence
+    # cannot be established (fewer than two distinct timestamps) the
+    # window is unsupported evidence and fails conservatively.
     if n_frames < 2:
         return False
-    times_win = time_ms[win_mask]
-    gaps = np.diff(times_win)
-    positive_gaps = gaps[gaps > 0]
-    if positive_gaps.size == 0:
+    distinct_times = np.unique(time_ms)
+    if distinct_times.size < 2 or not np.all(np.isfinite(distinct_times)):
         return False
-    nominal_frames = round(window_ms / float(np.median(positive_gaps))) + 1
+    cadence = float(np.median(np.diff(distinct_times)))
+    if not np.isfinite(cadence) or cadence <= 0.0:
+        return False
+    nominal_frames = round(window_ms / cadence) + 1
     if nominal_frames < 1 or (n_frames / nominal_frames) < min_coverage:
+        return False
+
+    # Temporal-gap guard (Round-4): a window whose recorded frames leave
+    # a hole larger than the nominal cadence is not contiguous evidence.
+    # The above-threshold fraction would then be computed over
+    # disconnected islands and cannot demonstrate sustained locomotion.
+    times_win = np.sort(time_ms[win_mask])
+    if np.any(np.diff(times_win) > cadence * 1.5 + 1e-9):
         return False
 
     above = int(np.sum(abs_v[win_mask] > threshold))

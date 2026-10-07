@@ -9,7 +9,10 @@ import numpy as np
 import pytest
 import torch
 
-from nsmor.pipeline.nested_prior import load_dataset_with_fingerprint
+from nsmor.pipeline.nested_prior import (
+    load_artifact_bytes,
+    load_dataset_with_fingerprint,
+)
 from nsmor.pipeline.resampling import (
     resample_trial_for_model, resolve_model_anchor_frame,
 )
@@ -145,7 +148,7 @@ def test_etl_persists_unavailable_trials_and_model_grid(tmp_path, monkeypatch) -
     monkeypatch.setattr(prep, "_load_trials_and_diagnostics", load_with_unavailable)
     output = tmp_path / "dataset.pt"
     prep.prepare_dataset(raw, output, dt_ms=4.0)
-    data = torch.load(output, weights_only=False)
+    data = load_artifact_bytes(output.read_bytes())
     ledger = data["labeling_eligibility"]
     assert len(ledger) == 26
     assert sum(row["status"] == "labeled" for row in ledger) == 25
@@ -160,6 +163,45 @@ def test_etl_persists_unavailable_trials_and_model_grid(tmp_path, monkeypatch) -
         assert len(x) == record["model_n"] + record["synthetic_prepend_frames"]
         assert record["method"] == "causal_previous_source_sample_hold"
         assert record["model_end_ms"] <= record["source_end_ms"]
+
+
+def test_etl_nonfinite_anchor_is_unavailable_not_a_class(tmp_path, monkeypatch) -> None:
+    """Round-4 #6: a non-finite anchor must land in the ledger, not a label.
+
+    ``prepare_data`` previously checked only for the presence of the
+    ``stimulus_onset`` event NAME, so a trial whose anchor timestamp is
+    NaN would be certified as a behavioural class.  The ledger must record
+    it as unavailable and the labeler must exclude it.
+    """
+    from scripts import prepare_data as prep
+    from tests.test_pipeline import _make_label_audit_csvs
+    import torch
+
+    raw = tmp_path / "raw"
+    _make_label_audit_csvs(raw, n_sessions=5)
+    original_load = prep._load_trials_and_diagnostics
+
+    def load_with_nonfinite(*args, **kwargs):
+        trials, diagnostics, n_kin, n_evt = original_load(*args, **kwargs)
+        corrupt = deepcopy(trials[0])
+        corrupt["trial_id"] = 998
+        mask = corrupt["event_types"] == "stimulus_onset"
+        corrupt["event_times"][mask] = np.nan
+        trials.append(corrupt)
+        return trials, diagnostics, n_kin, n_evt
+
+    monkeypatch.setattr(prep, "_load_trials_and_diagnostics", load_with_nonfinite)
+    output = tmp_path / "dataset.pt"
+    prep.prepare_dataset(raw, output, dt_ms=4.0)
+    data = load_artifact_bytes(output.read_bytes())
+    ledger = data["labeling_eligibility"]
+    assert len(ledger) == 26
+    assert sum(row["status"] == "labeled" for row in ledger) == 25
+    corrupt = [row for row in ledger if row["trial_id"] == 998]
+    assert len(corrupt) == 1
+    assert corrupt[0]["status"] == "unavailable_no_stimulus_anchor"
+    assert corrupt[0]["label"] is None
+    assert 998 not in data["trial_ids"]
 
 
 @pytest.mark.parametrize("origin,n", [(1.1, 17), (1000.1, 101)])

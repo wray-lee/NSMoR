@@ -1739,8 +1739,17 @@ class NSMoRCore(nn.Module):
         sensory_noise_std: float = 0.0,
         lif_tbptt_steps: int = 64,
         dt_ms: float = 10.0,
+        persistence_skip: float = 0.0,
     ) -> None:
         super().__init__()
+        if (
+            isinstance(persistence_skip, bool)
+            or not isinstance(persistence_skip, (int, float))
+            or not math.isfinite(persistence_skip)
+            or not 0.0 <= persistence_skip <= 1.0
+        ):
+            raise ValueError("persistence_skip must be a finite scalar in [0, 1]")
+        self.persistence_skip: float = float(persistence_skip)
         self.sensory_dim = sensory_dim
         self.mcmc_dim = mcmc_dim
         self.hidden_dim = hidden_dim
@@ -1818,8 +1827,43 @@ class NSMoRCore(nn.Module):
             raise ValueError(
                 f"Expected feature dim {expected_dim}, got {X_batch.shape[-1]}"
             )
-
         B, T, _ = X_batch.shape
+
+        if self.persistence_skip != 0.0:
+            if self.sensory_dim < 3:
+                raise ValueError("Nonzero persistence_skip requires sensory_dim >= 3")
+            assert lengths.shape == (B,), (
+                f"Expected lengths ({B},), got {lengths.shape}"
+            )
+            if lengths.dtype not in (
+                torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64,
+            ):
+                raise ValueError("lengths must have an integer, nonboolean dtype")
+            lengths_int = lengths.to(torch.int64)
+            if not torch.all((lengths_int >= 0) & (lengths_int <= T)):
+                raise ValueError(f"lengths must satisfy 0 <= lengths <= T={T}")
+            lengths = lengths_int
+            target_mean = getattr(self, "target_mean", 0.0)
+            target_std = getattr(self, "target_std", 1.0)
+            target_clip = getattr(self, "target_clip_cm_s", 0.0)
+            backend_mean = getattr(self.backend, "target_mean", 0.0)
+            backend_std = getattr(self.backend, "target_std", 1.0)
+            backend_clip = getattr(self.backend, "target_clip_cm_s", 0.0)
+            if (
+                target_mean != 0.0
+                or target_std != 1.0
+                or target_clip != 0.0
+                or backend_mean != 0.0
+                or backend_std != 1.0
+                or backend_clip != 0.0
+            ):
+                raise ValueError(
+                    "persistence_skip requires physical unnormalized/unclipped "
+                    f"mode (got k={self.persistence_skip}), with restored "
+                    f"target_mean={(target_mean, backend_mean)}, "
+                    f"target_std={(target_std, backend_std)}, "
+                    f"target_clip_cm_s={(target_clip, backend_clip)}."
+                )
 
         # ── Unpack input ──
         sensory_x = X_batch[:, :, :self.sensory_dim]
@@ -1863,6 +1907,24 @@ class NSMoRCore(nn.Module):
         #
         # An explicit .detach() would break Phase 1 by severing the
         # gradient path before it reaches the trainable frontend.
+        # Fixed observed-history residual; the recurrent path is unchanged.
+        def _apply_skip(y: torch.Tensor) -> torch.Tensor:
+            if self.persistence_skip != 0.0:
+                v_lag = X_batch[:, :, 2]
+                assert v_lag.shape == (B, T), (
+                    f"Expected lag ({B}, {T}), got {v_lag.shape}"
+                )
+                t_idx = torch.arange(T, device=X_batch.device).unsqueeze(0)
+                mask = t_idx < lengths.to(
+                    device=X_batch.device, dtype=torch.int64,
+                ).unsqueeze(1)
+                assert mask.shape == (B, T), (
+                    f"Expected mask ({B}, {T}), got {mask.shape}"
+                )
+                y = y + self.persistence_skip * torch.where(mask, v_lag, 0.0)
+            assert y.shape == (B, T), f"y shape {tuple(y.shape)} != (B={B}, T={T})"
+            return y
+
         if states is not None:
             y_pred, internals, states_out = self.backend(
                 e_sensory, mcmc_prior, lengths,
@@ -1870,6 +1932,7 @@ class NSMoRCore(nn.Module):
                 override_gates=override_gates,
                 states=states,
             )
+            y_pred = _apply_skip(y_pred)
             # Include frontend dendritic state in states_out so
             # autoregressive checkpoint/restore preserves it.
             if self.frontend._dendritic_enabled:
@@ -1884,12 +1947,14 @@ class NSMoRCore(nn.Module):
                 return_internals=True,
                 override_gates=override_gates,
             )
+            y_pred = _apply_skip(y_pred)
             return y_pred, internals
 
-        return self.backend(
+        y_pred = self.backend(
             e_sensory, mcmc_prior, lengths,
             override_gates=override_gates,
         )
+        return _apply_skip(y_pred)
 
     def freeze_modules(self, module_names: List[str]) -> None:
         """
