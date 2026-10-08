@@ -238,6 +238,11 @@ def test_jax_weight_copy_restores_units_without_torch_backend_hook(normalized_ch
     monkeypatch.setattr(jax_eval, 'JAX_AVAILABLE', True)
     monkeypatch.setattr(jax_eval, 'NSMoRModel', lambda **_kwargs: object())
     monkeypatch.setattr(jax_eval, 'load_from_torch_state_dict', lambda *_args, **_kwargs: {})
+    # The Flax-support guard and input validator are JAX-optional imports (None
+    # without JAX) covered by their own tests, so stub them like the other JAX
+    # symbols here.
+    monkeypatch.setattr(jax_eval, 'assert_flax_supported', lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(jax_eval, 'validate_input_and_lengths', lambda *_args, **_kwargs: None)
     monkeypatch.setattr(jax_eval, 'jnp', SimpleNamespace(asarray=np.asarray))
     wrapper = jax_eval.JAXEvalWrapper.from_torch(model, torch.device('cpu'))
     assert (wrapper.target_mean, wrapper.target_std, wrapper.target_clip_cm_s) == (5.0, 2.0, 100.0)
