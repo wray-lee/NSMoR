@@ -32,14 +32,21 @@ logger = logging.getLogger(__name__)
 try:
     import jax
     import jax.numpy as jnp
-    from nsmor.jax.model import NSMoRModel, load_from_torch_state_dict
+    from nsmor.jax.model import (
+        NSMoRModel,
+        assert_flax_supported,
+        load_from_torch_state_dict,
+        validate_input_and_lengths,
+    )
 
     JAX_AVAILABLE = True
 except ImportError:
     jax = None  # type: ignore[assignment]
     jnp = None  # type: ignore[assignment]
     NSMoRModel = None  # type: ignore[misc, assignment]
+    assert_flax_supported = None  # type: ignore[misc, assignment]
     load_from_torch_state_dict = None  # type: ignore[misc, assignment]
+    validate_input_and_lengths = None  # type: ignore[misc, assignment]
     JAX_AVAILABLE = False
 
 
@@ -81,6 +88,12 @@ class JAXEvalWrapper:
     def from_torch(cls, model: NSMoRCore, device: Optional[torch.device] = None) -> JAXEvalWrapper:
         if not JAX_AVAILABLE:
             raise RuntimeError("JAX is not installed")
+
+        # Fail closed BEFORE any mapping/eval when the Torch model enables a
+        # mechanism the Flax path cannot honor (stacked GRU, dendritic
+        # filtering, STP, hard reset).  A strict backend request must never
+        # silently produce a structurally divergent computation.
+        assert_flax_supported(model, context="JAXEvalWrapper.from_torch")
 
         if device is None:
             try:
@@ -128,11 +141,15 @@ class JAXEvalWrapper:
             gru_neuromod_gain=float(backend.gru_neuromod_gain),
             # Eval is always deterministic=True, so dropout is inert; copied
             # anyway so the wrapper stays faithful if that ever changes.
-            dropout_rate=float(getattr(model.direction_head.net[2], "p", 0.1)),
+            dropout_rate=float(getattr(model.direction_head, "dropout_rate", 0.1)),
             sensory_noise_std=float(model.sensory_encoder.noise_std),
             persistence_skip=k,
+            activation=str(getattr(model, "activation", "relu")),
         )
-        params = load_from_torch_state_dict(jax_model, model.state_dict())
+        params = load_from_torch_state_dict(
+            jax_model, model.state_dict(), source=model,
+            context="JAXEvalWrapper.from_torch",
+        )
         wrapper = cls(
             jax_model=jax_model,
             params=params,
@@ -206,17 +223,18 @@ class JAXEvalWrapper:
 
         B, T, D = X_batch.shape
         assert D == self.sensory_dim + self.mcmc_dim
+        # Unconditional input/length/finiteness preflight on the host BEFORE
+        # the int32 cast or the compiled apply (NOT gated on persistence_skip).
+        # The shared validator rejects fractional/negative/overlong lengths and
+        # nonfinite valid frames; an invalid padded suffix stays harmless.
+        validate_input_and_lengths(
+            X_batch.detach().cpu().numpy(),
+            lengths.detach().cpu().numpy(),
+            context="JAXEvalWrapper",
+        )
         if getattr(self, "persistence_skip", 0.0) != 0.0:
             if self.sensory_dim < 3:
                 raise ValueError("Nonzero persistence_skip requires sensory_dim >= 3")
-            assert lengths.shape == (B,), (
-                f"Expected lengths ({B},), got {lengths.shape}"
-            )
-            l_np = lengths.detach().cpu().numpy()
-            if not np.issubdtype(l_np.dtype, np.integer):
-                raise ValueError("lengths must have an integer, nonboolean dtype")
-            if not np.all((l_np >= 0) & (l_np <= T)):
-                raise ValueError(f"lengths must satisfy 0 <= lengths <= T={T}")
             target_mean = getattr(self, "target_mean", 0.0)
             target_std = getattr(self, "target_std", 1.0)
             target_clip = getattr(self, "target_clip_cm_s", 0.0)

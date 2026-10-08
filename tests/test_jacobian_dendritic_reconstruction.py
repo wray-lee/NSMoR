@@ -87,6 +87,9 @@ def test_reconstruction_falls_back_to_sensory_encoder_without_frontend(monkeypat
     """Legacy probe models with no ``.frontend`` keep the inner-encoder path."""
 
     class ProbeModel(torch.nn.Module):
+        # r6 R8: declare the routed gru_hidden IS the raw recurrent coordinate.
+        gru_hidden_is_raw = True
+
         def __init__(self) -> None:
             super().__init__()
             self.dt_ms, self.sensory_dim, self.hidden_dim = 4.0, 4, 8

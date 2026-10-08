@@ -7,6 +7,12 @@
 - **⚠️ Email Redaction Hazard**: Claude Code 环境会将邮箱地址脱敏为 `[EMAIL_REDACTED]`。若 `git config user.email` 被环境或 agent 意外写入字面量 `[EMAIL_REDACTED]`，后续所有 commit 将无法关联 GitHub 账户（无头像、不计入 contribution）。**每次 session 开始时必须验证**：`git config user.email` 输出的是真实邮箱 `i@wray7.top` 而非 `[EMAIL_REDACTED]`。如不正确，立即执行 `git config user.email 'i@wray7.top'`。
 - **WSL Execution Environment**: All python/pytest/bash operations run in WSL Zsh with `t` conda activate alias.
 - **Workflow 定点失败重试（CRITICAL）**: Workflow 内部 subagent 失败时，只重启或补跑指定的失败 subagent；不得停止或重启整个 Workflow、重跑成功项或打断正常运行的 subagent。先用 journal 定位失败项并保留成功结果；若无单项重试接口，用只含失败项的最小补跑 Workflow，再接入必要的后续步骤。不得仅凭 `resume` 调用声称缓存已复用，必须以实际执行记录确认。
+- **Claude Pro 并行 Agent 熔断与模型分级规则（CRITICAL）**:
+  - **背景与风控**: Claude Pro 属于交互式（interactive）配额体系，无法承受高阶模型大并发（实测 12 个 Opus 5.5 xhigh 并行 agent 会在 17.5 分钟内耗尽 90% 的 5 小时配额并触发 44 分钟 429 Rate Limit）。
+  - **派发 >= 4 并行 subagent 前强制检查**:
+    1. **模型分级（Tiering）**: 有明确 rubric / checklist / 可验证探针的 segment 或 worker 任务，**必须**使用 Sonnet 或 subagent 默认模型（Sonnet / subagent 默认模型不设并发限制），优先 subagent 默认模型，若困难部分分配sonnet；仅在需要跨分段裁决冲突、给出最终结论的 synthesis 节点允许使用顶级模型（Opus/Fable）。**严禁全员 Opus/Fable + xhigh 并行**。
+    2. **顶级模型并发上限**: 单个 Pro 环境下，Opus / Fable 顶级模型并行数 **<= 3**。
+    3. **并发例外**: Sonnet / subagent 默认模型不设置并发上限
 
 ---
 

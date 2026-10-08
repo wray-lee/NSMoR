@@ -31,11 +31,11 @@ Stage 2 of the Hybrid Funnel architecture, containing the dual-pathway recurrent
 _Avoid_: backend, decision core, stage 2
 
 **SensoryEncoder**:
-A feedforward module mapping 4-D raw sensory features to hidden representations with optional Gaussian noise injection for stochastic resonance.
+A feedforward module mapping 4-D raw sensory features to hidden representations with optional Gaussian noise injection for stochastic resonance. Its activation is configurable via ``ModelConfig.activation``: ``"relu"`` (default, historical) or ``"swiglu"`` (opt-in gated activation ``SiLU(W_gate x) ⊙ (W_value x)``, Shazeer 2020).
 _Avoid_: input encoder, feature encoder
 
 **DirectionHead**:
-The final decoder module that maps integrated hidden representations to scalar velocity predictions.
+The final decoder module that maps integrated hidden representations to scalar velocity predictions. Shares the ``ModelConfig.activation`` choice with the SensoryEncoder; ``"swiglu"`` adds gated projections before a ``Linear(H, 1)`` readout.
 _Avoid_: decoder, output head, prediction head
 
 **Hybrid Funnel**:
@@ -115,7 +115,7 @@ _Avoid_: non-responder, inactive
 ### Training
 
 **BioJointLoss**:
-Composite loss function combining masked MSE, router regularization (penalizing GRU Pathway collapse), ATP metabolic energy cost, population sparsity L1 penalty, temporal coherence (jerk) penalty, and optional Routing Auxiliary Loss.
+Composite loss function combining masked MSE, router regularization (penalizing GRU Pathway collapse), ATP metabolic energy cost, population sparsity L1 penalty, temporal-coherence smoothness (``lambda_jerk``, a frame-based third-velocity-difference proxy — NOT physical jerk), and optional Routing Auxiliary Loss.
 _Avoid_: loss, joint loss, bio loss
 
 **Routing Auxiliary Loss**:

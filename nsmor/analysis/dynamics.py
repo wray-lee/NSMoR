@@ -25,7 +25,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from nsmor.model_nsmor_core import NSMoRCore
+from nsmor.model_nsmor_core import NSMoRCore, refinement_module_present
 
 
 logger = logging.getLogger(__name__)
@@ -49,6 +49,115 @@ def _has_expanding_eigenmode(eigenvalues: torch.Tensor) -> bool:
         eigenvalues[index].item(), magnitudes[index].item(),
     )
     return True
+
+
+def assert_supported_gru_depth(model: nn.Module, *, context: str) -> None:
+    """Fail closed when the model stacks more than one GRU layer.
+
+    The fixed-point/Jacobian adapters map a single ``(H,) -> (H,)``
+    recurrent step (``h_{t+1} = GRU(x_t, h_t)``).  A stacked GRU's
+    top-layer state also depends on the lower layers, so a one-layer
+    h-state map cannot certify stacked dynamics; refuse rather than
+    silently analyse layer 0.  A model that exposes no GRU layer count
+    (duck-typed probes) is treated as single-layer.
+    """
+    gru_unit = getattr(getattr(model, "backend", None), "gru_unit", None)
+    if gru_unit is None:
+        gru_unit = getattr(model, "gru_unit", None)
+    gru = getattr(gru_unit, "gru", None)
+    num_layers = int(
+        getattr(gru, "num_layers", getattr(gru_unit, "num_layers", 1))
+    )
+    if num_layers != 1:
+        raise ValueError(
+            f"{context} supports a single-layer GRU only; got "
+            f"num_layers={num_layers}. A one-layer (H,) -> (H,) recurrent "
+            f"map cannot certify stacked-GRU dynamics; use "
+            f"num_gru_layers=1 (no silent layer-0 fallback)."
+        )
+
+
+def assert_no_adaptive_refinement_for_full_jacobian(
+    model: nn.Module, *, context: str,
+) -> None:
+    """Refuse a full-system Jacobian whenever the model carries refinement.
+
+    R1 / finding B11: the differentiated coordinate is the PRE-refinement blend
+    ``h_out = g_lif*lif_spikes + g_gru*gru_hidden`` (model_nsmor_core.py:2857),
+    computed BEFORE the refinement block runs (:2865).  When the model carries
+    a refinement module, the model's actual readout is the refined latent, so
+    the returned ``dh_out/dx`` is a partial derivative of an INTERNAL
+    coordinate, not of the system's output map — it would be reported at an
+    unstated coordinate.  This holds for both the adaptive (ACT halt) and the
+    fixed-depth modes, so both are refused.  (The earlier "discrete ACT depth"
+    rationale was incorrect: the discrete halt is downstream of ``h_out`` and
+    is not what is differentiated here.)
+
+    The GRU-pathway fixed-point/Jacobian coordinate stays the RAW GRU state
+    (``gru_hidden_raw``) and is unaffected: the refined latent is a readout, not
+    a new autonomous recurrent state.
+    """
+    if refinement_module_present(model):
+        backend = getattr(model, "backend", model)
+        mode = getattr(backend, "refinement_mode", None)
+        raise ValueError(
+            f"{context}: full-system Jacobian is refused while the model "
+            f"carries a refinement module (refinement_mode={mode!r}). The "
+            f"differentiated coordinate h_out is the pre-refinement blend, not "
+            f"the model's refined readout, so dh_out/dx would be a partial "
+            f"derivative at an unstated coordinate. Analyse the raw GRU "
+            f"coordinate instead, or construct with refinement_mode='off'."
+        )
+
+
+def raw_gru_trajectory(
+    model: nn.Module,
+    internals: Dict[str, torch.Tensor],
+    *,
+    context: str,
+) -> torch.Tensor:
+    """Return the RAW recurrent GRU trajectory ``(B, T, H)``.
+
+    Scientific fixed-point/Jacobian/slow-point/residual analysis needs
+    the actual recurrent coordinate.  ``internals["gru_hidden"]`` is the
+    routed output and, when the neuromodulatory gain is enabled, is the
+    gain-scaled trajectory — using it as a recurrent coordinate is
+    wrong.  Prefer the additive ``gru_hidden_raw`` key (r5 R5).
+
+    When ``gru_hidden_raw`` is absent, the routed ``gru_hidden`` is accepted
+    as the raw coordinate ONLY under an EXPLICIT known-safe declaration:
+    either ``model.gru_hidden_is_raw is True`` (the model asserts its routed
+    output IS the raw state) or a gain attribute that is PRESENT and exactly
+    ``0.0`` (gain disabled, so routed output equals the raw state).  Missing
+    gain metadata is UNKNOWN, not unit gain: a legacy module that exports a
+    scaled ``gru_hidden`` with no gain attribute is rejected rather than
+    silently analysed at the wrong recurrent coordinate (r6 R8).
+    """
+    raw = internals.get("gru_hidden_raw")
+    if raw is not None:
+        return raw
+    # Explicit "the routed output IS raw" declaration.
+    if getattr(model, "gru_hidden_is_raw", None) is True:
+        return internals["gru_hidden"]
+    _UNSET = object()
+    gain = getattr(model, "gru_neuromod_gain", _UNSET)
+    if gain is _UNSET:
+        gain = getattr(getattr(model, "backend", None), "gru_neuromod_gain", _UNSET)
+    if gain is _UNSET:
+        raise ValueError(
+            f"{context}: internals expose no 'gru_hidden_raw' and the model "
+            f"declares neither 'gru_hidden_is_raw=True' nor a "
+            f"'gru_neuromod_gain'; the gain is UNKNOWN, so the routed "
+            f"'gru_hidden' cannot be trusted as a raw recurrent coordinate."
+        )
+    if float(gain) != 0.0:
+        raise ValueError(
+            f"{context}: internals expose no 'gru_hidden_raw' while the "
+            f"model enables neuromodulatory gain (gru_neuromod_gain={gain}); "
+            f"the routed 'gru_hidden' is gain-scaled and cannot be used as a "
+            f"raw recurrent coordinate."
+        )
+    return internals["gru_hidden"]
 
 
 class FixedPointAdapter:
@@ -82,6 +191,9 @@ class FixedPointAdapter:
     ) -> None:
         self.model = model
         self.model.eval()
+
+        # R6: refuse stacked GRU before reporting a one-layer HxH operator.
+        assert_supported_gru_depth(model, context="FixedPointAdapter")
 
         if device is None:
             device = next(model.parameters()).device
@@ -141,8 +253,11 @@ class FixedPointAdapter:
                 x_batch, lengths, return_internals=True,
             )
 
-            # gru_hidden: (B, T, H)
-            gru_hidden = internals["gru_hidden"]
+            # Raw recurrent trajectory: (B, T, H).  ``gru_hidden`` is the
+            # routed (post-gain) output; use the raw coordinate (r5 R5).
+            gru_hidden = raw_gru_trajectory(
+                self.model, internals, context="FixedPointAdapter.extract_gru_states",
+            )
 
             # ── Shape assertion ──
             H = gru_hidden.shape[2]
@@ -616,7 +731,14 @@ class FixedPointAdapter:
 
         Raises:
             AssertionError: If tensor shapes are inconsistent.
+            ValueError: If the model carries a refinement module (the
+                differentiated coordinate is the pre-refinement blend, not the
+                model's refined readout; the Jacobian is refused rather than
+                reported at an unstated coordinate).
         """
+        assert_no_adaptive_refinement_for_full_jacobian(
+            self.model, context="compute_full_system_jacobian",
+        )
         H = self.model.hidden_dim
 
         # Ensure input has gradients

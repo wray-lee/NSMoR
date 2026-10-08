@@ -37,6 +37,15 @@ class ModelConfig:
     num_gru_layers: int = 1
     dropout: float = 0.1
 
+    # Activation used by the sensory encoder and the direction head.
+    # ``"relu"`` (default) preserves the historical architecture and its
+    # exact state_dict keys.  ``"swiglu"`` opts into a genuine gated
+    # activation ``SiLU(W_gate x) * (W_value x)`` (Shazeer 2020,
+    # "GLU Variants Improve Transformer").  Gating is a coarse model of
+    # multiplicative dendritic/synaptic gating and is offered as a
+    # HYPOTHESIS, not as evidence about the real cricket circuit.
+    activation: str = "relu"
+
     # Physical sampling interval (ms).  ALL time constants below are
     # declared in PHYSICAL TIME (ms) and converted internally via
     #   alpha = exp(-dt_ms / tau_ms)
@@ -104,7 +113,24 @@ class ModelConfig:
     # Fixed observed-history residual; zero preserves historical predictions.
     persistence_skip: float = 0.0
 
+    # ── Adaptive latent refinement (architecture v1) ──
+    # A SHARED bounded residual block (+ shared halt head) applied to the
+    # post-fusion latent.  ``"off"`` (default) leaves the parameter tree and
+    # numerics bitwise unchanged.  ``"fixed"`` runs ``refinement_max_steps``
+    # shared-block applications per valid row (a matched-capacity control);
+    # ``"adaptive"`` learns a per-row depth via ACT-style cumulative halting.
+    # This is representational refinement, NOT additional biological time: one
+    # external timestep still advances the LIF/GRU state exactly once.
+    refinement_mode: str = "off"
+    refinement_max_steps: int = 4
+    refinement_eps: float = 0.01
+    refinement_update_scale: float = 1.0
+
     def __post_init__(self) -> None:
+        if self.activation not in ("relu", "swiglu"):
+            raise ValueError(
+                f"activation must be 'relu' or 'swiglu', got {self.activation!r}"
+            )
         if (
             isinstance(self.persistence_skip, bool)
             or not isinstance(self.persistence_skip, (int, float))
@@ -113,6 +139,39 @@ class ModelConfig:
             raise ValueError("persistence_skip must be a finite scalar in [0, 1]")
         if not 0.0 <= self.persistence_skip <= 1.0:
             raise ValueError("persistence_skip must be in [0, 1]")
+        if self.refinement_mode not in ("off", "fixed", "adaptive"):
+            raise ValueError(
+                "refinement_mode must be 'off'/'fixed'/'adaptive', got "
+                f"{self.refinement_mode!r}"
+            )
+        if (
+            isinstance(self.refinement_max_steps, bool)
+            or not isinstance(self.refinement_max_steps, int)
+            or self.refinement_max_steps < 1
+        ):
+            raise ValueError(
+                "refinement_max_steps must be an int >= 1, got "
+                f"{self.refinement_max_steps!r}"
+            )
+        if (
+            isinstance(self.refinement_eps, bool)
+            or not isinstance(self.refinement_eps, (int, float))
+            or not math.isfinite(self.refinement_eps)
+            or not 0.0 < float(self.refinement_eps) < 1.0
+        ):
+            raise ValueError(
+                f"refinement_eps must be in (0, 1), got {self.refinement_eps!r}"
+            )
+        if (
+            isinstance(self.refinement_update_scale, bool)
+            or not isinstance(self.refinement_update_scale, (int, float))
+            or not math.isfinite(self.refinement_update_scale)
+            or self.refinement_update_scale <= 0.0
+        ):
+            raise ValueError(
+                "refinement_update_scale must be finite > 0, got "
+                f"{self.refinement_update_scale!r}"
+            )
 
 
 @dataclass
@@ -320,7 +379,13 @@ class LossConfig:
     lambda_sparse: float = 0.0
     """Population sparsity L1 weight (Olshausen & Field 1996). 0 disables."""
     lambda_jerk: float = 0.0
-    """Temporal coherence (jerk penalty) weight (Gabbiani et al. 1999). 0 disables."""
+    """Frame-based third-velocity-difference smoothness weight.
+
+    Legacy parameter name ("jerk"); the penalty is the squared third finite
+    difference of the scalar velocity on the sampled frame grid, with no
+    ``dt`` scaling — a smoothness proxy, NOT physical jerk.  The numerics are
+    unchanged for checkpoint/experiment compatibility. 0 disables.
+    """
     lambda_routing_aux: float = 0.0
     """Auxiliary routing differentiation weight (Ticket #15).
 
@@ -342,6 +407,16 @@ class LossConfig:
     (~0.185) and could never saturate. Peri-stimulus top-k saturates
     both groups and is not used.
     """
+    lambda_compute: float = 0.0
+    """Adaptive-refinement compute-cost weight (architecture v1).
+
+    Scales the ACT ponder surrogate (``N.detach() + R`` averaged over valid
+    tokens) produced by the adaptive refinement module.  ``0.0`` (default)
+    leaves the loss bitwise unchanged — the term is never added.  A positive
+    value requires ``model.refinement_mode != 'off'`` and the model's
+    ``refinement_ponder_cost``; a missing/nonfinite cost is refused (no bypass
+    flag).  NOT warmup-scaled (the compute budget is a hard objective, not a
+    bio-regularizer to ramp)."""
     jerk_threshold: float = 0.1
     """Threshold for sudden-change jerk mask (unused when mask=None)."""
     warmup_epochs: int = 0
@@ -463,6 +538,33 @@ class ExperimentConfig:
                     "persistence_skip requires physical unnormalized and unclipped "
                     "mode (normalize_targets=False, target_clip_cm_s=0)."
                 )
+        if (
+            isinstance(self.loss.lambda_compute, bool)
+            or not isinstance(self.loss.lambda_compute, (int, float))
+            or not math.isfinite(self.loss.lambda_compute)
+            or self.loss.lambda_compute < 0.0
+        ):
+            raise ValueError(
+                "lambda_compute must be a finite scalar >= 0, got "
+                f"{self.loss.lambda_compute!r}"
+            )
+        # A compute-cost objective with no refinement module would have no
+        # ponder cost to penalize; refuse rather than silently no-op.
+        if self.loss.lambda_compute > 0.0 and self.model.refinement_mode == "off":
+            raise ValueError(
+                "lambda_compute > 0 requires an enabled refinement module "
+                "(model.refinement_mode in {'fixed','adaptive'}), got 'off'."
+            )
+        # Adaptive TRAINING requires a positive explicit compute cost (the ACT
+        # depth is only trainable through the ponder surrogate at the loss
+        # seam).  Refuse rather than silently train an unbudgeted adaptive
+        # model — no bypass flag.
+        if self.model.refinement_mode == "adaptive" and self.loss.lambda_compute <= 0.0:
+            raise ValueError(
+                "refinement_mode='adaptive' requires lambda_compute > 0 (the ACT "
+                "depth is trained only through the compute-cost surrogate); got "
+                f"lambda_compute={self.loss.lambda_compute!r}."
+            )
 
     # ── Serialisation ────────────────────────────────────────
 
