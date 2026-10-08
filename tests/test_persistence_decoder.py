@@ -6,7 +6,12 @@ tests pin the contract that the residual is a *pure additive output* term:
 
 1. Bit-exact legacy parity at ``persistence_skip=0.0`` against the immutable
    historical source object (git commit ``65b9d1a7...``), including strict
-   state-dict loading and every internal/state tensor.
+   state-dict loading.  Parity is claimed on the prediction ``y`` and on every
+   internal tensor over VALID (non-padded) frames only; padded-frame internals
+   and the exported recurrent carries are deliberately NOT bit-exact (the
+   corrected core sanitizes padding and exports a per-sample carry, whereas the
+   historical object advanced through padded garbage -- see the relaxations in
+   ``test_bit_exact_parity_with_historical_object``).
 2. Fixed additive effect on active frames for finite ``k`` in (0, 1], with
    padding frames and all recurrent internals bit-identical.
 3. Gradient parity between a deterministic k=0 model and a nonzero-k model
@@ -112,6 +117,17 @@ def _clone_with_skip(model: NSMoRCore, k: float) -> NSMoRCore:
     return clone
 
 
+def _solo_states(
+    model: NSMoRCore,
+    x: torch.Tensor,
+    lengths: torch.Tensor,
+) -> Dict[str, torch.Tensor]:
+    """Export carry states for a single sample run at exactly ``lengths``."""
+    with torch.no_grad():
+        _, _, states = model(x, lengths, return_internals=True, states={})
+    return states
+
+
 def _parameter_grads(
     model: NSMoRCore,
     x: torch.Tensor,
@@ -165,12 +181,47 @@ def test_bit_exact_parity_with_historical_object(sensory_dim: int) -> None:
 
     assert torch.equal(y_hist, y_k0)
     assert torch.equal(y_hist_s, y_k0_s)
-    assert int_hist.keys() == int_k0.keys()
+    # The historical internals key set must be preserved exactly; the corrected
+    # core adds ONLY the documented additive raw recurrent trajectory key
+    # (r5 R5).  With the gain disabled it equals the routed ``gru_hidden``.
+    assert set(int_k0) - set(int_hist) == {"gru_hidden_raw"}
+    assert set(int_hist) <= set(int_k0)
+    assert torch.equal(int_k0["gru_hidden_raw"], int_hist["gru_hidden"])
+    # Valid (non-padded) frames are bit-exact against the historical object.
+    # Padded-frame *internals* intentionally differ: the corrected core
+    # sanitizes invalid frames BEFORE computation (invalid padding must never
+    # be computed into NaN/overflow state), whereas the historical object
+    # advanced the encoder/router through padded garbage.  This is the defect
+    # this batch fixes; the prediction ``y`` above stays bit-exact on every
+    # frame (the additive residual is zero off the valid support).
+    _valid = (torch.arange(x.shape[1]).unsqueeze(0) < lengths.unsqueeze(1))
     for key in int_hist:
-        assert torch.equal(int_hist[key], int_k0[key]), key
+        a, b = int_hist[key], int_k0[key]
+        assert a.shape == b.shape
+        assert torch.equal(a[_valid], b[_valid]), key
     assert st_hist.keys() == st_k0.keys()
+    # Outputs and internals are bit-exact.  The exported *carry* is now
+    # per-sample: the historical object advanced the recurrent state through
+    # PADDED frames (the defect this batch fixes), so its carry on the padded
+    # suffix is contaminated.  The corrected carry must instead equal a solo
+    # run of each sample at its own true length.
     for key in st_hist:
-        assert torch.equal(st_hist[key], st_k0[key]), key
+        a, b = st_hist[key], st_k0[key]
+        assert a.shape == b.shape
+        axis = 1 if key == "gru_h" else 0  # gru_h is (num_layers, B, H)
+        for i in range(x.shape[0]):
+            solo = _solo_states(current, x[i:i + 1], lengths[i:i + 1])
+            got = b.select(axis, i)
+            want = solo[key].select(axis, 0)
+            # A solo (B=1) run differs from the batched run only in the last
+            # float bits (batch-dependent matmul reduction order).
+            assert torch.allclose(got, want, atol=1e-6, rtol=1e-5), (
+                f"{key} sample {i} carry != run at its true length"
+            )
+        # Full-length samples must additionally match the historical object.
+        for i in range(x.shape[0]):
+            if int(lengths[i]) == x.shape[1]:
+                assert torch.equal(a.select(axis, i), b.select(axis, i)), key
 
 
 @pytest.mark.parametrize("sensory_dim", [4, 2])

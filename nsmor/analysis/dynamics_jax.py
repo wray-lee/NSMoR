@@ -39,7 +39,11 @@ except ImportError:
     lax = None
     JAX_AVAILABLE = False
 
-from nsmor.analysis.dynamics import FixedPointAdapter, _has_expanding_eigenmode
+from nsmor.analysis.dynamics import (
+    FixedPointAdapter,
+    _has_expanding_eigenmode,
+    assert_supported_gru_depth,
+)
 from nsmor.model_nsmor_core import NSMoRCore
 
 logger = logging.getLogger(__name__)
@@ -156,6 +160,10 @@ class FixedPointAdapterJAX:
         """
         self.model = model
         self.model.eval()
+
+        # R6: refuse stacked GRU before copying layer-0 weights as if they
+        # were the whole recurrent operator.
+        assert_supported_gru_depth(model, context="FixedPointAdapterJAX")
 
         if device is None:
             device = next(model.parameters()).device

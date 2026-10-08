@@ -17,6 +17,34 @@ model:
   num_gru_layers: 1       # stacked GRU layers
   dropout: 0.1            # dropout in GRU and decoder
 
+  # Activation for the sensory encoder and direction head.
+  #   relu   (default) — historical architecture; state_dict keys and
+  #                      predictions are unchanged.
+  #   swiglu           — opt-in gated activation SiLU(W_gate x) * (W_value x)
+  #                      (Shazeer 2020, "GLU Variants Improve Transformer").
+  # Prospective only: it is NOT part of the frozen optimization experiment and
+  # adds no new science controls there.  Gating is a coarse model of
+  # multiplicative dendritic/synaptic gating — a hypothesis, not animal proof.
+  # Enable with a config override, e.g.:
+  #   python scripts/train.py --config config/default.yaml --output_dir runs/swiglu
+  # after setting `activation: swiglu` here (or in a derived config).
+  activation: relu
+
+  # ── Adaptive latent refinement (architecture v1) ──────────────
+  # A SHARED bounded residual block (+ shared halt head) applied to the
+  # post-fusion latent, before the direction head.  Representational
+  # refinement only — one external timestep still advances LIF/GRU once.
+  #   off      (default) — no refinement parameters; historical numerics
+  #                        and state_dict keys are unchanged.
+  #   fixed    — shared block applied refinement_max_steps times per valid
+  #              row (matched-capacity control).
+  #   adaptive — learned per-row depth via ACT cumulative halting.
+  # Raw JAX / Flax backends reject an enabled mode (not implemented there).
+  refinement_mode: "off"
+  refinement_max_steps: 4        # max internal depth K (>= 1)
+  refinement_eps: 0.01           # ACT halt when cumulative p >= 1 - eps
+  refinement_update_scale: 1.0   # bound on per-step residual update
+
   # Physical model-grid interval (ms). All lif_tau_* below are declared
   # in PHYSICAL ms and converted internally via alpha = exp(-dt/tau).
   # Reviewer Round-1 BLOCKER-1: changing the model-grid interval can no
@@ -126,9 +154,11 @@ loss:
   lambda_reg: 0.2           # router anti-collapse; NOT warmup-scaled
   lambda_energy: 0.001        # ATP metabolic cost (0 disables)
   lambda_sparse: 0.005        # population sparsity L1 (0 disables)
-  lambda_jerk: 0.005         # temporal coherence / jerk penalty (0 disables)
+  lambda_jerk: 0.005         # frame-based 3rd-velocity-difference smoothness proxy
+                             # (legacy name "jerk"; NOT physical jerk, no dt scaling; 0 disables)
   lambda_routing_aux: 0.0    # auxiliary routing separation (Ticket #15; 0 disables; warmup-scaled)
   routing_aux_margin: 0.024  # hinge on trial-mean g_lif (1.0× pooled std; backup corpus)
+  lambda_compute: 0.0        # adaptive-refinement compute cost (0 disables; requires refinement_mode != off)
   jerk_threshold: 0.1       # sudden-change jerk mask threshold
   warmup_epochs: 20          # CF9: extended warmup for new biophysical mechanisms
 

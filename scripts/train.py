@@ -441,6 +441,57 @@ def _decode_numpy_rng_state(record: Any) -> tuple:
     )
 
 
+# R3 / A5, B14: mechanism settings that change the model's ARCHITECTURE or the
+# loss, not merely its numeric coefficients.  Fixed and adaptive refinement
+# share one parameter tree, so a strict ``load_state_dict`` accepts a resume
+# under different flags and silently continues as a DIFFERENT control arm.  The
+# preflight below compares these exact leaves against the active config.
+_ARCHITECTURE_CONFIG_LEAVES: Tuple[Tuple[str, str], ...] = (
+    ("model", "refinement_mode"),
+    ("model", "refinement_max_steps"),
+    ("model", "refinement_eps"),
+    ("model", "refinement_update_scale"),
+    ("model", "activation"),
+    ("loss", "lambda_compute"),
+)
+
+
+def _require_architecture_config_match(
+    ckpt: Dict[str, Any], config: ExperimentConfig, ckpt_path: Path,
+) -> None:
+    """Fail closed when a resume switches an architecture-defining setting.
+
+    A checkpoint stores ``config.to_dict()``.  This compares the recorded
+    refinement / activation / ``lambda_compute`` leaves against the ACTIVE
+    config and refuses any mismatch, so a resume can never silently continue as
+    a different architecture (finding R3 / A5, B14).  Legacy checkpoints
+    without a stored config are left to the existing limited fallback.
+    """
+    ckpt_cfg = ckpt.get("config")
+    if not isinstance(ckpt_cfg, dict):
+        return
+    active = config.to_dict()
+    mismatches: List[str] = []
+    for section, leaf in _ARCHITECTURE_CONFIG_LEAVES:
+        ckpt_section = ckpt_cfg.get(section)
+        if not isinstance(ckpt_section, dict) or leaf not in ckpt_section:
+            continue
+        recorded = ckpt_section[leaf]
+        current = active[section][leaf]
+        if recorded != current:
+            mismatches.append(
+                f"{section}.{leaf}: checkpoint={recorded!r} vs active={current!r}"
+            )
+    if mismatches:
+        raise ValueError(
+            f"Resume checkpoint {ckpt_path} was trained with a different "
+            f"architecture/loss configuration: {'; '.join(mismatches)}. "
+            "Fixed and adaptive refinement share one parameter tree, so a "
+            "strict load would silently continue as another control arm. "
+            "Refusing resume (fail closed)."
+        )
+
+
 def _require_complete_current_schema(
     ckpt: Dict[str, Any], ckpt_path: Path,
 ) -> None:
@@ -1706,6 +1757,41 @@ def build_arg_parser() -> argparse.ArgumentParser:
              "Restricted to normalize_targets=False and target_clip_cm_s=0.0.",
     )
 
+    # ── Adaptive latent refinement (architecture v1) ──────────
+    parser.add_argument(
+        "--refinement_mode",
+        type=str,
+        default=None,
+        choices=["off", "fixed", "adaptive"],
+        help="Adaptive latent refinement mode: off (default), fixed, or "
+             "adaptive. Raw JAX/Flax backends reject an enabled mode.",
+    )
+    parser.add_argument(
+        "--refinement_max_steps",
+        type=int,
+        default=None,
+        help="Maximum internal refinement depth K (>= 1). Default 4.",
+    )
+    parser.add_argument(
+        "--refinement_eps",
+        type=float,
+        default=None,
+        help="ACT halting threshold in (0, 1). Default 0.01.",
+    )
+    parser.add_argument(
+        "--refinement_update_scale",
+        type=float,
+        default=None,
+        help="Bound on the per-step residual update (> 0). Default 1.0.",
+    )
+    parser.add_argument(
+        "--lambda_compute",
+        type=float,
+        default=None,
+        help="Adaptive-refinement compute-cost weight (>= 0). Default 0.0. "
+             "Required > 0 for adaptive training.",
+    )
+
     # ── Checkpointing ─────────────────────────────────────────
     parser.add_argument(
         "--resume",
@@ -1784,6 +1870,16 @@ def build_config(argv: Optional[Sequence[str]] = None) -> Tuple[ExperimentConfig
         config.training.target_clip_cm_s = args.target_clip_cm_s
     if getattr(args, "persistence_skip", None) is not None:
         config.model.persistence_skip = args.persistence_skip
+    if getattr(args, "refinement_mode", None) is not None:
+        config.model.refinement_mode = args.refinement_mode
+    if getattr(args, "refinement_max_steps", None) is not None:
+        config.model.refinement_max_steps = args.refinement_max_steps
+    if getattr(args, "refinement_eps", None) is not None:
+        config.model.refinement_eps = args.refinement_eps
+    if getattr(args, "refinement_update_scale", None) is not None:
+        config.model.refinement_update_scale = args.refinement_update_scale
+    if getattr(args, "lambda_compute", None) is not None:
+        config.loss.lambda_compute = args.lambda_compute
     config.validate()
     if args.freeze is not None:
         config.finetune.freeze_modules = args.freeze
@@ -1855,6 +1951,11 @@ def build_model(config: ExperimentConfig) -> NSMoRCore:
         sensory_noise_std=config.model.sensory_noise_std,
         lif_tbptt_steps=config.model.lif_tbptt_steps,
         persistence_skip=config.model.persistence_skip,
+        activation=config.model.activation,
+        refinement_mode=config.model.refinement_mode,
+        refinement_max_steps=config.model.refinement_max_steps,
+        refinement_eps=config.model.refinement_eps,
+        refinement_update_scale=config.model.refinement_update_scale,
     )
     param_count = sum(p.numel() for p in model.parameters())
     logger.info("Model initialized — %s parameters", f"{param_count:,}")
@@ -2775,6 +2876,7 @@ def train_one_epoch(
     lambda_routing_aux: float = 0.0,
     wind_only_mask_full: Optional[np.ndarray] = None,
     routing_aux_margin: float = 0.024,
+    lambda_compute: float = 0.0,
 ) -> float:
     """
     Run one training epoch.
@@ -2789,7 +2891,8 @@ def train_one_epoch(
         lambda_reg: Router regularization weight.
         lambda_energy: ATP metabolic cost weight.
         lambda_sparse: Population sparsity L1 weight.
-        lambda_jerk: Temporal coherence weight.
+        lambda_jerk: Frame-based third-velocity-difference smoothness weight
+            (legacy name "jerk"; NOT physical jerk — no dt scaling).
         annealing_factor: Scaling factor for bio-loss lambdas.
         grad_clip_norm: Max gradient norm for clipping.
         log_interval: Log every N batches.
@@ -2865,6 +2968,10 @@ def train_one_epoch(
                 )
             else:
                 # Phase 2 / single-phase: full bio-constrained loss
+                # Adaptive-refinement compute cost (architecture v1): the
+                # ponder cost lives in the model internals; it is only added
+                # at this loss seam.  A positive lambda_compute requires it.
+                _ponder = internals.get("refinement_ponder_cost", None)
                 loss = criterion(
                     y_pred=y_pred,
                     y_true=y_batch,
@@ -2881,6 +2988,8 @@ def train_one_epoch(
                     lambda_routing_aux=lambda_routing_aux,
                     wind_only_mask=wind_only_mask,
                     routing_aux_margin=routing_aux_margin,
+                    lambda_compute=lambda_compute,
+                    refinement_ponder_cost=_ponder,
                 )
 
         # ── Membrane health monitoring (CF9: per-epoch averages) ──
@@ -3069,6 +3178,7 @@ def validate(
     lambda_routing_aux: float = 0.0,
     wind_only_mask_full: Optional[np.ndarray] = None,
     routing_aux_margin: float = 0.024,
+    lambda_compute: float = 0.0,
 ) -> float:
     """
     Run validation (no gradient computation).
@@ -3081,7 +3191,8 @@ def validate(
         lambda_reg: Router regularization weight.
         lambda_energy: ATP metabolic cost weight.
         lambda_sparse: Population sparsity L1 weight.
-        lambda_jerk: Temporal coherence weight.
+        lambda_jerk: Frame-based third-velocity-difference smoothness weight
+            (legacy name "jerk"; NOT physical jerk — no dt scaling).
         phase: Training phase (1=frontend, 2=backend, 0=single-phase).
         target_mean: Target mean (cm/s) used when target normalization is
             enabled; paired with ``target_std`` to put ``y_true`` on the
@@ -3144,6 +3255,7 @@ def validate(
             g_gru = internals["routing_gates"][:, :, 1:2]
             g_lif = internals["routing_gates"][:, :, 0:1]  # Ticket #16
             lif_spikes = internals["lif_spikes"]
+            _ponder = internals.get("refinement_ponder_cost", None)
             loss = criterion(
                 y_pred=y_pred,
                 y_true=y_batch,
@@ -3159,6 +3271,8 @@ def validate(
                 lambda_routing_aux=lambda_routing_aux,
                 wind_only_mask=wind_only_mask,
                 routing_aux_margin=routing_aux_margin,
+                lambda_compute=lambda_compute,
+                refinement_ponder_cost=_ponder,
             )
 
         total_loss += loss.item()
@@ -4029,7 +4143,7 @@ def train(
     - **Phase 2** (epochs phase1_epochs … num_epochs-1):
       Freeze ``FrontendEncoder``, train ``BioDecisionCore``
       with :class:`BioDecisionLoss` (MSE + router reg +
-      ATP + sparsity + jerk).
+      ATP + sparsity + frame-based smoothness).
 
     When ``phase1_epochs`` is ``None`` (default), the pipeline
     runs in single-phase mode — fully backward compatible.
@@ -4459,6 +4573,9 @@ def train(
         # terminal save) and only constrains the current schema; a legacy /
         # version-mismatched parent keeps its limited fallback.
         _require_complete_current_schema(ckpt_peek, ckpt_path)
+        # R3: refuse a resume that switches an architecture-defining setting
+        # (refinement / activation / lambda_compute) relative to the checkpoint.
+        _require_architecture_config_match(ckpt_peek, config, ckpt_path)
 
         # ── Fail-closed nested resume validation ──
         # Checkpoint provenance vs active run configuration:
@@ -5202,6 +5319,7 @@ def train(
             lambda_routing_aux=config.loss.lambda_routing_aux,
             wind_only_mask_full=train_is_pure_wind,
             routing_aux_margin=config.loss.routing_aux_margin,
+            lambda_compute=config.loss.lambda_compute,
         )
         # Advance the cosine.  When lr_warmup_epochs==0 (default), the step is
         # unconditional exactly as in the original pipeline, preserving the
@@ -5243,6 +5361,7 @@ def train(
                 lambda_routing_aux=config.loss.lambda_routing_aux,
                 wind_only_mask_full=val_is_pure_wind,
                 routing_aux_margin=config.loss.routing_aux_margin,
+                lambda_compute=config.loss.lambda_compute,
             )
             history["val_loss"].append(val_loss)
         else:

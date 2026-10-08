@@ -97,7 +97,16 @@ class BioDecisionLoss(nn.Module):
     - **Router regularization** — penalizes GRU routing gate collapse
     - **ATP metabolic cost** — penalizes mean firing rate
     - **Population sparsity** (L1) — pushes firing rate toward target
-    - **Temporal coherence** (jerk) — enforces smooth kinematics
+    - **Temporal-coherence smoothness** (``lambda_jerk``) — penalizes the
+      squared third finite difference of the scalar velocity prediction.
+      This is a *frame-based third-velocity-difference smoothness proxy*,
+      NOT physical jerk (physical jerk is the first time-derivative of
+      acceleration, equivalently the second derivative of velocity): it
+      carries no ``dt`` scaling and is evaluated on the sampled frame grid,
+      so the third difference of velocity corresponds to a snap-like fourth
+      derivative of position, not jerk.
+      The historical parameter name/key and its numerics are preserved
+      unchanged for checkpoint/experiment compatibility.
 
     This loss is used to train
     :class:`~nsmor.model_nsmor_core.BioDecisionCore` while
@@ -146,6 +155,8 @@ class BioDecisionLoss(nn.Module):
         lambda_routing_aux: float = 0.0,
         wind_only_mask: Optional[torch.Tensor] = None,
         routing_aux_margin: float = 0.024,
+        lambda_compute: float = 0.0,
+        refinement_ponder_cost: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Compute bio-decision loss (MSE + physics penalties).
@@ -160,7 +171,9 @@ class BioDecisionLoss(nn.Module):
             lif_spikes: ``(B, T, H)`` — LIF spike tensor.
             lambda_energy: ATP metabolic cost weight.
             lambda_sparse: Population sparsity L1 weight.
-            lambda_jerk: Temporal coherence weight.
+            lambda_jerk: Frame-based third-velocity-difference smoothness
+                weight (legacy name "jerk"; NOT physical jerk — no dt
+                scaling, evaluated on the sampled frame grid).
             annealing_factor: Scaling factor for bio-loss lambdas.
             lambda_routing_aux: Auxiliary routing loss weight for modality differentiation.
             wind_only_mask: ``(B,)`` — boolean, True for pure-wind trials.
@@ -169,6 +182,13 @@ class BioDecisionLoss(nn.Module):
                 backup-corpus calibration (whole-trial mean, not peri
                 top-k). The previous 0.2 exceeded the observed 5–95
                 frame-level range.
+            lambda_compute: Weight on the adaptive-refinement compute cost
+                (ACT ponder surrogate). ``0.0`` (default) is bitwise
+                unchanged — the term is skipped entirely. Only supplied when
+                refinement is enabled (see ``refinement_ponder_cost``).
+            refinement_ponder_cost: Scalar ponder cost from the refinement
+                module (``N.detach() + R`` averaged over valid tokens).
+                Required (and finite) whenever ``lambda_compute > 0``.
 
         Returns:
             Scalar loss tensor.
@@ -230,7 +250,12 @@ class BioDecisionLoss(nn.Module):
             p = torch.tensor(self.target_rate, device=p_hat.device)
             total_loss = total_loss + lambda_sparse_eff * sparse_scale * torch.abs(p_hat - p)
 
-        # ── Temporal coherence (jerk) ──
+        # ── Temporal-coherence smoothness (frame-based third-difference proxy)
+        # NOTE: dy3 is the third finite difference of the scalar velocity on
+        # the sampled frame grid (no dt scaling).  This is a smoothness proxy,
+        # NOT physical jerk.  The historical lambda_jerk numerics are kept
+        # unchanged for experiment/checkpoint compatibility.
+        # ──
         if lambda_jerk_eff > 0 and T >= 4:
             dy1 = y_pred[:, 1:] - y_pred[:, :-1]
             dy2 = dy1[:, 1:] - dy1[:, :-1]
@@ -249,6 +274,58 @@ class BioDecisionLoss(nn.Module):
                 g_lif, lengths, wind_only_mask, margin=routing_aux_margin
             )
             total_loss = total_loss + lambda_routing_aux_eff * aux_loss
+
+        # ── Adaptive-refinement compute cost (architecture v1) ──
+        # Opt-in and default-off: lambda_compute=0.0 leaves the loss bitwise
+        # unchanged (the term is never touched).  H3 / findings A3, B5: the
+        # ORIGINAL weight is validated UNCONDITIONALLY, BEFORE the zero fast
+        # path, so a boolean ``False`` (which ``== 0.0`` and previously slipped
+        # through) is refused like ``True``.  When a positive weight is
+        # requested the ponder cost is MANDATORY and must be a FINITE REAL
+        # SCALAR tensor (a non-scalar ponder would make the joint loss
+        # vector-valued and break ``loss.backward()``); a missing, nonfinite or
+        # non-scalar cost is refused rather than silently dropped.
+        if (
+            isinstance(lambda_compute, bool)
+            or not isinstance(lambda_compute, (int, float))
+            or not math.isfinite(lambda_compute)
+            or lambda_compute < 0.0
+        ):
+            raise ValueError(
+                "lambda_compute must be a finite scalar >= 0, got "
+                f"{lambda_compute!r}"
+            )
+        if lambda_compute != 0.0:
+            if refinement_ponder_cost is None:
+                raise ValueError(
+                    "lambda_compute > 0 requires refinement_ponder_cost; "
+                    "refusing to silently drop the compute term."
+                )
+            if not isinstance(refinement_ponder_cost, torch.Tensor):
+                raise ValueError(
+                    "refinement_ponder_cost must be a torch.Tensor scalar, got "
+                    f"{type(refinement_ponder_cost).__name__}"
+                )
+            # R6 / A11: require a 0-d tensor, not merely numel()==1.  A (1,)
+            # shaped ponder makes the joint loss (1,)-shaped, violating the
+            # "Scalar loss tensor" contract and silently broadcasting
+            # downstream.  ``dim()==0`` is the exact scalar contract.
+            if refinement_ponder_cost.dim() != 0:
+                raise ValueError(
+                    "refinement_ponder_cost must be a 0-d scalar tensor, got "
+                    f"shape {tuple(refinement_ponder_cost.shape)}"
+                )
+            if not refinement_ponder_cost.is_floating_point():
+                raise ValueError(
+                    "refinement_ponder_cost must be a real floating scalar, got "
+                    f"dtype {refinement_ponder_cost.dtype}"
+                )
+            if not bool(torch.isfinite(refinement_ponder_cost).all()):
+                raise ValueError(
+                    "refinement_ponder_cost is nonfinite; refusing to add a "
+                    "nonfinite compute-cost term."
+                )
+            total_loss = total_loss + lambda_compute * refinement_ponder_cost
 
         return total_loss
 
@@ -362,6 +439,8 @@ class BioJointLoss(nn.Module):
         lambda_routing_aux: float = 0.0,
         wind_only_mask: Optional[torch.Tensor] = None,
         routing_aux_margin: float = 0.024,
+        lambda_compute: float = 0.0,
+        refinement_ponder_cost: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Compute the bio-constrained joint loss.
@@ -379,11 +458,17 @@ class BioJointLoss(nn.Module):
             lif_spikes: ``(B, T, H)`` — optional LIF spike tensor.
             lambda_energy: ATP metabolic cost weight.
             lambda_sparse: Population sparsity L1 weight.
-            lambda_jerk: Temporal coherence weight.
+            lambda_jerk: Frame-based third-velocity-difference smoothness
+                weight (legacy name "jerk"; NOT physical jerk — no dt
+                scaling, evaluated on the sampled frame grid).
             annealing_factor: Scaling factor for bio-loss lambdas.
             lambda_routing_aux: Auxiliary routing loss weight for modality differentiation.
             wind_only_mask: ``(B,)`` — boolean, True for pure-wind trials.
             routing_aux_margin: Hinge margin for the routing-aux term.
+            lambda_compute: Adaptive-refinement compute-cost weight (default
+                0.0 keeps the loss bitwise unchanged).
+            refinement_ponder_cost: Scalar ACT ponder cost; required and
+                finite whenever ``lambda_compute > 0``.
 
         Returns:
             Scalar loss tensor.
@@ -403,6 +488,8 @@ class BioJointLoss(nn.Module):
             lambda_routing_aux=lambda_routing_aux,
             wind_only_mask=wind_only_mask,
             routing_aux_margin=routing_aux_margin,
+            lambda_compute=lambda_compute,
+            refinement_ponder_cost=refinement_ponder_cost,
         )
 
 

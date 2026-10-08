@@ -775,8 +775,11 @@ class TestBiophysics:
         assert "lif_spike_history" in states2, (
             "lif_spike_history missing from states_out"
         )
-        # CF4: dendritic state is visual-only (B, sensory_dim//2=2), not (B, sensory_dim)
-        assert states2["frontend_dendritic_state"].shape == (1, 2)
+        # Correctness fix: the dendritic filter acts on the SINGLE visual
+        # channel (index 0), so the private carry is (B, 1), not (B, 2).
+        # (The earlier (B,2) width came from filtering the first half of the
+        # 4-D layout, which wrongly included the wind channel.)
+        assert states2["frontend_dendritic_state"].shape == (1, 1)
         assert states2["lif_spike_history"].shape == (1, self.H)
         # Step 3: verify states can be passed back
         y3, int3, states3 = model(

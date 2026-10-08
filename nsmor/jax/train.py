@@ -40,8 +40,10 @@ from nsmor.jax.dataloader import (
 )
 from nsmor.jax.model import (
     NSMoRModel,
+    assert_flax_supported,
     load_from_torch_state_dict,
     to_torch_state_dict,
+    validate_input_and_lengths,
     validate_lengths,
 )
 
@@ -111,7 +113,12 @@ def compute_bio_joint_loss(
             sparse_scale = math.sqrt(float(hidden_dim))
             sparse_loss = lambda_sparse * sparse_scale * jnp.abs(p_hat - target_rate)
 
-    # 4. Temporal coherence (jerk penalty)
+    # 4. Temporal coherence (frame-based third-velocity-difference proxy;
+    # legacy name "jerk" — NOT physical jerk, which is the first derivative of
+    # acceleration / second derivative of velocity. This proxy is the third
+    # finite difference of the sampled velocity with no dt scaling, i.e. a
+    # snap-like fourth derivative of position on the frame grid.)
+    # Numerics/name/key are unchanged for experiment compatibility.
     jerk_loss = jnp.array(0.0, dtype=jnp.float32)
     if lambda_jerk > 0.0 and T >= 4:
         dy1 = y_pred[:, 1:] - y_pred[:, :-1]
@@ -348,6 +355,10 @@ def train_jax(
     val_loader = JAXDataLoader(val_dataset, batch_size=micro_bs, shuffle=False)
 
     # 2. Build Model
+    # Fail closed BEFORE construction when the requested config enables a
+    # mechanism the Flax path cannot honor, so JAX training cannot silently
+    # diverge from the complete Torch path.
+    assert_flax_supported(config.model, context="train_jax")
     model = NSMoRModel(
         sensory_dim=config.model.sensory_dim,
         mcmc_dim=config.model.mcmc_dim,
@@ -369,6 +380,7 @@ def train_jax(
         dropout_rate=config.model.dropout,
         sensory_noise_std=getattr(config.model, "sensory_noise_std", 0.0),
         persistence_skip=float(getattr(config.model, "persistence_skip", 0.0)),
+        activation=str(getattr(config.model, "activation", "relu")),
     )
 
     rng = jax.random.PRNGKey(config.training.random_seed)
@@ -380,7 +392,9 @@ def train_jax(
 
     if resume_weights is not None:
         logger.info("Loading JAX development weights from %s", resume_path)
-        params = load_from_torch_state_dict(model, resume_weights)
+        params = load_from_torch_state_dict(
+            model, resume_weights, source=config.model, context="train_jax",
+        )
 
     param_count = sum(p.size for p in jax.tree_util.tree_leaves(params))
     logger.info("Model initialized: %d parameters", param_count)
@@ -482,6 +496,16 @@ def train_jax(
 
         # Training epoch
         for x_b, y_b, l_b in train_loader:
+            # Unconditional host preflight on the ORIGINAL concrete batch
+            # BEFORE the compiled step and any optimizer execution.  The
+            # traced NSMoRModel validator cannot inspect runtime values, so a
+            # valid nonfinite observation (NaN/Inf) must be refused HERE, not
+            # silently fed into the optimizer (r4 R2).  This covers
+            # persistence_skip zero AND nonzero; legal zero rows and an
+            # invalid padded suffix remain supported.
+            validate_input_and_lengths(
+                np.asarray(x_b), np.asarray(l_b), context="train_jax train",
+            )
             if config.model.persistence_skip != 0.0:
                 validate_lengths(l_b, x_b.shape[0], x_b.shape[1])
             state, step_metrics = train_step(state, x_b, y_b, l_b)
@@ -498,6 +522,12 @@ def train_jax(
         val_spks = []
 
         for x_v, y_v, l_v in val_loader:
+            # Same unconditional host preflight before the compiled eval step
+            # (r4 R2): a valid nonfinite observation must be refused before
+            # eval execution at persistence_skip zero AND nonzero.
+            validate_input_and_lengths(
+                np.asarray(x_v), np.asarray(l_v), context="train_jax eval",
+            )
             if config.model.persistence_skip != 0.0:
                 validate_lengths(l_v, x_v.shape[0], x_v.shape[1])
             v_metrics = eval_step(state.params, x_v, y_v, l_v)

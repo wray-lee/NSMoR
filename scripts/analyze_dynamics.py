@@ -40,6 +40,7 @@ from sklearn.decomposition import PCA
 from sklearn.utils.extmath import svd_flip
 
 from nsmor.analysis.uq import cohens_d, log_pca_variance
+from nsmor.analysis.dynamics import raw_gru_trajectory
 from nsmor.dataloader_factory import create_optimized_dataloader
 from nsmor.nsmor_dataloader import NSMoRDataset
 from nsmor.config import DEFAULT_FEATURE, Label
@@ -285,6 +286,15 @@ def extract_full_dynamics(
 
     Returns:
         DynamicsBundle with all extracted trajectories.
+
+    Coordinate declaration (architecture v1): the recurrent coordinate analysed
+    here is the RAW GRU trajectory (``gru_hidden_raw``), not the routed
+    ``gru_hidden`` and not the adaptive-refinement readout.  When adaptive
+    latent refinement is enabled, ``refined_hidden`` is a readout of the
+    post-fusion latent and is NOT an autonomous recurrent state; the GRU
+    fixed-point/Jacobian coordinate is unchanged.  Only the full-system
+    Jacobian (which the readout does affect) is refused under adaptive
+    refinement (see ``nsmor.analysis.dynamics``).
     """
     logger.info("Extracting full dynamics (single model pass)...")
     model.eval()
@@ -303,8 +313,11 @@ def extract_full_dynamics(
             # Forward pass with all internals
             _, internals = model(X_batch, lengths, return_internals=True)
 
-            # Extract tensors
-            gru_hidden = internals["gru_hidden"]       # (B, T, H)
+            # Extract tensors.  Use the RAW recurrent trajectory, not the
+            # routed/post-gain ``gru_hidden`` (r5 R5).
+            gru_hidden = raw_gru_trajectory(
+                model, internals, context="extract_full_dynamics",
+            )                                          # (B, T, H)
             lif_spikes = internals["lif_spikes"]       # (B, T, H)
             routing_gates = internals["routing_gates"] # (B, T, 2)
 

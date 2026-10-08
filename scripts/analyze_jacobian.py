@@ -66,7 +66,7 @@ import numpy as np
 import torch
 
 from nsmor.analysis.analyze_jacobian_jax import create_jacobian_adapter
-from nsmor.analysis.dynamics import FixedPointAdapter
+from nsmor.analysis.dynamics import FixedPointAdapter, raw_gru_trajectory
 from nsmor.nsmor_dataloader import NSMoRDataset
 from nsmor.dataloader_factory import create_optimized_dataloader
 from nsmor.checkpoint import load_checkpoint
@@ -957,6 +957,19 @@ def _reconstruct_gru_input(
         if getattr(frontend, "_dendritic_enabled", False):
             frontend._dendritic_state = None
         e_sensory = frontend(sensory_x, lengths)     # (B, T, H)
+        # Match the actual GRU input exactly: ``BioDecisionCore`` (and the
+        # top-level core) exclude invalid (padded) frames with a selection
+        # BEFORE the GRU/LIF/router math, so the per-frame encoding the GRU
+        # receives is zero on the padded suffix.  Reconstruct the same
+        # selection for a real model (which always has a frontend).
+        lengths_i = lengths.to(device=X_batch.device, dtype=torch.int64)
+        valid = (
+            torch.arange(T, device=X_batch.device).unsqueeze(0)
+            < lengths_i.unsqueeze(1)
+        )                                            # (B, T) bool
+        e_sensory = torch.where(
+            valid.unsqueeze(-1), e_sensory, torch.zeros_like(e_sensory),
+        )
     else:
         if getattr(model.sensory_encoder, "_dendritic_enabled", False):
             model.sensory_encoder._dendritic_state = None
@@ -1074,8 +1087,11 @@ def extract_gru_states_at_epochs(
             # Forward pass with internals to get GRU hidden states
             _y_pred, internals = model(X_batch, lengths, return_internals=True)
 
-            # gru_hidden: (B, T, H)
-            gru_hidden = internals["gru_hidden"]
+            # Raw recurrent GRU trajectory (B, T, H): the actual recurrent
+            # coordinate, not the routed/post-gain ``gru_hidden`` (r5 R5).
+            gru_hidden = raw_gru_trajectory(
+                model, internals, context="extract_gru_states_at_epochs",
+            )
             H = gru_hidden.shape[2]
 
             # ── Task 2: Exact input reconstruction ─────────────

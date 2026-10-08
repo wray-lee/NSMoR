@@ -29,12 +29,499 @@ All tensors are annotated with their shape in comments.
 from __future__ import annotations
 
 import math
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
+
+
+# Valid activation names for the encoder / decoder projections.
+# ``relu`` preserves the historical architecture and state_dict keys;
+# ``swiglu`` selects a genuine gated activation
+# ``SiLU(W_gate x) * (W_value x)`` (Shazeer 2020).
+_VALID_ACTIVATIONS = ("relu", "swiglu")
+
+# Integer (nonboolean) length dtypes accepted at every public boundary.
+_INT_LENGTH_DTYPES = (
+    torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64,
+)
+
+
+def _validate_original_lengths(
+    lengths: torch.Tensor,
+    batch_size: int,
+    timesteps: int,
+    *,
+    context: str,
+) -> torch.Tensor:
+    """Validate original length tensors BEFORE any integer cast.
+
+    Every public component boundary shares this preflight so a fractional,
+    boolean, negative or overlong length is rejected against the ORIGINAL
+    dtype instead of being silently truncated by ``.to(torch.int64)`` (which
+    reinterprets ``1.75 -> 1``, ``-0.5 -> 0``, ``True -> 1``).  Returns the
+    validated lengths cast to ``int64`` for downstream use.
+
+    Args:
+        lengths: Original ``(B,)`` length tensor.
+        batch_size: Expected ``B``.
+        timesteps: Padded ``T``; lengths must satisfy ``0 <= lengths <= T``.
+        context: Caller label used in error messages.
+
+    Raises:
+        ValueError: On a shape, dtype or range violation.
+    """
+    if lengths.shape != (batch_size,):
+        raise ValueError(
+            f"{context}: lengths shape {tuple(lengths.shape)} != "
+            f"(B={batch_size},)"
+        )
+    if lengths.dtype not in _INT_LENGTH_DTYPES:
+        raise ValueError(
+            f"{context}: lengths must have an integer, nonboolean dtype, "
+            f"got {lengths.dtype}"
+        )
+    lengths_i = lengths.to(torch.int64)
+    if bool((lengths_i < 0).any()) or bool((lengths_i > timesteps).any()):
+        raise ValueError(
+            f"{context}: lengths must satisfy 0 <= lengths <= T={timesteps}"
+        )
+    return lengths_i
+
+
+def _validate_original_carry(
+    supplied: torch.Tensor,
+    expected_shape: Tuple[int, ...],
+    *,
+    key: str,
+    device: torch.device,
+    dtype: torch.dtype,
+    domain: Optional[str] = None,
+) -> torch.Tensor:
+    """Validate an ORIGINAL Torch carry field before cast/device/math.
+
+    Inspects the supplied tensor's ORIGINAL real-floating dtype, exact shape
+    and finiteness BEFORE any numeric conversion, so a boolean/integer/complex
+    carry (whose imaginary part ``.float()`` would silently discard) or a
+    nonfinite carry (e.g. ``lif_v=NaN``) is rejected rather than poisoning the
+    recurrence.  Returns the validated field converted to ``dtype``/``device``.
+
+    ``dtype`` MUST be the ACTUAL computation dtype (float32 for the forced-FP32
+    LIF/GRU paths), not a default-dtype canonical allocation: a finite float64
+    ``1e300`` is representable in float64 but overflows to ``+inf`` when the
+    recurrence narrows it, so representability is checked against the real
+    computation representation.
+
+    ``domain`` optionally enforces a physically-constrained range (r6 R3):
+    ``"nonneg"`` for time-since-spike counters / physical adaptation and
+    ``"fraction"`` for STP resource/facilitation and EMA spike-history fields
+    in ``[0, 1]``.  Membrane/GRU coordinates are unconstrained.
+
+    Raises:
+        ValueError: On a non-tensor, non-real-floating dtype, wrong shape, a
+            nonfinite value, non-representability in ``dtype``, or a domain
+            violation.
+    """
+    if not isinstance(supplied, torch.Tensor):
+        raise ValueError(
+            f"carry field {key!r} must be a torch.Tensor, got "
+            f"{type(supplied).__name__}"
+        )
+    if not supplied.is_floating_point():
+        raise ValueError(
+            f"carry field {key!r} must have a real floating dtype, got "
+            f"{supplied.dtype}"
+        )
+    if tuple(supplied.shape) != tuple(expected_shape):
+        raise ValueError(
+            f"carry field {key!r} shape {tuple(supplied.shape)} != "
+            f"{tuple(expected_shape)}"
+        )
+    if not torch.isfinite(supplied).all():
+        raise ValueError(f"carry field {key!r} contains nonfinite values")
+    if domain is not None:
+        _check_carry_domain(supplied, key=key, domain=domain)
+    converted = supplied.to(device=device, dtype=dtype)
+    # Representability after conversion (r5 R1 / r6 R1): a finite original
+    # float64 value such as 1e300 becomes float32 +inf when narrowed.  The
+    # original finiteness check above is necessary but NOT sufficient; the
+    # ACTUAL computation representation must also be finite, otherwise an
+    # ostensibly-safe no-op row exports an infinite carry.
+    if not torch.isfinite(converted).all():
+        raise ValueError(
+            f"carry field {key!r} is not representable in the computation "
+            f"dtype {dtype}: finite {supplied.dtype} values overflow to "
+            f"nonfinite after conversion."
+        )
+    return converted
+
+
+def _check_carry_domain(
+    value: torch.Tensor, *, key: str, domain: str,
+) -> None:
+    """Reject a supplied physical carry outside its justified domain (r6 R3)."""
+    if domain == "nonneg":
+        if bool((value < 0).any()):
+            raise ValueError(
+                f"carry field {key!r} must be non-negative (a physical "
+                f"time-since-spike counter / adaptation value); got a "
+                f"negative value."
+            )
+    elif domain == "fraction":
+        if bool((value < 0).any()) or bool((value > 1.0).any()):
+            raise ValueError(
+                f"carry field {key!r} must lie in [0, 1] (a fraction / EMA "
+                f"history value); got a value outside that range."
+            )
+    else:  # pragma: no cover - programming error
+        raise ValueError(f"unknown carry domain {domain!r} for {key!r}")
+
+
+def _validate_np_leaf(
+    raw: Any, *, key: str, expected_shape: Optional[Tuple[int, ...]] = None,
+    dtype: Any = None,
+) -> "np.ndarray":
+    """Validate an ORIGINAL numpy/torch parameter leaf before numeric narrowing.
+
+    Shared by the raw-JAX parameter copier and the Flax state-dict converter
+    (root 2).  Checks, on the ORIGINAL value BEFORE any float32 conversion:
+    real-floating dtype, exact shape (when given), finiteness; then independently
+    requires the destination representation (``dtype``, float32) to be finite, so
+    a finite float64 ``1e300`` that overflows on narrowing fails closed instead
+    of producing a poisoned leaf.
+    """
+    import numpy as _np
+
+    arr = _np.asarray(raw)
+    if not _np.issubdtype(arr.dtype, _np.floating):
+        raise ValueError(
+            f"parameter {key!r} must be real-floating, got dtype {arr.dtype}."
+        )
+    if expected_shape is not None and tuple(arr.shape) != tuple(expected_shape):
+        raise ValueError(
+            f"parameter {key!r} shape {tuple(arr.shape)} != expected "
+            f"{tuple(expected_shape)}."
+        )
+    if not _np.isfinite(arr).all():
+        raise ValueError(
+            f"parameter {key!r} contains nonfinite values; refusing to copy a "
+            f"poisoned parameter."
+        )
+    if dtype is not None:
+        narrowed = arr.astype(dtype)
+        if not _np.isfinite(narrowed).all():
+            raise ValueError(
+                f"parameter {key!r} is not representable in the destination "
+                f"{_np.dtype(dtype)} representation (a finite original "
+                f"overflowed on narrowing); refusing to copy."
+            )
+        return narrowed
+    return arr
+
+
+def _require_real_floating_observation(
+    tensor: Any, *, name: str, context: str,
+) -> None:
+    """Reject a non-real-floating public observation BEFORE any conversion.
+
+    A public observation boundary must inspect the ORIGINAL dtype: an integer,
+    boolean or complex measurement (whose imaginary part a later ``.float()``
+    would silently discard) is a scientific/data error, not a value to coerce.
+    Shared by the Torch core, the direct backend and the raw-JAX boundary so
+    every public seam refuses the same invalid inputs.
+
+    Raises:
+        ValueError: When ``tensor`` is not a real-floating torch tensor.
+    """
+    if not isinstance(tensor, torch.Tensor):
+        raise ValueError(
+            f"{context}: {name} must be a torch.Tensor, got "
+            f"{type(tensor).__name__}"
+        )
+    if not tensor.is_floating_point():
+        raise ValueError(
+            f"{context}: {name} must have a real floating dtype, got "
+            f"{tensor.dtype}. Integer/boolean/complex observations are "
+            "refused before conversion."
+        )
+
+
+def _validate_refinement_options(
+    *, mode: Any, max_steps: Any, eps: Any, update_scale: Any, context: str,
+) -> Tuple[str, int, float, float]:
+    """Validate ORIGINAL refinement options independent of module creation.
+
+    The refinement-option contract must hold at every public trust boundary,
+    including ``refinement_mode == "off"`` where no module is constructed.
+    This single validator is shared by :class:`AdaptiveLatentRefinement` and
+    :class:`BioDecisionCore` (and mirrors ``ModelConfig.__post_init__``) so a
+    bool/NaN/negative/illegal setting is refused even when refinement is
+    disabled and the module is absent.  The ORIGINAL values are validated
+    before any cast.
+
+    Returns the validated ``(mode, int(max_steps), float(eps),
+    float(update_scale))``.
+
+    Raises:
+        ValueError: On any malformed option.
+    """
+    if mode not in ("off", "fixed", "adaptive"):
+        raise ValueError(
+            f"{context}: refinement_mode must be 'off'/'fixed'/'adaptive', "
+            f"got {mode!r}"
+        )
+    if isinstance(max_steps, bool) or not isinstance(max_steps, int) or max_steps < 1:
+        raise ValueError(
+            f"{context}: refinement_max_steps must be an int >= 1, got "
+            f"{max_steps!r}"
+        )
+    if (
+        isinstance(eps, bool)
+        or not isinstance(eps, (int, float))
+        or not math.isfinite(eps)
+        or not (0.0 < float(eps) < 1.0)
+    ):
+        raise ValueError(
+            f"{context}: refinement_eps must be in (0, 1), got {eps!r}"
+        )
+    if (
+        isinstance(update_scale, bool)
+        or not isinstance(update_scale, (int, float))
+        or not math.isfinite(update_scale)
+        or update_scale <= 0.0
+    ):
+        raise ValueError(
+            f"{context}: refinement_update_scale must be finite > 0, got "
+            f"{update_scale!r}"
+        )
+    return mode, int(max_steps), float(eps), float(update_scale)
+
+
+def assert_mechanism_tree_consistent(source: Any, *, context: str) -> None:
+    """Fail closed if an ENABLED mechanism lacks its required parameter leaves.
+
+    H4 / findings A5, B2: a live mechanism flag (``gru_neuromod_gain``,
+    ``lif_cell.stp_enabled``, ``lif_cell.lateral_inhibition``) may be set
+    inconsistently AFTER construction (e.g. a direct attribute mutation),
+    leaving the branch active while its parameters were never created.  Every
+    such consumer would then raise a bare ``AttributeError`` deep inside the
+    math (or, in the raw-JAX converter, mid-dereference).  This SINGLE shared
+    preflight inspects the flags against the actual parameter tree and raises a
+    descriptive ``ValueError`` BEFORE any leaf is read.  It is used by the
+    Torch ``BioDecisionCore.forward`` and by the raw-JAX live converter.
+
+    It is NOT a dynamic setter framework: a constructor-configured mechanism
+    (which always creates its leaves) and the disabled default are unaffected.
+
+    Args:
+        source: A ``BioDecisionCore``/``NSMoRCore`` (or any object exposing
+            ``backend``/``lif_cell``).
+        context: Caller label used in the error message.
+
+    Raises:
+        ValueError: When an enabled mechanism is missing required parameters.
+    """
+    backend = getattr(source, "backend", source)
+    lif = getattr(backend, "lif_cell", None)
+    if lif is None:
+        lif = getattr(source, "lif_cell", None)
+    missing: List[str] = []
+    gain = float(getattr(backend, "gru_neuromod_gain", 0.0) or 0.0)
+    if gain > 0.0:
+        for name in ("_gain_scale", "_gain_bias"):
+            if not hasattr(backend, name):
+                missing.append(f"backend.{name}")
+    if lif is not None:
+        if bool(getattr(lif, "stp_enabled", False)):
+            for name in ("U_stp_raw", "_decay_fac", "_decay_rec"):
+                if not hasattr(lif, name):
+                    missing.append(f"lif_cell.{name}")
+        if float(getattr(lif, "lateral_inhibition", 0.0) or 0.0) > 0.0:
+            if not hasattr(lif, "_W_inhib_raw"):
+                missing.append("lif_cell._W_inhib_raw")
+    if missing:
+        raise ValueError(
+            f"{context}: inconsistent mechanism configuration — enabled "
+            f"mechanism(s) are missing required parameters ({', '.join(missing)}). "
+            "This indicates a live flag was mutated after construction; "
+            "refusing to run a mechanism whose parameters were never created. "
+            "Construct the model with the mechanism enabled instead."
+        )
+
+
+def refinement_module_present(source: Any) -> bool:
+    """Return True if the EXECUTED backend actually carries a refinement module.
+
+    R1 / findings A1, B1, B11, B16: the Torch core executes refinement whenever
+    ``backend.refinement is not None`` (model_nsmor_core.py:2865), regardless of
+    the ``refinement_mode`` string.  A model whose mode was mutated to ``"off"``
+    AFTER construction still carries the module, so keying a refusal on the
+    stale string alone lets the fused JAX kernel silently drop the block.  This
+    shared predicate inspects the executed child, not the alias.
+
+    Args:
+        source: A ``NSMoRCore``, a ``BioDecisionCore``, or a config object.
+
+    Returns:
+        True when a refinement module (or a non-``"off"``/``None`` mode alias)
+        is present on the source or its ``backend``.
+    """
+    backend = getattr(source, "backend", source)
+    if getattr(backend, "refinement", None) is not None:
+        return True
+    for holder in (source, backend):
+        mode = getattr(holder, "refinement_mode", None)
+        if mode not in (None, "off"):
+            return True
+    return False
+
+
+def _refinement_empty_zero(
+    h_fused: torch.Tensor, valid: torch.Tensor,
+) -> torch.Tensor:
+    """Return a graph-connected DIFFERENTIABLE zero for an all-empty batch.
+
+    H2 / findings A2, B1: the previous ``h_fused.sum() * 0.0`` reduced the RAW
+    input, so NaN padding gave ``NaN * 0 = NaN`` and a finite-overflow padding
+    (e.g. 3e38) overflowed the sum to ``inf * 0 = NaN`` — a nonfinite ponder
+    cost for a batch that executed NO work.  Select the SAFE (valid) operands
+    FIRST, then reduce and multiply by zero: every element is a real zero, so
+    the reduction is exactly ``0.0`` while the result stays connected to the
+    graph (gradient 0, never leaf-less).  Shared by the fixed and adaptive
+    empty branches so both sites cannot diverge.
+    """
+    safe = torch.where(valid.unsqueeze(-1), h_fused, torch.zeros_like(h_fused))
+    return safe.sum() * 0.0
+
+
+def _canonical_encoder_topology(activation: str) -> Tuple[Tuple[type, ...], bool]:
+    """Return the exact ordered ``net`` module types for a canonical encoder.
+
+    Returns ``(module_types, has_gate_proj)``.  ``activation`` must be a
+    supported name.
+    """
+    if activation == "swiglu":
+        return (nn.Linear, nn.LayerNorm), True
+    return (nn.Linear, nn.LayerNorm, nn.ReLU), False
+
+
+def _canonical_head_topology(activation: str) -> Tuple[Tuple[type, ...], bool]:
+    """Return the exact ordered ``net`` module types for a canonical head."""
+    if activation == "swiglu":
+        return (nn.LayerNorm, nn.Dropout), True
+    return (nn.LayerNorm, nn.ReLU, nn.Dropout, nn.Linear), False
+
+
+def certify_executed_topology(source: Any, *, context: str) -> None:
+    """Certify the ACTUAL executed encoder/readout topology of a live source.
+
+    The known-live converters (Flax ``load_from_torch_state_dict`` and raw
+    ``NSMoRCoreJAX``) hard-code an exact ordered computation:
+
+    * ``sensory_encoder`` (relu): ``Linear -> LayerNorm(eps=1e-5) -> ReLU``
+      (swiglu): ``Linear -> LayerNorm(eps=1e-5)`` plus ``gate_proj`` and
+      ``SiLU(gate_proj(h)) * h``
+    * ``direction_head`` (relu): ``LayerNorm(eps=1e-5) -> ReLU -> Dropout(p)
+      -> Linear`` (swiglu): ``LayerNorm(eps=1e-5) -> Dropout(p)`` plus
+      ``gate_proj``/``value_proj``/``out_proj`` and
+      ``SiLU(gate) * value``.
+
+    A source whose executed modules differ (an Identity replacing ReLU, an
+    appended/missing operator, a stale child activation, a noncanonical or
+    nonfinite LayerNorm epsilon, a live dropout rate the destination cannot
+    reproduce) would be silently mapped onto a DIFFERENT computation.  This
+    certificate inspects the actual modules/slots/semantics (r7 R1) and rejects
+    any divergence.  ``source`` with no executed ``frontend``/``backend`` (a
+    Flax model/config) is a no-op.
+
+    Raises:
+        ValueError: On any divergence from the canonical executed topology.
+    """
+    frontend = getattr(source, "frontend", None)
+    backend = getattr(source, "backend", None)
+    if frontend is None and backend is None:
+        return
+
+    se = getattr(frontend, "sensory_encoder", None)
+    if se is None:
+        se = getattr(source, "sensory_encoder", None)
+    dh = getattr(backend, "direction_head", None)
+    if dh is None:
+        dh = getattr(source, "direction_head", None)
+
+    problems: List[str] = []
+
+    def _check(
+        module: Any, name: str, expected: Tuple[type, ...],
+        need_projs: Tuple[str, ...], hidden_dim: Optional[int] = None,
+    ) -> None:
+        if module is None:
+            return
+        activation = getattr(module, "activation", None)
+        if activation not in _VALID_ACTIVATIONS:
+            problems.append(f"{name}.activation={activation!r}")
+            return
+        net = getattr(module, "net", None)
+        if not isinstance(net, nn.Sequential):
+            problems.append(f"{name}.net is not a Sequential")
+            return
+        got = [type(sub) for sub in net]
+        if got != list(expected):
+            problems.append(
+                f"{name}.net modules {[t.__name__ for t in got]} != "
+                f"{[t.__name__ for t in expected]}"
+            )
+        # Finite supported LayerNorm epsilon AND true normalized axes/affine
+        # semantics at every normalization slot (root 1).  A live LayerNorm
+        # with a non-canonical normalized_shape (e.g. ``(2, 4)``) or disabled
+        # affine normalizes different axes than the destination's last-axis,
+        # affine LayerNorm, silently changing the executed computation.
+        for idx, sub in enumerate(net):
+            if isinstance(sub, nn.LayerNorm):
+                if not math.isfinite(float(sub.eps)) or abs(float(sub.eps) - 1e-5) > 1e-12:
+                    problems.append(f"{name}.net[{idx}].eps={sub.eps}")
+                if hidden_dim is not None and tuple(sub.normalized_shape) != (int(hidden_dim),):
+                    problems.append(
+                        f"{name}.net[{idx}].normalized_shape={tuple(sub.normalized_shape)}"
+                    )
+                if not bool(getattr(sub, "elementwise_affine", True)):
+                    problems.append(f"{name}.net[{idx}].elementwise_affine=False")
+        # Live dropout rate the destination reproduces from ``dropout_rate``.
+        declared = getattr(module, "dropout_rate", None)
+        for idx, sub in enumerate(net):
+            if isinstance(sub, nn.Dropout):
+                if declared is None:
+                    problems.append(f"{name}.net[{idx}] dropout without declared rate")
+                elif not math.isfinite(float(sub.p)) or abs(
+                    float(sub.p) - float(declared)
+                ) > 1e-12:
+                    problems.append(f"{name}.net[{idx}].p={sub.p} != declared {declared}")
+        # Required projection children of a gated (swiglu) branch.
+        for proj in need_projs:
+            child = getattr(module, proj, None)
+            if not isinstance(child, nn.Linear):
+                problems.append(f"{name}.{proj} is not a Linear")
+
+    h_dim = getattr(source, "hidden_dim", None)
+    se_types, se_gate = _canonical_encoder_topology(
+        getattr(se, "activation", "relu") if se is not None else "relu"
+    )
+    _check(se, "sensory_encoder", se_types, ("gate_proj",) if se_gate else (), h_dim)
+    dh_types, dh_gate = _canonical_head_topology(
+        getattr(dh, "activation", "relu") if dh is not None else "relu"
+    )
+    dh_projs = ("gate_proj", "value_proj", "out_proj") if dh_gate else ()
+    _check(dh, "direction_head", dh_types, dh_projs, h_dim)
+
+    if problems:
+        raise ValueError(
+            f"{context}: live source has executed normalization/activation/"
+            f"dropout topology the destination cannot reproduce "
+            f"({'; '.join(problems)}). Refusing to map parameters across "
+            f"divergent runtime computation."
+        )
 
 
 # ===============================================================
@@ -45,11 +532,23 @@ class SensoryEncoder(nn.Module):
     """
     Map raw 4-D sensory features to a hidden representation.
 
-    ``Linear(4, hidden_dim)`` + ``LayerNorm`` + ``ReLU``
+    ``activation="relu"`` (default)::
+
+        Linear(4, hidden_dim) -> LayerNorm -> ReLU
+
+    ``activation="swiglu"``::
+
+        h = LayerNorm(Linear(4, hidden_dim)(x))
+        out = SiLU(gate_proj(h)) * h        # genuine gated activation
+
+    where ``gate_proj`` is a second ``Linear(hidden_dim, hidden_dim)``.
+    SwiGLU is ``SiLU(W_gate x) * (W_value x)``; a single ``SiLU(W x)`` is
+    NOT gated and is not what this branch implements.
 
     Optionally injects Gaussian noise during training to model intrinsic
     neural variability and stochastic resonance (Gap D).
     Ref: Douglass et al. 1993, Nature 365:721-723.
+    Ref: Shazeer 2020, "GLU Variants Improve Transformer" (gated activation).
 
     Input:  ``(B, T, 4)``
     Output: ``(B, T, H)``
@@ -60,6 +559,7 @@ class SensoryEncoder(nn.Module):
         sensory_dim: int = 4,
         hidden_dim: int = 64,
         noise_std: float = 0.0,
+        activation: str = "relu",
     ) -> None:
         """
         Args:
@@ -70,13 +570,34 @@ class SensoryEncoder(nn.Module):
                 and stochastic resonance.  0 disables (backward
                 compatible).  Typical: 0.01-0.1.
                 Ref: Douglass et al. 1993, Nature 365:721-723.
+            activation: ``"relu"`` (default, historical) or ``"swiglu"``
+                (opt-in gated activation).
+
+        Raises:
+            ValueError: If *activation* is not a supported name.
         """
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(sensory_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.ReLU(),
-        )
+        if activation not in _VALID_ACTIVATIONS:
+            raise ValueError(
+                f"activation must be one of {_VALID_ACTIVATIONS}, "
+                f"got {activation!r}"
+            )
+        self.activation = activation
+        self.hidden_dim = hidden_dim
+        if activation == "swiglu":
+            # LayerNorm is applied to the value projection, matching the
+            # relu branch's post-Linear normalisation point.
+            self.net = nn.Sequential(
+                nn.Linear(sensory_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+            )
+            self.gate_proj = nn.Linear(hidden_dim, hidden_dim)
+        else:
+            self.net = nn.Sequential(
+                nn.Linear(sensory_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.ReLU(),
+            )
         self.noise_std = noise_std
 
     def forward(self, sensory: torch.Tensor) -> torch.Tensor:
@@ -87,7 +608,14 @@ class SensoryEncoder(nn.Module):
         Returns:
             ``(B, T, H)``
         """
+        B, T, _ = sensory.shape
+        H = self.hidden_dim
         h = self.net(sensory)
+        if self.activation == "swiglu":
+            h = F.silu(self.gate_proj(h)) * h
+        assert h.shape == (B, T, H), (
+            f"SensoryEncoder output {tuple(h.shape)} != (B={B}, T={T}, H={H})"
+        )
         # Inject noise during training only (stochastic resonance)
         if self.training and self.noise_std > 0.0:
             noise = torch.randn_like(h) * self.noise_std
@@ -322,17 +850,16 @@ class LIFCell(nn.Module):
                 Default 50 ms — within the 20-100 ms window of
                 feedforward inhibition in cricket cercal pathways.
             dendritic_tau: Time constant for the dendritic low-pass
-                filter applied to visual inputs before somatic
+                filter applied to the visual input before somatic
                 integration.  Models the separate dendritic
                 compartmentalization seen in LGI: wind signals arrive
                 at cercal dendrites (fast, no filtering) while visual
                 signals traverse optic lobe dendrites (slower, with
-                temporal smoothing).  When > 0, the first
-                ``sensory_dim//2`` input channels (visual) pass
-                through an IIR filter with this time constant before
-                reaching the soma, while the remaining channels
-                (wind/kinematic) bypass it.  0 disables (backward
-                compatible).
+                temporal smoothing).  When > 0, the SINGLE visual
+                channel (sensory layout index 0) passes through an IIR
+                filter with this time constant before reaching the
+                soma, while the remaining channels (wind/kinematic)
+                bypass it.  0 disables (backward compatible).
                 Ref: London & Hausser 2005, Annu. Rev. Neurosci.
         """
         super().__init__()
@@ -541,8 +1068,8 @@ class LIFCell(nn.Module):
         # ── Dendritic Compartmentalization (Gap B) ──
         # Ref: London & Hausser 2005, Annu. Rev. Neurosci.
         # Models separate dendritic processing for visual vs wind inputs.
-        # Visual inputs (first half) pass through IIR filter; wind inputs
-        # (second half) reach soma directly.
+        # The single visual channel (sensory index 0) passes through the IIR
+        # filter; wind/kinematic channels reach the soma directly.
         self.dendritic_tau = dendritic_tau
         self._dendritic_enabled = dendritic_tau > 0.0
         if self._dendritic_enabled:
@@ -560,6 +1087,8 @@ class LIFCell(nn.Module):
         self,
         input_t: torch.Tensor,
         state: Optional[Tuple[torch.Tensor, ...]] = None,
+        *,
+        _checked: bool = False,
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, ...]]:
         """
         Advance the LIF state by one time-step.
@@ -575,6 +1104,12 @@ class LIFCell(nn.Module):
                 - A 5-tuple ``(V, I_syn, refract_counter, v_threshold_eff, w_adapt)``
                   (STP variables default: x=1, u=U when STP enabled).
                 - A 7-tuple with STP state when STP enabled.
+            _checked: PRIVATE (r8 R5).  When True, the per-step public
+                trust-boundary validation is skipped.  Set ONLY by
+                ``BioDecisionCore._run_lif_path``, which validates the supplied
+                carry ONCE at its public entry and then feeds internally
+                produced state through the T-loop.  Default False keeps the
+                full validation for every direct/public caller.
 
         Returns:
             ``(spike, new_state)`` where:
@@ -684,6 +1219,63 @@ class LIFCell(nn.Module):
             f"w_adapt shape {tuple(w_adapt.shape)} != (B={B}, H={H})"
         )
 
+        # ── Trust boundary: validate the COMPLETE original direct-LIF input
+        # and state BEFORE any arithmetic (r7 R2).  This is a documented PUBLIC
+        # step API; the top-level dictionary guards do not protect direct
+        # callers.  Every supplied field is checked for ORIGINAL real-floating
+        # dtype, exact shape, finiteness and its justified physical domain
+        # (membrane/synaptic coordinates are intentionally unconstrained;
+        # counters/adaptation non-negative; STP fractions and the EMA
+        # spike-history cache in [0, 1]).  A negative history would otherwise
+        # flip lateral inhibition to excitation, and a nonfinite membrane/input
+        # would poison spikes and the exported state.  Conversion is a no-op
+        # (the direct cell computes in the supplied dtype), so the original
+        # representation is also the computation representation.
+        #
+        # r8 R5: ``_checked`` skips this host-synchronizing validation for the
+        # INTERNAL T-loop only.  ``BioDecisionCore._run_lif_path`` validates the
+        # supplied carry once at its public entry and then feeds state it
+        # produced itself, so re-validating every step (about 20 device syncs
+        # per step) is redundant cost, not extra safety.  Numerics are
+        # bitwise unchanged; a direct/public caller keeps the full validation.
+        if not _checked:
+            def _bound(key: str, val: Any, domain: Optional[str]) -> torch.Tensor:
+                return _validate_original_carry(
+                    val, (B, H), key=key, device=device,
+                    dtype=getattr(val, "dtype", None), domain=domain,
+                )
+
+            if not (input_t.is_floating_point() and torch.isfinite(input_t).all()):
+                raise ValueError(
+                    "LIFCell input_t must be real-floating and finite; got "
+                    f"dtype={input_t.dtype}."
+                )
+            v = _bound("LIFCell.v", v, None)
+            i_syn = _bound("LIFCell.i_syn", i_syn, None)
+            refract_counter = _bound("LIFCell.refract_counter", refract_counter, "nonneg")
+            v_thresh_eff = _bound("LIFCell.v_thresh_eff", v_thresh_eff, None)
+            w_adapt = _bound("LIFCell.w_adapt", w_adapt, "nonneg")
+            rel_refract_counter = _bound(
+                "LIFCell.rel_refract_counter", rel_refract_counter, "nonneg",
+            )
+            if self.stp_enabled:
+                x_resource = _bound("LIFCell.x_resource", x_resource, "fraction")
+                u_facil = _bound("LIFCell.u_facil", u_facil, "fraction")
+            # The lateral-inhibition spike-history cache lives OUTSIDE
+            # ``state``.  A GENUINELY ABSENT cache (None) is lazily initialized
+            # below, but a MALFORMED supplied cache (a Tensor of the wrong
+            # shape, or a same-shape nonfinite / out-of-domain history) is a
+            # poisoned observation and must be REJECTED, not silently reset
+            # (root 4).  "Absent" and "malformed" are distinct.
+            if self.lateral_inhibition > 0.0:
+                _supplied_hist = getattr(self, "_spike_history", None)
+                if _supplied_hist is not None:
+                    self._spike_history = _validate_original_carry(
+                        _supplied_hist, (B, H), key="LIFCell._spike_history",
+                        device=device, dtype=getattr(_supplied_hist, "dtype", None),
+                        domain="fraction",
+                    )
+
         # ── 1. Short-Term Plasticity: inter-step decay (FIRST) ──
         # Critical: decay must happen BEFORE the spike-triggered jump.
         # This is the correct Tsodyks-Markram discretization.
@@ -706,8 +1298,18 @@ class LIFCell(nn.Module):
             # Clamp to prevent float drift.
             # CF2 fix: use min=1e-6 (not 0.0) consistently with
             # post-spike clamp to avoid gradient dead zone at exact zero.
+            # r6 R3: clamp BEFORE the nonfinite check so a bounded supplied
+            # STP state cannot introduce nonfinite arithmetic; a supplied
+            # nonfinite/out-of-domain STP field is refused earlier at the
+            # public trust boundary.
             u_pre = u_pre.clamp(min=1e-6, max=1.0)           # (B, H)
             x_pre = x_pre.clamp(min=1e-6, max=1.0)           # (B, H)
+            if not (torch.isfinite(u_pre).all() and torch.isfinite(x_pre).all()):
+                raise ValueError(
+                    "STP state produced nonfinite facilitation/resource after "
+                    "decay; refusing to propagate a poisoned short-term "
+                    "plasticity state."
+                )
 
             # STP modulation factor
             stp_factor = x_pre * u_pre                       # (B, H)
@@ -779,7 +1381,11 @@ class LIFCell(nn.Module):
             # Retrieve or initialize spike history (EMA of recent spikes)
             spike_hist = getattr(self, '_spike_history', None)
             if spike_hist is None or spike_hist.shape != (B, H):
-                spike_hist = torch.zeros(B, H, device=device)
+                # root 5: match the actual compute dtype (v_new), not the
+                # ambient global default.
+                spike_hist = torch.zeros(
+                    B, H, device=device, dtype=v_new.dtype,
+                )
             # Update spike history (will be finalized after spike detection)
             # For now, use the previous step's spike history
             # CF1 fix: Apply diagonal mask to enforce zero self-inhibition.
@@ -937,15 +1543,21 @@ class LIFCell(nn.Module):
             ``(V, I_syn, refract_counter, v_threshold_eff, w_adapt)``
             each ``(B, H)``.
         """
+        # root 5: allocate the canonical state in the model's OWN compute dtype,
+        # not the ambient global default.  Under a global torch float64 default a
+        # float32 model otherwise creates float64 init state that crashes the
+        # first float32 recurrence (double != float).  A float64 model (whose
+        # parameter dtype is float64) still gets float64 state.
+        _dt = self.W_in.weight.dtype
         v = torch.full(
-            (batch_size, self.hidden_dim), self.v_rest, device=device,
+            (batch_size, self.hidden_dim), self.v_rest, device=device, dtype=_dt,
         )
-        i_syn = torch.zeros(batch_size, self.hidden_dim, device=device)
-        refract_counter = torch.zeros(batch_size, self.hidden_dim, device=device)
+        i_syn = torch.zeros(batch_size, self.hidden_dim, device=device, dtype=_dt)
+        refract_counter = torch.zeros(batch_size, self.hidden_dim, device=device, dtype=_dt)
         v_thresh_eff = torch.full(
-            (batch_size, self.hidden_dim), self.v_threshold, device=device,
+            (batch_size, self.hidden_dim), self.v_threshold, device=device, dtype=_dt,
         )
-        w_adapt = torch.zeros(batch_size, self.hidden_dim, device=device)
+        w_adapt = torch.zeros(batch_size, self.hidden_dim, device=device, dtype=_dt)
         return v, i_syn, refract_counter, v_thresh_eff, w_adapt
 
     def init_state_6(
@@ -966,6 +1578,7 @@ class LIFCell(nn.Module):
         _large = float(10 * max(self.rel_refract_steps, 1))
         rel_refract_counter = torch.full(
             (batch_size, self.hidden_dim), _large, device=device,
+            dtype=self.W_in.weight.dtype,
         )
         return v, i_syn, refract_counter, v_thresh_eff, w_adapt, rel_refract_counter
 
@@ -1016,7 +1629,9 @@ class GRUUnit(nn.Module):
     GRU pathway with ``pack_padded_sequence`` / ``pad_packed_sequence``.
 
     Input:  ``(B, T, H)`` — sensory encoding
-    Output: ``(B, T, H)`` — recurrent hidden states
+    Output: ``(B, T, H)`` — recurrent hidden states (default), or
+            ``(out (B, T, H), h_n (num_layers, B, H))`` when
+            ``return_hidden=True``.
     """
 
     def __init__(
@@ -1026,6 +1641,7 @@ class GRUUnit(nn.Module):
         dropout: float = 0.1,
     ) -> None:
         super().__init__()
+        self.num_layers = num_layers
         self.gru = nn.GRU(
             input_size=hidden_dim,
             hidden_size=hidden_dim,
@@ -1039,43 +1655,140 @@ class GRUUnit(nn.Module):
         x: torch.Tensor,
         lengths: torch.Tensor,
         h0: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        return_hidden: bool = False,
+    ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             x: ``(B, T, H)``
             lengths: ``(B,)`` — true sequence lengths.
             h0: ``(num_layers, B, H)`` — optional initial hidden state.
+            return_hidden: If ``True``, also return the raw packed-GRU final
+                hidden state ``h_n`` ``(num_layers, B, H)`` — the true
+                per-sample endpoint, BEFORE any output-only gain.  The
+                default ``False`` preserves the historical output-only
+                return type ``(B, T, H)``.
 
         Returns:
-            ``(B, T, H)``
+            ``(B, T, H)`` when ``return_hidden=False``; otherwise
+            ``(out (B, T, H), h_n (num_layers, B, H))``.
         """
+        B, T, H = x.shape
+        assert x.shape == (B, T, H)
+        # H5 / finding A6: validate the ORIGINAL observation dtype at this
+        # direct public boundary BEFORE ``.contiguous()``/finiteness/kernels.
+        # A complex/int/bool observation (whose imaginary part a later cast
+        # would discard) is refused; the top-level facade guard does not cover
+        # direct GRUUnit callers.
+        _require_real_floating_observation(x, name="x", context="GRUUnit")
         x = x.contiguous()
+
+        # A zero-time tensor (T == 0) is unsupported and is refused BEFORE any
+        # indexing.  This is distinct from ``lengths == 0`` (a zero-length
+        # sample in a T > 0 batch), which is a valid exact no-op below.
+        if T == 0:
+            raise ValueError(
+                "GRUUnit.forward requires T >= 1; a zero-time tensor (T=0) is "
+                "unsupported (distinct from lengths==0, a valid no-op)."
+            )
+        lengths_i = _validate_original_lengths(
+            lengths, B, T, context="GRUUnit",
+        ).to(device=x.device).contiguous()
+
         if h0 is not None:
-            h0 = h0.contiguous()
+            h0 = _validate_original_carry(
+                h0, (self.num_layers, B, H), key="h0",
+                device=x.device, dtype=x.dtype,
+            ).contiguous()
+
+        # Sanitize invalid (padded) frames BEFORE any recurrent math via
+        # selection, so a NaN/Inf padded suffix can never poison the GRU
+        # output, the packed ``h_n`` carry, or the input/parameter/h0
+        # gradients.  A nonfinite value in a VALID frame is refused (a real
+        # observation is never silently sanitized).  ``torch.where`` (not an
+        # arithmetic multiply) is the exact selection: invalid frames become
+        # canonical zeros, which also makes the ``clamp(min=1)`` dummy frame
+        # for an empty packed sequence numerically safe.
+        valid = (
+            torch.arange(T, device=x.device).unsqueeze(0) < lengths_i.unsqueeze(1)
+        )                                                    # (B, T) bool
+        if not torch.isfinite(x[valid]).all():
+            raise ValueError(
+                "GRUUnit received nonfinite values in valid frames; refusing "
+                "to sanitize real observations."
+            )
+        x = torch.where(valid.unsqueeze(-1), x, torch.zeros_like(x))
 
         self.gru.flatten_parameters()
 
-        lengths_cpu = lengths.clamp(min=1).cpu().contiguous()
+        # r6 R2: a zero-length row's clamped dummy packed frame must NOT
+        # evaluate the original inactive ``h0``.  With a finite-but-huge
+        # inactive carry (e.g. 1e38) and recurrent weights >1, the dummy
+        # recurrence overflows; the value is discarded by the selection below,
+        # but the discarded branch's backward computes ``0 * inf = NaN`` and
+        # poisons the required identity gradient.  Substitute safe zeros for
+        # inactive rows for the recurrence ONLY; the original carry is restored
+        # by differentiable selection below (identity derivative 1, finite
+        # zero cross/input derivatives).  Active rows use their own h0.
+        empty = (lengths_i == 0)                               # (B,)
+        h0_safe = h0
+        if bool(empty.any()) and h0 is not None:
+            h0_safe = torch.where(
+                empty.view(1, B, 1), torch.zeros_like(h0), h0,
+            )
+
+        lengths_cpu = lengths_i.clamp(min=1).cpu().contiguous()
         packed = pack_padded_sequence(
             x, lengths_cpu, batch_first=True, enforce_sorted=False,
         )
-        packed_out, _ = self.gru(packed, h0)
+        packed_out, h_n = self.gru(packed, h0_safe)
         out, _ = pad_packed_sequence(
             packed_out, batch_first=True, total_length=x.shape[1],
         )
-        return out
+        assert out.shape == (B, T, H), (
+            f"GRU output {tuple(out.shape)} != (B={B}, T={T}, H={H})"
+        )
+        # ``h_n`` is the raw recurrent carry (num_layers, B, H): the true
+        # per-sample endpoint, unpadded and pre-gain.  ``pack_padded_sequence``
+        # already returns the state at each sample's valid endpoint.
+        assert h_n.shape == (self.num_layers, B, H), (
+            f"GRU h_n {tuple(h_n.shape)} != (num_layers={self.num_layers}, "
+            f"B={B}, H={H})"
+        )
+
+        # Zero-length rows: clamping the packed length to 1 makes the GRU
+        # advance a garbage frame for ``lengths == 0`` samples.  A zero-length
+        # sample has no valid frames, so its recurrent carry must be an EXACT
+        # no-op — preserve the incoming ``h_n`` (or the canonical zeros when no
+        # state was supplied) and export zeros.  This keeps a finished sample's
+        # carry unchanged when a batch is resumed.
+        if bool(empty.any()):
+            carry0 = h0 if h0 is not None else torch.zeros(
+                self.num_layers, B, H, device=x.device, dtype=h_n.dtype,
+            )
+            h_n = torch.where(empty.view(1, B, 1), carry0, h_n)
+            out = torch.where(
+                empty.view(B, 1, 1), torch.zeros_like(out), out,
+            )
+
+        if not return_hidden:
+            return out
+        return out, h_n
 
 
 # ===============================================================
-# 4.  MoR Router (Causal Inference Gate)
+# 4.  MoR Router (Learned Representational-Routing Gate)
 # ===============================================================
 
 class MoRRouter(nn.Module):
     """
     Per-time-step routing network that blends LIF and GRU outputs.
 
+    This is a learned representational-routing gate, not a causal-inference
+    estimator.  The two weights are *coupled*: a ``softmax`` over the two
+    logits makes ``g_lif + g_gru = 1`` per time-step.
+
     Input:  ``(B, H + M)`` at each step
-    Output: ``(B, 2)`` — independent routing weights in [0, 1]
+    Output: ``(B, 2)`` — coupled softmax weights summing to 1
     """
 
     def __init__(self, hidden_dim: int = 64, mcmc_dim: int = 4) -> None:
@@ -1093,7 +1806,8 @@ class MoRRouter(nn.Module):
             mcmc_prior: ``(B, M)``
 
         Returns:
-            ``(B, 2)`` — ``[g_lif, g_gru]`` independently in [0, 1].
+            ``(B, 2)`` — ``[g_lif, g_gru]`` as coupled softmax weights
+            (each in [0, 1], summing to 1).
         """
         combined = torch.cat([e_sensory, mcmc_prior], dim=-1)
         logits = self.gate(combined)
@@ -1106,20 +1820,65 @@ class MoRRouter(nn.Module):
 
 class DirectionHead(nn.Module):
     """
-    Final decoder: ``LayerNorm -> ReLU -> Dropout -> Linear(H, 1)``.
+    Final decoder.
+
+    ``activation="relu"`` (default)::
+
+        LayerNorm -> ReLU -> Dropout -> Linear(H, 1)
+
+    ``activation="swiglu"``::
+
+        n = Dropout(LayerNorm(h))
+        out = Linear(H, 1)(SiLU(gate_proj(n)) * value_proj(n))
+
+    ``gate_proj`` and ``value_proj`` are ``Linear(H, H)``; the readout is a
+    separate ``Linear(H, 1)``.  SwiGLU is ``SiLU(W_gate x) * (W_value x)``.
 
     Input:  ``(B, T, H)``
     Output: ``(B, T)``
     """
 
-    def __init__(self, hidden_dim: int = 64, dropout: float = 0.1) -> None:
+    def __init__(
+        self,
+        hidden_dim: int = 64,
+        dropout: float = 0.1,
+        activation: str = "relu",
+    ) -> None:
+        """
+        Args:
+            hidden_dim: Input hidden dimensionality.
+            dropout: Dropout probability (applied in both branches).
+            activation: ``"relu"`` (default, historical) or ``"swiglu"``.
+
+        Raises:
+            ValueError: If *activation* is not a supported name.
+        """
         super().__init__()
-        self.net = nn.Sequential(
-            nn.LayerNorm(hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, 1),
-        )
+        if activation not in _VALID_ACTIVATIONS:
+            raise ValueError(
+                f"activation must be one of {_VALID_ACTIVATIONS}, "
+                f"got {activation!r}"
+            )
+        self.activation = activation
+        self.hidden_dim = hidden_dim
+        # Stable attribute for downstream introspection (e.g. the JAX eval
+        # wrapper) so callers need not index into ``net``.
+        self.dropout_rate = dropout
+        if activation == "swiglu":
+            self.net = nn.Sequential(
+                nn.LayerNorm(hidden_dim),
+                nn.Dropout(dropout),
+            )
+            self.gate_proj = nn.Linear(hidden_dim, hidden_dim)
+            self.value_proj = nn.Linear(hidden_dim, hidden_dim)
+            self.out_proj = nn.Linear(hidden_dim, 1)
+        else:
+            self.net = nn.Sequential(
+                nn.LayerNorm(hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, 1),
+            )
 
     def forward(self, h: torch.Tensor) -> torch.Tensor:
         """
@@ -1129,7 +1888,20 @@ class DirectionHead(nn.Module):
         Returns:
             ``(B, T)``
         """
-        return self.net(h).squeeze(-1)
+        B, T, H = h.shape
+        if self.activation == "swiglu":
+            n = self.net(h)
+            assert n.shape == (B, T, H), (
+                f"DirectionHead norm {tuple(n.shape)} != (B={B}, T={T}, H={H})"
+            )
+            y = self.out_proj(F.silu(self.gate_proj(n)) * self.value_proj(n))
+        else:
+            y = self.net(h)
+        y = y.squeeze(-1)
+        assert y.shape == (B, T), (
+            f"DirectionHead output {tuple(y.shape)} != (B={B}, T={T})"
+        )
+        return y
 
 
 # ===============================================================
@@ -1169,6 +1941,7 @@ class FrontendEncoder(nn.Module):
         sensory_noise_std: float = 0.0,
         dendritic_tau: float = 0.0,
         dt_ms: float = 10.0,
+        activation: str = "relu",
     ) -> None:
         """
         Args:
@@ -1182,10 +1955,14 @@ class FrontendEncoder(nn.Module):
                 Ref: London & Hausser 2005.
             dt_ms: Sampling interval in ms (physical time base for all
                 time constants).
+            activation: ``"relu"`` (default) or ``"swiglu"`` for the
+                sensory encoder.
         """
         super().__init__()
         self.sensory_dim = sensory_dim
-        self.sensory_encoder = SensoryEncoder(sensory_dim, hidden_dim, sensory_noise_std)
+        self.sensory_encoder = SensoryEncoder(
+            sensory_dim, hidden_dim, sensory_noise_std, activation=activation,
+        )
 
         # ── Dendritic compartmentalization ──
         # Ref: London & Hausser 2005, Annu. Rev. Neurosci.
@@ -1223,10 +2000,39 @@ class FrontendEncoder(nn.Module):
         B, T, _ = sensory_x.shape
         device = sensory_x.device
 
-        # Dendritic IIR filter on visual channels (optional)
+        # A zero-time tensor is unsupported and refused BEFORE any indexing
+        # (distinct from ``lengths == 0``, a valid zero-length no-op sample).
+        if T == 0:
+            raise ValueError(
+                "FrontendEncoder.forward requires T >= 1; a zero-time tensor "
+                "(T=0) is unsupported (distinct from lengths==0)."
+            )
+        lengths_i = _validate_original_lengths(
+            lengths, B, T, context="FrontendEncoder",
+        ).to(device=device)
+
+        # Reject nonfinite values in VALID frames: a NaN/Inf in a real
+        # observation is a scientific/data error, not padding, and must not be
+        # silently hidden.  Invalid (padded) frames are sanitized to zero below.
+        valid_mask = (
+            torch.arange(T, device=device).unsqueeze(0)
+            < lengths_i.unsqueeze(1)
+        )                                                    # (B, T) bool
+        if not torch.isfinite(sensory_x[valid_mask]).all():
+            raise ValueError(
+                "FrontendEncoder received nonfinite values in valid frames; "
+                "refusing to sanitize real observations."
+            )
+        # Sanitize invalid (padded) frames BEFORE any computation so overflow /
+        # NaN in the padded suffix can never propagate into the encoder, the
+        # dendritic IIR carry, or downstream state.
+        sensory_x = torch.where(
+            valid_mask.unsqueeze(-1), sensory_x,
+            torch.zeros_like(sensory_x),
+        )
+
+        # Dendritic IIR filter on the visual channel (optional)
         if self._dendritic_enabled:
-            D = self.sensory_dim
-            half_d = D // 2
             alpha_dend = self._alpha_dend
 
             dend_state = getattr(self, '_dendritic_state', None)
@@ -1235,11 +2041,75 @@ class FrontendEncoder(nn.Module):
             # forward call unless it explicitly restores autoregressive
             # state.  The shape check below remains as a secondary
             # guard for direct FrontendEncoder use.
-            if dend_state is None or dend_state.shape != (B, half_d):
-                dend_state = torch.zeros(B, half_d, device=device)
+            #
+            # Historical (B, 2) carry is MIGRATED, not silently reset: the
+            # current contract is a single visual-channel low-pass (B, 1).
+            # Column 0 is the visual component; the discarded column was the
+            # retired wind-memory filter (wind is no longer filtered).  Any
+            # other rank/width/dtype is rejected.
+            if dend_state is None:
+                dend_state = torch.zeros(B, 1, device=device)
+            else:
+                if not isinstance(dend_state, torch.Tensor):
+                    raise ValueError(
+                        "dendritic carry must be a torch.Tensor, got "
+                        f"{type(dend_state).__name__}"
+                    )
+                if dend_state.dim() != 2 or dend_state.shape[0] != B:
+                    raise ValueError(
+                        "dendritic carry must be (B, 1) [legacy (B, 2) "
+                        f"migrated]; got shape {tuple(dend_state.shape)} for B={B}"
+                    )
+                if dend_state.shape[1] == 2:
+                    # Legacy wind-memory width: keep the visual component.
+                    dend_state = dend_state[:, 0:1]
+                elif dend_state.shape[1] != 1:
+                    raise ValueError(
+                        "dendritic carry must be (B, 1) or legacy (B, 2); got "
+                        f"width {dend_state.shape[1]}"
+                    )
+                if not dend_state.is_floating_point():
+                    raise ValueError("dendritic carry must be floating point")
+                if not torch.isfinite(dend_state).all():
+                    raise ValueError(
+                        "dendritic carry contains nonfinite values; refusing "
+                        "to propagate a poisoned low-pass state."
+                    )
+                dend_state = dend_state.to(device=device, dtype=sensory_x.dtype)
+                # Representability after conversion (r5 R1): the ORIGINAL
+                # finiteness above is insufficient — a finite float64 carry
+                # can overflow to float32 +inf when narrowed.
+                if not torch.isfinite(dend_state).all():
+                    raise ValueError(
+                        "dendritic carry is not representable in the "
+                        f"computation dtype {sensory_x.dtype}: finite values "
+                        "overflow to nonfinite after conversion."
+                    )
+            # Snapshot the incoming carry BEFORE the IIR loop advances it, so
+            # a zero-length sample can restore its exact no-op value AND keep
+            # the identity gradient to the incoming state (r4 R6).  The
+            # snapshot is deliberately NOT detached: a ``requires_grad``
+            # incoming carry must satisfy d(exported_empty)/d(incoming) = 1.
+            incoming = dend_state                               # (B, 1)
 
-            visual_raw = sensory_x[:, :, :half_d]   # (B, T, D//2)
-            wind_raw = sensory_x[:, :, half_d:]     # (B, T, D//2)
+            # r6 R2: keep inactive rows OUT of the dendritic IIR before it is
+            # evaluated.  A finite-but-huge inactive carry (e.g. 3e38) fed
+            # through the IIR repopulates the padded visual frames and reaches
+            # the encoder, whose backward through those discarded rows is
+            # nonfinite.  Substitute a safe zero carry for inactive rows for
+            # the IIR ONLY; the original incoming carry is restored for export
+            # by differentiable selection below (identity derivative 1).
+            empty_dend = (lengths_i == 0).unsqueeze(-1)         # (B, 1)
+            dend_state = torch.where(
+                empty_dend, torch.zeros_like(incoming), incoming,
+            )
+
+            # The 4-D sensory layout is [visual, wind, v_lag, a_lag]:
+            # ONLY channel 0 is the visual channel that traverses the slow
+            # optic-lobe dendrite.  Channels 1.. (wind, kinematic history)
+            # are fast cercal/somatic signals and MUST bypass the filter.
+            visual_raw = sensory_x[:, :, 0:1]        # (B, T, 1)
+            bypass_raw = sensory_x[:, :, 1:]         # (B, T, D-1)
 
             _SEG_LEN = 32
 
@@ -1270,8 +2140,27 @@ class FrontendEncoder(nn.Module):
 
                 dend_visual[:, seg_start:seg_end, :] = seg_out
 
-            self._dendritic_state = dend_state.detach()
-            sensory_x = torch.cat([dend_visual, wind_raw], dim=-1)
+            # Freeze the exported carry at each sample's TRUE endpoint:
+            # padded frames must not advance the dendritic low-pass state
+            # that the next autoregressive call resumes from.  Selecting the
+            # frame at ``lengths-1`` is exact and, for full-length samples,
+            # equals the historical end-of-sequence state.  A ZERO-length
+            # sample has no valid frame: it is an exact no-op that preserves
+            # the incoming carry (never the surrogate frame-0 update).
+            end_idx = (lengths_i - 1).clamp(min=0)              # (B,)
+            dend_end = dend_visual[
+                torch.arange(B, device=device), end_idx, 0
+            ]                                                   # (B,)
+            dend_end = dend_end.unsqueeze(-1)                   # (B, 1)
+            empty = (lengths_i == 0).unsqueeze(-1)              # (B, 1)
+            # Truncate (TBPTT) ONLY the actively advancing rows at their true
+            # endpoint; a zero-length row keeps the differentiable identity
+            # path to its incoming carry (r4 R6).  A blanket ``.detach()``
+            # here severed the empty-row identity gradient (finding A6).
+            self._dendritic_state = torch.where(
+                empty, incoming, dend_end.detach(),
+            )                                                   # (B, 1)
+            sensory_x = torch.cat([dend_visual, bypass_raw], dim=-1)
 
         return self.sensory_encoder(sensory_x)
 
@@ -1279,6 +2168,279 @@ class FrontendEncoder(nn.Module):
 # ===============================================================
 # 6b.  Bio-Decision Core (Hybrid Funnel — Stage 2)
 # ===============================================================
+
+class AdaptiveLatentRefinement(nn.Module):
+    """Shared adaptive-recursion latent refinement (opt-in, architecture v1).
+
+    A SHARED bounded residual block and a SHARED halt head are applied
+    iteratively to the CURRENT post-fusion latent ``u_0 = h_fused`` (after the
+    LIF/GRU fusion and before the direction head).  This is representational
+    refinement, NOT additional biological time: one external timestep still
+    advances the LIF membrane/synaptic/refractory state and the GRU temporal
+    state exactly once.  The module never calls ``LIFCell``/``GRUUnit``.
+
+    Modes (``mode``):
+
+    * ``"off"`` — the module is not constructed; historical numerics/keys are
+      unchanged.
+    * ``"fixed"`` — the shared block is applied exactly ``max_steps`` times to
+      every valid row (the halt head is present in the parameter tree but is NOT
+      executed).  The refined output is the FINAL step ``u_K``.
+    * ``"adaptive"`` — ACT-style adaptive depth.  ``p_k = sigmoid(HaltHead(u_k))``
+      is shared across internal depth and external ``t``.  For each valid row the
+      first index ``N`` with ``cum_N = sum_{j<=N} p_j >= 1 - eps`` (else
+      ``max_steps``) defines the depth.  The output is the FULL PREFIX ACT
+      mixture
+
+          out = sum_{j=1..N-1} p_j * u_j  +  R * u_N ,   R = 1 - sum_{j<N} p_j
+
+      with weights nonnegative and summing to one; at forced max depth the
+      remainder mass is fully allocated to ``u_N``; ``N == 1`` gives ``out = u_1``.
+
+    Real compute saving: only ACTIVE valid rows (not yet halted) are gathered and
+    the shared block/halt head run on that subset each step; halted rows stop
+    executing.  This is NOT all-K compute plus weighting.
+
+    Gradient reality / limits (documented, not hidden):
+
+    * The discrete first-crossing index ``N`` has NO pathwise derivative.  The
+      trainable ponder surrogate is ``N.detach() + R`` (the ACT estimator): ``N``
+      is a detached integer order, only the remainder ``R`` is differentiable.
+      This surrogate is NOT actual work / MAC / ATP.  Actual integer depth is
+      recorded separately (``refinement_depth``/``refinement_updates``) and is
+      detached.  ``K == 1`` or immediate halting can have ZERO halt gradient.
+    * The block update is bounded (``scale * tanh(...)``); LayerNorm alone is not
+      a stability proof.  Finite gradients/numerics are checked empirically.
+    * A negative halt-head bias DECREASES ``p`` and typically INCREASES depth; it
+      is NOT used to encourage early halting.  Initialization is checked
+      empirically (nondegenerate depth), not asserted.
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        *,
+        mode: str = "off",
+        max_steps: int = 4,
+        eps: float = 0.01,
+        update_scale: float = 1.0,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        # Share the refinement-option contract with the off-mode boundary so
+        # the enabled and disabled paths cannot diverge.
+        mode, max_steps, eps, update_scale = _validate_refinement_options(
+            mode=mode, max_steps=max_steps, eps=eps, update_scale=update_scale,
+            context="AdaptiveLatentRefinement",
+        )
+        # H1 / finding A1: ``mode="off"`` is NOT a valid module state.  This
+        # public constructor is the ENABLED refinement module; "off" means the
+        # module is absent, and ``BioDecisionCore`` already never constructs it
+        # for "off".  Refusing "off" here is the smallest consistent contract:
+        # it can never create parameters, consume RNG, or execute refinement
+        # under an "off" flag.  The declared option contract is validated FIRST
+        # (so a malformed off-mode request still fails closed on the option
+        # itself), then "off" is refused.
+        if mode == "off":
+            raise ValueError(
+                "AdaptiveLatentRefinement is the ENABLED refinement module and "
+                "does not accept mode='off'; 'off' means the module is absent "
+                "(BioDecisionCore builds it only for 'fixed'/'adaptive'). "
+                "Construct with mode='fixed' or 'adaptive', or omit the module."
+            )
+        self.mode = mode
+        self.max_steps = int(max_steps)
+        self.eps = float(eps)
+        self.update_scale = float(update_scale)
+        self.hidden_dim = int(hidden_dim)
+
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.fc1 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        # Shared halt head (used only in adaptive mode).
+        self.halt = nn.Linear(hidden_dim, 1)
+
+    def _block(self, u: torch.Tensor) -> torch.Tensor:
+        h = self.norm(u)
+        h = torch.tanh(self.fc1(h))
+        h = self.fc2(h)
+        # Bounded residual: |delta| <= update_scale.  LayerNorm alone is not a
+        # stability proof; the bounded increment controls per-step drift.
+        delta = self.update_scale * torch.tanh(h)
+        return u + delta
+
+    def forward(
+        self, h_fused: torch.Tensor, valid: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Refine ``h_fused`` (B, T, H).
+
+        Returns ``(out, depth, updates, ponder_cost, weights)`` where
+        ``depth`` is int ``(B, T)`` (0 for padding), ``updates`` is an int
+        scalar (``depth.sum()``), ``ponder_cost`` is a differentiable scalar
+        normalized over valid tokens (0 when all-empty), and ``weights`` is
+        ``(B, T, K)`` (valid rows sum to 1, padding 0).
+
+        ``weights`` semantics differ by mode because the modes have different
+        outputs: ``fixed`` returns the FINAL state ``u_K`` (one-hot mass at
+        slot ``K``), while ``adaptive`` returns the ACT full-prefix mixture
+        (mass spread over the executed steps).  Both are truthful per-row
+        diagnostics, not a shared uniform mean.
+        """
+        B, T, H = h_fused.shape
+        assert h_fused.shape == (B, T, H)
+        assert valid.shape == (B, T)
+        K = self.max_steps
+        device = h_fused.device
+
+        flat = h_fused.reshape(B * T, H)
+        valid_flat = valid.reshape(B * T)
+        n_valid = int(valid_flat.sum().item())
+        updates_scalar = torch.zeros((), dtype=torch.long, device=device)
+
+        if self.mode == "fixed":
+            # Real-work contract: gather ONLY the valid rows and run the shared
+            # block exactly K times on that subset.  An all-empty batch performs
+            # NO block call (no fabricated work) and returns an exact-zero
+            # output.  Padded rows are scattered as exact zeros, so they carry
+            # no value and receive no parameter/input gradient contribution
+            # (root G1 / findings A1, B2).
+            out_flat = torch.zeros(B * T, H, device=device, dtype=h_fused.dtype)
+            if n_valid > 0:
+                idx = valid_flat.nonzero(as_tuple=True)[0]
+                u = flat.index_select(0, idx)
+                for _ in range(K):
+                    u = self._block(u)
+                out_flat = out_flat.index_copy(0, idx, u)
+            out = out_flat.reshape(B, T, H)
+            depth = torch.where(
+                valid,
+                torch.full((B, T), K, dtype=torch.long, device=device),
+                torch.zeros((B, T), dtype=torch.long, device=device),
+            )
+            # Counter equals the ACTUAL executed rows (n_valid * K), zero for an
+            # all-empty batch (no block call).
+            updates_scalar = torch.tensor(
+                n_valid * K, dtype=torch.long, device=device,
+            )
+            ponder = (
+                # All-empty: a safe, graph-connected differentiable zero (H2).
+                _refinement_empty_zero(h_fused, valid)
+                if n_valid == 0 else torch.full((), float(K), device=device)
+            )
+            # Fixed output is the FINAL step u_K, so the truthful per-row weight
+            # diagnostic is a one-hot at step K (mass fully on the executed
+            # final state), NOT a misleading uniform 1/K mean over every step.
+            # Valid rows sum to 1; padding is exactly 0.
+            weights = torch.zeros(
+                (B, T, K), device=device, dtype=h_fused.dtype,
+            )
+            weights[..., K - 1] = torch.where(
+                valid, torch.ones((B, T), device=device, dtype=h_fused.dtype),
+                torch.zeros((B, T), device=device, dtype=h_fused.dtype),
+            )
+            return out, depth, updates_scalar, ponder, weights
+
+        # ── adaptive ──
+        u = flat.clone()
+        prefix = torch.zeros(B * T, H, device=device, dtype=h_fused.dtype)
+        cum = torch.zeros(B * T, device=device, dtype=h_fused.dtype)
+        final_out = torch.zeros(B * T, H, device=device, dtype=h_fused.dtype)
+        depth_flat = torch.zeros(B * T, dtype=torch.long, device=device)
+        weights_flat = torch.zeros(B * T, K, device=device, dtype=h_fused.dtype)
+        halted = ~valid_flat  # invalid/padding rows start "done"
+        N_order = torch.zeros(B * T, dtype=torch.long, device=device)
+        R_val = torch.zeros(B * T, device=device, dtype=h_fused.dtype)
+        total_updates = 0
+        for k in range(1, K + 1):
+            active = (~halted) & valid_flat
+            n_active = int(active.sum().item())
+            if n_active == 0:
+                break
+            idx = active.nonzero(as_tuple=True)[0]
+            u_act = self._block(u[idx])
+            p_act = torch.sigmoid(self.halt(u_act)).squeeze(-1)  # (n_active,)
+            total_updates += n_active
+            u = u.index_copy(0, idx, u_act)
+            p = torch.zeros(B * T, device=device, dtype=h_fused.dtype)
+            p = p.index_copy(0, idx, p_act)
+            new_cum = cum + p
+            # A row crosses AT this step when its cumulative halt reaches
+            # 1 - eps for the first time here.
+            just = active & (new_cum >= (1.0 - self.eps)) & (N_order == 0)
+            if bool(just.any()):
+                j_idx = just.nonzero(as_tuple=True)[0]
+                # R = 1 - sum_{j<k} p_j = 1 - cum (cum is the PRE-step prefix).
+                R_j = (1.0 - cum)[just]
+                # out = sum_{j<k} p_j u_j + R * u_k  (prefix excludes this step).
+                final_out = final_out.index_copy(
+                    0, j_idx, prefix[just] + R_j.unsqueeze(-1) * u[just],
+                )
+                depth_flat = depth_flat.index_copy(
+                    0, j_idx, torch.full_like(depth_flat[just], k),
+                )
+                N_order = N_order.index_copy(
+                    0, j_idx, torch.full_like(N_order[just], k),
+                )
+                R_val = R_val.index_copy(0, j_idx, R_j)
+            # Rows still active AFTER this step accumulate p_k u_k into the
+            # prefix (they have k < N).  At the FINAL step (k == K) we do NOT
+            # accumulate: the still-active rows become the never-crossing rows
+            # whose remainder is allocated to u_K with R = 1 - sum_{j<K} p_j
+            # (the same formula as crossing exactly at K).
+            accum = active & ~just
+            if k < K and bool(accum.any()):
+                prefix = prefix + torch.where(
+                    accum.unsqueeze(-1), p.unsqueeze(-1) * u, torch.zeros_like(u),
+                )
+            # Provisional weight p_k for active rows (final step overwritten by R).
+            weights_flat[:, k - 1] = torch.where(active, p, torch.zeros_like(p))
+            cum = new_cum
+            halted = halted | (new_cum >= (1.0 - self.eps))
+        # Rows that never crossed within K: N = K, remainder fully allocated to
+        # u_K with R = 1 - sum_{j<K} p_j.  ``cum`` holds sum_{j<=K} p_j, so the
+        # final-step halt probability ``p`` must be removed to recover the
+        # prefix sum.  (``never`` is nonempty only when the loop ran to K, so
+        # ``p`` is the K-th step value.)
+        never = valid_flat & (N_order == 0)
+        if bool(never.any()):
+            n_idx = never.nonzero(as_tuple=True)[0]
+            R_j = (1.0 - (cum - p))[never]
+            final_out = final_out.index_copy(
+                0, n_idx, prefix[never] + R_j.unsqueeze(-1) * u[never],
+            )
+            depth_flat = depth_flat.index_copy(
+                0, n_idx, torch.full_like(depth_flat[never], K),
+            )
+            N_order = N_order.index_copy(
+                0, n_idx, torch.full_like(N_order[never], K),
+            )
+            R_val = R_val.index_copy(0, n_idx, R_j)
+        # The FINAL state weight is R (not p_N).  Put R in the N-th slot and
+        # zero every slot beyond N, so valid rows sum to 1.
+        for kk in range(1, K + 1):
+            beyond = (N_order != 0) & (N_order < kk)
+            is_n = N_order == kk
+            col = weights_flat[:, kk - 1]
+            col = torch.where(is_n, R_val, col)
+            col = torch.where(beyond, torch.zeros_like(col), col)
+            weights_flat[:, kk - 1] = col
+        out = final_out.reshape(B, T, H)
+        depth = depth_flat.reshape(B, T)
+        updates_scalar = torch.tensor(total_updates, dtype=torch.long, device=device)
+        weights = weights_flat.reshape(B, T, K)
+        # Differentiable ACT ponder surrogate: N.detach() + R (per valid row).
+        if n_valid == 0:
+            # All-empty: a safe, graph-connected differentiable zero (H2), so
+            # downstream backward never errors on a leaf-less scalar and NaN /
+            # overflow padding cannot poison the cost.
+            ponder = _refinement_empty_zero(h_fused, valid)
+        else:
+            N_detached = N_order.to(h_fused.dtype).detach()
+            per_row = N_detached + R_val
+            valid_flat_f = valid_flat.to(h_fused.dtype)
+            ponder = (per_row * valid_flat_f).sum() / valid_flat_f.sum()
+        return out, depth, updates_scalar, ponder, weights
+
 
 class BioDecisionCore(nn.Module):
     """
@@ -1332,6 +2494,11 @@ class BioDecisionCore(nn.Module):
         gru_neuromod_gain: float = 0.0,
         lif_tbptt_steps: int = 64,
         dt_ms: float = 10.0,
+        activation: str = "relu",
+        refinement_mode: str = "off",
+        refinement_max_steps: int = 4,
+        refinement_eps: float = 0.01,
+        refinement_update_scale: float = 1.0,
     ) -> None:
         """
         Args:
@@ -1357,6 +2524,17 @@ class BioDecisionCore(nn.Module):
             lif_tbptt_steps: Truncated BPTT window for LIF (0=full BPTT).
             dt_ms: Sampling interval in ms (physical time base for all
                 LIF time constants).
+            activation: ``"relu"`` (default) or ``"swiglu"`` for the
+                direction head.
+            refinement_mode: ``"off"`` (default; module absent, historical
+                numerics unchanged), ``"fixed"`` (shared block applied
+                ``refinement_max_steps`` times to every valid row), or
+                ``"adaptive"`` (ACT-style learned depth).
+            refinement_max_steps: Maximum internal refinement depth K (>= 1).
+            refinement_eps: ACT halting threshold; a row halts when its
+                cumulative halt probability reaches ``1 - eps``.
+            refinement_update_scale: Bound on the per-step residual update
+                (``|delta| <= update_scale``).
         """
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -1382,7 +2560,35 @@ class BioDecisionCore(nn.Module):
         )
         self.gru_unit = GRUUnit(hidden_dim, num_gru_layers, dropout)
         self.router = MoRRouter(hidden_dim, mcmc_dim)
-        self.direction_head = DirectionHead(hidden_dim, dropout)
+        self.direction_head = DirectionHead(hidden_dim, dropout, activation=activation)
+
+        # ── Opt-in adaptive latent refinement (architecture v1) ──
+        # ``off`` leaves the parameter tree / numerics bitwise unchanged; the
+        # module is only constructed for ``fixed``/``adaptive``.
+        #
+        # Root G6 / finding B6: the ORIGINAL refinement options are validated
+        # independently of whether a module is constructed, so an ``off`` model
+        # still refuses a bool/NaN/negative/illegal setting at the public trust
+        # boundary (mirroring ModelConfig).  Validation runs BEFORE the off
+        # branch, so ``off`` consumes no RNG and adds no parameters.
+        (refinement_mode, refinement_max_steps, refinement_eps,
+         refinement_update_scale) = _validate_refinement_options(
+            mode=refinement_mode, max_steps=refinement_max_steps,
+            eps=refinement_eps, update_scale=refinement_update_scale,
+            context="BioDecisionCore",
+        )
+        self.refinement_mode = refinement_mode
+        if refinement_mode == "off":
+            self.refinement = None
+        else:
+            self.refinement = AdaptiveLatentRefinement(
+                hidden_dim,
+                mode=refinement_mode,
+                max_steps=refinement_max_steps,
+                eps=refinement_eps,
+                update_scale=refinement_update_scale,
+                dropout=dropout,
+            )
 
         # ── Neuromodulatory gain for GRU pathway (Gap C) ──
         self.gru_neuromod_gain = gru_neuromod_gain
@@ -1425,56 +2631,162 @@ class BioDecisionCore(nn.Module):
             f"(B={B}, T={T}, H={self.hidden_dim})"
         )
 
+        # H4 / findings A5, B2: one shared preflight of every enabled mechanism
+        # (gain, STP, lateral inhibition) against its required parameter tree,
+        # BEFORE any leaf is read.  An inconsistent live flag (mutated after
+        # construction) fails closed with a descriptive ValueError instead of a
+        # bare AttributeError deep inside the recurrence.
+        assert_mechanism_tree_consistent(self, context="BioDecisionCore")
+
+        # A zero-time tensor is refused before indexing (distinct from
+        # ``lengths == 0``, a valid zero-length no-op sample).
+        if T == 0:
+            raise ValueError(
+                "BioDecisionCore.forward requires T >= 1; a zero-time tensor "
+                "(T=0) is unsupported (distinct from lengths==0)."
+            )
+        lengths_i = _validate_original_lengths(
+            lengths, B, T, context="BioDecisionCore",
+        ).to(device=device)
+        lengths = lengths_i
+        # Sanitize invalid (padded) frames BEFORE any GRU/LIF/router/head math
+        # so a finite-overflow or NaN padded suffix can never poison a
+        # recurrent carry or the next prediction.  The raw SENSORY channels are
+        # already sanitized in the frontend (before the encoder); the MCMC
+        # prior reaches the router/GRU directly and is sanitized here.  Nonfinite
+        # values in a VALID frame are refused (a real observation is never
+        # silently sanitized).  Selection (torch.where) is used, not arithmetic
+        # masking.
+        valid = (
+            torch.arange(T, device=device).unsqueeze(0)
+            < lengths.unsqueeze(1)
+        )                                                    # (B, T) bool
+        # ── Root G3 / findings A3, B4: validate the ORIGINAL observation dtype
+        # at this public boundary BEFORE any conversion.  A complex measurement
+        # (whose imaginary part the later ``.float()`` would silently discard)
+        # or an integer/boolean observation is refused rather than coerced.
+        _require_real_floating_observation(
+            e_sensory, name="e_sensory", context="BioDecisionCore",
+        )
+        _require_real_floating_observation(
+            mcmc_prior, name="mcmc_prior", context="BioDecisionCore",
+        )
+        if not torch.isfinite(e_sensory[valid]).all():
+            raise ValueError(
+                "BioDecisionCore received nonfinite sensory encoding in valid "
+                "frames; refusing to sanitize real observations."
+            )
+        if not torch.isfinite(mcmc_prior[valid]).all():
+            raise ValueError(
+                "BioDecisionCore received nonfinite MCMC prior in valid "
+                "frames; refusing to sanitize real observations."
+            )
+        mcmc_prior = torch.where(
+            valid.unsqueeze(-1), mcmc_prior, torch.zeros_like(mcmc_prior),
+        )
+        # Sanitize invalid ENCODED frames too.  ``e_sensory`` is supplied
+        # directly by a caller (NSMoRCore passes the frontend output, but
+        # BioDecisionCore is a public boundary reachable on its own), so a
+        # NaN/Inf padded suffix must be excluded BEFORE the LIF/GRU/router/head
+        # math rather than only masked afterwards — otherwise it poisons the
+        # output, the routing gates and every parameter/input gradient.  The
+        # valid-frame finiteness above already refused real nonfinite input.
+        e_sensory = torch.where(
+            valid.unsqueeze(-1), e_sensory, torch.zeros_like(e_sensory),
+        )
+
         # ── Initial states (autoregressive mode, CF3: +rel_refract) ──
+        # Each call initializes the canonical LIF tuple and caches for THIS
+        # call, then overlays every independently supplied carry field with
+        # validation.  The overlay is deliberately NOT gated on ``lif_v``: a
+        # partial state supplying only ``lif_i_syn`` / ``lif_w_adapt`` /
+        # ``lif_rel_refract`` / ``lif_spike_history`` / ... must be honored,
+        # and a field the caller omits must reset to its canonical default
+        # rather than reuse a prior call's cache (spike-history leakage).
         lif_state0: Optional[Tuple[torch.Tensor, ...]] = None
         gru_h0: Optional[torch.Tensor] = None
         if states is not None:
-            lif_v0 = states.get("lif_v", None)
-            lif_i_syn0 = states.get("lif_i_syn", None)
-            lif_refract0 = states.get("lif_refract", None)
-            lif_w_adapt0 = states.get("lif_w_adapt", None)
-            lif_rel_refract0 = states.get("lif_rel_refract", None)
-            if lif_v0 is not None:
-                _zeros = torch.zeros_like(lif_v0)
-                _large_rel = float(10 * max(self.lif_cell.rel_refract_steps, 1))
-                _rel_refract_default = torch.full_like(lif_v0, _large_rel)
-                if self.lif_cell.stp_enabled:
-                    lif_x_resource0 = states.get("lif_x_resource", None)
-                    lif_u_facil0 = states.get("lif_u_facil", None)
-                    lif_state0 = (
-                        lif_v0,
-                        lif_i_syn0 if lif_i_syn0 is not None else _zeros,
-                        lif_refract0 if lif_refract0 is not None else _zeros,
-                        torch.full_like(lif_v0, self.lif_cell.v_threshold),
-                        lif_w_adapt0 if lif_w_adapt0 is not None else _zeros,
-                        lif_rel_refract0 if lif_rel_refract0 is not None else _rel_refract_default,
-                        lif_x_resource0 if lif_x_resource0 is not None else torch.ones_like(lif_v0),
-                        lif_u_facil0 if lif_u_facil0 is not None else torch.full(
-                            (B, self.hidden_dim),
-                            torch.sigmoid(self.lif_cell.U_stp_raw).item(),
-                            device=lif_v0.device,
-                        ),
-                    )
-                else:
-                    lif_state0 = (
-                        lif_v0,
-                        lif_i_syn0 if lif_i_syn0 is not None else _zeros,
-                        lif_refract0 if lif_refract0 is not None else _zeros,
-                        torch.full_like(lif_v0, self.lif_cell.v_threshold),
-                        lif_w_adapt0 if lif_w_adapt0 is not None else _zeros,
-                        lif_rel_refract0 if lif_rel_refract0 is not None else _rel_refract_default,
-                    )
-            gru_h0 = states.get("gru_h", None)
+            # Physical-domain map (r6 R3): counters/adaptation are non-negative;
+            # STP resource/facilitation fractions lie in [0, 1].  Membrane and
+            # GRU coordinates have no arbitrary bound (absent from this map).
+            _DOMAINS: Dict[str, str] = {
+                "lif_refract": "nonneg",
+                "lif_rel_refract": "nonneg",
+                "lif_w_adapt": "nonneg",
+                "lif_x_resource": "fraction",
+                "lif_u_facil": "fraction",
+            }
 
+            def _carry(key: str, ref: torch.Tensor) -> torch.Tensor:
+                """Return a validated ``(B, H)`` supplied field, else *ref*."""
+                supplied = states.get(key, None)
+                if supplied is None:
+                    return ref
+                # Validate the ORIGINAL dtype, shape and finiteness BEFORE any
+                # conversion: a boolean/integer/complex carry (whose imaginary
+                # part ``.float()`` would silently discard) or a nonfinite
+                # carry (e.g. ``lif_v=NaN``) is rejected rather than poisoning
+                # the recurrence.  Shared with the raw-JAX boundary.  The dtype
+                # is the ACTUAL forced-FP32 computation dtype, not a
+                # default-dtype canonical allocation (r6 R1).
+                return _validate_original_carry(
+                    supplied, tuple(ref.shape), key=key,
+                    device=device, dtype=torch.float32,
+                    domain=_DOMAINS.get(key),
+                )
+
+            # Canonical tuple (also resets the lateral-inhibition spike-history
+            # cache).  ``init_state`` leaves ``_dendritic_state`` untouched for
+            # this cell (its ``_dendritic_enabled`` is False); the frontend
+            # dendritic carry is restored by ``NSMoRCore.forward``.
+            _canonical = self.lif_cell.init_state(B, device)
+            _keys: Tuple[Optional[str], ...] = (
+                "lif_v", "lif_i_syn", "lif_refract", None, "lif_w_adapt",
+                "lif_rel_refract",
+            )
+            if len(_canonical) == 8:  # STP enabled
+                _keys = _keys + ("lif_x_resource", "lif_u_facil")
+            assert len(_keys) == len(_canonical), (
+                f"LIF carry key map {len(_keys)} != canonical state "
+                f"{len(_canonical)}"
+            )
+            lif_state0 = tuple(
+                canon if key is None else _carry(key, canon)
+                for key, canon in zip(_keys, _canonical)
+            )
+            # The stacked GRU carry ``(num_layers, B, H)`` is validated on its
+            # ORIGINAL dtype/shape/finiteness against the ACTUAL forced-FP32
+            # computation dtype before the later ``.float()``.
+            _gru_in = states.get("gru_h", None)
+            if _gru_in is not None:
+                gru_h0 = _validate_original_carry(
+                    _gru_in, (self.gru_unit.num_layers, B, self.hidden_dim),
+                    key="gru_h", device=device, dtype=torch.float32,
+                )
+
+            # Install supplied caches AFTER canonical initialization so an
+            # omitted cache stays reset (never a prior-call value).  A
+            # malformed cache is rejected, not silently replaced by the
+            # canonical default.
             if self.lif_cell._dendritic_enabled:
                 dend_state_in = states.get("lif_dendritic_state", None)
                 if dend_state_in is not None:
-                    self.lif_cell._dendritic_state = dend_state_in
+                    self.lif_cell._dendritic_state = _validate_original_carry(
+                        dend_state_in, (B, self.hidden_dim),
+                        key="lif_dendritic_state", device=device,
+                        dtype=torch.float32,
+                    )
 
             if self.lif_cell.lateral_inhibition > 0.0:
                 spike_hist_in = states.get("lif_spike_history", None)
                 if spike_hist_in is not None:
-                    self.lif_cell._spike_history = spike_hist_in
+                    # r6 R3: the spike history is an EMA of binary spikes, so
+                    # its justified domain is [0, 1].
+                    self.lif_cell._spike_history = _validate_original_carry(
+                        spike_hist_in, (B, self.hidden_dim),
+                        key="lif_spike_history", device=device,
+                        dtype=torch.float32, domain="fraction",
+                    )
 
         # ── Path A: LIF (step-by-step) ──
         (out_lif, lif_potentials, lif_spikes, lif_thresholds,
@@ -1512,14 +2824,51 @@ class BioDecisionCore(nn.Module):
             # Cast inputs to FP32 for the non-LIF computation graph
             e_sensory_f32 = e_sensory.float()
             mcmc_prior_f32 = mcmc_prior.float()
+            # ── Root G4 / findings A3, B5: validate the ACTIVE operands against
+            # the ACTUAL forced-FP32 computation representation AFTER the safe
+            # padding selection (invalid frames are already exact zeros) and
+            # BEFORE any numerical kernel.  A finite original float64 value such
+            # as 1e300 overflows to +inf on narrowing and would poison the
+            # router/GRU and export NaN y and gates.  Padding is already zero,
+            # so harmless overflowing padding is never rejected and valid
+            # representable controls pass.  No clamp / nan_to_num workaround.
+            for _name, _orig, _f32 in (
+                ("e_sensory", e_sensory, e_sensory_f32),
+                ("mcmc_prior", mcmc_prior, mcmc_prior_f32),
+            ):
+                if not torch.isfinite(_f32[valid]).all():
+                    raise ValueError(
+                        f"BioDecisionCore received {_name} whose finite "
+                        f"{_orig.dtype} values are not representable in the "
+                        f"float32 computation representation (overflow on "
+                        f"narrowing) in valid frames; refusing to run a "
+                        f"poisoned kernel."
+                    )
             # Cast GRU hidden state to FP32 (may be FP16 from autoregressive
             # mode where states were stored under AMP).
             gru_h0_f32 = gru_h0.float() if gru_h0 is not None else None
 
             # ── Path B: GRU (packed) ──
-            out_gru = self.gru_unit(e_sensory_f32, lengths, h0=gru_h0_f32)
+            # ``gru_h_n`` is the RAW packed-GRU final hidden state
+            # (num_layers, B, H) — the true per-sample endpoint, before the
+            # output-only neuromodulatory gain and without padding.  It is
+            # the correct recurrent carry; exporting the padded/post-gain
+            # trajectory (the historical bug) zeroed the carry on padded
+            # samples and recycled a gain-scaled value.
+            out_gru, gru_h_n = self.gru_unit(
+                e_sensory_f32, lengths, h0=gru_h0_f32, return_hidden=True,
+            )
+            # Raw recurrent GRU trajectory BEFORE the output-only gain (r5 R5).
+            # Scientific analysis (fixed-point / Jacobian / slow-point) must use
+            # the actual recurrent coordinate, not the gain-scaled routed
+            # output; ``out_gru`` below carries the gain for the routed output
+            # contract, while ``gru_hidden_raw`` is the true state trajectory.
+            gru_hidden_raw = out_gru
 
             # ── Neuromodulatory gain on GRU (Gap C) ──
+            # H4 / findings A5, B2: the shared mechanism-tree preflight (run
+            # once before the LIF path) already refused an inconsistent enabled
+            # flag, so this branch may read its parameters directly.
             if self.gru_neuromod_gain > 0.0:
                 mcmc_safe = mcmc_prior_f32.clamp(min=1e-8)
                 entropy = -(mcmc_safe * mcmc_safe.log()).sum(dim=-1)
@@ -1550,8 +2899,30 @@ class BioDecisionCore(nn.Module):
             # ── Integration ──
             h_out = g_lif * out_lif.float() + g_gru * out_gru
 
+            # ── Opt-in adaptive latent refinement (architecture v1) ──
+            # Applied to the POST-FUSION latent, BEFORE the direction head.
+            # This is representational refinement only: the LIF membrane /
+            # synaptic / refractory state and the GRU temporal state each
+            # advanced exactly ONCE above (one external timestep = one
+            # LIF/GRU advance).  Padding / empty rows never recurse (depth 0).
+            if self.refinement is not None:
+                (h_refined, refinement_depth, refinement_updates,
+                 refinement_ponder_cost, refinement_weights) = self.refinement(
+                    h_out, valid,
+                )
+            else:
+                h_refined = h_out
+                refinement_depth = torch.zeros(
+                    (B, T), dtype=torch.long, device=device,
+                )
+                refinement_updates = torch.zeros(
+                    (), dtype=torch.long, device=device,
+                )
+                refinement_ponder_cost = torch.zeros((), device=device)
+                refinement_weights = h_out.new_zeros((B, T, 0))
+
             # ── Decode ──
-            y_pred = self.direction_head(h_out)
+            y_pred = self.direction_head(h_refined)
 
         assert y_pred.shape == (B, T), (
             f"y_pred shape {tuple(y_pred.shape)} != (B={B}, T={T})"
@@ -1567,8 +2938,42 @@ class BioDecisionCore(nn.Module):
             "lif_spikes": lif_spikes,
             "lif_thresholds": lif_thresholds,
             "lif_w_adapt": lif_w_adapt_over_time,
+            # Existing routed-output contract (post output-only gain).  Kept
+            # unchanged for backward compatibility.
             "gru_hidden": out_gru,
+            # Additive RAW recurrent GRU trajectory (B, T, H), pre-gain — the
+            # actual recurrent coordinate for fixed-point / Jacobian analysis
+            # (r5 R5).  When the gain is disabled this equals ``gru_hidden``.
+            "gru_hidden_raw": gru_hidden_raw,
         }
+        assert internals["gru_hidden_raw"].shape == (B, T, self.hidden_dim), (
+            f"gru_hidden_raw shape {tuple(internals['gru_hidden_raw'].shape)} "
+            f"!= (B={B}, T={T}, H={self.hidden_dim})"
+        )
+        # ── Adaptive latent refinement internals (architecture v1) ──
+        # Present ONLY when refinement is enabled, so an ``off`` model's
+        # internals dict is bitwise/structurally unchanged (frozen additive
+        # names, enabled modes only).  When enabled these are always populated
+        # (fixed mode reports the executed K, adaptive mode the per-row depth).
+        if self.refinement is not None:
+            assert h_refined.shape == (B, T, self.hidden_dim), (
+                f"refined_hidden shape {tuple(h_refined.shape)} != "
+                f"(B={B}, T={T}, H={self.hidden_dim})"
+            )
+            assert refinement_depth.shape == (B, T), (
+                f"refinement_depth shape {tuple(refinement_depth.shape)} != "
+                f"(B={B}, T={T})"
+            )
+            K = self.refinement.max_steps
+            assert refinement_weights.shape == (B, T, K), (
+                f"refinement_weights shape {tuple(refinement_weights.shape)} != "
+                f"(B={B}, T={T}, K={K})"
+            )
+            internals["refined_hidden"] = h_refined
+            internals["refinement_depth"] = refinement_depth
+            internals["refinement_updates"] = refinement_updates
+            internals["refinement_ponder_cost"] = refinement_ponder_cost
+            internals["refinement_weights"] = refinement_weights
 
         if states is not None:
             states_out: Dict[str, torch.Tensor] = {
@@ -1577,7 +2982,10 @@ class BioDecisionCore(nn.Module):
                 "lif_refract": lif_refract_final.contiguous(),
                 "lif_w_adapt": lif_w_adapt_final.contiguous(),
                 "lif_rel_refract": lif_rel_refract_final.contiguous(),
-                "gru_h": out_gru[:, -1:, :].permute(1, 0, 2).contiguous(),
+                # Raw packed-GRU carry (num_layers, B, H) at each sample's
+                # true endpoint, pre-gain and unpadded.  This is the correct
+                # recurrent state, not the padded/post-gain trajectory.
+                "gru_h": gru_h_n.contiguous(),
             }
             if self.lif_cell.stp_enabled:
                 states_out["lif_x_resource"] = lif_x_resource_final.contiguous()
@@ -1642,16 +3050,108 @@ class BioDecisionCore(nn.Module):
 
             for t in range(T):
                 inp_t = e_sensory[:, t, :].float()
+                # Per-sample validity at this frame: True for t < lengths.
+                mask_b = (t < lengths)                       # (B,) bool
+                mask_2d = mask_b.unsqueeze(-1)               # (B, 1)
                 if self._tbptt_steps > 0 and t > 0 and t % self._tbptt_steps == 0:
-                    lif_state = tuple(s.detach() for s in lif_state)
-                spike, lif_state = self.lif_cell(inp_t, lif_state)
+                    # Selective TBPTT: detach ONLY the genuinely advancing
+                    # (active) rows at a boundary.  A finished row (t >= length)
+                    # keeps its differentiable carried path so other samples'
+                    # padding / shorter lengths cannot sever its gradient.
+                    lif_state = tuple(
+                        torch.where(mask_2d, s.detach(), s) for s in lif_state
+                    )
+                prev_state = lif_state
+                _lat_inhib = self.lif_cell.lateral_inhibition > 0.0
+                if _lat_inhib:
+                    prev_spike_hist = getattr(self.lif_cell, '_spike_history', None)
+                    if prev_spike_hist is None:
+                        prev_spike_hist = torch.zeros(
+                            B, H, device=device, dtype=lif_state[0].dtype,
+                        )
+                # r5 R2 (corrected): keep inactive rows OUT of the recurrence
+                # arithmetic BEFORE it is evaluated by substituting a safe
+                # finite operand (zeros) for the LIF step only.  This is
+                # defense-in-depth: it bounds every inactive-row operand to a
+                # provably-finite value, so no future arithmetic change in the
+                # LIF cell can turn an extreme (but validated finite) inactive
+                # carry into a discarded-branch nonfinite backward.
+                #
+                # Honest scope (A9/B9): the ORIGINAL claim that feeding an
+                # extreme relative-refractory counter into ``exp(-k_rel *
+                # counter)`` produces ``0 * inf = NaN`` in the backward is NOT
+                # reproducible.  For every non-negative counter the counters
+                # admit, ``exp(-k_rel * counter)`` underflows to exactly 0 with
+                # derivative 0, so the discarded branch stays finite; a 5-field
+                # x 8-value x config sweep found no poisoning input.  The
+                # value-preservation contract (inactive carry restored exactly
+                # by the differentiable selection below: identity derivative 1,
+                # cross-field derivative 0) is what is actually exercised.
+                # Active rows use their own state unchanged.
+                safe_state = tuple(
+                    torch.where(mask_2d, s, torch.zeros_like(s))
+                    for s in lif_state
+                )
+                # The lateral-inhibition spike-history cache lives OUTSIDE
+                # ``lif_state``; substitute a safe zero history for inactive
+                # rows for the LIF step only, then restore the original with
+                # differentiable selection below (r6 R2).  A finite-but-huge
+                # inactive cache (e.g. [1e38, -1e38, ...]) fed to
+                # ``spike_hist @ W_inhib`` overflows; its discarded backward
+                # would be NaN.
+                if _lat_inhib and prev_spike_hist is not None:
+                    self.lif_cell._spike_history = torch.where(
+                        mask_2d, prev_spike_hist,
+                        torch.zeros_like(prev_spike_hist),
+                    )
+                # r8 R5: ``_checked=True`` skips the per-step public trust
+                # boundary -- the supplied carry was already validated once at
+                # the BioDecisionCore.forward entry (lif_state0) and every
+                # subsequent step consumes state this loop produced.  Numerics
+                # are bitwise unchanged; only the redundant host syncs are gone.
+                spike, lif_state_new = self.lif_cell(
+                    inp_t, safe_state, _checked=True,
+                )
 
-                mask = (t < lengths).float().unsqueeze(-1)
-                out_lif[:, t, :] = spike * mask
-                potentials[:, t, :] = lif_state[0] * mask
-                spikes[:, t, :] = spike * mask
-                w_adapt_over_time[:, t, :] = lif_state[4] * mask
-                thresh_over_time[:, t, :] = lif_state[3] * mask
+                # Freeze EVERY per-sample recurrent/cache field once the true
+                # endpoint is passed: a padded frame must not advance the
+                # membrane, synaptic current, refractory counters, adaptation,
+                # STP, relative-refractory counter or lateral-inhibition
+                # spike history.  Selection via ``torch.where`` (not arithmetic
+                # multiply) is the exact per-sample freeze: it keeps the
+                # valid-frame gradient path unchanged (mask True there) and,
+                # unlike ``s*mask``, cannot let a nonfinite padded-frame value
+                # survive as ``NaN * 0``.
+                lif_state = tuple(
+                    torch.where(mask_2d, s, p)
+                    for s, p in zip(lif_state_new, prev_state)
+                )
+                if _lat_inhib:
+                    sh_new = getattr(self.lif_cell, '_spike_history', None)
+                    if sh_new is not None:
+                        # Restore the ORIGINAL inactive history (r6 R2): the
+                        # cache was zeroed for the inactive rows before the
+                        # LIF step, so select the advancing value only for
+                        # active rows and the true previous history otherwise.
+                        self.lif_cell._spike_history = torch.where(
+                            mask_2d, sh_new, prev_spike_hist,
+                        )
+
+                out_lif[:, t, :] = torch.where(
+                    mask_2d, spike, torch.zeros_like(spike),
+                )
+                potentials[:, t, :] = torch.where(
+                    mask_2d, lif_state[0], torch.zeros_like(lif_state[0]),
+                )
+                spikes[:, t, :] = torch.where(
+                    mask_2d, spike, torch.zeros_like(spike),
+                )
+                w_adapt_over_time[:, t, :] = torch.where(
+                    mask_2d, lif_state[4], torch.zeros_like(lif_state[4]),
+                )
+                thresh_over_time[:, t, :] = torch.where(
+                    mask_2d, lif_state[3], torch.zeros_like(lif_state[3]),
+                )
 
         v_final = lif_state[0]
         i_syn_final = lif_state[1]
@@ -1682,6 +3182,7 @@ _FREEZABLE_MODULES = frozenset({
     "gru_unit",
     "router",
     "direction_head",
+    "refinement",
 })
 
 
@@ -1740,6 +3241,11 @@ class NSMoRCore(nn.Module):
         lif_tbptt_steps: int = 64,
         dt_ms: float = 10.0,
         persistence_skip: float = 0.0,
+        activation: str = "relu",
+        refinement_mode: str = "off",
+        refinement_max_steps: int = 4,
+        refinement_eps: float = 0.01,
+        refinement_update_scale: float = 1.0,
     ) -> None:
         super().__init__()
         if (
@@ -1749,7 +3255,14 @@ class NSMoRCore(nn.Module):
             or not 0.0 <= persistence_skip <= 1.0
         ):
             raise ValueError("persistence_skip must be a finite scalar in [0, 1]")
+        if activation not in _VALID_ACTIVATIONS:
+            raise ValueError(
+                f"activation must be one of {_VALID_ACTIVATIONS}, "
+                f"got {activation!r}"
+            )
         self.persistence_skip: float = float(persistence_skip)
+        self.activation = activation
+        self.refinement_mode = refinement_mode
         self.sensory_dim = sensory_dim
         self.mcmc_dim = mcmc_dim
         self.hidden_dim = hidden_dim
@@ -1762,6 +3275,7 @@ class NSMoRCore(nn.Module):
             sensory_noise_std=sensory_noise_std,
             dendritic_tau=lif_dendritic_tau,
             dt_ms=dt_ms,
+            activation=activation,
         )
         self.backend = BioDecisionCore(
             hidden_dim=hidden_dim,
@@ -1786,6 +3300,11 @@ class NSMoRCore(nn.Module):
             gru_neuromod_gain=gru_neuromod_gain,
             lif_tbptt_steps=lif_tbptt_steps,
             dt_ms=dt_ms,
+            activation=activation,
+            refinement_mode=refinement_mode,
+            refinement_max_steps=refinement_max_steps,
+            refinement_eps=refinement_eps,
+            refinement_update_scale=refinement_update_scale,
         )
 
         # ── Backward-compatible attribute aliases ──
@@ -1819,6 +3338,13 @@ class NSMoRCore(nn.Module):
         Returns:
             Same as original ``NSMoRCore.forward``.
         """
+        # ── Root G3 / finding B4: validate the ORIGINAL observation dtype at
+        # this public boundary BEFORE any conversion (integer/boolean/complex
+        # observations are refused rather than silently cast).  Done before
+        # ``.contiguous()``/indexing so the check sees the caller's dtype.
+        _require_real_floating_observation(
+            X_batch, name="X_batch", context="NSMoRCore",
+        )
         X_batch = X_batch.contiguous()
         lengths = lengths.contiguous()
 
@@ -1828,21 +3354,18 @@ class NSMoRCore(nn.Module):
                 f"Expected feature dim {expected_dim}, got {X_batch.shape[-1]}"
             )
         B, T, _ = X_batch.shape
+        if T == 0:
+            raise ValueError(
+                "NSMoRCore.forward requires T >= 1; a zero-time tensor (T=0) "
+                "is unsupported (distinct from lengths==0, a valid no-op)."
+            )
+        lengths = _validate_original_lengths(
+            lengths, B, T, context="NSMoRCore",
+        )
 
         if self.persistence_skip != 0.0:
             if self.sensory_dim < 3:
                 raise ValueError("Nonzero persistence_skip requires sensory_dim >= 3")
-            assert lengths.shape == (B,), (
-                f"Expected lengths ({B},), got {lengths.shape}"
-            )
-            if lengths.dtype not in (
-                torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64,
-            ):
-                raise ValueError("lengths must have an integer, nonboolean dtype")
-            lengths_int = lengths.to(torch.int64)
-            if not torch.all((lengths_int >= 0) & (lengths_int <= T)):
-                raise ValueError(f"lengths must satisfy 0 <= lengths <= T={T}")
-            lengths = lengths_int
             target_mean = getattr(self, "target_mean", 0.0)
             target_std = getattr(self, "target_std", 1.0)
             target_clip = getattr(self, "target_clip_cm_s", 0.0)
@@ -1980,6 +3503,11 @@ class NSMoRCore(nn.Module):
                 submodule = self.frontend.sensory_encoder
             else:
                 submodule = getattr(self.backend, name)
+            if submodule is None:
+                raise ValueError(
+                    f"Cannot freeze '{name}': the module is absent "
+                    "(refinement is only built when refinement_mode != 'off')."
+                )
             for param in submodule.parameters():
                 param.requires_grad = False
 
