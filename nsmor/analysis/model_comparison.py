@@ -98,16 +98,31 @@ _MC_MAX_CELLS = 262144
 _DEFAULT_SEED = 42
 
 
-def declared_family_slots() -> tuple[str, ...]:
+def declared_family_slots(
+    candidate_ids: tuple[str, ...] | None = None,
+) -> tuple[str, ...]:
     """Return the frozen 78 comparison slots in a deterministic order.
+
+    Args:
+        candidate_ids: Candidate ids to build slots for. Defaults to the
+            module-level :data:`CANDIDATE_IDS` (the k-family). The real-data
+            preliminary protocol passes ``("A1", "A2")`` so the SAME frozen
+            slot algebra and comparator/scope grid is reused verbatim instead
+            of being re-implemented downstream. Any candidate set of length
+            ``len(CANDIDATE_IDS)`` yields the frozen family size (78).
 
     Returns:
         Tuple of ``"<candidate>|<comparator>|<scope>"`` slot keys, length
         :data:`DECLARED_FAMILY_SIZE` (78).
     """
+    cands = CANDIDATE_IDS if candidate_ids is None else tuple(candidate_ids)
+    assert len(cands) == len(CANDIDATE_IDS), (
+        f"Declared family requires {len(CANDIDATE_IDS)} candidates, "
+        f"got {len(cands)}"
+    )
     slots = tuple(
         f"{candidate}|{comparator}|{scope}"
-        for candidate in CANDIDATE_IDS
+        for candidate in cands
         for comparator in COMPARATOR_IDS
         for scope in SCOPE_IDS
     )
@@ -652,6 +667,8 @@ def paired_mse_comparison(
 
 def holm_correct_declared_family(
     p_values: Mapping[str, float | None],
+    *,
+    candidate_ids: tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
     """Holm-adjust the frozen 78-slot family, preserving unavailable slots.
 
@@ -662,6 +679,8 @@ def holm_correct_declared_family(
     Args:
         p_values: Mapping from :func:`declared_family_slots` keys to a
             finite p-value in ``[0, 1]`` or ``None`` when unavailable.
+        candidate_ids: Candidate ids the family was declared for; forwarded to
+            :func:`declared_family_slots`. Defaults to the k-family.
 
     Returns:
         JSON-safe dict with ``family_size``, ``valid_test_count``,
@@ -672,7 +691,7 @@ def holm_correct_declared_family(
         ValueError: If any declared slot is missing, any undeclared slot is
             present, or a supplied p-value is not finite in ``[0, 1]``.
     """
-    declared = declared_family_slots()
+    declared = declared_family_slots(candidate_ids)
     declared_set = set(declared)
     provided = set(p_values)
     missing = declared_set - provided

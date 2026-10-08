@@ -1,0 +1,106 @@
+{
+  "baseline_config_sha256": "709ca1f1a121c2b0904d14ca056ad335dac14f5e178e9edb3f22b541ba18ff1b",
+  "baseline_epoch": 295,
+  "arms": {
+    "A1": {
+      "arm_keys": {
+        "activation": "swiglu",
+        "refinement_mode": "off",
+        "lambda_compute": 0.0,
+        "output_dir": ".scratch/realdata-preliminary-20261009/A1-swiglu-off"
+      },
+      "lambda_reg_resolved": 0.2,
+      "phase1_epochs": null,
+      "changed_leaves": [
+        [
+          "checkpoint.output_dir",
+          ".scratch/model-opt-baseline-300-20261003-rerun",
+          ".scratch/realdata-preliminary-20261009/A1-swiglu-off"
+        ]
+      ],
+      "added_leaves": [
+        [
+          "model.activation",
+          "swiglu"
+        ],
+        [
+          "model.persistence_skip",
+          0.0
+        ],
+        [
+          "model.refinement_mode",
+          "off"
+        ],
+        [
+          "model.refinement_max_steps",
+          4
+        ],
+        [
+          "model.refinement_eps",
+          0.01
+        ],
+        [
+          "model.refinement_update_scale",
+          1.0
+        ],
+        [
+          "loss.lambda_compute",
+          0.0
+        ]
+      ],
+      "missing_leaves": [],
+      "yaml_sha256": "ab3b57ad033a86fca186afd85d523ff015da63385f7b5df55d6220499c1403f9",
+      "yaml_path": "config/realdata-preliminary-20261009/A1-swiglu-off.yaml"
+    },
+    "A2": {
+      "arm_keys": {
+        "activation": "swiglu",
+        "refinement_mode": "adaptive",
+        "lambda_compute": 0.01,
+        "output_dir": ".scratch/realdata-preliminary-20261009/A2-swiglu-adaptive"
+      },
+      "lambda_reg_resolved": 0.2,
+      "phase1_epochs": null,
+      "changed_leaves": [
+        [
+          "checkpoint.output_dir",
+          ".scratch/model-opt-baseline-300-20261003-rerun",
+          ".scratch/realdata-preliminary-20261009/A2-swiglu-adaptive"
+        ]
+      ],
+      "added_leaves": [
+        [
+          "model.activation",
+          "swiglu"
+        ],
+        [
+          "model.persistence_skip",
+          0.0
+        ],
+        [
+          "model.refinement_mode",
+          "adaptive"
+        ],
+        [
+          "model.refinement_max_steps",
+          4
+        ],
+        [
+          "model.refinement_eps",
+          0.01
+        ],
+        [
+          "model.refinement_update_scale",
+          1.0
+        ],
+        [
+          "loss.lambda_compute",
+          0.01
+        ]
+      ],
+      "missing_leaves": [],
+      "yaml_sha256": "96c16d78697f2dae8814837caaafbda4d540cf423b31088716e28b4849398a39",
+      "yaml_path": "config/realdata-preliminary-20261009/A2-swiglu-adaptive.yaml"
+    }
+  }
+}

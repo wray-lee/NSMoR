@@ -698,6 +698,7 @@ def assemble_declared_family(
     comparator_scopes: Mapping[str, Mapping[str, Any]],
     *,
     exchangeability_asserted: bool = False,
+    candidate_ids: tuple[str, ...] | None = None,
 ) -> Dict[str, Any]:
     """Assemble the frozen 78-slot inferential family and compute statistics.
 
@@ -706,6 +707,11 @@ def assemble_declared_family(
         comparator_scopes: Mapping of comparator_id -> scope_data.
             Keys must include "head_only_baseline", "persistence", "zero".
         exchangeability_asserted: Must be a genuine bool explicitly passed.
+        candidate_ids: Candidate ids the family is declared for; defaults to
+            the k-family :data:`CANDIDATE_IDS`. The real-data preliminary
+            protocol passes ``("A1", "A2")`` to reuse this SAME frozen
+            assembler instead of a downstream re-implementation. Must have
+            length ``len(CANDIDATE_IDS)`` so the family stays 78 slots.
 
     Returns:
         Dict with slot results, Holm-Bonferroni correction, and metadata.
@@ -716,14 +722,16 @@ def assemble_declared_family(
             f"{type(exchangeability_asserted).__name__}"
         )
 
+    cands = CANDIDATE_IDS if candidate_ids is None else tuple(candidate_ids)
+
     for cmp_id in COMPARATOR_IDS:
         if cmp_id not in comparator_scopes:
             raise ValueError(f"Missing declared comparator: {cmp_id}")
 
-    slots = declared_family_slots()
+    slots = declared_family_slots(cands)
     p_values: Dict[str, Optional[float]] = {}
     family_slots_data: Dict[str, Any] = {}
-    present_candidates = [cid for cid in CANDIDATE_IDS if cid in candidate_scopes]
+    present_candidates = [cid for cid in cands if cid in candidate_scopes]
 
     for slot_key in slots:
         cand_id, comp_id, scope_id = slot_key.split("|")
@@ -824,11 +832,11 @@ def assemble_declared_family(
             **comp_result,
         }
 
-    holm_result = holm_correct_declared_family(p_values)
+    holm_result = holm_correct_declared_family(p_values, candidate_ids=cands)
 
     return {
         "family_size": DECLARED_FAMILY_SIZE,
-        "both_arms_present": len(present_candidates) == len(CANDIDATE_IDS),
+        "both_arms_present": len(present_candidates) == len(cands),
         "present_candidates": present_candidates,
         "exchangeability_asserted": exchangeability_asserted,
         "holm_bonferroni": holm_result,
