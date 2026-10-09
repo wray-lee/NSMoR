@@ -77,3 +77,40 @@ flip cannot be attributed to either.
   any division-of-labour claim.
 - Peak speed is under-predicted by every arm, consistent with smoothing loss
   terms.
+
+## Setup audit (read-only; follows the step-3 gate)
+
+Outputs: `C:/Users/Wray/.claude/jobs/a4ff95ef/tmp/realdata-setup-audit-20261010/`
+(`persistence_ceiling.json`, `loss_terms_a1.json`).
+
+- **Target.** Unsmoothed scalar path speed, `sqrt(dx²+dy²)/dt` from finite
+  differences (`scripts/pre_load_adapt.py:1442-1459`), 4.006 ms sampling.
+  On the validation split 80.4% of frames are exactly 0 and 2.53% are
+  ≥ 10 cm/s. Signed components and heading are absent from the stored
+  dataset but recoverable from the raw CSVs (`dx, dy, dz`); exposing them
+  changes the data contract and the frozen target binding.
+- **Inputs.** X = [visual angle(t), wind(t), observed speed(t−1), observed
+  acceleration(t−1), 4 behavioural-state priors]
+  (`nsmor/data_extractor.py:355-359`). The lagged channels are observed
+  history, so one-step persistence is a linear copy of an input.
+- **Persistence ceiling** (432 trials, 1,036,748 frames). Lag-1
+  autocorrelation 0.963 overall (0.931 in escape frames); R² of Y[t] on
+  Y[t−1] = 0.927 overall (persistence MSE 1.910) and 0.857 in escape frames.
+  At lag 5: R² 0.615 / 0.179; lag 25: −0.25 / −1.16; lag 125: −0.77 / −1.40.
+  At h = 1 a model can add at most ≈ 7% of variance overall and ≈ 14% in
+  escape frames.
+- **Models do not reach the trivial copy.** Persistence MSE 1.910 vs A1 2.37
+  and A2 2.07, although observed speed(t−1) is an input.
+- **Loss.** On A1 validation batches: MSE 96.5% of total, `g_gru²`
+  regularisation 2.1%, jerk 1.3%, energy and sparsity < 0.01%. Only MSE and
+  jerk act on the prediction; the rest act on internals. Checkpoint selection
+  and early stopping use validation **total** loss, not MSE
+  (`scripts/train.py:5420`).
+
+Candidate changes for the next pre-registration (each to be tested, none
+assumed to help): signed velocity or heading + speed target; residual
+learning over persistence as a mandatory arm; a history-ablated arm (lagged
+channels zeroed); a jerk ablation checked against peak speed; MSE-based
+checkpoint selection; horizon-stratified metrics reported against the
+measured ceiling; escape-frame metrics reported separately; and diagnosing
+why the trained models fall short of copying their own lagged-speed input.
