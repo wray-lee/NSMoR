@@ -961,7 +961,11 @@ def test_segment_records_parent_controls_not_active_config(tmp_path: Path) -> No
     # Reliable requirement is tied to the ACTIVE cadence (1), and is truthful.
     assert lc["reliable_mode"] is True
     assert lc["reliable_zero_worker_required"] is True
-    assert lc["legacy_worker_equivalence_established"] is False
+    # A persistent multi-worker resume IS a bitwise continuation (the
+    # pre-warm fix), so that equivalence is ESTABLISHED; a resume that CHANGES
+    # the worker count is NOT (the two consume the global stream differently).
+    assert lc["worker_resume_equivalence_established"] is True
+    assert lc["worker_count_change_equivalence_established"] is False
 
 
 def test_segment_records_resolved_loader_workers(tmp_path: Path) -> None:
@@ -2025,9 +2029,11 @@ def test_real_cadence10_workers_allowed_and_compatible(tmp_path: Path) -> None:
     src_dir = Path(source.checkpoint.output_dir)
 
     # Resume a cadence-10 parent at cadence 10 with workers>0: still allowed.
-    # (cadence 10 writes no epoch_1.pth, so resume from the always-present
-    # best checkpoint.)
-    periodic = src_dir / "best_model.pth"
+    # (cadence 10 writes no epoch_1.pth, so resume from the segment's last
+    # complete-epoch checkpoint, final_model.pth — best_model.pth is NOT a
+    # resume source and is refused by _require_resume_source_is_newest_complete_epoch.)
+    periodic = src_dir / "final_model.pth"
+    assert periodic.exists(), "the source segment must write final_model.pth"
     resumed = _real_config(tmp_path, epochs=2, name="c10_resume")
     resumed.training.checkpoint_interval = 10
     resumed.training.num_workers = 1
@@ -2039,7 +2045,8 @@ def test_real_cadence10_workers_allowed_and_compatible(tmp_path: Path) -> None:
     ):
         result = trainer.train(
             resumed, dataset_path=str(ds),
-            trusted_historical_checkpoint_sha256=_existing_shas(periodic),
+            trusted_historical_checkpoint_sha256=_existing_shas(
+                periodic, src_dir / "best_model.pth"),
         )
     assert result is not None
 
@@ -3798,3 +3805,90 @@ def test_legacy_parent_without_scheduler_state_still_resumes(
                 periodic, source_dir / "best_model.pth"),
         )
     assert result["history_start_epoch"] == 1
+
+
+# ═════════════════════════════════════════════════════════════
+# G2: train.py itself refuses a non-newest-complete-epoch resume source
+# ═════════════════════════════════════════════════════════════
+#
+# §11.1 authorizes resuming only from a run's LAST complete-epoch checkpoint.
+# The engine layer (not only the launcher helper) must enforce that: a bare
+# ``train.py --resume`` cannot pick ``best_model.pth`` (the best SELECTED epoch,
+# possibly far older) or a stale periodic when a newer last-epoch file exists.
+
+
+def test_resume_from_best_model_is_refused_by_engine(tmp_path: Path) -> None:
+    """A bare train.py --resume from best_model.pth fails closed before an epoch.
+
+    ``best_model.pth`` is the best SELECTED epoch, which can be far older than
+    the last executed epoch; resuming from it would silently re-train completed
+    epochs.  The engine refuses it regardless of directory contents.
+    """
+    from scripts import train as trainer
+
+    ds = _make_synthetic_dataset(tmp_path)
+    source = _real_config(tmp_path, epochs=2, name="g2_src")
+    with mock.patch.object(trainer, "validate", return_value=0.5):
+        trainer.train(source, dataset_path=str(ds))
+    src_dir = Path(source.checkpoint.output_dir)
+    best = src_dir / "best_model.pth"
+    assert best.exists()
+
+    resumed = _real_config(tmp_path, epochs=3, name="g2_resume")
+    resumed.checkpoint.resume_from = str(best)
+    executed: list[int] = []
+
+    def hook(**kwargs: Any) -> Any:
+        executed.append(kwargs["epoch"])
+        return 1.0, {}
+
+    with mock.patch.object(trainer, "train_one_epoch", side_effect=hook):
+        with pytest.raises(ValueError, match="best_model.pth is the best SELECTED epoch"):
+            trainer.train(
+                resumed, dataset_path=str(ds),
+                trusted_historical_checkpoint_sha256=_existing_shas(
+                    best, src_dir / "final_model.pth"),
+            )
+    assert executed == [], f"a refused resume executed epochs: {executed}"
+
+
+def test_resume_from_stale_periodic_is_refused_by_engine(tmp_path: Path) -> None:
+    """An in-place resume from an older periodic is refused when a newer exists.
+
+    A SIGKILL at a non-multiple of ``checkpoint_interval`` can leave a newer
+    ``final_model.pth`` and an older ``epoch_*.pth`` in the same run dir.
+    Resuming IN PLACE (output_dir == the run's own dir) from the older periodic
+    would re-train completed epochs, so it is refused.
+    """
+    from scripts import train as trainer
+
+    ds = _make_synthetic_dataset(tmp_path)
+    source = _real_config(tmp_path, epochs=3, name="g2_stale_src")
+    source.training.checkpoint_interval = 1
+    with mock.patch.object(trainer, "validate", return_value=0.5):
+        trainer.train(source, dataset_path=str(ds))
+    src_dir = Path(source.checkpoint.output_dir)
+    older = src_dir / "epoch_1.pth"          # stored epoch 0
+    newer = src_dir / "final_model.pth"      # stored epoch 2
+    assert older.exists() and newer.exists()
+
+    # IN-PLACE resume: same output dir as the run, older source.
+    resumed = _real_config(tmp_path, epochs=5, name="g2_stale_src")
+    resumed.checkpoint.resume_from = str(older)
+    with pytest.raises(ValueError, match="newer complete-epoch checkpoint"):
+        trainer.train(
+            resumed, dataset_path=str(ds),
+            trusted_historical_checkpoint_sha256=_existing_shas(
+                older, src_dir / "best_model.pth"),
+        )
+
+    # The NEWEST source (final_model.pth) in the same dir IS accepted.
+    ok = _real_config(tmp_path, epochs=5, name="g2_stale_src")
+    ok.checkpoint.resume_from = str(newer)
+    with mock.patch.object(trainer, "validate", return_value=0.5):
+        result = trainer.train(
+            ok, dataset_path=str(ds),
+            trusted_historical_checkpoint_sha256=_existing_shas(
+                newer, src_dir / "best_model.pth"),
+        )
+    assert result is not None

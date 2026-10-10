@@ -30,6 +30,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -961,35 +962,42 @@ def _require_reliable_recovery_loaders(
     *,
     checkpoint_interval: int,
 ) -> None:
-    """Fail closed when a RELIABLE-recovery cadence cannot load with zero workers.
+    """Refuse the reliable cadence when it cannot load with zero workers.
 
     Reliable recovery is the cadence-one regime: ``checkpoint_interval == 1``
     is what makes a checkpoint an exact epoch boundary of a run whose
-    trajectory is claimed reproducible.  That claim requires ZERO-WORKER
-    loading.  With ``num_workers > 0`` (and especially ``persistent_workers``)
-    the loader iterator owns multiprocessing worker state — the RNG stream and
-    the live iterator's consumption position — that is neither captured in the
-    checkpoint nor reconstructable from it.  An uninterrupted persistent
-    iterator and a newly constructed resumed iterator therefore consume
-    DIFFERENT global RNG histories, so a resume silently diverges even when no
-    worker-side randomness is present (independent same-budget model/backprop
-    probe: workers0 exact equality, persistent workers1 divergence).  Restoring
-    only the parent's RNG state cannot make a new iterator equivalent to the
-    existing persistent one.
+    trajectory is claimed reproducible.  The documented reliable profile pins
+    that regime to ZERO-WORKER loading, and this guard enforces it for the
+    ACTUAL resolved train/val loaders (``num_workers=-1`` auto-scales, so the
+    request and the resolution can differ), whether fresh or resumed.
 
-    The requirement is tied to the CADENCE, not to ``--resume``:
+    This is now a CONSERVATIVE profile restriction, NOT a claim that a
+    multi-worker loader cannot be resumed.  The historical divergence — a
+    resumed process building a FRESH persistent iterator, re-drawing the
+    parent base seed and re-seeding the sampler, and so shifting the whole
+    resumed trajectory — had a single root cause that is FIXED by
+    :func:`_prewarm_persistent_loaders`: on resume the persistent iterator is
+    re-established around a save/restore of the global RNG, so the resumed
+    process consumes the global stream exactly as the uninterrupted run did at
+    the epoch boundary.  With that fix a persistent multi-worker loader IS a
+    bitwise continuation (CPU, fixed seed) PROVIDED the dataset and collate
+    consume no worker-side RNG — the precondition this module now enforces
+    separately on resume (:func:`_resume_worker_rng_hazard`).  The phase-2 arm
+    regime (``num_workers: -1`` auto-scaling to >0, ``persistent_workers:
+    true``, ``checkpoint_interval: 10``) relies on exactly this and is asserted
+    bitwise in ``tests/test_resume_equivalence.py``.
 
-    - ``checkpoint_interval == 1`` — reliable mode, whether fresh or resumed.
-      The ACTUAL resolved train/val loaders must have zero workers, else the
-      run is refused before any epoch.
-    - ``checkpoint_interval != 1`` — the prior interval-10 behavior.  That
-      cadence makes no exact-continuation claim (an interrupted interval-10
-      run can only be continued as a fresh zero-worker segment), so no worker
-      count is constrained and existing runs keep working unchanged.
+    The zero-worker requirement is tied to the CADENCE, not to ``--resume``:
+
+    - ``checkpoint_interval == 1`` — the documented reliable profile, whether
+      fresh or resumed.  The ACTUAL resolved train/val loaders must have zero
+      workers, else the run is refused before any epoch.
+    - ``checkpoint_interval != 1`` — no worker count is constrained (the
+      interval-10 behavior is unchanged), and a resume of a persistent
+      multi-worker loader is bitwise per :func:`_prewarm_persistent_loaders`.
 
     The guard never reconfigures the loader silently (that would change the
-    user's scientific controls) and never claims an equivalence the
-    configuration cannot provide.  ``val_loader`` is included for completeness
+    user's scientific controls).  ``val_loader`` is included for completeness
     of the refusal message; validation does not advance the training
     trajectory.
     """
@@ -1030,6 +1038,97 @@ def _checkpoint_lineage_identity(payload: bytes, path: Path) -> Dict[str, Any]:
         "sha256": hashlib.sha256(payload).hexdigest(),
         "size_bytes": len(payload),
     }
+
+
+# The LAST-EPOCH checkpoint families: ``final_model.pth`` (the segment's last
+# executed epoch) and ``epoch_<n>.pth`` (a periodic).  ``best_model.pth`` is
+# NOT one of them — it stores the best SELECTED epoch, which can be far older
+# than the last executed epoch, so resuming from it would silently re-train
+# completed epochs.
+_LAST_EPOCH_FAMILIES = ("final_model.pth",)
+_EPOCH_PERIODIC_RE = re.compile(r"epoch_(\d+)\.pth$")
+
+
+def _require_resume_source_is_newest_complete_epoch(
+    resume_path: Path,
+    peek: Dict[str, Any],
+    output_dir: Path,
+) -> None:
+    """Refuse a resume source that is not the newest complete-epoch checkpoint.
+
+    §11.1 authorizes resuming ONLY from a run's LAST complete-epoch checkpoint.
+    ``scripts/train.py`` must enforce that itself — not delegate it to the
+    launcher helper — so a bare ``train.py --resume`` cannot silently re-train
+    completed epochs by picking a stale source:
+
+    * ``best_model.pth`` is NEVER a valid resume source.  It is the best
+      SELECTED epoch, which may be far older than the last executed epoch;
+      resuming from it re-trains every epoch after the best one.  Refused
+      unconditionally, regardless of what else is in the directory — matching
+      the launcher helper (``resume_decision.py``), which excludes it too.
+    * IN-PLACE recovery (the source lives in the run's OWN output dir — the
+      launcher's mode and exactly what §11.1 governs): when that dir holds a
+      last-epoch family file (``final_model.pth`` / ``epoch_*.pth``) whose
+      stored epoch is NEWER than the source's, the source is stale.  Refused.
+
+    The newest-epoch rule is scoped to IN-PLACE recovery because §11.1 is a
+    statement about a run resuming from ITS OWN last checkpoint; a resume into
+    a DIFFERENT output dir from an explicitly chosen source is a deliberate
+    fork/continuation (exercised by the phase-boundary resume tests) and is not
+    the silent-re-train risk this rule targets.  That exemption is intentional,
+    not a hole: forking an older source into a NEW dir is a deliberate
+    continuation the operator names explicitly, whereas the in-place case is a
+    run re-entering its own dir where a stale source would silently re-train.
+    A source in a dir with no decodable last-epoch file (a fresh dir, a test
+    fixture, a renamed artifact) is accepted unchanged.  ``peek`` is the
+    already-decoded source (never re-read).
+    """
+    if resume_path.name == "best_model.pth":
+        raise ValueError(
+            f"Refusing to resume from {resume_path}: best_model.pth is the best "
+            "SELECTED epoch, which can be far older than the run's last executed "
+            "epoch.  Resuming from it would silently re-train completed epochs.  "
+            "Resume from the newest complete-epoch checkpoint "
+            "(final_model.pth / epoch_*.pth) instead (fail closed)."
+        )
+
+    if resume_path.parent.resolve() != Path(output_dir).resolve():
+        return  # a fork into a different dir: not the in-place recovery §11.1 governs
+
+    src_epoch = peek.get("epoch")
+    if not isinstance(src_epoch, int) or isinstance(src_epoch, bool):
+        return  # undecodable source epoch: nothing to compare against
+
+    newest_name: Optional[str] = None
+    newest_epoch = src_epoch
+    for cand in sorted(resume_path.parent.glob("*.pth")):
+        if cand.name == "best_model.pth" or cand.resolve() == resume_path.resolve():
+            continue
+        if (
+            cand.name not in _LAST_EPOCH_FAMILIES
+            and not _EPOCH_PERIODIC_RE.match(cand.name)
+        ):
+            continue
+        try:
+            state = load_artifact_bytes(cand.read_bytes(), map_location="cpu")
+        except Exception:  # noqa: BLE001 - an undecodable sibling is not newer
+            continue
+        epoch = state.get("epoch")
+        if not isinstance(epoch, int) or isinstance(epoch, bool):
+            continue
+        if epoch > newest_epoch:
+            newest_epoch = epoch
+            newest_name = cand.name
+
+    if newest_name is not None:
+        raise ValueError(
+            f"Refusing to resume from {resume_path} (stored epoch {src_epoch}): "
+            f"a newer complete-epoch checkpoint {newest_name} (epoch "
+            f"{newest_epoch}) exists in the same run directory.  §11.1 authorizes "
+            "resuming only from the run's LAST complete-epoch checkpoint; "
+            "resuming from an older one would silently re-train completed "
+            "epochs (fail closed)."
+        )
 
 
 def _parent_training_controls(
@@ -1127,13 +1226,30 @@ def _segment_loader_controls(
         ),
         "parent_num_workers": _parent_int("num_workers"),
         "parent_persistent_workers": _parent_bool("persistent_workers"),
-        # Reliable exact continuation is only supported with zero workers and
-        # is only CLAIMED at cadence one; a nonzero parent->zero active change
-        # is NOT established as trajectory-equivalent to the parent's original
-        # execution.
+        # The documented reliable (cadence-one) profile pins zero workers and
+        # the code ENFORCES it for the resolved loaders.  At cadence one this
+        # is the truthful requirement.  It is a PROFILE restriction, NOT a
+        # claim that workers>0 cannot be resumed (see the two flags below).
         "reliable_mode": reliable,
         "reliable_zero_worker_required": reliable,
-        "legacy_worker_equivalence_established": False,
+        # A persistent multi-worker loader IS a bitwise continuation on resume:
+        # ``_prewarm_persistent_loaders`` re-establishes the persistent iterator
+        # around a save/restore of the global RNG, so the resumed process
+        # consumes the global stream exactly as the uninterrupted run did at the
+        # epoch boundary (CPU, fixed seed).  This holds PROVIDED the dataset and
+        # collate consume no worker-side RNG, which the resume preflight enforces
+        # (``_resume_worker_rng_hazard``).  The phase-2 arm regime (workers>0,
+        # ``persistent_workers: true``, ``checkpoint_interval: 10``) relies on
+        # exactly this, so the equivalence IS established and this flag agrees
+        # with §11.1.  (The prior ``legacy_worker_equivalence_established=False``
+        # key conflated this with the worker-CHANGE case and was stale.)
+        "worker_resume_equivalence_established": True,
+        # A resume that CHANGES the worker count (or the ``persistent_workers``
+        # flag) is NOT established as trajectory-equivalent to the parent's
+        # original execution: the two consume the global stream differently, so
+        # the change is a genuine re-shuffle, not a benign re-entry.  Never
+        # claim otherwise.
+        "worker_count_change_equivalence_established": False,
     }
 
 
@@ -1387,6 +1503,366 @@ def _atomic_save_checkpoint(**kwargs) -> Path:
         pass
     os.replace(tmp, target)
     return target
+
+
+# ── Safe-pause sentinel ───────────────────────────────────────
+# A run pauses CLEANLY at an epoch boundary by dropping an empty ``STOP`` file
+# into its output dir.  The training loop checks for it AFTER that epoch's best
+# and periodic checkpoints are fully written (temp file + fsync + atomic
+# rename), so a pause can never interrupt a save.  This is the supported way to
+# free the GPU for same-machine PsychoPy stimulus timing (or to survive a WSL
+# restart) without ever killing a process mid-save.  A resume CONSUMES the
+# sentinel at the training layer (before any epoch), so a stale sentinel can
+# never re-pause a resumed run even when it is launched by a bare
+# ``train.py --resume``; the resume launcher also removes it defensively.
+_PAUSE_SENTINEL_NAME = "STOP"
+
+# Distinct process exit status for a run that stopped at an epoch boundary on
+# a safe-pause STOP sentinel.  A paused run is NOT a failure and NOT a normal
+# completion: the launcher must be able to tell them apart from the exit code
+# alone (protocol §11.1 / S4).  Chosen outside the range used by argparse (2)
+# and shell conventions (126/127/128+), and outside 0/1.
+PAUSE_EXIT_CODE = 17
+
+
+def _pause_requested(output_dir: Path) -> bool:
+    """True when the run's output dir holds the ``STOP`` pause sentinel."""
+    return (Path(output_dir) / _PAUSE_SENTINEL_NAME).exists()
+
+
+def _capture_rng_state() -> Dict[str, Any]:
+    """Snapshot the global RNG streams a persistent DataLoader consumes.
+
+    ``torch`` (the parent process) and ``numpy`` are always captured; ``cuda``
+    is captured only when CUDA is available (``torch.cuda.get_rng_state_all``
+    is a no-op CPU build and would otherwise raise).  The returned mapping is
+    restored by :func:`_restore_rng_state`.
+    """
+    state: Dict[str, Any] = {
+        "torch": torch.get_rng_state(),
+        "numpy": np.random.get_state(),
+    }
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def _restore_rng_state(state: Dict[str, Any]) -> None:
+    """Restore a snapshot taken by :func:`_capture_rng_state`."""
+    torch.set_rng_state(state["torch"])
+    np.random.set_state(state["numpy"])
+    if "cuda" in state:
+        torch.cuda.set_rng_state_all(state["cuda"])
+
+
+def _loader_rng_is_resume_critical(
+    loader: Optional[torch.utils.data.DataLoader],
+) -> bool:
+    """True when *loader* consumes global RNG via a persistent iterator.
+
+    A ``persistent_workers`` loader builds its iterator ONCE and reuses it via
+    ``_reset`` for every later epoch; the FIRST ``iter()`` consumes an EXTRA
+    global-RNG draw (the parent-process base seed plus, for a shuffled loader,
+    the ``RandomSampler`` seed) that every later epoch does not.  A resumed
+    process that simply builds a FRESH iterator re-draws those seeds and shifts
+    the global stream — the divergence this fix prevents.  ``num_workers=0``
+    iterators hold no such hidden state and are out of scope (and rejected at
+    the reliable cadence-1 boundary anyway).
+    """
+    return (
+        loader is not None
+        and int(getattr(loader, "num_workers", 0)) > 0
+        and bool(getattr(loader, "persistent_workers", False))
+    )
+
+
+def _prewarm_persistent_loaders(
+    loaders: Sequence[Optional[torch.utils.data.DataLoader]],
+) -> None:
+    """Establish persistent iterator(s) WITHOUT advancing the global RNG.
+
+    A resumed process must consume the global RNG exactly as the uninterrupted
+    process did at the epoch boundary.  The uninterrupted persistent loader
+    already owns its iterator, so at each later epoch ``iter(loader)`` takes the
+    cheap ``_reset`` path and draws only the per-epoch ``RandomSampler`` seed.
+    A freshly constructed resumed loader would instead take the FIRST-
+    construction path and draw that seed AND the parent base seed, shifting the
+    global stream by one draw (and shifting the sampler seed), so the resumed
+    trajectory diverges even though no worker-side randomness is present.
+
+    Building the iterator once here — around a save/restore of the global RNG —
+    makes the resumed loader take the same ``_reset`` path.  The warm-up draws
+    are undone, so this is a pure no-op on the RNG stream; the training loop's
+    own ``iter(loader)`` then draws exactly the boundary's worth, matching the
+    uninterrupted run.  Only persistent multi-worker loaders are touched, so a
+    fresh (non-resumed) run — which never calls this — is bitwise unchanged.
+    """
+    targets = [ld for ld in loaders if _loader_rng_is_resume_critical(ld)]
+    if not targets:
+        return
+    saved = _capture_rng_state()
+    try:
+        for ld in targets:
+            iter(ld)  # establish the persistent iterator; draws are discarded
+    finally:
+        _restore_rng_state(saved)
+
+
+def _unwrap_dataset(dataset: Any) -> Any:
+    """Peel ``Subset`` / wrapper layers to the underlying dataset object.
+
+    The lazy path wraps the real dataset in a local ``LazySubset`` (a
+    ``torch.utils.data.Subset``); the eager path passes ``NSMoRDataset``
+    directly.  A worker-side RNG hazard lives in the leaf dataset (its
+    ``__getitem__``), so the check must reach it.  ``getattr`` on the wrapper
+    forwards to ``_inner`` (``ClockAwareLazyDataset.__getattr__``), so a single
+    ``.dataset`` hop on a ``Subset`` exposes the leaf.
+    """
+    seen: set[int] = set()
+    node = dataset
+    while node is not None and id(node) not in seen:
+        seen.add(id(node))
+        if isinstance(node, torch.utils.data.Subset):
+            node = node.dataset
+            continue
+        break
+    return node
+
+
+def _legacy_random_crop_risk(dataset: Any) -> Optional[str]:
+    """Describe a LEGACY random-crop ``__getitem__`` (worker-side RNG), else None.
+
+    ``NSMoRDataset.__getitem__`` (``nsmor/nsmor_dataloader.py`` ~L246) falls back
+    to ``np.random.randint`` for a random crop whenever ``anchor_frames`` is
+    ``None`` AND the trial is longer than ``max_seq_len``.  In a worker that draw
+    comes from the WORKER's NumPy stream, whose state after k epochs is not in
+    the checkpoint — so a resumed persistent worker cannot reproduce it and the
+    resume is NOT bitwise.  ``anchor_frames`` present (the phase-2 corpus) or a
+    dataset that never crops both disable the hazard.
+
+    Only the EAGER ``NSMoRDataset`` exposes this legacy branch; the lazy
+    datasets always crop through ``resolve_anchor_crop`` (no RNG).  The check is
+    therefore conservative: it flags the eager dataset only when its legacy
+    branch is reachable (``anchor_frames is None``), which is exactly the
+    documented deprecated path.
+    """
+    from nsmor.nsmor_dataloader import NSMoRDataset
+
+    leaf = _unwrap_dataset(dataset)
+    if isinstance(leaf, NSMoRDataset) and getattr(leaf, "anchor_frames", None) is None:
+        return (
+            "the eager NSMoRDataset has anchor_frames=None, so __getitem__ uses "
+            "the deprecated legacy random crop (np.random.randint) in worker "
+            "processes; the worker RNG state after k epochs is not captured in "
+            "the checkpoint, so a resume would silently re-shuffle."
+        )
+    return None
+
+
+def _numpy_state_changed(before: tuple, after: tuple) -> bool:
+    """True when the NumPy global stream advanced between two ``get_state()``.
+
+    Compares the FULL state tuple, not just ``pos``/``keys``.  A draw of
+    ``np.random.standard_normal()`` can be served entirely from the cached
+    Gaussian (state ``has_gauss`` and ``cached_gaussian``, indices 3 and 4)
+    WITHOUT advancing ``pos`` or the ``keys`` array — a one-draw or even-draw
+    consumer would then be a false negative if only ``pos``/``keys`` were
+    compared.  Every field that a draw can move is therefore compared.
+    """
+    return (
+        after[1].shape != before[1].shape
+        or not np.array_equal(after[1], before[1])  # keys
+        or after[2] != before[2]                     # pos
+        or after[3] != before[3]                     # has_gauss
+        or after[4] != before[4]                     # cached_gaussian
+    )
+
+
+# A draw can be index-DEPENDENT (e.g. a legacy random crop fires only when the
+# trial is longer than ``max_seq_len``).  Probing more than the first index
+# makes an index-0-only false negative far less likely; the static
+# legacy-crop check still covers the documented offender.
+_RNG_PROBE_INDICES = (0, 1)
+
+
+def _dataset_getitem_consumes_rng(dataset: Any) -> bool:
+    """True when the leaf dataset's ``__getitem__`` advances the global RNG.
+
+    The worker-RNG precondition is about the dataset's ``__getitem__`` (and any
+    collate) drawing from a global stream the checkpoint does not carry.  Rather
+    than only pattern-match a KNOWN offender, this probes the actual leaf
+    dataset: it snapshots both global streams, calls ``__getitem__`` on several
+    indices (:data:`_RNG_PROBE_INDICES`, so an index-dependent draw is not
+    missed by an index-0-only probe), and reports whether either stream
+    advanced.  Both global streams are compared in FULL — the NumPy comparison
+    includes ``has_gauss``/``cached_gaussian`` (see :func:`_numpy_state_changed`)
+    so a ``standard_normal`` draw served from the cache is detected.  The probe
+    RESTORES both streams afterward, so it has no side effect on the training
+    RNG.  A dataset that raises on an index (a fixture needing a captured-source
+    context) is treated as no observed draw at that index — the static
+    legacy-crop check still covers the documented offender.
+    """
+    leaf = _unwrap_dataset(dataset)
+    if leaf is None or not hasattr(leaf, "__getitem__"):
+        return False
+    try:
+        n = len(leaf)
+    except Exception:  # noqa: BLE001 - an unsized leaf cannot be probed
+        n = 0
+    torch_state = torch.get_rng_state()
+    numpy_state = np.random.get_state()
+    try:
+        for idx in _RNG_PROBE_INDICES:
+            if n and idx >= n:
+                continue
+            try:
+                leaf[idx]
+            except Exception:  # noqa: BLE001 - an unbuildable item is not a draw
+                continue
+            if not torch.equal(torch.get_rng_state(), torch_state):
+                return True
+            if _numpy_state_changed(numpy_state, np.random.get_state()):
+                return True
+        return False
+    finally:
+        torch.set_rng_state(torch_state)
+        np.random.set_state(numpy_state)
+
+
+def _collate_fn_consumes_rng(collate_fn: Any, probe_batch: Any = None) -> bool:
+    """True when *collate_fn* advances the global torch OR NumPy RNG.
+
+    A ``collate_fn`` runs in the WORKER process too (the same process as the
+    dataset ``__getitem__``), so a draw inside it advances a stream the
+    checkpoint does not carry, exactly like a draw inside ``__getitem__``.  The
+    precondition therefore covers collate, and this probe enforces it: it
+    snapshots both global streams, calls ``collate_fn`` on *probe_batch* (a
+    two-item list — the real item shape when the caller supplies one, else a
+    trivial ``(X, Y)`` pair), and reports whether either stream advanced
+    (full-state NumPy comparison).  Both streams are RESTORED afterward.  A
+    ``collate_fn`` that raises on the probe input (a bespoke signature) is
+    treated as no observed draw — its own correctness is the caller's concern,
+    not a hazard this guard can see.
+    """
+    if not callable(collate_fn):
+        return False
+    if probe_batch is None:
+        item = (torch.zeros(4, 8), torch.zeros(4))
+        probe_batch = [item, item]
+    torch_state = torch.get_rng_state()
+    numpy_state = np.random.get_state()
+    try:
+        try:
+            collate_fn(probe_batch)
+        except Exception:  # noqa: BLE001 - a bespoke collate is not a draw
+            return False
+        if not torch.equal(torch.get_rng_state(), torch_state):
+            return True
+        return _numpy_state_changed(numpy_state, np.random.get_state())
+    finally:
+        torch.set_rng_state(torch_state)
+        np.random.set_state(numpy_state)
+
+
+def _clean_probe_item(dataset: Any) -> Any:
+    """A representative item from a dataset already proven RNG-clean, else None.
+
+    Called only after :func:`_dataset_getitem_consumes_rng` has returned
+    ``False``, so fetching the item draws no global RNG and leaves both streams
+    unchanged.  The item's SHAPE matters: it lets the collate probe run the
+    loader's real ``collate_fn`` (2-tuple, 3-tuple or 4-tuple item) rather than
+    a guess.  Returns ``None`` when the dataset yields nothing probeable.
+    """
+    leaf = _unwrap_dataset(dataset)
+    if leaf is None or not hasattr(leaf, "__getitem__"):
+        return None
+    try:
+        if len(leaf) == 0:
+            return None
+        return leaf[0]
+    except Exception:  # noqa: BLE001 - an unbuildable item is not probeable
+        return None
+
+
+def _resume_worker_rng_hazard(
+    train_loader: torch.utils.data.DataLoader,
+    val_loader: Optional[torch.utils.data.DataLoader],
+) -> Optional[str]:
+    """Describe why a resumed multi-worker loader would NOT be bitwise, else None.
+
+    A resume is a bitwise continuation only when the worker processes consume
+    NO global RNG: the loader's own base seed and per-epoch ``RandomSampler``
+    seed are handled by :func:`_prewarm_persistent_loaders`, but any RNG drawn
+    INSIDE a dataset ``__getitem__`` OR a ``collate_fn`` (both run in the worker
+    process) advances a stream the checkpoint does not carry.  Three layers of
+    detection are applied:
+
+    1. The documented offender — the eager ``NSMoRDataset`` legacy random crop
+       (``anchor_frames is None``) — is flagged statically
+       (:func:`_legacy_random_crop_risk`).
+    2. Any OTHER dataset whose ``__getitem__`` consumes global RNG is flagged by
+       a side-effect-free runtime probe over several indices
+       (:func:`_dataset_getitem_consumes_rng`), so a novel worker-side RNG path
+       cannot slip through.
+    3. The loader's ``collate_fn`` is probed the same way
+       (:func:`_collate_fn_consumes_rng`); a collate that draws global RNG in a
+       worker is a hazard even when ``__getitem__`` is clean.
+
+    ``num_workers == 0`` iterators run in the parent process, whose NumPy state
+    IS restored from the checkpoint, so they are out of scope.
+    """
+    for name, loader in (("train", train_loader), ("val", val_loader)):
+        if loader is None:
+            continue
+        if int(getattr(loader, "num_workers", 0)) <= 0:
+            continue
+        dataset = getattr(loader, "dataset", None)
+        risk = _legacy_random_crop_risk(dataset)
+        if risk is not None:
+            return f"{name} loader: {risk}"
+        if _dataset_getitem_consumes_rng(dataset):
+            return (
+                f"{name} loader: the dataset __getitem__ consumes global RNG "
+                "(torch or NumPy), so in a worker process its stream advances "
+                "outside the checkpoint and a resume would silently re-shuffle."
+            )
+        # The dataset is proven RNG-clean, so a representative item can be
+        # fetched with no side effect and used to run the loader's REAL
+        # collate_fn (correct item arity), not a guessed one.
+        probe_item = _clean_probe_item(dataset)
+        probe_batch = None if probe_item is None else [probe_item, probe_item]
+        if _collate_fn_consumes_rng(getattr(loader, "collate_fn", None), probe_batch):
+            return (
+                f"{name} loader: the collate_fn consumes global RNG (torch or "
+                "NumPy), so in a worker process its stream advances outside the "
+                "checkpoint and a resume would silently re-shuffle."
+            )
+    return None
+
+
+def _require_bitwise_resume_loader_rng(
+    train_loader: torch.utils.data.DataLoader,
+    val_loader: Optional[torch.utils.data.DataLoader],
+) -> None:
+    """Fail closed when a resumed multi-worker loader consumes worker-side RNG.
+
+    Bitwise resume equivalence is guaranteed ONLY when the dataset
+    ``__getitem__`` and collate consume no global RNG in workers.  This is the
+    explicit, ENFORCED precondition of §11.1: the loader's own seeds are
+    re-established by :func:`_prewarm_persistent_loaders`, but worker-side RNG
+    is not recoverable, so a run whose loaders would use it is refused before
+    any epoch.  Called only on a resume; fresh training is untouched.
+    """
+    hazard = _resume_worker_rng_hazard(train_loader, val_loader)
+    if hazard is not None:
+        raise ValueError(
+            "Refusing to resume: bitwise resume equivalence requires that the "
+            "dataset __getitem__ and collate consume no worker-side RNG, but "
+            f"{hazard} Use anchor-aligned cropping (provide anchor_frames), "
+            "num_workers=0, or a dataset whose __getitem__ consumes no RNG "
+            "(fail closed rather than claim a continuation this loader cannot "
+            "provide)."
+        )
 
 
 def _check_checkpoint_prior_lineage(ckpt: Dict[str, Any], expected: Dict[str, Any], path: Path, *,
@@ -4677,6 +5153,12 @@ def train(
         train_loader, val_loader,
         checkpoint_interval=config.training.checkpoint_interval,
     )
+    # Resume precondition (§11.1): bitwise continuation is guaranteed only when
+    # the dataset __getitem__ and collate consume no worker-side RNG.  Enforced
+    # on resume only (a fresh run is untouched), and AFTER the zero-worker
+    # reliable guard so the two refusals do not overlap.
+    if config.checkpoint.resume_from is not None:
+        _require_bitwise_resume_loader_rng(train_loader, val_loader)
     _resolved_workers = _resolved_loader_workers(train_loader, val_loader)
 
     # Ticket #16: stimulus condition metadata for routing auxiliary loss
@@ -4918,6 +5400,13 @@ def train(
         resume_payload = ckpt_path.read_bytes()
         ckpt_peek = load_artifact_bytes(resume_payload, map_location="cpu")
         validate_checkpoint_clock(ckpt_peek, model.dt_ms, require_dt_ms=True)
+        # §11.1 authorizes resuming only from the run's LAST complete-epoch
+        # checkpoint.  ``train.py`` enforces this itself — not only the resume
+        # launcher — so a bare ``--resume`` cannot silently re-train completed
+        # epochs: ``best_model.pth`` is never a resume source, and a source
+        # older than a newer last-epoch family file in the same run dir is
+        # refused.  Runs before any state restoration or epoch.
+        _require_resume_source_is_newest_complete_epoch(ckpt_path, ckpt_peek, output_dir)
         # A current-schema parent claims an exact continuation, so its full
         # canonical state must be present before anything restores from it.
         # This runs FIRST in the resume preflight (before any epoch or any
@@ -5417,6 +5906,10 @@ def train(
     # the resumed epoch).  Consumed after the loop to finalize without an
     # epoch.  See the terminal decision below.
     _terminal_on_resume = False
+    # Set when a safe-pause sentinel (``STOP``) was observed at a completed
+    # epoch boundary.  Consumed after the loop to finalize this segment without
+    # executing further epochs.  See the sentinel check at the loop tail.
+    _paused_on_sentinel = False
     if config.checkpoint.resume_from is not None:
         _ewi, _history, _np_state, history_start_epoch = _restore_recovery_state(
             ckpt_peek, ckpt_path, resume_epoch=start_epoch,
@@ -5526,8 +6019,40 @@ def train(
         resolved_workers=_resolved_workers,
     )
 
+    # ── Consume a stale safe-pause sentinel on resume ─────────
+    # A resume from this run's OWN checkpoint can still find the ``STOP``
+    # sentinel that requested the pause.  Consume it HERE, at the training
+    # layer and before any epoch, so the pause/resume contract is closed no
+    # matter how the resume was launched — including a direct
+    # ``train.py --resume`` that never goes through the resume launcher.
+    # Without this, a direct resume would observe the stale sentinel at the
+    # next epoch boundary and silently re-pause after one epoch.
+    if config.checkpoint.resume_from is not None and _pause_requested(output_dir):
+        try:
+            (output_dir / _PAUSE_SENTINEL_NAME).unlink()
+        except FileNotFoundError:  # pragma: no cover - raced with an operator
+            pass
+        logger.info(
+            "Consumed safe-pause sentinel %s on resume; the run will not "
+            "re-pause until a NEW STOP file appears.",
+            output_dir / _PAUSE_SENTINEL_NAME,
+        )
+
     # ── Bio-loss warmup schedule ─────────────────────────────
     warmup_epochs = config.loss.warmup_epochs
+
+    # ── RNG-exact loader re-entry on resume ───────────────────
+    # A persistent multi-worker loader owns a live iterator whose FIRST
+    # construction drew extra seeds from the global RNG; every later epoch
+    # reuses it via ``_reset`` and draws only the per-epoch sampler seed.  A
+    # resumed process that builds a FRESH iterator would re-draw those seeds,
+    # shifting the global stream (and the shuffle order) so the resumed
+    # trajectory diverges from the uninterrupted run.  Re-establish the
+    # persistent iterator(s) here, around a save/restore of the global RNG, so
+    # the resumed loader re-enters at the SAME boundary state the uninterrupted
+    # run had — bitwise.  Guarded to a resume so a fresh run is untouched.
+    if config.checkpoint.resume_from is not None:
+        _prewarm_persistent_loaders([train_loader, val_loader])
 
     epoch = start_epoch - 1
     for epoch in range(start_epoch, config.training.num_epochs):
@@ -5863,6 +6388,25 @@ def train(
             )
             break
 
+        # ── Safe pause (epoch-boundary STOP sentinel) ─────────
+        # Reached only AFTER this epoch's best and periodic checkpoints are
+        # fully written (temp + fsync + atomic rename), so a pause never
+        # interrupts a save.  The sentinel is left in place for the resume
+        # launcher to consume; the run finalizes this segment (writing
+        # ``final_model.pth``) exactly as an early stop would, so the resumed
+        # segment's ``start_epoch`` is the next epoch and the trajectory
+        # continues bitwise.  An early stop (checked above) is terminal and
+        # takes precedence over a pause.
+        if _pause_requested(output_dir):
+            _paused_on_sentinel = True
+            logger.info(
+                "Safe pause requested (STOP sentinel at %s): stopping at the "
+                "completed epoch %d boundary after checkpointing; resume from "
+                "this segment's checkpoint to continue.",
+                output_dir / _PAUSE_SENTINEL_NAME, epoch,
+            )
+            break
+
     # ── Final checkpoint ──────────────────────────────────────
     final_path = output_dir / "final_model.pth"
     _atomic_save_checkpoint(
@@ -6040,6 +6584,10 @@ def train(
         "animal_identity_status": nested_provenance["animal_identity_status"],
         "dataset_source_sha256": dataset_source_sha256,
         "dataset_source_binding": dataset_source_binding,
+        # True when this segment stopped on a safe-pause STOP sentinel (not on
+        # an early stop or the epoch budget).  Additive: an uninterrupted run
+        # reports False, so existing consumers are unaffected.
+        "paused": _paused_on_sentinel,
     }
 
 
@@ -6052,6 +6600,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     CLI entry point.
 
     Parses arguments, loads config, and runs :func:`train`.
+
+    A run that stopped at an epoch boundary on a safe-pause STOP sentinel
+    exits with :data:`PAUSE_EXIT_CODE` so a launcher can distinguish a pause
+    from a normal completion (0) or a failure (nonzero).  All other exits keep
+    their existing status.
 
     Args:
         argv: Argument list (defaults to ``sys.argv[1:]``).
@@ -6079,6 +6632,13 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     with open(train_log_path, "w") as f:
         json.dump(results, f, indent=2)
     logger.info("Results: %s. Saved: %s", results, train_log_path)
+    if results.get("paused"):
+        logger.info(
+            "Safe pause: exiting with distinct code %d (not a completion, "
+            "not a failure) so the launcher can report it as a pause.",
+            PAUSE_EXIT_CODE,
+        )
+        sys.exit(PAUSE_EXIT_CODE)
 
 
 if __name__ == "__main__":

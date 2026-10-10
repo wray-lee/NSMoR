@@ -168,14 +168,24 @@ def test_restricted_roundtrip_rejects_malicious_reducer() -> None:
 
 
 def test_restricted_roundtrip_restores_registry_on_success_and_failure() -> None:
-    """The ambient registry is restored exactly after both success and error."""
-    previous = torch.serialization.get_safe_globals()
+    """The ambient registry is restored exactly after both success and error.
+
+    Membership is compared as a SET, not a list: ``get_safe_globals()`` returns
+    a list whose ORDER is not stable across a ``clear_safe_globals`` /
+    ``add_safe_globals`` round-trip in this torch build (observed with torch
+    2.14.0+cu132 when another test module has also registered globals), so a
+    list comparison is order-flaky and reports a spurious "index 37 differs"
+    even though the same members are restored.  The invariant under test is the
+    restored membership; the order is an implementation detail of the ambient
+    registry and is not part of the contract.
+    """
+    previous = set(torch.serialization.get_safe_globals())
     restored = _restricted_roundtrip({"payload": torch.arange(3)})
     assert restored["payload"].shape == (3,)
-    assert torch.serialization.get_safe_globals() == previous
+    assert set(torch.serialization.get_safe_globals()) == previous
     with pytest.raises((pickle.UnpicklingError, ValueError)):
         _restricted_roundtrip(_GeneratedReducer())
-    assert torch.serialization.get_safe_globals() == previous
+    assert set(torch.serialization.get_safe_globals()) == previous
 
 
 def test_load_csv_snapshot_parses_clock_pair_from_stream(tmp_path: Path) -> None:

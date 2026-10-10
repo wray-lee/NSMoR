@@ -564,8 +564,10 @@ Pre-declared policy if a run nevertheless OOMs at batch 128:
 **Run order: serial; R0 first**, then R1, R2, R3, each at seeds 42, 43, 44
 (12 runs). R0 first fixes the MSE-selected control before any ablation is read.
 
-Training command shape (each of the 12 runs; no `--resume`; `--epochs` not
-overridden — the config's 300 is authoritative):
+Training command shape (each of the 12 runs; `--epochs` not overridden — the
+config's 300 is authoritative). A run starts fresh, or — only under the
+interruption-recovery rule in §11.1 — resumes from its last complete-epoch
+checkpoint:
 
 ```
 python scripts/train.py \
@@ -609,6 +611,263 @@ whose checkpoint config does not match its declared arm keys — including a
 refused by the scorer (fail closed), and each arm's val loader targets are
 asserted elementwise equal to `extract_canonical_validation_targets`' series
 before any scoring (fail closed, §5 item 4).
+
+### 11.1 Interruption recovery (amendment 2026-10-10)
+
+The original rule "no `--resume`" is replaced by an interruption-recovery rule.
+A run may be interrupted — to free the GPU for same-machine PsychoPy stimulus
+timing, or to survive a WSL failure / memory reclaim — and resumed from its
+**last complete-epoch checkpoint** only when ALL of the following hold:
+
+1. **Same frozen commit and worktree.** The resuming process runs inside the
+   same frozen worktree, at the same frozen commit, with a clean tracked tree;
+   `nsmor` and `scripts.train` resolve inside that worktree.
+2. **Same config SHA-256.** The run's `provenance.json` records the arm YAML's
+   SHA-256; it must equal the current YAML's SHA-256.
+3. **Resume preflight passes.** The checkpoint is a current-schema
+   (`recovery_state_version=2`) recoverable payload whose lineage, clock,
+   optimizer/scheduler/RNG state and phase match the active run; a preflight
+   failure refuses the resume (fail closed). The source is the run's LAST
+   complete-epoch checkpoint: `scripts/train.py` itself refuses `best_model.pth`
+   (the best SELECTED epoch, which may be far older) and, for an in-place
+   recovery, any source older than a newer last-epoch family file in the same
+   run dir (`_require_resume_source_is_newest_complete_epoch`) — so a bare
+   `train.py --resume` enforces this, not only the launcher.
+4. **All original logs and recovery records retained.** The interrupted
+   segment's `train.stdout.log`, checkpoints and `segment_*.json` records are
+   never overwritten or deleted: a fresh segment owns `train.stdout.log`, and
+   every resume writes a NEW segment-indexed log (`train.segment<N>.log`)
+   rather than truncating the prior segment's. Each resume appends an entry to
+   `status.log` and to a `resume_log` in `provenance.json` recording the
+   resume time, the checkpoint's epoch and the resume source; `provenance.json`
+   is rewritten in place (atomically, temp + fsync + rename) with its
+   `resume_log` extended, so its prior fields and prior entries are preserved —
+   it is never truncated to a partial or empty file. The `status.log` /
+   `resume_log` records are written by the resume LAUNCHER
+   (`run_frozen_resume.sh` + `resume_decision.py`); a bare `train.py --resume`
+   bypasses the launcher, satisfies the equivalence guarantee, but writes
+   neither, so condition 5's per-run interruption reporting is guaranteed only
+   on the launcher path.
+5. **Results report interruptions.** For every run, the results report the
+   number of interruptions, the interruption epochs and the resume sources.
+
+Resume equivalence to uninterrupted training is established at code level
+(CPU, fixed seed): model weights, optimizer state, LR scheduler state, NumPy
+and Torch RNG states, the per-epoch shuffle order, the early-stopping counter,
+the best metric and best-checkpoint record, the `selection_metric` /
+`zero_input_channels` provenance and the per-epoch logged losses are all
+bitwise equal between an uninterrupted run and an interrupted-then-resumed run
+(`tests/test_resume_equivalence.py`). The NumPy stream is EXERCISED, not
+vacuous: the anchor-aligned crop the fixture takes does not itself draw from
+the global NumPy stream, so each epoch performs one supported stochastic draw;
+dropping the NumPy restore then makes the assertion fail (mutation-checked).
+The stdlib `random` RNG is deliberately NOT claimed: training never consumes
+`random.*` and no checkpoint stores its state, so it is not a
+continuation-bearing quantity.
+
+This bitwise guarantee holds in BOTH the reliable-recovery cadence
+(`num_workers=0`, `checkpoint_interval=1`) AND the REAL phase-2 arm regime
+(`num_workers: -1` auto-scaling to >0 on the full corpus, `persistent_workers:
+true`, `checkpoint_interval: 10`), on CPU with a fixed seed. The arm-regime
+equality is asserted for `selection_metric=total` and an R2-style
+`selection_metric=mse` + `zero_input_channels=[2,3]` config, at both
+`num_workers=1` and `num_workers=0`
+(`tests/test_resume_equivalence.py::test_arm_regime_resume_is_bitwise`).
+
+The enabling fix targets the exact root cause. A persistent multi-worker
+DataLoader builds its iterator ONCE and, at each later epoch, reuses it via
+`_reset`, so `iter(loader)` at an epoch boundary draws only the per-epoch
+`RandomSampler` seed from the global torch RNG. The FIRST construction instead
+draws that seed AND the parent-process base seed, and re-seeds the sampler from
+the shifted stream. A resumed process that simply built a fresh iterator
+therefore drew one extra global-RNG word (and a different sampler seed), which
+shifted the entire resumed trajectory — a genuinely different optimization
+path, not a benign re-shuffle. The fix
+(`scripts/train.py::_prewarm_persistent_loaders`) re-establishes the persistent
+iterator(s) on resume around a save/restore of the global RNG, so the resumed
+process consumes the global stream exactly as the uninterrupted run did at that
+epoch boundary. It is a pure no-op on the RNG stream (the warm-up draws are
+undone) and runs ONLY on a resume, so fresh (non-resumed) training is bitwise
+unchanged. Removing the pre-warm reproduces the divergence (mutation-checked:
+the `num_workers=1` cases fail, the `num_workers=0` cases stay bitwise).
+
+**Precondition (explicit and ENFORCED): worker-side RNG.** The fix above
+restores only the loader's OWN seeds; it cannot recover a draw taken INSIDE a
+dataset `__getitem__` OR a `collate_fn` running in a worker process, whose
+stream state after k epochs is not in the checkpoint. Bitwise resume is
+therefore guaranteed ONLY when the dataset `__getitem__` and collate consume no
+worker-side RNG. This is now an enforced precondition, not a caveat: on a
+resume `scripts/train.py::_require_bitwise_resume_loader_rng` audits the
+actual loaders and REFUSES (fail closed) any run whose dataset would use the
+legacy random-crop path (`nsmor/nsmor_dataloader.py` ~L246, `anchor_frames is
+None`), any other dataset whose `__getitem__` advances the global torch or
+NumPy stream, OR a loader `collate_fn` that advances either stream (all three
+via side-effect-free runtime probes — the dataset probe over several indices,
+the collate probe on a real clean item). The probes compare the FULL NumPy
+state, `has_gauss`/`cached_gaussian` included, so a `standard_normal` draw
+served from the Gaussian cache (which leaves `pos`/`keys` unchanged) is
+detected rather than missed. The phase-2 corpus provides `anchor_frames` and
+its `NSMoRDataset.__getitem__` draws nothing, so the twelve arms satisfy the
+precondition; the eager `NSMoRDataset` legacy random crop, a synthetic
+RNG-consuming dataset, and an RNG-consuming collate are all covered by tests
+(`test_real_corpus_dataset_consumes_no_worker_rng`,
+`test_resume_refused_when_dataset_consumes_worker_rng`,
+`test_resume_refused_when_collate_consumes_worker_rng`,
+`test_rng_probe_detects_gaussian_cache_draw`). A resume whose loaders
+fail this precondition is refused before any epoch rather than silently
+diverging.
+
+On GPU the guarantee is **not** bitwise: the training code sets NO determinism
+flags (`torch.use_deterministic_algorithms`, `cudnn.deterministic` and
+`CUBLAS_WORKSPACE_CONFIG` are all unset), so cuDNN/cuBLAS reductions and
+atomics (and non-deterministic kernel selection) make a resumed and an
+uninterrupted run differ by GPU-reduction rounding — exactly as two
+uninterrupted GPU runs differ. No tolerance is measured or claimed for this
+code, so a GPU resume is **explicitly unsupported** for any phase-2 arm: it is
+reported as state-exact and trajectory-unverified, and must NOT be used to
+produce a phase-2 result. What IS exact on GPU is the restored continuation
+STATE (model/optimizer/scheduler/RNG bytes); everything downstream of it is
+unverified. For the twelve GPU arms the bitwise claim is therefore carried by
+the LOGICAL guard, not by a measured GPU trajectory: the pre-warm runs only
+when `checkpoint.resume_from` is set, so a fresh GPU run (no `--resume`) never
+touches the resume seam and is unchanged; the GPU arm's resume is state-exact
+only.
+
+The bitwise measurements above are on CPU pinned to a SINGLE thread
+(`torch.set_num_threads(1)`, interop threads 1, CUDA hidden —
+`tests/test_resume_equivalence.py::_cpu_single_thread`). Thread count is part
+of the reproducibility contract: multi-threaded CPU reductions (and any GPU
+kernel) are not bitwise, so the claim is scoped to the thread-pinned CPU the
+tests pin. The equality is measured on a tiny SYNTHETIC corpus and a SHORT run
+(4-6 epochs) — an emulation of the arm regime's loader configuration
+(`num_workers>0`, `persistent_workers=true`, `checkpoint_interval=10`), not the
+full corpus at 300 epochs; the arm-regime equality rests on the loader
+configuration being exercised, which the emulation reproduces exactly. A
+SIGKILL at a non-multiple epoch (which writes no `final_model.pth`, only an
+older periodic) is covered by the `final_model.pth`/newest-complete-epoch UNIT
+tests and the launcher `decide` tests, NOT end-to-end: the equivalence tests
+interrupt via a safe pause (which writes `final_model.pth`) or a
+checkpointed-epoch exception, and the newest-source rule itself is unit-tested.
+
+`seed 42` (`R0-control-seed42`) was started from the LIVE tree
+(`D:/Projects/NSMoR`) by `run_arms.sh`, NOT the frozen worktree, so its
+provenance head differs from the frozen commit. It must NOT be resumed across
+code versions: the resume launcher's provenance check refuses it. If it is
+interrupted it is a deviation — rerun it from the frozen worktree, or disclose
+it as interrupted — and it is not silently continued on the new code.
+
+The safe-pause mechanism (a `STOP` sentinel file in the run's output dir,
+checked only after the epoch's checkpoint is fully written via temp + fsync +
+atomic rename) never interrupts a save, and a paused run exits with the
+distinct status `17` (`train.py`'s `PAUSE_EXIT_CODE`) so a launcher can tell a
+pause from a completion (`0`) or a failure (nonzero) from the exit code alone.
+The preliminary-phase conclusions and
+the k1.0 recovery segment/gaps remain exactly as recorded; this amendment
+changes only the run-order/resume rule.
+
+**Amendment log — 2026-10-10.** Reason: make the already-implemented epoch
+recovery (commit `56253c0`; 2026-10-06 authorization) a formal mechanism so
+training can be paused for same-machine PsychoPy experiments and survive WSL
+failures, instead of the blanket "no `--resume`". Equivalence evidence:
+`tests/test_resume_equivalence.py` (CPU, seed 42, tiny synthetic data) proves
+bitwise equality of every continuation-bearing quantity between an
+uninterrupted run and an interrupted-then-resumed run, under
+`selection_metric=total` and an R2-style `selection_metric=mse` +
+`zero_input_channels=[2,3]` config, in the reliable cadence
+(`num_workers=0`, `checkpoint_interval=1`) AND the real arm regime
+(`num_workers=1`, `persistent_workers=True`, `checkpoint_interval=10`,
+`test_arm_regime_resume_is_bitwise`); a resume that switches `selection_metric`
+is refused (fail closed). The arm-regime equality rests on
+`_prewarm_persistent_loaders` (re-establish the persistent iterator around an
+RNG save/restore on resume), mutation-checked to be load-bearing. The
+stdlib-Python RNG dimension the task enumerated is NOT asserted because
+training never consumes `random.*` (no such call in `scripts/train.py` or
+`nsmor/*.py`) and no checkpoint stores its state, so it is not a
+continuation-bearing quantity; CUDA RNG state (`cuda_rng_state`) is likewise
+not asserted, since the claim is CPU-only and no GPU is used. Fresh-training
+equivalence is preserved AND regression-pinned:
+`test_fresh_training_weights_are_unchanged` asserts the exact final-weights
+SHA-256 of a fresh run, measured identical on the pre-amendment base commit
+(8ed5edb) and on the amended code in the arm regime (workers=1, persistent,
+interval=10) as well (no default behaviour changed).
+
+**Amendment log — 2026-10-11.** Reason: the 2026-10-10 text scoped the bitwise
+guarantee to `num_workers=0` and disclosed that the arms resume "approximately".
+That disclosure was a bug report, not a scientific limit: the divergence had a
+single, fixable root cause (a fresh loader iterator re-drawing the base seed and
+re-seeding the sampler on resume). `_prewarm_persistent_loaders` fixes it, so
+the arm regime is now a bitwise continuation and the "`resume == uninterrupted`
+FALSE" headline is RETRACTED — `resume == uninterrupted` is TRUE (bitwise, CPU,
+fixed seed) for the twelve phase-2 arms' loader configuration. The GPU statement
+is unchanged: state-exact, trajectory not bitwise, same as two uninterrupted GPU
+runs. The earlier characterization test that asserted the arms diverge is
+replaced by `test_arm_regime_resume_is_bitwise`.
+
+**Limitations of this amendment (first-class, not buried).** The bitwise result
+is CPU-only and requires a fixed seed; on GPU it is state-exact but not bitwise
+(no determinism flags), exactly as for two uninterrupted GPU runs — a GPU
+resume is reported as state-exact and trajectory-unverified and must NOT be used
+to produce a phase-2 result. The `seed 42` arm is a cross-code-version deviation
+(started from the live tree) and is never silently resumed. `final_model.pth`
+is an accepted resume source: the safe-pause and the recovery helper both treat
+it as the segment's last complete-epoch checkpoint, and the helper orders resume
+candidates by the checkpoint's OWN stored epoch across the last-epoch families
+(never by family, and NEVER from `best_model.pth` — the best epoch can be far
+older than the last executed epoch, so resuming from it would silently re-train
+completed epochs; a dir holding only `best_model.pth` is refused), so an
+interruption at a non-multiple of `checkpoint_interval` recovers the NEWEST
+complete epoch rather than an older periodic — for `checkpoint_interval: 10`, a
+pause at epoch 12 resumes from `final_model.pth` (epoch 12), not `epoch_10.pth`
+(epoch 9).
+
+**Amendment log — 2026-10-11 (round-4).** Reason: close five review findings.
+(1) G1: the worker-RNG precondition above is now explicit and enforced
+(`_require_bitwise_resume_loader_rng`), with tests for both a detected
+RNG-consuming dataset and the real-corpus dataset's no-RNG property. (2) G2:
+`train.py` itself now refuses `best_model.pth` as a resume source and refuses a
+source older than a newer last-epoch family file in its own run dir
+(`_require_resume_source_is_newest_complete_epoch`), so a bare `--resume`
+enforces §11.1's "last complete-epoch checkpoint" rule, not only the launcher.
+(3) G3: the stale loader-control claims are corrected — the segment record now
+carries `worker_resume_equivalence_established: true` (the persistent
+multi-worker resume IS a bitwise continuation) and
+`worker_count_change_equivalence_established: false` (a resume that CHANGES the
+worker count is not), replacing the conflated
+`legacy_worker_equivalence_established: false`; the
+`_require_reliable_recovery_loaders` docstring no longer claims workers>0 cannot
+be resumed. (4) G4: the arm-regime equivalence test now uses TWO train batches
+per epoch (`batch_size=4` on the 8-trial split) and asserts the per-epoch
+`RandomSampler` index order parent-side (observable at any worker count) in
+addition to weights. (5) G5: this section now states the CPU-single-thread
+scope, the GPU logical-guard basis, the synthetic-corpus/short-run emulation,
+and that a SIGKILL at a non-multiple epoch is covered by unit tests, not
+end-to-end.
+
+**Amendment log — 2026-10-11 (round-5).** Reason: close the round-5 review
+findings on the round-4 fixes. (1) G1 (blocker): the enforced worker-RNG
+precondition now actually covers the loader's `collate_fn` — a collate that
+draws global torch/NumPy RNG in a worker is detected and refused
+(`_collate_fn_consumes_rng`), so the code matches the "dataset `__getitem__`
+AND collate" guarantee the text already stated. (2) Major: the dataset probe's
+NumPy comparison now checks the FULL state (`has_gauss`/`cached_gaussian`
+included), closing a false negative where a `standard_normal` draw served from
+the Gaussian cache left `pos`/`keys` unchanged; the probe also runs over more
+than one index, so an index-dependent draw (e.g. a crop that fires only on long
+trials) is not missed by an index-0-only probe. (3) Major: the real-corpus
+no-RNG test now sets `max_seq_len` strictly below the fixture sequence length
+and asserts the anchor-crop branch actually executes, so the property is
+asserted on the code path it names. (4) Major: the truncated duplicate G2
+comment banner at EOF of `tests/test_epoch_recovery.py` is removed, and the
+dead `_LAST_EPOCH_FAMILIES` constant is now the single source of truth used by
+`_require_resume_source_is_newest_complete_epoch` (code and constant agree).
+The launcher (`run_frozen_resume.sh`) precondition comment states the same
+scope. A new test covers the collate hazard, the Gaussian-cache draw, and the
+executed crop branch (`tests/test_resume_equivalence.py`).
+
+*This amendment's text is bound to the reviewed worktree commit by the
+`sha256` of `docs/realdata-phase2-protocol-20261010.md` recorded in each run's
+`provenance.json`; that hash is left to the review commit and is not
+hand-written here.*
 
 ## 12. Release boundary
 

@@ -975,19 +975,28 @@ def test_resume_preserves_best_validation_score_and_checkpoint(tmp_path: Path) -
     assert math.isfinite(best_v1)
     best_ckpt_1 = Path(config1.checkpoint.output_dir) / "best_model.pth"
     assert best_ckpt_1.exists()
+    # The resume source is the segment's last complete-epoch checkpoint
+    # (final_model.pth); best_model.pth is NOT a resume source and is refused
+    # by _require_resume_source_is_newest_complete_epoch.
+    final_ckpt_1 = Path(config1.checkpoint.output_dir) / "final_model.pth"
+    assert final_ckpt_1.exists()
 
-    # Artificially set best_val_loss in checkpoint to a very low value (e.g. 0.001)
-    # to test that resume doesn't overwrite it when epoch 2 val_loss is higher.
-    ckpt1_data = load_artifact_bytes(best_ckpt_1.read_bytes())
-    ckpt1_data["loss"] = 0.001
-    ckpt1_data["val_loss"] = 0.001
-    ckpt1_data["best_val_loss"] = 0.001
-    torch.save(ckpt1_data, best_ckpt_1)
+    # Artificially set best_val_loss in the best AND the last-epoch checkpoint
+    # to a very low value (e.g. 0.001) to test that resume doesn't overwrite it
+    # when epoch 2 val_loss is higher.  Both are stamped so the reconciliation
+    # (which certifies the companion best against the resumed source) sees a
+    # consistent historical best.
+    for path in (best_ckpt_1, final_ckpt_1):
+        ckpt1_data = load_artifact_bytes(path.read_bytes())
+        ckpt1_data["loss"] = 0.001
+        ckpt1_data["val_loss"] = 0.001
+        ckpt1_data["best_val_loss"] = 0.001
+        torch.save(ckpt1_data, path)
 
     # Resume for epoch 2
     config2 = _make_config(tmp_path / "run2")
     config2.training.num_epochs = 2
-    config2.checkpoint.resume_from = str(best_ckpt_1)
+    config2.checkpoint.resume_from = str(final_ckpt_1)
 
     res2 = train(
         config2,
