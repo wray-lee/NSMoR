@@ -27,6 +27,19 @@
 #   run_frozen_resume.sh <frozen_commit> <worktree> <arm>...
 #   run_frozen_resume.sh pause <worktree> <arm>...     # safe-pause helper
 #
+# Environment:
+#   ORIGIN_COMMIT=<C>  successor-commit resume opt-in (§11.1 amendment
+#                      2026-10-11): accept a provenance head == C only when git
+#                      confirms C is an ancestor of the frozen commit C' (via
+#                      git.exe on the Windows path form).  Without it a head
+#                      != C' is refused as a cross-code-version resume.
+#   OUT_ROOT=<abs dir> absolute output root (default: this worktree's
+#                      .scratch/realdata-phase2-20261010).  Set it to the run's
+#                      own dir root so the launcher, running inside C', appends
+#                      the new segment to the run started under C.
+#   DRY_RUN=1          run the decider with --dry-run and report the decision;
+#                      writes NOTHING to the run dir and launches no training.
+#
 # `pause` drops an empty STOP sentinel in each arm's output dir.  The training
 # loop checks for it ONLY after that epoch's best/periodic checkpoint is fully
 # written (temp + fsync + atomic rename) and then exits cleanly, so a pause
@@ -68,6 +81,28 @@ shift 2
 cd "$WT"   # run INSIDE the frozen worktree so cwd/sys.path cannot reach the live repo
 export PYTHONPATH=$WT
 
+# The worktrees' .git files point at Windows paths (gitdir: C:/disk/...), so the
+# WSL git cannot resolve them; run git.exe on the wslpath -w form and strip CR
+# (mirrors run_frozen2.sh's git.exe + tr -d '\r').  The pipeline's exit status is
+# tr's (0), so callers that need git's own status run git.exe directly.
+gitw() { local wt="$1"; shift; git.exe -C "$(wslpath -w "$wt")" "$@" 2>/dev/null | tr -d '\r'; }
+
+# Output root: ABSOLUTE so the launcher, running inside the C' frozen worktree,
+# can resume a run dir that lives under a DIFFERENT (origin) worktree's
+# .scratch.  When NOT overridden it defaults to this worktree's own scratch and
+# train.py keeps its own (relative) output_dir, so the default path stays
+# byte-identical.
+OUT_ROOT_SET=${OUT_ROOT:+1}
+OUT_ROOT=${OUT_ROOT:-$WT/.scratch/realdata-phase2-20261010}
+# Successor-commit resume opt-in (§11.1): the run's own starting commit C.
+# Empty (default) keeps the strict same-commit rule (a head != frozen is
+# refused).  When set, the decider accepts a provenance head == C only if git
+# confirms C is an ancestor of the frozen commit C'.
+ORIGIN_COMMIT=${ORIGIN_COMMIT:-}
+# DRY_RUN=1 runs the decider (--dry-run) and reports the decision without
+# recording or launching training; it writes NOTHING to the run dir.
+DRY_RUN=${DRY_RUN:-0}
+
 # Inputs default to the frozen phase-2 corpus (identical to run_frozen.sh).
 # They are overridable ONLY for CPU smoke-testing the resume decision on a
 # throwaway worktree; the preflight (HEAD/clean/modules) is never overridden.
@@ -81,10 +116,10 @@ ARMS_DIR=${ARMS_DIR:-config/realdata-phase2-20261010}
 HELPER=$JOBDIR/resume_decision.py
 
 for ARM in "$@"; do
-  OUT=.scratch/realdata-phase2-20261010/$ARM
+  OUT=$OUT_ROOT/$ARM
   CFG=$WT/$ARMS_DIR/$ARM.yaml
-  HEAD=$(git -C "$WT" rev-parse HEAD)
-  DIRTY=$(git -C "$WT" status --porcelain --untracked-files=no)
+  HEAD=$(gitw "$WT" rev-parse HEAD)
+  DIRTY=$(gitw "$WT" status --porcelain --untracked-files=no)
   if [ "$HEAD" != "$FROZEN" ] || [ -n "$DIRTY" ]; then
     echo "$(date -Is) $ARM REFUSED: worktree head=$HEAD dirty=[$DIRTY]" >> "$LOG"; exit 1
   fi
@@ -96,14 +131,30 @@ for ARM in "$@"; do
   NUM_EPOCHS=$(python -c "import yaml,sys; print(int(yaml.safe_load(open('$CFG'))['training']['num_epochs']))")
 
   RESUME_CKPT=""
+  if [ "$DRY_RUN" = "1" ] && { [ ! -d "$OUT" ] || [ -z "$(ls -A "$OUT" 2>/dev/null)" ]; }; then
+    # A dry run must write NOTHING, so never create an empty run dir for it.
+    echo "$(date -Is) $ARM DRY-RUN: no non-empty run dir at $OUT (nothing to resume; nothing written)" >> "$LOG"
+    continue
+  fi
   if [ -d "$OUT" ] && [ -n "$(ls -A "$OUT" 2>/dev/null)" ]; then
-    DECISION=$(python "$HELPER" decide "$OUT" "$WT" "$FROZEN" "$CFG" "$NUM_EPOCHS")
+    DECIDE_ARGS=("$OUT" "$WT" "$FROZEN" "$CFG" "$NUM_EPOCHS")
+    if [ -n "$ORIGIN_COMMIT" ]; then DECIDE_ARGS+=("$ORIGIN_COMMIT"); fi
+    if [ "$DRY_RUN" = "1" ]; then DECIDE_ARGS+=(--dry-run); fi
+    DECISION=$(python "$HELPER" decide "${DECIDE_ARGS[@]}")
     rc=$?
     if [ $rc -ne 0 ]; then
       echo "$(date -Is) $ARM REFUSED: $DECISION" >> "$LOG"; continue
     fi
+    if [ "$DRY_RUN" = "1" ]; then
+      echo "$(date -Is) $ARM DRY-RUN OK: would resume from $DECISION (origin=${ORIGIN_COMMIT:-none}, frozen=$FROZEN)" >> "$LOG"
+      continue
+    fi
     RESUME_CKPT=$DECISION
-    python "$HELPER" record "$OUT" "$RESUME_CKPT" "$FROZEN" >> "$LOG"
+    if [ -n "$ORIGIN_COMMIT" ]; then
+      python "$HELPER" record "$OUT" "$RESUME_CKPT" "$FROZEN" "$ORIGIN_COMMIT" >> "$LOG"
+    else
+      python "$HELPER" record "$OUT" "$RESUME_CKPT" "$FROZEN" >> "$LOG"
+    fi
     # Consume the pause sentinel now that we are resuming from its checkpoint,
     # so the resumed run does not immediately re-pause.
     rm -f "$OUT/$SENTINEL"
@@ -128,6 +179,14 @@ for ARM in "$@"; do
     } > "$OUT/provenance.json"
   fi
 
+  # --output_dir pins writes to the run's OWN dir.  When OUT_ROOT points at the
+  # origin worktree's .scratch (a successor-commit resume) this appends the new
+  # segment/checkpoints/logs to the existing run instead of creating a fresh dir
+  # under the C' worktree; when OUT_ROOT is unset the config's own output_dir is
+  # used unchanged, so the default path is byte-identical.
+  OUTDIR_ARGS=()
+  if [ -n "$OUT_ROOT_SET" ]; then OUTDIR_ARGS=(--output_dir "$OUT"); fi
+
   if [ -n "$RESUME_CKPT" ]; then
     # NEVER truncate a prior segment's log.  The fresh segment owns
     # train.stdout.log; every resume writes a NEW indexed segment log, so the
@@ -136,14 +195,15 @@ for ARM in "$@"; do
     # evidence this amendment promises to retain.
     SEG=$(( $(ls -1 "$OUT"/train.segment*.log 2>/dev/null | wc -l) + 1 ))
     RUNLOG=$OUT/train.segment${SEG}.log
-    echo "$(date -Is) $ARM START (resume from $RESUME_CKPT, frozen $FROZEN, log $RUNLOG)" >> "$LOG"
+    echo "$(date -Is) $ARM START (resume from $RESUME_CKPT, frozen $FROZEN, origin ${ORIGIN_COMMIT:-none}, log $RUNLOG)" >> "$LOG"
     python "$WT/scripts/train.py" --config "$CFG" --dataset "$DATASET" \
-      --nested_prior_artifact "$PRIOR" --resume "$RESUME_CKPT" > "$RUNLOG" 2>&1
+      --nested_prior_artifact "$PRIOR" "${OUTDIR_ARGS[@]}" \
+      --resume "$RESUME_CKPT" > "$RUNLOG" 2>&1
   else
     RUNLOG=$OUT/train.stdout.log
     echo "$(date -Is) $ARM START (fresh, frozen $FROZEN)" >> "$LOG"
     python "$WT/scripts/train.py" --config "$CFG" --dataset "$DATASET" \
-      --nested_prior_artifact "$PRIOR" > "$RUNLOG" 2>&1
+      --nested_prior_artifact "$PRIOR" "${OUTDIR_ARGS[@]}" > "$RUNLOG" 2>&1
   fi
   rc=$?
   if [ $rc -eq 17 ]; then

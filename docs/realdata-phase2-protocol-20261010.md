@@ -651,6 +651,59 @@ timing, or to survive a WSL failure / memory reclaim — and resumed from its
 5. **Results report interruptions.** For every run, the results report the
    number of interruptions, the interruption epochs and the resume sources.
 
+**Successor-commit resume (amendment 2026-10-11).** A run STARTED on commit C
+may be resumed on a DIFFERENT commit C' (a successor that adds the formal
+resume mechanism) only when ALL of the following hold, in addition to 1–5
+above (condition 1's "same frozen commit" is thereby relaxed to "C is an
+ancestor of C'", with the remaining conditions unchanged):
+
+- (i) **Ancestry.** C is an ancestor of C'. Verified mechanically by
+  `git merge-base --is-ancestor C C'` via Windows `git.exe` (the worktree
+  `.git` files hold Windows paths, so the WSL `git` cannot resolve them), run
+  by the resume decider (`scripts/resume_decision.py::_git_ancestor`) behind
+  the launcher's `ORIGIN_COMMIT=<C>` opt-in.
+- (ii) **Fresh-training identity.** Fresh (non-resumed) training is established
+  bitwise identical between C and C': the pinned-environment fresh-weights
+  SHA-256 test (`tests/test_resume_equivalence.py::test_fresh_training_weights_are_unchanged`,
+  `_FRESH_WEIGHTS_SHA`) measures equal on C and on C', and the portable
+  invariant test (`test_fresh_training_never_prewarms_and_is_deterministic`)
+  holds on C'. Measured for C=`8ed5edb` and C'=`ef3c3aa`: both produce the
+  pinned weights SHA-256 `6a8a43517d1985a5c3732df026cdb39c0d097c3389fab8d797e08bd2a72052a0`.
+- (iii) **No fresh-training code path changed.** C..C' changes no fresh-training
+  code path except resume-only paths. Verified by reviewing and recording the
+  diff of `scripts/train.py` and `nsmor/` between C and C' (the `git diff C C'`
+  for those paths is the recorded evidence). Every hunk that alters a
+  computation is inside a `resume_from is not None` guard or is a helper
+  reached only from such a guard (the resume seam:
+  `_prewarm_persistent_loaders`, `_require_bitwise_resume_loader_rng`,
+  `_require_resume_source_is_newest_complete_epoch`, the safe-pause sentinel
+  consumed on resume). `nsmor/model_nsmor_core.py` and `nsmor/loss.py` are
+  byte-identical across C..C'. The only fresh-run-reachable changes are
+  no-ops on a fresh run: additive metadata that is `False`/unchanged for a
+  fresh run (`paused` in the results dict, the renamed/added segment-record
+  loader-control fields) and the epoch-tail safe-pause check, which reads a
+  `STOP` sentinel that does not exist for a fresh run and therefore does not
+  alter the trajectory. The fresh-training MODEL trajectory and weights are
+  bitwise unchanged, which is exactly what (ii)'s pinned fresh-weights equality
+  measures; the fresh-training path draws no extra global RNG.
+- (iv) **Both commits recorded.** The resume launcher records BOTH C and C' in
+  the run's `provenance.json` `resume_log` entry (fields `origin_commit`=C and
+  `head`=C') and in the `status.log` line for the resume.
+- (v) **Reporting.** The run is reported with its interruption count, the
+  interruption epoch, the source checkpoint and BOTH commits.
+
+The opt-in is explicit and fail-closed: without `ORIGIN_COMMIT=<C>` a
+provenance head != C' is still refused as a cross-code-version resume, and with
+it a head != C is refused (the opt-in must name the run's OWN recorded head).
+The `R0-control-seed43` run (started on C=`8ed5edb`, interrupted by a WSL
+restart after epoch 58, periodic `epoch_10..epoch_50` + `best_model.pth`
+retained) is resumed on a successor commit C' that contains the mechanism
+(`ef3c3aa`, or a descendant such as the amendment branch commit) from
+`epoch_50.pth` (stored epoch 49, next epoch 50) under this clause.  Because the
+launcher pins HEAD == C', the frozen commit passed to it is whichever successor
+commit the resume actually runs at.
+
+
 Resume equivalence to uninterrupted training is established at code level
 (CPU, fixed seed): model weights, optimizer state, LR scheduler state, NumPy
 and Torch RNG states, the per-epoch shuffle order, the early-stopping counter,
@@ -863,6 +916,39 @@ dead `_LAST_EPOCH_FAMILIES` constant is now the single source of truth used by
 The launcher (`run_frozen_resume.sh`) precondition comment states the same
 scope. A new test covers the collate hazard, the Gaussian-cache draw, and the
 executed crop branch (`tests/test_resume_equivalence.py`).
+
+**Amendment log — 2026-10-11 (successor-commit resume).** Reason: the
+`R0-control-seed43` run started on the frozen commit C=`8ed5edb` was interrupted
+by a WSL restart after epoch 58; the formal resume mechanism (pre-warm, resume
+preflight, newest-complete-epoch guard, safe-pause sentinel, launcher) exists
+only on the SUCCESSOR commit C'=`ef3c3aa`, so continuing it required resuming
+across a code version. This amendment adds the "successor-commit resume" clause
+above (conditions i–v) and the supporting mechanism. Evidence: (i) ancestry
+`git merge-base --is-ancestor 8ed5edb ef3c3aa` = true; (ii) the pinned
+fresh-weights SHA-256 is `6a8a4351…a72052a0` on BOTH C and C'
+(`tests/test_resume_equivalence.py::test_fresh_training_weights_are_unchanged`,
+measured on C by an out-of-tree probe and on C' by the in-tree test); (iii) the
+`git diff 8ed5edb ef3c3aa -- scripts/ nsmor/` touches only `scripts/train.py`,
+`scripts/resume_decision.py` and `scripts/run_frozen_resume.sh` (`nsmor/` is
+untouched; the only fresh-run-reachable train.py changes are the additive
+`paused` flag and the epoch-tail sentinel check, both no-ops on a fresh run);
+(iv) `scripts/resume_decision.py::record` now writes both `origin_commit` and
+`head`, and `run_frozen_resume.sh` passes the origin through; (v) the launcher
+`status.log` line names both. Mechanism: the launcher's `ORIGIN_COMMIT=<C>`
+opt-in plus an absolute `OUT_ROOT` (so the launcher, running inside the C'
+worktree, appends to the run dir under the C worktree's `.scratch`), and a
+`--dry-run` decider mode that writes nothing to the run dir. A dry run of the
+seed-43 resume selects `epoch_50.pth` (stored epoch 49, next epoch 50) and
+`train.py`'s own resume preflight (clock, newest-complete-epoch, complete
+schema, architecture-config match, nested prior lineage, and the worker-RNG
+precondition) accepts a checkpoint written by C's code, so no divergence from
+§11.1's fail-closed rules is introduced. New tests:
+`tests/test_run_frozen_resume.py::{test_successor_resume_accepted_when_origin_is_ancestor,
+test_successor_resume_refused_when_origin_not_ancestor,
+test_successor_resume_refused_without_optin,
+test_successor_resume_refused_when_optin_names_other_head,
+test_dry_run_returns_decision_without_writing}`. The preliminary conclusions are
+untouched.
 
 *This amendment's text is bound to the reviewed worktree commit by the
 `sha256` of `docs/realdata-phase2-protocol-20261010.md` recorded in each run's

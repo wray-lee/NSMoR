@@ -18,7 +18,7 @@ import hashlib
 import importlib.util
 import json
 import sys
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from typing import Any
@@ -237,9 +237,26 @@ def test_record_appends_resume_log(tmp_path: Path) -> None:
     assert entry["checkpoint_epoch"] == 4
     assert entry["source"] == "run_frozen_resume.sh"
     assert entry["head"] == _FROZEN
+    assert entry["origin_commit"] is None
     assert "time" in entry
     # Atomic write leaves no temp file behind.
     assert not (out / "provenance.json.tmp").exists()
+
+
+def test_record_writes_both_commits_on_successor_resume(tmp_path: Path) -> None:
+    """A successor-commit resume records BOTH C (origin) and C' (head) (§11.1)."""
+    cfg = tmp_path / "arm.yaml"
+    cfg.write_text("training:\n  num_epochs: 10\n")
+    out = tmp_path / "arm"
+    _write_prov(out, cfg, _FROZEN, f"{_WT}/nsmor/__init__.py")
+    ckpt = out / "epoch_4.pth"
+    _write_ckpt(ckpt, 4)
+
+    mod = _helper()
+    mod.record(str(out), str(ckpt), _FROZEN_C, _ORIGIN)
+    entry = json.loads((out / "provenance.json").read_text())["resume_log"][0]
+    assert entry["head"] == _FROZEN_C
+    assert entry["origin_commit"] == _ORIGIN
 
 
 def test_resume_from_final_model_when_no_periodic(tmp_path: Path) -> None:
@@ -376,3 +393,131 @@ def test_refuses_non_nested_historical_without_trusted_pin(tmp_path: Path) -> No
     rc, msg = _decide(out, cfg)
     assert rc == 1, msg
     assert "trusted_historical_checkpoint_sha256" in msg, msg
+
+
+# ── Successor-commit resume (§11.1 amendment, 2026-10-11) ─────────────
+# A run started on commit C may be resumed on a successor commit C' only with
+# the ORIGIN_COMMIT=<C> opt-in AND git confirming C is an ancestor of C'.  These
+# tests exercise the decision logic hermetically: ``_git_ancestor`` is
+# monkeypatched so ancestry is controlled without a real repository (the WSL git
+# cannot read the worktrees' Windows ``.git``).
+
+_ORIGIN = "8ed5edb994ef105db0551aedc50f6003b97fe87f"
+_FROZEN_C = "ef3c3aac51f1f60f926cc1b47ad27041f31464b0"
+
+
+def _successor_fixture(tmp_path: Path) -> tuple:
+    """A (cprime_worktree, origin_worktree, out, cfg) tuple for a successor run.
+
+    The active worktree (C') holds the config; the run's ``code_worktree`` (C)
+    is a DIFFERENT directory, so the config key and the recorded modules must be
+    re-rooted onto the origin worktree to match.
+    """
+    cprime_wt = tmp_path / "wt_prime"
+    origin_wt = tmp_path / "wt_origin"
+    (cprime_wt / "config").mkdir(parents=True)
+    origin_wt.mkdir()
+    cfg = cprime_wt / "config" / "arm.yaml"
+    cfg.write_text("training:\n  num_epochs: 10\n")
+    out = tmp_path / "arm"
+    out.mkdir(parents=True)
+    (out / "provenance.json").write_text(json.dumps({
+        "arm": out.name,
+        "head": _ORIGIN,
+        "code_worktree": str(origin_wt),
+        "resolved_modules": f"{origin_wt}/nsmor/__init__.py",
+        "sha256": {
+            str(origin_wt / "config" / "arm.yaml"):
+                hashlib.sha256(cfg.read_bytes()).hexdigest(),
+        },
+        "resume_log": [],
+    }, indent=2) + "\n")
+    _write_ckpt(out / "epoch_50.pth", 49)
+    return cprime_wt, origin_wt, out, cfg
+
+
+def _decide_successor(
+    out: Path, cprime_wt: Path, cfg: Path, *, origin: str | None,
+    ancestor: bool, n: int = 300,
+) -> tuple:
+    mod = _helper()
+    mod._git_ancestor = lambda wt, a, d: ancestor  # type: ignore[assignment]
+    buf = StringIO()
+    with redirect_stdout(buf):
+        rc = mod.decide(
+            str(out), str(cprime_wt), _FROZEN_C, str(cfg), str(n), origin,
+        )
+    return rc, buf.getvalue().strip()
+
+
+def test_successor_resume_accepted_when_origin_is_ancestor(tmp_path: Path) -> None:
+    """head==C, C an ancestor of C', ORIGIN_COMMIT given → accepted, re-rooted."""
+    cprime_wt, _origin_wt, out, cfg = _successor_fixture(tmp_path)
+    rc, msg = _decide_successor(out, cprime_wt, cfg, origin=_ORIGIN, ancestor=True)
+    assert rc == 0, msg
+    assert msg.endswith("epoch_50.pth"), msg
+
+
+def test_successor_resume_refused_when_origin_not_ancestor(tmp_path: Path) -> None:
+    """ORIGIN_COMMIT given but C is NOT an ancestor of C' → refused."""
+    cprime_wt, _origin_wt, out, cfg = _successor_fixture(tmp_path)
+    rc, msg = _decide_successor(out, cprime_wt, cfg, origin=_ORIGIN, ancestor=False)
+    assert rc == 1, msg
+    assert "not an ancestor" in msg, msg
+
+
+def test_successor_resume_refused_without_optin(tmp_path: Path) -> None:
+    """head != frozen with NO ORIGIN_COMMIT → refused as cross-code-version."""
+    cprime_wt, _origin_wt, out, cfg = _successor_fixture(tmp_path)
+    rc, msg = _decide_successor(out, cprime_wt, cfg, origin=None, ancestor=True)
+    assert rc == 1, msg
+    assert "cross-code-version" in msg, msg
+
+
+def test_successor_resume_refused_when_optin_names_other_head(
+    tmp_path: Path,
+) -> None:
+    """ORIGIN_COMMIT must name the run's OWN recorded head, not any ancestor."""
+    cprime_wt, _origin_wt, out, cfg = _successor_fixture(tmp_path)
+    rc, msg = _decide_successor(
+        out, cprime_wt, cfg, origin="deadbeef" * 5, ancestor=True,
+    )
+    assert rc == 1, msg
+    assert "different origin" in msg, msg
+
+
+def test_successor_resume_refused_when_git_check_fails(tmp_path: Path) -> None:
+    """A git infrastructure failure (no git.exe / bad repo) fails closed."""
+    cprime_wt, _origin_wt, out, cfg = _successor_fixture(tmp_path)
+    mod = _helper()
+
+    def boom(wt: str, a: str, d: str) -> bool:
+        raise RuntimeError("git.exe not found")
+
+    mod._git_ancestor = boom  # type: ignore[assignment]
+    buf = StringIO()
+    with redirect_stdout(buf):
+        rc = mod.decide(str(out), str(cprime_wt), _FROZEN_C, str(cfg), "300",
+                        _ORIGIN)
+    assert rc == 1, buf.getvalue()
+    assert "could not be performed" in buf.getvalue(), buf.getvalue()
+
+
+def test_dry_run_returns_decision_without_writing(tmp_path: Path) -> None:
+    """--dry-run reports the decision and writes NOTHING to the run dir."""
+    cprime_wt, _origin_wt, out, cfg = _successor_fixture(tmp_path)
+    before = {p.name: p.read_bytes() for p in out.iterdir()}
+    mod = _helper()
+    mod._git_ancestor = lambda wt, a, d: True  # type: ignore[assignment]
+    err = StringIO()
+    buf = StringIO()
+    with redirect_stdout(buf), redirect_stderr(err):
+        rc = mod.decide(
+            str(out), str(cprime_wt), _FROZEN_C, str(cfg), "300", _ORIGIN,
+            dry_run=True,
+        )
+    assert rc == 0, buf.getvalue()
+    assert buf.getvalue().strip().endswith("epoch_50.pth")
+    assert "next epoch 50" in err.getvalue(), err.getvalue()
+    after = {p.name: p.read_bytes() for p in out.iterdir()}
+    assert after == before, "dry run must not write to the run dir"
