@@ -227,6 +227,180 @@ def test_sustained_run_helper():
         [False, True, False]
 
 
+class _FakeModelOutValid:
+    """Stand-in that emits a time-consuming ``out_valid`` emission mask.
+
+    ``pred`` reproduces the target exactly (a perfect model) and the mask is
+    supplied per trial, so a test can drive the R4-B2 per-frame-mask path.
+    """
+
+    def __init__(self, valid_masks: list[np.ndarray]):
+        self.valid_masks = [np.asarray(m, dtype=bool) for m in valid_masks]
+        self._i = 0
+
+    def eval(self):
+        return self
+
+    def __call__(self, x: torch.Tensor, lengths, return_internals=False):
+        B, T, _ = x.shape
+        pred = x.mean(dim=-1)                      # (B, T): target on the channel
+        ov = torch.zeros(B, T, dtype=torch.bool)
+        for b in range(B):
+            mask = self.valid_masks[self._i]
+            self._i += 1
+            ov[b, :mask.size] = torch.as_tensor(mask)
+        internals = {
+            "routing_gates": torch.zeros(B, T, 2),
+            "lif_spikes": torch.zeros(B, T, 2),
+            "out_valid": ov,
+        }
+        return pred, internals
+
+
+def _outvalid_loader(y_values: np.ndarray, valid: np.ndarray):
+    y_arr = np.asarray(y_values, dtype=np.float32)
+    L = y_arr.size
+    y = torch.as_tensor(y_arr).view(1, L)
+    x = y.unsqueeze(-1).clone()
+    lengths = torch.full((1,), L, dtype=torch.long)
+    ds = torch.utils.data.TensorDataset(x, y, lengths)
+    return torch.utils.data.DataLoader(ds, batch_size=1)
+
+
+def test_out_valid_one_hole_does_not_bridge_lag1_baseline(compute_metrics):
+    """R4-B2: a single interior hole must NOT be compressed away.
+
+    Reviewer's 8-frame example: a linear ramp ``[0..7]`` with one hole at
+    frame 4.  The lag-one comparator's error on every scored frame is 1, so
+    the CORRECT ``baseline_mse`` is exactly ``1.0``.  Compressing the masked
+    frames (the rejected behavior) would drop frame 4, make frames 3 and 5
+    adjacent, and read the comparator's predecessor across the hole — giving
+    the spurious ``1.5``.
+    """
+    y = np.array([0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0])
+    valid = np.array([True, True, True, True, False, True, True, True])
+    loader = _outvalid_loader(y, valid)
+    model = _FakeModelOutValid([valid])
+    m = compute_metrics(
+        model, loader, torch.device("cpu"),
+        target_mean=0.0, target_std=1.0, target_clip_cm_s=0.0,
+        escape_band_cm_s=10.0, persistence_benchmark=True,
+    )
+    bench = m["persistence_benchmark"]
+    assert m["mse"] == pytest.approx(0.0)          # perfect model
+    assert bench["baseline_mse"] == pytest.approx(1.0), (
+        f"a hole bridged the lag-one comparator: {bench['baseline_mse']}"
+    )
+    # frame 4 (masked) and frame 5 (predecessor masked) are both excluded.
+    assert bench["n_eligible_frames"] == 5
+
+
+def test_out_valid_interior_hole_breaks_escape_run(compute_metrics):
+    """R4-B2: a hole breaks a sustained escape run instead of being bridged.
+
+    ``[0,0,20,20,20,0,0,0]`` is a 3-frame sustained escape without the hole;
+    with a hole at frame 3 the membership mask on the UNCOMPRESSED target is
+    ``[F,F,T,F,T,F,F,F]`` and neither lone frame survives ``min_run=2``, so
+    ``n_escape_frames == 0``.  Compressing would drop frame 3 and bridge
+    frames 2 and 4 into a spurious 2-frame run (``n_escape_frames == 2``).
+    """
+    y = np.array([0.0, 0.0, 20.0, 20.0, 20.0, 0.0, 0.0, 0.0])
+    valid = np.array([True, True, True, False, True, True, True, True])
+    loader = _outvalid_loader(y, valid)
+    m = compute_metrics(
+        _FakeModelOutValid([valid]), loader, torch.device("cpu"),
+        target_mean=0.0, target_std=1.0, target_clip_cm_s=0.0,
+        escape_band_cm_s=10.0,
+    )
+    assert int(m["n_escape_frames"]) == 0, (
+        f"hole bridged an escape run: n_escape_frames={m['n_escape_frames']}"
+    )
+
+
+def test_out_valid_none_leaves_metrics_bitwise_unchanged(compute_metrics):
+    """Off mode (no ``out_valid``) is byte-identical to the legacy path."""
+    y = np.array([0.0, 0.0, 30.0, 30.0, 5.0, 0.0])
+    m = compute_metrics(
+        _FakeModel(scale=1.0), _tiny_loader(y), torch.device("cpu"),
+        target_mean=0.0, target_std=1.0, target_clip_cm_s=100.0,
+        escape_band_cm_s=10.0, persistence_benchmark=True,
+    )
+    # The historical (no-mask) numbers, unchanged by the R4-B2 refactor.
+    assert m["n_escape_frames"] == 2.0
+    assert m["persistence_benchmark"]["n_eligible_frames"] == len(y) - 1
+
+
+def test_out_valid_masks_headline_under_persistence_benchmark(compute_metrics):
+    """R4-B2: the headline MSE is masked even in the opt-in branch.
+
+    A model wrong ONLY on a never-emitted (masked) frame must score headline
+    MSE ``0.0`` under ``persistence_benchmark=True``.  The regression this
+    guards scored the unmasked headline (``0.25``) in that branch.
+    """
+    y = np.array([1.0, 1.0, 1.0, 1.0])
+    pred = np.array([1.0, 1.0, 0.0, 1.0])   # wrong only at the masked frame 2
+    valid = np.array([True, True, False, True])
+    L = y.size
+    x = torch.as_tensor(pred, dtype=torch.float32).view(1, L, 1)
+    yt = torch.as_tensor(y, dtype=torch.float32).view(1, L)
+    lengths = torch.full((1,), L, dtype=torch.long)
+    loader = torch.utils.data.DataLoader(
+        torch.utils.data.TensorDataset(x, yt, lengths), batch_size=1,
+    )
+    m = compute_metrics(
+        _FakeModelOutValid([valid]), loader, torch.device("cpu"),
+        target_mean=0.0, target_std=1.0, target_clip_cm_s=0.0,
+        escape_band_cm_s=10.0, persistence_benchmark=True,
+    )
+    assert m["mse"] == pytest.approx(0.0), (
+        f"masked headline leaked in the opt-in branch: {m['mse']}"
+    )
+
+
+def test_persistence_benchmark_out_valid_mask_per_frame():
+    """Direct unit test: the mask requires ``out_valid[t]`` AND ``t-1`` and
+    the comparator still reads the true, uncompressed ``y_true[t-1]``."""
+    mod = _load_train_module()
+    y = np.array([0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0])
+    valid = np.array([True, True, True, True, False, True, True, True])
+    m = mod.persistence_benchmark_metrics(
+        [y], [y.copy()], escape_band_cm_s=10.0, out_valid_seqs=[valid],
+    )
+    # Eligible = {1,2,3,6,7}: frame 4 masked, frame 5 predecessor-masked.
+    assert m["n_eligible_frames"] == 5
+    assert m["baseline_mse"] == pytest.approx(1.0)
+    assert m["mse"] == pytest.approx(0.0)
+    # Omitting the mask (legacy) scores all t>=1 frames, baseline 1.0 too
+    # (linear ramp), but on 7 frames — proving the mask changed the set.
+    m_nomask = mod.persistence_benchmark_metrics(
+        [y], [y.copy()], escape_band_cm_s=10.0,
+    )
+    assert m_nomask["n_eligible_frames"] == 7
+
+
+def test_sweep_escape_sensitivity_out_valid_hole():
+    """The sweep applies the mask on the uncompressed arrays: a hole breaks
+    an escape run and never-emitted frames join neither band."""
+    mod = _load_train_module()
+    y = np.array([0.0, 0.0, 20.0, 20.0, 20.0, 0.0, 0.0, 0.0])
+    valid = np.array([True, True, True, False, True, True, True, True])
+    rows = mod.sweep_escape_sensitivity(
+        [y], [y.copy()], bands_cm_s=[10.0], min_runs=(2,),
+        all_valid=[valid],
+    )
+    r = rows[0]
+    assert r["n_escape_frames"] == 0, (
+        f"hole bridged a sweep run: {r['n_escape_frames']}"
+    )
+    # The never-emitted frame is in neither band: 8 - 1 masked = 7 scored.
+    assert r["escape_ratio"] == pytest.approx(0.0)
+    # With no mask (legacy) the 3-frame run survives -> n_escape == 3.
+    rows_nomask = mod.sweep_escape_sensitivity(
+        [y], [y.copy()], bands_cm_s=[10.0], min_runs=(2,),
+    )
+    assert rows_nomask[0]["n_escape_frames"] == 3
+
+
 def test_sweep_escape_sensitivity():
     # Regression (round-5 review): the band x min_run sensitivity sweep must
     # (a) apply _sustained_run PER SEQUENCE (no cross-trial run bridging),

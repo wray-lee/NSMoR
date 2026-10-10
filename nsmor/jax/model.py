@@ -244,6 +244,9 @@ def _semantic_signature(source: Any) -> Dict[str, Any]:
     # Adaptive latent refinement (architecture v1): the Flax destination only
     # ever runs "off"; a Torch source with an enabled mode must reject here.
     _put("refinement_mode", getattr(source, "refinement_mode", None))
+    # Time-consuming recursion (ADR 0009): the Flax destination only ever runs
+    # "off"; a Torch source with an enabled mode must reject here.
+    _put("time_consuming_mode", getattr(source, "time_consuming_mode", None))
 
     noise = _attr(source, "sensory_noise_std")
     if noise is None:
@@ -493,6 +496,19 @@ def assert_flax_supported(source: Any, *, context: str) -> None:
             )
         unsupported.append(f"refinement module present (mode={ref_mode!r})")
 
+    # Time-consuming recursion (ADR 0009): the Flax graph does not implement
+    # the delayed/accumulated output map.  Inspect the EXECUTED child, not the
+    # mode string, so a mode mutated to "off" after construction is refused.
+    from nsmor.model_nsmor_core import time_consuming_module_present
+
+    if time_consuming_module_present(source):
+        tc_mode = getattr(source, "time_consuming_mode", None)
+        if tc_mode in (None, "off"):
+            tc_mode = getattr(
+                getattr(source, "backend", None), "time_consuming_mode", None,
+            )
+        unsupported.append(f"time-consuming module present (mode={tc_mode!r})")
+
     if unsupported:
         raise ValueError(
             f"{context}: JAX/Flax backend does not implement "
@@ -660,6 +676,7 @@ class NSMoRModel(nn.Module):
     persistence_skip: float = 0.0
     activation: str = "relu"
     refinement_mode: str = "off"
+    time_consuming_mode: str = "off"
 
     def setup(self) -> None:
         if (
@@ -681,6 +698,15 @@ class NSMoRModel(nn.Module):
                 f"NSMoRModel (Flax) does not implement adaptive latent "
                 f"refinement (refinement_mode={self.refinement_mode!r}); use "
                 f"the complete Torch backend or set refinement_mode='off'."
+            )
+        # Time-consuming recursion (ADR 0009): the Flax graph does not
+        # implement the delayed/accumulated output map; refuse an enabled mode.
+        if self.time_consuming_mode not in ("off", None):
+            raise ValueError(
+                f"NSMoRModel (Flax) does not implement time-consuming "
+                f"recursion (time_consuming_mode={self.time_consuming_mode!r}); "
+                f"use the complete Torch backend or set "
+                f"time_consuming_mode='off'."
             )
         self.sensory_encoder = SensoryEncoderJAX(
             hidden_dim=self.hidden_dim,
