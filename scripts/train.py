@@ -65,7 +65,7 @@ from nsmor.loss import BioJointLoss, BioDecisionLoss, FrontendLoss
 from nsmor.model_utils import (
     require_trusted_historical_checkpoint_sha256, resolve_dataset_session_ids,
 )
-from nsmor.model_nsmor_core import NSMoRCore
+from nsmor.model_nsmor_core import NSMoRCore, time_consuming_module_present
 from nsmor.pipeline.conditions import derive_stimulus_metadata
 from nsmor.pipeline.grouping import grouped_train_val_split, prior_identity_status
 from nsmor.pipeline.nested_prior import (
@@ -140,6 +140,10 @@ _PROVENANCE_KEYS = frozenset({
     # selection metric / history ablation it was trained under.
     "selection_metric",
     "zero_input_channels",
+    # Time-consuming recursion (ADR 0009): the EXECUTED mode, recorded
+    # additively so a checkpoint names the exact output map (delayed/truncated
+    # emission) it was trained under.  Rides the same pop-then-patch seam.
+    "time_consuming_mode",
     # Epoch-boundary recovery state (see the recovery helpers below).  These
     # ride the same pop-then-patch seam so nsmor/checkpoint.py stays untouched.
     "recovery_state_version",
@@ -459,7 +463,56 @@ _ARCHITECTURE_CONFIG_LEAVES: Tuple[Tuple[str, str], ...] = (
     ("model", "refinement_update_scale"),
     ("model", "activation"),
     ("loss", "lambda_compute"),
+    # Time-consuming recursion (ADR 0009): an enabled mode changes the output
+    # map (delayed/truncated emission), so a resume must not switch it.
+    ("model", "time_consuming_mode"),
+    ("model", "time_consuming_max_steps"),
+    ("model", "time_consuming_eps"),
+    ("model", "time_consuming_update_scale"),
+    ("model", "time_consuming_delay_scale"),
+    ("model", "time_consuming_threshold"),
 )
+
+
+def _require_resume_equivalence_for_time_consuming(
+    model: NSMoRCore, ckpt_path: Path,
+) -> None:
+    """Fail closed on resuming a run that executes time-consuming recursion.
+
+    ADR 0009 adds an opt-in, delayed/accumulated output map whose per-frame
+    emission mask (``out_valid``) re-orders which frames are scored.  Bitwise
+    resume equivalence has been demonstrated ONLY for the default ``off``
+    mode (``tests/test_resume_equivalence.py``); no equivalence proof exists
+    for an ENABLED mode, and a resume would silently claim continuation
+    without one.  The resume-source / RNG preconditions elsewhere in this
+    module likewise never sampled an enabled trajectory, so their guarantee
+    does not extend to it.
+
+    Rather than silently proceed, refuse the resume with a clear, actionable
+    message.  ``off`` mode is unaffected: :func:`time_consuming_module_present`
+    inspects the EXECUTED child (``backend.time_consuming``), so a legacy or
+    ``off`` model is never refused, and a mode mutated to ``"off"`` after
+    construction (which still executes the module) is still caught.
+
+    Args:
+        model: The constructed model whose backend is about to be resumed.
+        ckpt_path: The resume source, used only for the diagnostic message.
+
+    Raises:
+        ValueError: When the model executes a time-consuming module.
+    """
+    if not time_consuming_module_present(model):
+        return
+    mode = getattr(model, "time_consuming_mode", None)
+    raise ValueError(
+        "Refusing to resume a time_consuming-enabled run "
+        f"(mode={mode!r}, resume source {ckpt_path}). Bitwise resume "
+        "equivalence has been demonstrated only for time_consuming_mode='off'; "
+        "no equivalence proof exists for an enabled mode, so resuming would "
+        "silently claim a continuation that has not been shown to hold. "
+        "Resume is therefore not supported for time-consuming modes; start a "
+        "fresh run instead."
+    )
 
 
 def _require_architecture_config_match(
@@ -515,12 +568,42 @@ def _require_architecture_config_match(
             f"zero_input_channels: checkpoint={recorded_zic} vs "
             f"active={active_zic}"
         )
+    # Time-consuming recursion (ADR 0009): the EXECUTED mode is stamped as a
+    # top-level checkpoint key.  This closes the gap the leaf loop above
+    # cannot see for a checkpoint whose stored config PREDATES the option
+    # leaves: a resume that switches the mode is refused when the recorded
+    # top-level key disagrees with the active one.
+    # Legacy-gap default (finding R1-B3): a checkpoint with NEITHER the
+    # top-level stamp NOR the stored config leaf predates the option, so it
+    # cannot have executed an enabled mode and its effective mode defaults to
+    # "off".  An enabled ACTIVE mode then mismatches the "off" default and is
+    # refused (never silently enabled on a legacy checkpoint).  A checkpoint
+    # whose stamp is absent but whose leaf is present is handled by the leaf
+    # loop above (``model.time_consuming_mode``), so it is not re-checked here.
+    recorded_tc = ckpt.get("time_consuming_mode", None)
+    active_tc = str(config.model.time_consuming_mode)
+    model_section = ckpt_cfg.get("model")
+    leaf_present = (
+        isinstance(model_section, dict) and "time_consuming_mode" in model_section
+    )
+    if recorded_tc is not None:
+        if str(recorded_tc) != active_tc:
+            mismatches.append(
+                f"time_consuming_mode: checkpoint={recorded_tc!r} vs "
+                f"active={active_tc!r}"
+            )
+    elif not leaf_present and active_tc != "off":
+        mismatches.append(
+            "time_consuming_mode: checkpoint=<legacy default 'off'> vs "
+            f"active={active_tc!r}"
+        )
     if mismatches:
         raise ValueError(
             f"Resume checkpoint {ckpt_path} was trained with a different "
             f"architecture/loss configuration: {'; '.join(mismatches)}. "
-            "Fixed and adaptive refinement share one parameter tree, so a "
-            "strict load would silently continue as another control arm. "
+            "Fixed and adaptive refinement share one parameter tree, and an "
+            "enabled time-consuming mode changes the output map, so a strict "
+            "load would silently continue as another control arm. "
             "Refusing resume (fail closed)."
         )
 
@@ -2058,11 +2141,18 @@ _SWEEP_BANDS: Optional[List[float]] = None
 
 # ── Phase-2 controls, resolved by build_config() ──────────────
 # Kept as script-owned module state (NOT added to the protected
-# ``nsmor/config_parser.py`` schema, so ``ExperimentConfig.to_dict()`` and
-# every existing config/checkpoint stay byte-unchanged).  Both default to the
-# current behaviour: ``()`` = no column zeroed, ``"total"`` = full-objective
-# selection.  build_config() sets them from the CLI/YAML; tests may set them
-# directly or pass the explicit arguments to build_dataloaders()/validate().
+# ``nsmor/config_parser.py`` schema, so for THESE keys ``ExperimentConfig.
+# to_dict()`` is unchanged).  Both default to the current behaviour: ``()`` =
+# no column zeroed, ``"total"`` = full-objective selection.  build_config()
+# sets them from the CLI/YAML; tests may set them directly or pass the explicit
+# arguments to build_dataloaders()/validate().
+#
+# NOTE (ADR 0009, finding R2-M2): the ``time_consuming_*`` leaves are NOT
+# script-owned — they live in the protected ``ModelConfig`` schema, so
+# ``config.to_dict()`` (and the segment ``config_sha256``) DOES change for
+# every run, off included.  The numerical outputs, ``state_dict`` keys and
+# construction RNG are byte-unchanged (defaults reproduce the historical
+# behavior); only the config-hash lineage string moves.
 _ZERO_INPUT_CHANNELS: Tuple[int, ...] = ()
 _SELECTION_METRIC: str = "total"
 
@@ -2426,6 +2516,49 @@ def build_arg_parser() -> argparse.ArgumentParser:
              "Required > 0 for adaptive training.",
     )
 
+    # ── Time-consuming recursion (phase-3 mechanism line, ADR 0009) ──
+    parser.add_argument(
+        "--time_consuming_mode",
+        type=str,
+        default=None,
+        choices=["off", "depth_delay", "accumulate"],
+        help="Time-consuming recursion mode: off (default), depth_delay "
+             "(adaptive depth delays emission), or accumulate (learned "
+             "accumulator to a threshold sets the delay). Raw JAX/Flax "
+             "backends reject an enabled mode.",
+    )
+    parser.add_argument(
+        "--time_consuming_max_steps",
+        type=int,
+        default=None,
+        help="Maximum time-consuming recursion depth / delay steps K (>= 1). "
+             "Default 4.",
+    )
+    parser.add_argument(
+        "--time_consuming_eps",
+        type=float,
+        default=None,
+        help="depth_delay halting threshold in (0, 1). Default 0.01.",
+    )
+    parser.add_argument(
+        "--time_consuming_update_scale",
+        type=float,
+        default=None,
+        help="Bound on the per-step residual update (> 0). Default 1.0.",
+    )
+    parser.add_argument(
+        "--time_consuming_delay_scale",
+        type=float,
+        default=None,
+        help="Frames of emission delay per recursion step (> 0). Default 1.0.",
+    )
+    parser.add_argument(
+        "--time_consuming_threshold",
+        type=float,
+        default=None,
+        help="accumulate-mode accumulator threshold (> 0). Default 1.0.",
+    )
+
     # ── Checkpointing ─────────────────────────────────────────
     parser.add_argument(
         "--resume",
@@ -2509,8 +2642,11 @@ def build_config(argv: Optional[Sequence[str]] = None) -> Tuple[ExperimentConfig
     # ``checkpoint.selection_metric`` (MSE-based checkpoint selection) are
     # resolved here into script-owned module state rather than added to the
     # protected ``nsmor/config_parser.py`` dataclasses.  Both default to the
-    # current behaviour, so ``ExperimentConfig.to_dict()`` — and hence every
-    # existing config and checkpoint — is byte-unchanged.  They are consumed
+    # current behaviour, so for THESE two keys ``ExperimentConfig.to_dict()``
+    # is unchanged.  (The ``time_consuming_*`` leaves below ARE part of the
+    # protected schema and so do move ``config_sha256`` for every run, off
+    # included — ADR 0009, finding R2-M2; the numerical behaviour and
+    # state_dict keys remain byte-identical.)  They are consumed
     # by ``build_dataloaders`` (ablation), ``train`` (selection) and recorded
     # as additive checkpoint provenance keys.
     global _ZERO_INPUT_CHANNELS, _SELECTION_METRIC
@@ -2533,6 +2669,18 @@ def build_config(argv: Optional[Sequence[str]] = None) -> Tuple[ExperimentConfig
         config.model.refinement_update_scale = args.refinement_update_scale
     if getattr(args, "lambda_compute", None) is not None:
         config.loss.lambda_compute = args.lambda_compute
+    if getattr(args, "time_consuming_mode", None) is not None:
+        config.model.time_consuming_mode = args.time_consuming_mode
+    if getattr(args, "time_consuming_max_steps", None) is not None:
+        config.model.time_consuming_max_steps = args.time_consuming_max_steps
+    if getattr(args, "time_consuming_eps", None) is not None:
+        config.model.time_consuming_eps = args.time_consuming_eps
+    if getattr(args, "time_consuming_update_scale", None) is not None:
+        config.model.time_consuming_update_scale = args.time_consuming_update_scale
+    if getattr(args, "time_consuming_delay_scale", None) is not None:
+        config.model.time_consuming_delay_scale = args.time_consuming_delay_scale
+    if getattr(args, "time_consuming_threshold", None) is not None:
+        config.model.time_consuming_threshold = args.time_consuming_threshold
     config.validate()
     if args.freeze is not None:
         config.finetune.freeze_modules = args.freeze
@@ -2609,6 +2757,12 @@ def build_model(config: ExperimentConfig) -> NSMoRCore:
         refinement_max_steps=config.model.refinement_max_steps,
         refinement_eps=config.model.refinement_eps,
         refinement_update_scale=config.model.refinement_update_scale,
+        time_consuming_mode=config.model.time_consuming_mode,
+        time_consuming_max_steps=config.model.time_consuming_max_steps,
+        time_consuming_eps=config.model.time_consuming_eps,
+        time_consuming_update_scale=config.model.time_consuming_update_scale,
+        time_consuming_delay_scale=config.model.time_consuming_delay_scale,
+        time_consuming_threshold=config.model.time_consuming_threshold,
     )
     param_count = sum(p.numel() for p in model.parameters())
     logger.info("Model initialized — %s parameters", f"{param_count:,}")
@@ -3713,11 +3867,14 @@ def train_one_epoch(
 
             # ── Compute loss ──
             if phase == 1:
-                # Phase 1: FrontendLoss — MSE only, no bio penalties
+                # Phase 1: FrontendLoss — MSE only, no bio penalties.  The
+                # out_valid mask (time-consuming mode) is honored here too, so
+                # the alignment rule cannot diverge between phases.
                 loss = criterion(
                     y_pred=y_pred,
                     y_true=y_batch,
                     lengths=lengths,
+                    out_valid=internals.get("out_valid", None),
                 )
             else:
                 # Phase 2 / single-phase: full bio-constrained loss
@@ -3725,6 +3882,12 @@ def train_one_epoch(
                 # ponder cost lives in the model internals; it is only added
                 # at this loss seam.  A positive lambda_compute requires it.
                 _ponder = internals.get("refinement_ponder_cost", None)
+                # Time-consuming recursion (ADR 0009): score only the frames
+                # the model actually emitted, so the zero-filled trailing
+                # frames (whose target is a real value) cannot bias the MSE.
+                # Absent (None) when the mode is off, so the default loss is
+                # bitwise unchanged.
+                _out_valid = internals.get("out_valid", None)
                 loss = criterion(
                     y_pred=y_pred,
                     y_true=y_batch,
@@ -3743,6 +3906,7 @@ def train_one_epoch(
                     routing_aux_margin=routing_aux_margin,
                     lambda_compute=lambda_compute,
                     refinement_ponder_cost=_ponder,
+                    out_valid=_out_valid,
                 )
 
         # ── Membrane health monitoring (CF9: per-epoch averages) ──
@@ -4023,12 +4187,21 @@ def validate(
 
         y_pred, internals = model(x_batch, lengths, return_internals=True)
 
+        # Time-consuming mode (ADR 0009): the alignment mask, present only
+        # when the module ran.  ``None`` for an off model, so the historical
+        # length-only behavior is bitwise unchanged.  Threaded into BOTH the
+        # loss and the checkpoint-selection MSE below so the selected quantity
+        # is the same masked quantity the loss optimizes (finding R2-B2).
+        _out_valid = internals.get("out_valid", None)
+
         if phase == 1:
-            # Phase 1: FrontendLoss — MSE only
+            # Phase 1: FrontendLoss — MSE only.  out_valid (time-consuming
+            # mode) is honored so phase 1 and phase 2 align identically.
             loss = criterion(
                 y_pred=y_pred,
                 y_true=y_batch,
                 lengths=lengths,
+                out_valid=_out_valid,
             )
         else:
             # Phase 2 / single-phase: full bio loss
@@ -4053,6 +4226,7 @@ def validate(
                 routing_aux_margin=routing_aux_margin,
                 lambda_compute=lambda_compute,
                 refinement_ponder_cost=_ponder,
+                out_valid=_out_valid,
             )
 
         total_loss += loss.item()
@@ -4077,6 +4251,15 @@ def validate(
             _mask = (
                 (arange_t >= 1) & (arange_t < lengths.unsqueeze(1))
             ).to(y_pred.dtype)
+            if _out_valid is not None:
+                # Same alignment the loss scores: a never-emitted, zero-filled
+                # trailing frame must not enter the selection MSE either
+                # (finding R2-B2).  ``None`` keeps the historical mask.
+                assert _out_valid.shape == (B_t, T_t), (
+                    f"out_valid shape {tuple(_out_valid.shape)} != "
+                    f"({B_t}, {T_t})"
+                )
+                _mask = _mask * _out_valid.to(_mask.dtype)
             assert _mask.shape == (B_t, T_t), (
                 f"selection mask shape {tuple(_mask.shape)} != ({B_t}, {T_t})"
             )
@@ -4271,6 +4454,7 @@ def persistence_benchmark_metrics(
     *,
     escape_band_cm_s: float = 10.0,
     target_clip_cm_s: float = 0.0,
+    out_valid_seqs: Optional[Sequence[np.ndarray]] = None,
 ) -> Dict[str, Any]:
     """Paired lag-one target-history benchmark over outer-validation sequences.
 
@@ -4289,6 +4473,16 @@ def persistence_benchmark_metrics(
     per-trial row — ordinal, length, eligible count, status — so no trial is
     dropped silently.
 
+    ``out_valid_seqs`` (time-consuming mode only; ``None`` keeps the
+    historical behavior) is a per-sequence emission mask aligned with
+    ``y_true_seqs``.  It is applied as a PER-FRAME mask on the UNCOMPRESSED
+    arrays (finding R4-B2): a frame ``t`` is scored for the model AND the
+    lag-one comparator only if ``out_valid[t]`` **and** ``out_valid[t-1]``,
+    and the comparator still reads the true, uncompressed ``y_true[t-1]``.
+    Compressing the masked frames would make two non-adjacent frames adjacent
+    and hand the comparator a pre-hole predecessor; masking keeps the true
+    frame adjacency intact.
+
     Args:
         y_true_seqs: Per-sequence 1-D ground-truth targets, already cropped
             to the same window the model was scored on, in physical units
@@ -4304,6 +4498,9 @@ def persistence_benchmark_metrics(
             (``0.0`` disables).  The escape/rest band membership and band
             errors are always measured on the RAW, unclipped values, exactly
             as the legacy band audit does.
+        out_valid_seqs: Per-sequence boolean emission masks aligned with
+            ``y_true_seqs`` (time-consuming mode).  ``None`` (default) scores
+            every ``t >= 1`` frame, bitwise unchanged.
 
     Returns:
         A supplemental metrics dict with headline MSE/RMSE/MAE/R² for both the
@@ -4346,6 +4543,11 @@ def persistence_benchmark_metrics(
             f"persistence benchmark requires aligned sequences, got "
             f"{len(y_true_seqs)} targets vs {len(y_pred_seqs)} predictions"
         )
+    if out_valid_seqs is not None and len(out_valid_seqs) != len(y_true_seqs):
+        raise ValueError(
+            f"persistence benchmark requires aligned emission masks, got "
+            f"{len(y_true_seqs)} targets vs {len(out_valid_seqs)} masks"
+        )
 
     true_raw: List[np.ndarray] = []
     pred_raw: List[np.ndarray] = []
@@ -4372,6 +4574,16 @@ def persistence_benchmark_metrics(
                 f"sequence {i}: y_true {true_i.shape} != y_pred {pred_i.shape}"
             )
         n = true_i.size
+        ov_i: Optional[np.ndarray] = None
+        if out_valid_seqs is not None:
+            ov_i = np.asarray(out_valid_seqs[i])
+            if ov_i.shape != (n,):
+                raise ValueError(
+                    f"sequence {i}: out_valid mask {ov_i.shape} != y_true "
+                    f"({n},)"
+                )
+            if ov_i.dtype != np.bool_:
+                ov_i = ov_i.astype(bool)
         if n < 2:
             # No t>=1 frame.  It contributes no frame, but is still reported
             # with an explicit status so no trial vanishes from the count.
@@ -4388,6 +4600,27 @@ def persistence_benchmark_metrics(
             continue
 
         eligible = np.arange(1, n)  # t >= 1, per sequence; never cross-sequence
+        if ov_i is not None:
+            # Per-frame mask on the UNCOMPRESSED arrays (finding R4-B2): frame
+            # ``t`` is scored for the model AND the lag-one comparator only if
+            # ``out_valid[t]`` AND ``out_valid[t-1]``; the comparator still
+            # reads the true, uncompressed ``y_true[t-1]``.
+            eligible = eligible[ov_i[eligible] & ov_i[eligible - 1]]
+        if eligible.size == 0:
+            # Every t>=1 frame was masked out (time-consuming mode); reported,
+            # never dropped silently, with its own explicit reason.
+            reason = ("all_eligible_frames_masked" if ov_i is not None
+                      else "no_t_ge_1_frame")
+            trials.append({"trial": i, "length": n, "eligible": 0,
+                           "status": "empty_eligible_all_frames_masked",
+                           "model_mse": None, "baseline_mse": None,
+                           "delta_model_minus_baseline_mse": None,
+                           "skill_vs_persistence": None,
+                           "model_mse_unavailable_reason": reason,
+                           "baseline_mse_unavailable_reason": reason,
+                           "delta_model_minus_baseline_mse_unavailable_reason": reason,
+                           "skill_vs_persistence_unavailable_reason": reason})
+            continue
         t_prev = eligible - 1
         # The predecessor target is consumed by every eligible frame, so it
         # must be finite (t=0 is a predecessor even though never scored).
@@ -4410,8 +4643,13 @@ def persistence_benchmark_metrics(
         # Escape/rest membership is derived from the ORIGINAL target with the
         # existing _sustained_run guard, BEFORE the t>=1 slice, then sliced —
         # never recomputed on the sliced array (which would shift run
-        # boundaries at the cut).
-        escape_full = _sustained_run(np.abs(true_i) >= escape_band_cm_s, min_run=2)
+        # boundaries at the cut).  ``out_valid`` is folded into the membership
+        # mask on the UNCOMPRESSED target so a hole breaks a run instead of
+        # bridging it (finding R4-B2).
+        escape_full = np.abs(true_i) >= escape_band_cm_s
+        if ov_i is not None:
+            escape_full = escape_full & ov_i
+        escape_full = _sustained_run(escape_full, min_run=2)
         true_raw.append(true_i[eligible])
         pred_raw.append(pred_i[eligible])
         prev_raw.append(true_prev)
@@ -4604,6 +4842,13 @@ def compute_metrics(
     variable sequence lengths via masking), then computes MSE, RMSE,
     MAE, and R² in a single pass.
 
+    In time-consuming mode (ADR 0009) the model's ``internals["out_valid"]``
+    emission mask is applied per trial, so the zero-filled, never-emitted
+    trailing frames — whose target is a real value — are excluded from the
+    headline, the escape audit and the persistence benchmark (finding R2-B2).
+    An ``off`` model emits no ``out_valid``, so the historical length-only
+    scoring is bitwise unchanged.
+
     Args:
         model: Trained model (should be in eval mode).
         loader: DataLoader for the evaluation split.
@@ -4655,6 +4900,10 @@ def compute_metrics(
     model.eval()
     all_pred: List[np.ndarray] = []
     all_true: List[np.ndarray] = []
+    # Per-trial emission masks (time-consuming mode).  Empty when the mode is
+    # off, so the historical length-only scoring is bitwise unchanged.
+    all_valid: List[np.ndarray] = []
+    any_out_valid = False
 
     for batch in loader:
         if len(batch) == 4:
@@ -4665,13 +4914,34 @@ def compute_metrics(
         y_batch = y_batch.to(device).contiguous()
         lengths = lengths.to(device).contiguous()
 
-        y_pred, _ = model(x_batch, lengths, return_internals=True)
+        y_pred, internals = model(x_batch, lengths, return_internals=True)
+        out_valid = internals.get("out_valid", None)
+        if out_valid is not None:
+            any_out_valid = True
+            assert out_valid.shape == y_pred.shape, (
+                f"out_valid shape {tuple(out_valid.shape)} != y_pred "
+                f"{tuple(y_pred.shape)}"
+            )
 
         # Mask padded timesteps per sequence
         for i in range(x_batch.size(0)):
             n = int(lengths[i])
             all_pred.append(y_pred[i, :n].cpu().numpy())
             all_true.append(y_batch[i, :n].cpu().numpy())
+            if out_valid is not None:
+                all_valid.append(out_valid[i, :n].cpu().numpy().astype(bool))
+
+    # The emission mask is applied as a PER-FRAME mask on the UNCOMPRESSED
+    # arrays — never by compressing (dropping) the masked frames (finding
+    # R4-B2).  Compressing would make two non-adjacent frames adjacent and
+    # corrupt every adjacency-consuming statistic: the lag-one persistence
+    # comparator (``y_true[t-1]``) would read a pre-hole frame, and a
+    # sustained escape run would bridge a hole.  ``all_valid`` is only
+    # populated when the mode ran, so the ``off`` path is bitwise unchanged.
+    flat_valid: Optional[np.ndarray] = None
+    if any_out_valid:
+        assert len(all_valid) == len(all_true)
+        flat_valid = np.concatenate(all_valid)
 
     # Promote to float64 BEFORE any physical-unit rescaling so the rescale is
     # validated (and computed) at float64 precision — a float32 input scaled
@@ -4708,16 +4978,26 @@ def compute_metrics(
         benchmark = persistence_benchmark_metrics(
             all_true, bench_pred, escape_band_cm_s=escape_band_cm_s,
             target_clip_cm_s=target_clip_cm_s,
+            out_valid_seqs=all_valid if any_out_valid else None,
         )
+        # Same per-frame mask on the UNCOMPRESSED arrays for the headline
+        # (finding R4-B2): never-emitted frames must not enter it either.
+        y_true_h = y_true_all if flat_valid is None else y_true_all[flat_valid]
+        y_pred_h = y_pred_all if flat_valid is None else y_pred_all[flat_valid]
         headline = _paired_metrics(
-            y_true_all, y_pred_all, y_true_all, empty_reason="no_frames",
+            y_true_h, y_pred_h, y_true_h, empty_reason="no_frames",
         )
         mse, rmse, mae, r2 = (headline[k] for k in ("mse", "rmse", "mae", "r2"))
     else:
-        mse = float(mean_squared_error(y_true_all, y_pred_all))
+        # Mask per-frame on the uncompressed arrays (finding R4-B2): a
+        # never-emitted, zero-filled frame must not enter the headline MSE.
+        # ``flat_valid is None`` (off mode) keeps the historical scoring.
+        y_true_h = y_true_all if flat_valid is None else y_true_all[flat_valid]
+        y_pred_h = y_pred_all if flat_valid is None else y_pred_all[flat_valid]
+        mse = float(mean_squared_error(y_true_h, y_pred_h))
         rmse = float(np.sqrt(mse))
-        mae = float(mean_absolute_error(y_true_all, y_pred_all))
-        r2 = float(r2_score(y_true_all, y_pred_all))
+        mae = float(mean_absolute_error(y_true_h, y_pred_h))
+        r2 = float(r2_score(y_true_h, y_pred_h))
 
     # ── High-velocity-band escape-signal check ────────────────
     # Reviewer requirement: a bulk-fitting model can report an excellent
@@ -4750,10 +5030,29 @@ def compute_metrics(
     # in the concatenated array is meaningless across trial boundaries, so a
     # run computed post-concat could bridge two unrelated trials (false escape)
     # or split one truncated at a boundary.
-    over_seq = [np.abs(t) >= escape_band_cm_s for t in all_true]
+    # Membership is computed on the UNCOMPRESSED target with ``out_valid``
+    # folded into the per-frame mask (finding R4-B2): a hole (never-emitted
+    # frame) breaks a run rather than being bridged, so ``_sustained_run``
+    # still sees true frame adjacency.  ``all_valid`` is per sequence and
+    # aligned with ``all_true``.
+    over_seq = []
+    for i, t in enumerate(all_true):
+        over = np.abs(t) >= escape_band_cm_s
+        if any_out_valid:
+            over = over & all_valid[i]
+        over_seq.append(over)
     keep_seq = [_sustained_run(o, min_run=2) for o in over_seq]
     is_escape = np.concatenate(keep_seq) if keep_seq else np.zeros(0, dtype=bool)
     n_escape = int(is_escape.sum())
+    # Resting frames exclude the never-emitted frames too (finding R4-B2): a
+    # zero-filled, never-emitted frame belongs to NEITHER band.  ``flat_valid``
+    # is ``None`` (all frames) when the mode is off, so this is a no-op there.
+    rest_valid = ~is_escape
+    if flat_valid is not None:
+        rest_valid = rest_valid & flat_valid
+    n_scored_frames = (
+        int(flat_valid.sum()) if flat_valid is not None else int(y_true_all.size)
+    )
     if persistence_benchmark:
         bands = {
             key: _paired_metrics(
@@ -4762,7 +5061,7 @@ def compute_metrics(
             )
             for key, mask, reason in (
                 ("escape_rmse", is_escape, "empty_escape_band"),
-                ("resting_rmse", ~is_escape, "empty_rest_band"),
+                ("resting_rmse", rest_valid, "empty_rest_band"),
             )
         }
         escape_rmse = bands["escape_rmse"]["rmse"]
@@ -4771,7 +5070,7 @@ def compute_metrics(
         escape_rmse = float(np.sqrt(mean_squared_error(
             y_true_all_raw[is_escape], y_pred_all_raw[is_escape]))) if n_escape else float("nan")
         resting_rmse = float(np.sqrt(mean_squared_error(
-            y_true_all_raw[~is_escape], y_pred_all_raw[~is_escape]))) if (~is_escape).any() else float("nan")
+            y_true_all_raw[rest_valid], y_pred_all_raw[rest_valid]))) if rest_valid.any() else float("nan")
 
     metrics: Dict[str, Any] = {
         "mse": mse,
@@ -4782,7 +5081,7 @@ def compute_metrics(
         "n_escape_frames": float(n_escape),
         "escape_rmse": escape_rmse,
         "resting_rmse": resting_rmse,
-        "escape_ratio": n_escape / max(1, int(y_true_all.size)),
+        "escape_ratio": n_escape / max(1, n_scored_frames),
     }
 
     if persistence_benchmark:
@@ -4804,6 +5103,7 @@ def sweep_escape_sensitivity(
     all_pred: List[np.ndarray],
     bands_cm_s: List[float],
     min_runs: List[int] = (1, 2, 3),
+    all_valid: Optional[List[np.ndarray]] = None,
 ) -> List[Dict[str, float]]:
     """
     Band x min_run sensitivity table for the escape audit.
@@ -4814,6 +5114,13 @@ def sweep_escape_sensitivity(
     not) to its two free parameters rather than a single arbitrary-threshold
     point estimate.
 
+    ``all_valid`` (time-consuming mode only; ``None`` keeps the historical
+    behavior) is a per-sequence emission mask aligned with ``all_true``.  It
+    is folded into the membership mask and the resting mask on the
+    UNCOMPRESSED arrays — never applied by compressing (finding R4-B2), so a
+    hole breaks an escape run instead of bridging it and never-emitted frames
+    join neither band.
+
     Returns one dict per (band, min_run) pair with keys ``band_cm_s``,
     ``min_run``, ``n_escape_frames``, ``n_escape_events`` (number of
     contiguous per-sequence runs — the event-level unit), ``escape_rmse``,
@@ -4822,23 +5129,35 @@ def sweep_escape_sensitivity(
     rows: List[Dict[str, float]] = []
     y_pred_all_raw = np.concatenate(all_pred)
     y_true_all_raw = np.concatenate(all_true)
+    flat_valid = (
+        np.concatenate(all_valid) if all_valid is not None else None
+    )
     err_sq_all = (y_pred_all_raw - y_true_all_raw) ** 2
     for band in bands_cm_s:
         for mr in min_runs:
-            keep_seq = [
-                _sustained_run(np.abs(t) >= band, min_run=mr) for t in all_true
-            ]
+            keep_seq = []
+            for i, t in enumerate(all_true):
+                over = np.abs(t) >= band
+                if all_valid is not None:
+                    over = over & all_valid[i]
+                keep_seq.append(_sustained_run(over, min_run=mr))
             is_escape = np.concatenate(keep_seq)
             n_escape = int(is_escape.sum())
+            rest = ~is_escape
+            if flat_valid is not None:
+                rest = rest & flat_valid
+            n_scored = (
+                int(flat_valid.sum()) if flat_valid is not None else int(is_escape.size)
+            )
             # Event count: transitions into an over-band kept run.
             n_events = sum(
                 int(np.count_nonzero(k[1:] & ~k[:-1]) + int(k[0]))
                 for k in keep_seq
             )
             esc = float(np.sqrt(err_sq_all[is_escape].mean())) if n_escape else float("nan")
-            rest = (
-                float(np.sqrt(err_sq_all[~is_escape].mean()))
-                if (~is_escape).any() else float("nan")
+            rest_rmse = (
+                float(np.sqrt(err_sq_all[rest].mean()))
+                if rest.any() else float("nan")
             )
             rows.append({
                 "band_cm_s": band,
@@ -4846,8 +5165,8 @@ def sweep_escape_sensitivity(
                 "n_escape_frames": n_escape,
                 "n_escape_events": n_events,
                 "escape_rmse": esc,
-                "resting_rmse": rest,
-                "escape_ratio": n_escape / max(1, is_escape.size),
+                "resting_rmse": rest_rmse,
+                "escape_ratio": n_escape / max(1, n_scored),
             })
     return rows
 
@@ -5225,14 +5544,27 @@ def train(
             "include eventual outer-validation labels. Scores are contaminated "
             "diagnostics, ineligible for strict QC/release gates; use a nested artifact."
         )
-    # Phase-2 script-owned controls, stamped additively into every checkpoint
-    # (they are NOT part of ``config.to_dict()``, which stays byte-unchanged).
+    # Phase-2 script-owned controls, stamped additively into every checkpoint.
+    # These two keys are NOT part of ``config.to_dict()`` (they are script
+    # globals).  NOTE (ADR 0009, finding R2-M2): ``config.to_dict()`` is NOT
+    # byte-unchanged across the time-consuming change — the six additive
+    # ``time_consuming_*`` ``ModelConfig`` leaves are serialized, so the
+    # segment ``config_sha256`` differs from a pre-0009 run for EVERY config
+    # including an ``off`` one.  The numerical outputs, state_dict keys and
+    # construction RNG are unchanged (defaults reproduce the historical
+    # behavior); only the config-hash lineage string moves.
     # A resume refuses a switch of ``selection_metric`` (see
     # ``_require_architecture_config_match``); ``zero_input_channels`` names
     # the history ablation a checkpoint was trained under.
     phase2_provenance: Dict[str, Any] = {
         "selection_metric": _SELECTION_METRIC,
         "zero_input_channels": list(_ZERO_INPUT_CHANNELS),
+        # Time-consuming recursion (ADR 0009): the EXECUTED mode is stamped as
+        # an additive top-level checkpoint key so a resume that switches it is
+        # detectable even against a checkpoint whose stored config lacks the
+        # (newly added) option leaves.  "off" reproduces the historical key
+        # value, so legacy checkpoints and the default are unaffected.
+        "time_consuming_mode": str(config.model.time_consuming_mode),
     }
     active_lineage: Dict[str, Any] = dict(nested_provenance)
     active_lineage["dataset_path"] = str(resolved_dataset_path)
@@ -5416,6 +5748,12 @@ def train(
         # R3: refuse a resume that switches an architecture-defining setting
         # (refinement / activation / lambda_compute) relative to the checkpoint.
         _require_architecture_config_match(ckpt_peek, config, ckpt_path)
+        # ADR 0009: an enabled time-consuming mode re-orders the scored frames
+        # via ``out_valid``, and no bitwise resume-equivalence proof exists for
+        # it (only for the default ``off`` mode).  Refuse the resume rather than
+        # silently claim equivalence.  Runs alongside the config-match guard so
+        # BOTH the mode-switch refusal and this equivalence refusal are live.
+        _require_resume_equivalence_for_time_consuming(model, ckpt_path)
 
         # ── Fail-closed nested resume validation ──
         # Checkpoint provenance vs active run configuration:
@@ -6519,22 +6857,36 @@ def train(
         if _SWEEP_BANDS:
             all_true: List[np.ndarray] = []
             all_pred: List[np.ndarray] = []
+            all_valid_sweep: List[np.ndarray] = []
+            any_valid_sweep = False
             for batch in val_loader:
                 assert len(batch) in (3, 4), f"Expected 3 or 4 batch fields, got {len(batch)}"
                 x_batch, y_batch, lengths = batch[:3]
                 x_batch = x_batch.to(device).contiguous()
                 lengths = lengths.to(device).contiguous()
                 with torch.no_grad():
-                    y_pred, _ = model(x_batch, lengths, return_internals=True)
+                    y_pred, internals = model(x_batch, lengths, return_internals=True)
+                    _ov = internals.get("out_valid", None)
+                    if _ov is not None:
+                        any_valid_sweep = True
                     for i in range(x_batch.size(0)):
                         n = int(lengths[i])
+                        # Keep the FULL crop uncompressed and hand the
+                        # emission mask to the sweep as a per-frame mask
+                        # (finding R4-B2); compressing would make non-adjacent
+                        # frames adjacent and bridge a hole in a run.
                         p = y_pred[i, :n].cpu().numpy()
                         if target_std != 1.0 or target_mean != 0.0:
                             p = p * target_std + target_mean
                         all_pred.append(p)
                         all_true.append(y_batch[i, :n].cpu().numpy())
+                        all_valid_sweep.append(
+                            _ov[i, :n].cpu().numpy().astype(bool) if _ov is not None
+                            else np.ones(n, dtype=bool)
+                        )
             rows = sweep_escape_sensitivity(
                 all_true, all_pred, _SWEEP_BANDS,
+                all_valid=all_valid_sweep if any_valid_sweep else None,
             )
             sweep_path = output_dir / "escape_sensitivity.csv"
             with open(sweep_path, "w", encoding="utf-8") as f:
