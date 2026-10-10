@@ -1460,13 +1460,21 @@ def test_nonnested_resume_and_best_reject_changed_bytes_at_same_path(tmp_path: P
     torch.save(source_b, ds_path)
     digest_b = hashlib.sha256(ds_path.read_bytes()).hexdigest()
     assert digest_a != digest_b
-    for source_name in ("epoch_1.pth", "best_model.pth"):
-        resume = _make_config(tmp_path, epochs=2, warmup_epochs=0)
-        resume.checkpoint.output_dir = str(tmp_path / f"blocked_{source_name}")
-        resume.checkpoint.resume_from = str(run_a / source_name)
-        with pytest.raises(ValueError, match="dataset_source_sha256 mismatch"):
-            train(resume, dataset_path=str(ds_path),
-                  trusted_historical_checkpoint_sha256=_checkpoint_shas(run_a / source_name))
+    # A changed dataset rejects a resume from the last-epoch checkpoint.
+    resume = _make_config(tmp_path, epochs=2, warmup_epochs=0)
+    resume.checkpoint.output_dir = str(tmp_path / "blocked_epoch_1.pth")
+    resume.checkpoint.resume_from = str(run_a / "epoch_1.pth")
+    with pytest.raises(ValueError, match="dataset_source_sha256 mismatch"):
+        train(resume, dataset_path=str(ds_path),
+              trusted_historical_checkpoint_sha256=_checkpoint_shas(run_a / "epoch_1.pth"))
+    # best_model.pth is never a resume source (G2): refused before the
+    # dataset-lineage check even runs.
+    resume_best = _make_config(tmp_path, epochs=2, warmup_epochs=0)
+    resume_best.checkpoint.output_dir = str(tmp_path / "blocked_best")
+    resume_best.checkpoint.resume_from = str(run_a / "best_model.pth")
+    with pytest.raises(ValueError, match="best_model.pth is the best SELECTED epoch"):
+        train(resume_best, dataset_path=str(ds_path),
+              trusted_historical_checkpoint_sha256=_checkpoint_shas(run_a / "best_model.pth"))
 
     cfg_b = _make_config(tmp_path, epochs=1, warmup_epochs=0)
     cfg_b.training.checkpoint_interval = 1
@@ -1773,7 +1781,7 @@ def test_final_evaluation_rejects_replaced_clock_before_state_mutation(
 
 @pytest.mark.parametrize("phase1_epochs", [None, 2, 1, 0])
 @pytest.mark.parametrize("candidate", [
-    "resume", "source_best", "companion_best", "destination_best",
+    "resume", "source_final", "companion_best", "destination_best",
 ])
 def test_train_preflight_rejects_checkpoint_clock_without_running_epochs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, candidate: str,
@@ -1792,7 +1800,10 @@ def test_train_preflight_rejects_checkpoint_clock_without_running_epochs(
     config.training.num_workers = 0
     source = tmp_path / "source"
     source.mkdir()
-    resume = source / ("best_model.pth" if candidate == "source_best" else "epoch_1.pth")
+    # ``source_final`` resumes from a last-epoch family file (final_model.pth);
+    # best_model.pth is never a resume source (G2) and would trip that guard
+    # before the clock preflight this test targets.
+    resume = source / ("final_model.pth" if candidate == "source_final" else "epoch_1.pth")
     saved = trainer.build_model(config)
     save_checkpoint(saved, trainer.build_optimizer(saved, config), 0, 1.,
                     config.to_dict(), resume)
@@ -1811,7 +1822,7 @@ def test_train_preflight_rejects_checkpoint_clock_without_running_epochs(
     config.checkpoint.resume_from = str(resume)
 
     bad_path = None
-    if candidate in ("resume", "source_best"):
+    if candidate in ("resume", "source_final"):
         state["config"]["model"]["dt_ms"] = 8.
         torch.save(state, resume)
         bad_path = resume

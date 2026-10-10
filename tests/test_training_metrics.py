@@ -1270,7 +1270,14 @@ def test_modern_digestless_resume_cannot_downgrade_to_historical_binding(
     resumed.training.num_workers = 0
     resume_name = "best_model.pth" if checkpoint_kind == "direct_best" else "epoch_1.pth"
     resumed.checkpoint.resume_from = str(source_dir / resume_name)
-    with pytest.raises(ValueError, match="modern.*dataset_source_sha256"):
+    # direct_best now fails closed even earlier: best_model.pth is never a
+    # resume source (G2).  The other kinds still hit the digestless-SHA guard.
+    expected = (
+        "best_model.pth is the best SELECTED epoch"
+        if checkpoint_kind == "direct_best"
+        else "modern.*dataset_source_sha256"
+    )
+    with pytest.raises(ValueError, match=expected):
         mod.train(resumed, dataset_path=str(path))
     assert not (tmp_path / "rejected" / "final_model.pth").exists()
 

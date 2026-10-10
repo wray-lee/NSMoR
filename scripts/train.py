@@ -30,10 +30,11 @@ import hashlib
 import json
 import logging
 import os
+import re
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 # Prefer the checkout's own ``nsmor`` package over any editable install that
 # points at a different worktree/main checkout.  Running ``scripts/train.py``
@@ -134,6 +135,11 @@ _PROVENANCE_KEYS = frozenset({
     "mcmc_prior_provenance",
     "animal_identity_status",
     "best_val_loss",
+    # Phase-2 script-owned controls (NOT part of the protected config
+    # schema).  Recorded additively so a checkpoint names the exact
+    # selection metric / history ablation it was trained under.
+    "selection_metric",
+    "zero_input_channels",
     # Epoch-boundary recovery state (see the recovery helpers below).  These
     # ride the same pop-then-patch seam so nsmor/checkpoint.py stays untouched.
     "recovery_state_version",
@@ -482,6 +488,33 @@ def _require_architecture_config_match(
             mismatches.append(
                 f"{section}.{leaf}: checkpoint={recorded!r} vs active={current!r}"
             )
+    # ``selection_metric`` (a script-owned phase-2 control, NOT part of the
+    # protected config schema) changes the meaning of the persisted
+    # ``best_val_loss`` scalar (total objective vs masked MSE).  A resume that
+    # switched it would compare a restored best under one metric against
+    # candidates under the other, so refuse the mixed-metric continuation.
+    # It is recorded as an additive top-level checkpoint key; legacy
+    # checkpoints without it default to "total".
+    recorded_sel = ckpt.get("selection_metric", "total")
+    active_sel = _SELECTION_METRIC
+    if recorded_sel != active_sel:
+        mismatches.append(
+            f"selection_metric: checkpoint={recorded_sel!r} vs "
+            f"active={active_sel!r}"
+        )
+    # ``zero_input_channels`` (the history ablation) is likewise script-owned
+    # and not part of the protected config schema, but it changes the ARM
+    # identity (R2 zeroes channels 2-3).  A resume that switched it would
+    # silently continue an arm under a different ablation, so refuse it
+    # alongside the selection_metric guard.  Legacy checkpoints without the
+    # key default to the unablated control ([]).
+    recorded_zic = sorted(int(c) for c in ckpt.get("zero_input_channels", []))
+    active_zic = sorted(int(c) for c in _ZERO_INPUT_CHANNELS)
+    if recorded_zic != active_zic:
+        mismatches.append(
+            f"zero_input_channels: checkpoint={recorded_zic} vs "
+            f"active={active_zic}"
+        )
     if mismatches:
         raise ValueError(
             f"Resume checkpoint {ckpt_path} was trained with a different "
@@ -929,35 +962,42 @@ def _require_reliable_recovery_loaders(
     *,
     checkpoint_interval: int,
 ) -> None:
-    """Fail closed when a RELIABLE-recovery cadence cannot load with zero workers.
+    """Refuse the reliable cadence when it cannot load with zero workers.
 
     Reliable recovery is the cadence-one regime: ``checkpoint_interval == 1``
     is what makes a checkpoint an exact epoch boundary of a run whose
-    trajectory is claimed reproducible.  That claim requires ZERO-WORKER
-    loading.  With ``num_workers > 0`` (and especially ``persistent_workers``)
-    the loader iterator owns multiprocessing worker state — the RNG stream and
-    the live iterator's consumption position — that is neither captured in the
-    checkpoint nor reconstructable from it.  An uninterrupted persistent
-    iterator and a newly constructed resumed iterator therefore consume
-    DIFFERENT global RNG histories, so a resume silently diverges even when no
-    worker-side randomness is present (independent same-budget model/backprop
-    probe: workers0 exact equality, persistent workers1 divergence).  Restoring
-    only the parent's RNG state cannot make a new iterator equivalent to the
-    existing persistent one.
+    trajectory is claimed reproducible.  The documented reliable profile pins
+    that regime to ZERO-WORKER loading, and this guard enforces it for the
+    ACTUAL resolved train/val loaders (``num_workers=-1`` auto-scales, so the
+    request and the resolution can differ), whether fresh or resumed.
 
-    The requirement is tied to the CADENCE, not to ``--resume``:
+    This is now a CONSERVATIVE profile restriction, NOT a claim that a
+    multi-worker loader cannot be resumed.  The historical divergence — a
+    resumed process building a FRESH persistent iterator, re-drawing the
+    parent base seed and re-seeding the sampler, and so shifting the whole
+    resumed trajectory — had a single root cause that is FIXED by
+    :func:`_prewarm_persistent_loaders`: on resume the persistent iterator is
+    re-established around a save/restore of the global RNG, so the resumed
+    process consumes the global stream exactly as the uninterrupted run did at
+    the epoch boundary.  With that fix a persistent multi-worker loader IS a
+    bitwise continuation (CPU, fixed seed) PROVIDED the dataset and collate
+    consume no worker-side RNG — the precondition this module now enforces
+    separately on resume (:func:`_resume_worker_rng_hazard`).  The phase-2 arm
+    regime (``num_workers: -1`` auto-scaling to >0, ``persistent_workers:
+    true``, ``checkpoint_interval: 10``) relies on exactly this and is asserted
+    bitwise in ``tests/test_resume_equivalence.py``.
 
-    - ``checkpoint_interval == 1`` — reliable mode, whether fresh or resumed.
-      The ACTUAL resolved train/val loaders must have zero workers, else the
-      run is refused before any epoch.
-    - ``checkpoint_interval != 1`` — the prior interval-10 behavior.  That
-      cadence makes no exact-continuation claim (an interrupted interval-10
-      run can only be continued as a fresh zero-worker segment), so no worker
-      count is constrained and existing runs keep working unchanged.
+    The zero-worker requirement is tied to the CADENCE, not to ``--resume``:
+
+    - ``checkpoint_interval == 1`` — the documented reliable profile, whether
+      fresh or resumed.  The ACTUAL resolved train/val loaders must have zero
+      workers, else the run is refused before any epoch.
+    - ``checkpoint_interval != 1`` — no worker count is constrained (the
+      interval-10 behavior is unchanged), and a resume of a persistent
+      multi-worker loader is bitwise per :func:`_prewarm_persistent_loaders`.
 
     The guard never reconfigures the loader silently (that would change the
-    user's scientific controls) and never claims an equivalence the
-    configuration cannot provide.  ``val_loader`` is included for completeness
+    user's scientific controls).  ``val_loader`` is included for completeness
     of the refusal message; validation does not advance the training
     trajectory.
     """
@@ -998,6 +1038,97 @@ def _checkpoint_lineage_identity(payload: bytes, path: Path) -> Dict[str, Any]:
         "sha256": hashlib.sha256(payload).hexdigest(),
         "size_bytes": len(payload),
     }
+
+
+# The LAST-EPOCH checkpoint families: ``final_model.pth`` (the segment's last
+# executed epoch) and ``epoch_<n>.pth`` (a periodic).  ``best_model.pth`` is
+# NOT one of them — it stores the best SELECTED epoch, which can be far older
+# than the last executed epoch, so resuming from it would silently re-train
+# completed epochs.
+_LAST_EPOCH_FAMILIES = ("final_model.pth",)
+_EPOCH_PERIODIC_RE = re.compile(r"epoch_(\d+)\.pth$")
+
+
+def _require_resume_source_is_newest_complete_epoch(
+    resume_path: Path,
+    peek: Dict[str, Any],
+    output_dir: Path,
+) -> None:
+    """Refuse a resume source that is not the newest complete-epoch checkpoint.
+
+    §11.1 authorizes resuming ONLY from a run's LAST complete-epoch checkpoint.
+    ``scripts/train.py`` must enforce that itself — not delegate it to the
+    launcher helper — so a bare ``train.py --resume`` cannot silently re-train
+    completed epochs by picking a stale source:
+
+    * ``best_model.pth`` is NEVER a valid resume source.  It is the best
+      SELECTED epoch, which may be far older than the last executed epoch;
+      resuming from it re-trains every epoch after the best one.  Refused
+      unconditionally, regardless of what else is in the directory — matching
+      the launcher helper (``resume_decision.py``), which excludes it too.
+    * IN-PLACE recovery (the source lives in the run's OWN output dir — the
+      launcher's mode and exactly what §11.1 governs): when that dir holds a
+      last-epoch family file (``final_model.pth`` / ``epoch_*.pth``) whose
+      stored epoch is NEWER than the source's, the source is stale.  Refused.
+
+    The newest-epoch rule is scoped to IN-PLACE recovery because §11.1 is a
+    statement about a run resuming from ITS OWN last checkpoint; a resume into
+    a DIFFERENT output dir from an explicitly chosen source is a deliberate
+    fork/continuation (exercised by the phase-boundary resume tests) and is not
+    the silent-re-train risk this rule targets.  That exemption is intentional,
+    not a hole: forking an older source into a NEW dir is a deliberate
+    continuation the operator names explicitly, whereas the in-place case is a
+    run re-entering its own dir where a stale source would silently re-train.
+    A source in a dir with no decodable last-epoch file (a fresh dir, a test
+    fixture, a renamed artifact) is accepted unchanged.  ``peek`` is the
+    already-decoded source (never re-read).
+    """
+    if resume_path.name == "best_model.pth":
+        raise ValueError(
+            f"Refusing to resume from {resume_path}: best_model.pth is the best "
+            "SELECTED epoch, which can be far older than the run's last executed "
+            "epoch.  Resuming from it would silently re-train completed epochs.  "
+            "Resume from the newest complete-epoch checkpoint "
+            "(final_model.pth / epoch_*.pth) instead (fail closed)."
+        )
+
+    if resume_path.parent.resolve() != Path(output_dir).resolve():
+        return  # a fork into a different dir: not the in-place recovery §11.1 governs
+
+    src_epoch = peek.get("epoch")
+    if not isinstance(src_epoch, int) or isinstance(src_epoch, bool):
+        return  # undecodable source epoch: nothing to compare against
+
+    newest_name: Optional[str] = None
+    newest_epoch = src_epoch
+    for cand in sorted(resume_path.parent.glob("*.pth")):
+        if cand.name == "best_model.pth" or cand.resolve() == resume_path.resolve():
+            continue
+        if (
+            cand.name not in _LAST_EPOCH_FAMILIES
+            and not _EPOCH_PERIODIC_RE.match(cand.name)
+        ):
+            continue
+        try:
+            state = load_artifact_bytes(cand.read_bytes(), map_location="cpu")
+        except Exception:  # noqa: BLE001 - an undecodable sibling is not newer
+            continue
+        epoch = state.get("epoch")
+        if not isinstance(epoch, int) or isinstance(epoch, bool):
+            continue
+        if epoch > newest_epoch:
+            newest_epoch = epoch
+            newest_name = cand.name
+
+    if newest_name is not None:
+        raise ValueError(
+            f"Refusing to resume from {resume_path} (stored epoch {src_epoch}): "
+            f"a newer complete-epoch checkpoint {newest_name} (epoch "
+            f"{newest_epoch}) exists in the same run directory.  §11.1 authorizes "
+            "resuming only from the run's LAST complete-epoch checkpoint; "
+            "resuming from an older one would silently re-train completed "
+            "epochs (fail closed)."
+        )
 
 
 def _parent_training_controls(
@@ -1095,13 +1226,30 @@ def _segment_loader_controls(
         ),
         "parent_num_workers": _parent_int("num_workers"),
         "parent_persistent_workers": _parent_bool("persistent_workers"),
-        # Reliable exact continuation is only supported with zero workers and
-        # is only CLAIMED at cadence one; a nonzero parent->zero active change
-        # is NOT established as trajectory-equivalent to the parent's original
-        # execution.
+        # The documented reliable (cadence-one) profile pins zero workers and
+        # the code ENFORCES it for the resolved loaders.  At cadence one this
+        # is the truthful requirement.  It is a PROFILE restriction, NOT a
+        # claim that workers>0 cannot be resumed (see the two flags below).
         "reliable_mode": reliable,
         "reliable_zero_worker_required": reliable,
-        "legacy_worker_equivalence_established": False,
+        # A persistent multi-worker loader IS a bitwise continuation on resume:
+        # ``_prewarm_persistent_loaders`` re-establishes the persistent iterator
+        # around a save/restore of the global RNG, so the resumed process
+        # consumes the global stream exactly as the uninterrupted run did at the
+        # epoch boundary (CPU, fixed seed).  This holds PROVIDED the dataset and
+        # collate consume no worker-side RNG, which the resume preflight enforces
+        # (``_resume_worker_rng_hazard``).  The phase-2 arm regime (workers>0,
+        # ``persistent_workers: true``, ``checkpoint_interval: 10``) relies on
+        # exactly this, so the equivalence IS established and this flag agrees
+        # with §11.1.  (The prior ``legacy_worker_equivalence_established=False``
+        # key conflated this with the worker-CHANGE case and was stale.)
+        "worker_resume_equivalence_established": True,
+        # A resume that CHANGES the worker count (or the ``persistent_workers``
+        # flag) is NOT established as trajectory-equivalent to the parent's
+        # original execution: the two consume the global stream differently, so
+        # the change is a genuine re-shuffle, not a benign re-entry.  Never
+        # claim otherwise.
+        "worker_count_change_equivalence_established": False,
     }
 
 
@@ -1357,6 +1505,366 @@ def _atomic_save_checkpoint(**kwargs) -> Path:
     return target
 
 
+# ── Safe-pause sentinel ───────────────────────────────────────
+# A run pauses CLEANLY at an epoch boundary by dropping an empty ``STOP`` file
+# into its output dir.  The training loop checks for it AFTER that epoch's best
+# and periodic checkpoints are fully written (temp file + fsync + atomic
+# rename), so a pause can never interrupt a save.  This is the supported way to
+# free the GPU for same-machine PsychoPy stimulus timing (or to survive a WSL
+# restart) without ever killing a process mid-save.  A resume CONSUMES the
+# sentinel at the training layer (before any epoch), so a stale sentinel can
+# never re-pause a resumed run even when it is launched by a bare
+# ``train.py --resume``; the resume launcher also removes it defensively.
+_PAUSE_SENTINEL_NAME = "STOP"
+
+# Distinct process exit status for a run that stopped at an epoch boundary on
+# a safe-pause STOP sentinel.  A paused run is NOT a failure and NOT a normal
+# completion: the launcher must be able to tell them apart from the exit code
+# alone (protocol §11.1 / S4).  Chosen outside the range used by argparse (2)
+# and shell conventions (126/127/128+), and outside 0/1.
+PAUSE_EXIT_CODE = 17
+
+
+def _pause_requested(output_dir: Path) -> bool:
+    """True when the run's output dir holds the ``STOP`` pause sentinel."""
+    return (Path(output_dir) / _PAUSE_SENTINEL_NAME).exists()
+
+
+def _capture_rng_state() -> Dict[str, Any]:
+    """Snapshot the global RNG streams a persistent DataLoader consumes.
+
+    ``torch`` (the parent process) and ``numpy`` are always captured; ``cuda``
+    is captured only when CUDA is available (``torch.cuda.get_rng_state_all``
+    is a no-op CPU build and would otherwise raise).  The returned mapping is
+    restored by :func:`_restore_rng_state`.
+    """
+    state: Dict[str, Any] = {
+        "torch": torch.get_rng_state(),
+        "numpy": np.random.get_state(),
+    }
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def _restore_rng_state(state: Dict[str, Any]) -> None:
+    """Restore a snapshot taken by :func:`_capture_rng_state`."""
+    torch.set_rng_state(state["torch"])
+    np.random.set_state(state["numpy"])
+    if "cuda" in state:
+        torch.cuda.set_rng_state_all(state["cuda"])
+
+
+def _loader_rng_is_resume_critical(
+    loader: Optional[torch.utils.data.DataLoader],
+) -> bool:
+    """True when *loader* consumes global RNG via a persistent iterator.
+
+    A ``persistent_workers`` loader builds its iterator ONCE and reuses it via
+    ``_reset`` for every later epoch; the FIRST ``iter()`` consumes an EXTRA
+    global-RNG draw (the parent-process base seed plus, for a shuffled loader,
+    the ``RandomSampler`` seed) that every later epoch does not.  A resumed
+    process that simply builds a FRESH iterator re-draws those seeds and shifts
+    the global stream — the divergence this fix prevents.  ``num_workers=0``
+    iterators hold no such hidden state and are out of scope (and rejected at
+    the reliable cadence-1 boundary anyway).
+    """
+    return (
+        loader is not None
+        and int(getattr(loader, "num_workers", 0)) > 0
+        and bool(getattr(loader, "persistent_workers", False))
+    )
+
+
+def _prewarm_persistent_loaders(
+    loaders: Sequence[Optional[torch.utils.data.DataLoader]],
+) -> None:
+    """Establish persistent iterator(s) WITHOUT advancing the global RNG.
+
+    A resumed process must consume the global RNG exactly as the uninterrupted
+    process did at the epoch boundary.  The uninterrupted persistent loader
+    already owns its iterator, so at each later epoch ``iter(loader)`` takes the
+    cheap ``_reset`` path and draws only the per-epoch ``RandomSampler`` seed.
+    A freshly constructed resumed loader would instead take the FIRST-
+    construction path and draw that seed AND the parent base seed, shifting the
+    global stream by one draw (and shifting the sampler seed), so the resumed
+    trajectory diverges even though no worker-side randomness is present.
+
+    Building the iterator once here — around a save/restore of the global RNG —
+    makes the resumed loader take the same ``_reset`` path.  The warm-up draws
+    are undone, so this is a pure no-op on the RNG stream; the training loop's
+    own ``iter(loader)`` then draws exactly the boundary's worth, matching the
+    uninterrupted run.  Only persistent multi-worker loaders are touched, so a
+    fresh (non-resumed) run — which never calls this — is bitwise unchanged.
+    """
+    targets = [ld for ld in loaders if _loader_rng_is_resume_critical(ld)]
+    if not targets:
+        return
+    saved = _capture_rng_state()
+    try:
+        for ld in targets:
+            iter(ld)  # establish the persistent iterator; draws are discarded
+    finally:
+        _restore_rng_state(saved)
+
+
+def _unwrap_dataset(dataset: Any) -> Any:
+    """Peel ``Subset`` / wrapper layers to the underlying dataset object.
+
+    The lazy path wraps the real dataset in a local ``LazySubset`` (a
+    ``torch.utils.data.Subset``); the eager path passes ``NSMoRDataset``
+    directly.  A worker-side RNG hazard lives in the leaf dataset (its
+    ``__getitem__``), so the check must reach it.  ``getattr`` on the wrapper
+    forwards to ``_inner`` (``ClockAwareLazyDataset.__getattr__``), so a single
+    ``.dataset`` hop on a ``Subset`` exposes the leaf.
+    """
+    seen: set[int] = set()
+    node = dataset
+    while node is not None and id(node) not in seen:
+        seen.add(id(node))
+        if isinstance(node, torch.utils.data.Subset):
+            node = node.dataset
+            continue
+        break
+    return node
+
+
+def _legacy_random_crop_risk(dataset: Any) -> Optional[str]:
+    """Describe a LEGACY random-crop ``__getitem__`` (worker-side RNG), else None.
+
+    ``NSMoRDataset.__getitem__`` (``nsmor/nsmor_dataloader.py`` ~L246) falls back
+    to ``np.random.randint`` for a random crop whenever ``anchor_frames`` is
+    ``None`` AND the trial is longer than ``max_seq_len``.  In a worker that draw
+    comes from the WORKER's NumPy stream, whose state after k epochs is not in
+    the checkpoint — so a resumed persistent worker cannot reproduce it and the
+    resume is NOT bitwise.  ``anchor_frames`` present (the phase-2 corpus) or a
+    dataset that never crops both disable the hazard.
+
+    Only the EAGER ``NSMoRDataset`` exposes this legacy branch; the lazy
+    datasets always crop through ``resolve_anchor_crop`` (no RNG).  The check is
+    therefore conservative: it flags the eager dataset only when its legacy
+    branch is reachable (``anchor_frames is None``), which is exactly the
+    documented deprecated path.
+    """
+    from nsmor.nsmor_dataloader import NSMoRDataset
+
+    leaf = _unwrap_dataset(dataset)
+    if isinstance(leaf, NSMoRDataset) and getattr(leaf, "anchor_frames", None) is None:
+        return (
+            "the eager NSMoRDataset has anchor_frames=None, so __getitem__ uses "
+            "the deprecated legacy random crop (np.random.randint) in worker "
+            "processes; the worker RNG state after k epochs is not captured in "
+            "the checkpoint, so a resume would silently re-shuffle."
+        )
+    return None
+
+
+def _numpy_state_changed(before: tuple, after: tuple) -> bool:
+    """True when the NumPy global stream advanced between two ``get_state()``.
+
+    Compares the FULL state tuple, not just ``pos``/``keys``.  A draw of
+    ``np.random.standard_normal()`` can be served entirely from the cached
+    Gaussian (state ``has_gauss`` and ``cached_gaussian``, indices 3 and 4)
+    WITHOUT advancing ``pos`` or the ``keys`` array — a one-draw or even-draw
+    consumer would then be a false negative if only ``pos``/``keys`` were
+    compared.  Every field that a draw can move is therefore compared.
+    """
+    return (
+        after[1].shape != before[1].shape
+        or not np.array_equal(after[1], before[1])  # keys
+        or after[2] != before[2]                     # pos
+        or after[3] != before[3]                     # has_gauss
+        or after[4] != before[4]                     # cached_gaussian
+    )
+
+
+# A draw can be index-DEPENDENT (e.g. a legacy random crop fires only when the
+# trial is longer than ``max_seq_len``).  Probing more than the first index
+# makes an index-0-only false negative far less likely; the static
+# legacy-crop check still covers the documented offender.
+_RNG_PROBE_INDICES = (0, 1)
+
+
+def _dataset_getitem_consumes_rng(dataset: Any) -> bool:
+    """True when the leaf dataset's ``__getitem__`` advances the global RNG.
+
+    The worker-RNG precondition is about the dataset's ``__getitem__`` (and any
+    collate) drawing from a global stream the checkpoint does not carry.  Rather
+    than only pattern-match a KNOWN offender, this probes the actual leaf
+    dataset: it snapshots both global streams, calls ``__getitem__`` on several
+    indices (:data:`_RNG_PROBE_INDICES`, so an index-dependent draw is not
+    missed by an index-0-only probe), and reports whether either stream
+    advanced.  Both global streams are compared in FULL — the NumPy comparison
+    includes ``has_gauss``/``cached_gaussian`` (see :func:`_numpy_state_changed`)
+    so a ``standard_normal`` draw served from the cache is detected.  The probe
+    RESTORES both streams afterward, so it has no side effect on the training
+    RNG.  A dataset that raises on an index (a fixture needing a captured-source
+    context) is treated as no observed draw at that index — the static
+    legacy-crop check still covers the documented offender.
+    """
+    leaf = _unwrap_dataset(dataset)
+    if leaf is None or not hasattr(leaf, "__getitem__"):
+        return False
+    try:
+        n = len(leaf)
+    except Exception:  # noqa: BLE001 - an unsized leaf cannot be probed
+        n = 0
+    torch_state = torch.get_rng_state()
+    numpy_state = np.random.get_state()
+    try:
+        for idx in _RNG_PROBE_INDICES:
+            if n and idx >= n:
+                continue
+            try:
+                leaf[idx]
+            except Exception:  # noqa: BLE001 - an unbuildable item is not a draw
+                continue
+            if not torch.equal(torch.get_rng_state(), torch_state):
+                return True
+            if _numpy_state_changed(numpy_state, np.random.get_state()):
+                return True
+        return False
+    finally:
+        torch.set_rng_state(torch_state)
+        np.random.set_state(numpy_state)
+
+
+def _collate_fn_consumes_rng(collate_fn: Any, probe_batch: Any = None) -> bool:
+    """True when *collate_fn* advances the global torch OR NumPy RNG.
+
+    A ``collate_fn`` runs in the WORKER process too (the same process as the
+    dataset ``__getitem__``), so a draw inside it advances a stream the
+    checkpoint does not carry, exactly like a draw inside ``__getitem__``.  The
+    precondition therefore covers collate, and this probe enforces it: it
+    snapshots both global streams, calls ``collate_fn`` on *probe_batch* (a
+    two-item list — the real item shape when the caller supplies one, else a
+    trivial ``(X, Y)`` pair), and reports whether either stream advanced
+    (full-state NumPy comparison).  Both streams are RESTORED afterward.  A
+    ``collate_fn`` that raises on the probe input (a bespoke signature) is
+    treated as no observed draw — its own correctness is the caller's concern,
+    not a hazard this guard can see.
+    """
+    if not callable(collate_fn):
+        return False
+    if probe_batch is None:
+        item = (torch.zeros(4, 8), torch.zeros(4))
+        probe_batch = [item, item]
+    torch_state = torch.get_rng_state()
+    numpy_state = np.random.get_state()
+    try:
+        try:
+            collate_fn(probe_batch)
+        except Exception:  # noqa: BLE001 - a bespoke collate is not a draw
+            return False
+        if not torch.equal(torch.get_rng_state(), torch_state):
+            return True
+        return _numpy_state_changed(numpy_state, np.random.get_state())
+    finally:
+        torch.set_rng_state(torch_state)
+        np.random.set_state(numpy_state)
+
+
+def _clean_probe_item(dataset: Any) -> Any:
+    """A representative item from a dataset already proven RNG-clean, else None.
+
+    Called only after :func:`_dataset_getitem_consumes_rng` has returned
+    ``False``, so fetching the item draws no global RNG and leaves both streams
+    unchanged.  The item's SHAPE matters: it lets the collate probe run the
+    loader's real ``collate_fn`` (2-tuple, 3-tuple or 4-tuple item) rather than
+    a guess.  Returns ``None`` when the dataset yields nothing probeable.
+    """
+    leaf = _unwrap_dataset(dataset)
+    if leaf is None or not hasattr(leaf, "__getitem__"):
+        return None
+    try:
+        if len(leaf) == 0:
+            return None
+        return leaf[0]
+    except Exception:  # noqa: BLE001 - an unbuildable item is not probeable
+        return None
+
+
+def _resume_worker_rng_hazard(
+    train_loader: torch.utils.data.DataLoader,
+    val_loader: Optional[torch.utils.data.DataLoader],
+) -> Optional[str]:
+    """Describe why a resumed multi-worker loader would NOT be bitwise, else None.
+
+    A resume is a bitwise continuation only when the worker processes consume
+    NO global RNG: the loader's own base seed and per-epoch ``RandomSampler``
+    seed are handled by :func:`_prewarm_persistent_loaders`, but any RNG drawn
+    INSIDE a dataset ``__getitem__`` OR a ``collate_fn`` (both run in the worker
+    process) advances a stream the checkpoint does not carry.  Three layers of
+    detection are applied:
+
+    1. The documented offender — the eager ``NSMoRDataset`` legacy random crop
+       (``anchor_frames is None``) — is flagged statically
+       (:func:`_legacy_random_crop_risk`).
+    2. Any OTHER dataset whose ``__getitem__`` consumes global RNG is flagged by
+       a side-effect-free runtime probe over several indices
+       (:func:`_dataset_getitem_consumes_rng`), so a novel worker-side RNG path
+       cannot slip through.
+    3. The loader's ``collate_fn`` is probed the same way
+       (:func:`_collate_fn_consumes_rng`); a collate that draws global RNG in a
+       worker is a hazard even when ``__getitem__`` is clean.
+
+    ``num_workers == 0`` iterators run in the parent process, whose NumPy state
+    IS restored from the checkpoint, so they are out of scope.
+    """
+    for name, loader in (("train", train_loader), ("val", val_loader)):
+        if loader is None:
+            continue
+        if int(getattr(loader, "num_workers", 0)) <= 0:
+            continue
+        dataset = getattr(loader, "dataset", None)
+        risk = _legacy_random_crop_risk(dataset)
+        if risk is not None:
+            return f"{name} loader: {risk}"
+        if _dataset_getitem_consumes_rng(dataset):
+            return (
+                f"{name} loader: the dataset __getitem__ consumes global RNG "
+                "(torch or NumPy), so in a worker process its stream advances "
+                "outside the checkpoint and a resume would silently re-shuffle."
+            )
+        # The dataset is proven RNG-clean, so a representative item can be
+        # fetched with no side effect and used to run the loader's REAL
+        # collate_fn (correct item arity), not a guessed one.
+        probe_item = _clean_probe_item(dataset)
+        probe_batch = None if probe_item is None else [probe_item, probe_item]
+        if _collate_fn_consumes_rng(getattr(loader, "collate_fn", None), probe_batch):
+            return (
+                f"{name} loader: the collate_fn consumes global RNG (torch or "
+                "NumPy), so in a worker process its stream advances outside the "
+                "checkpoint and a resume would silently re-shuffle."
+            )
+    return None
+
+
+def _require_bitwise_resume_loader_rng(
+    train_loader: torch.utils.data.DataLoader,
+    val_loader: Optional[torch.utils.data.DataLoader],
+) -> None:
+    """Fail closed when a resumed multi-worker loader consumes worker-side RNG.
+
+    Bitwise resume equivalence is guaranteed ONLY when the dataset
+    ``__getitem__`` and collate consume no global RNG in workers.  This is the
+    explicit, ENFORCED precondition of §11.1: the loader's own seeds are
+    re-established by :func:`_prewarm_persistent_loaders`, but worker-side RNG
+    is not recoverable, so a run whose loaders would use it is refused before
+    any epoch.  Called only on a resume; fresh training is untouched.
+    """
+    hazard = _resume_worker_rng_hazard(train_loader, val_loader)
+    if hazard is not None:
+        raise ValueError(
+            "Refusing to resume: bitwise resume equivalence requires that the "
+            "dataset __getitem__ and collate consume no worker-side RNG, but "
+            f"{hazard} Use anchor-aligned cropping (provide anchor_frames), "
+            "num_workers=0, or a dataset whose __getitem__ consumes no RNG "
+            "(fail closed rather than claim a continuation this loader cannot "
+            "provide)."
+        )
+
+
 def _check_checkpoint_prior_lineage(ckpt: Dict[str, Any], expected: Dict[str, Any], path: Path, *,
                                     trusted_historical_checkpoint_sha256=None,
                                     checkpoint_sha256=None) -> None:
@@ -1547,6 +2055,115 @@ logger = logging.getLogger(__name__)
 # Opt-in escape-band sensitivity sweep list, set by build_config() from
 # --sweep_escape_band and consumed by train().  ``None`` disables (default).
 _SWEEP_BANDS: Optional[List[float]] = None
+
+# ── Phase-2 controls, resolved by build_config() ──────────────
+# Kept as script-owned module state (NOT added to the protected
+# ``nsmor/config_parser.py`` schema, so ``ExperimentConfig.to_dict()`` and
+# every existing config/checkpoint stay byte-unchanged).  Both default to the
+# current behaviour: ``()`` = no column zeroed, ``"total"`` = full-objective
+# selection.  build_config() sets them from the CLI/YAML; tests may set them
+# directly or pass the explicit arguments to build_dataloaders()/validate().
+_ZERO_INPUT_CHANNELS: Tuple[int, ...] = ()
+_SELECTION_METRIC: str = "total"
+
+
+def _parse_selection_metric(value: Optional[str]) -> str:
+    """Validate a ``--selection_metric`` value; ``None`` keeps ``'total'``."""
+    if value is None:
+        return "total"
+    if value not in ("total", "mse"):
+        raise ValueError(
+            f"--selection_metric must be 'total' or 'mse', got {value!r}"
+        )
+    return value
+
+
+def _read_phase2_block(config_path: Optional[str]) -> Dict[str, Any]:
+    """Read the script-owned ``phase2:`` block from a config YAML.
+
+    The two phase-2 controls live OUTSIDE the protected
+    ``nsmor/config_parser.py`` schema, so they cannot ride the dataclass YAML
+    keys.  They are declared in a top-level ``phase2:`` mapping instead, which
+    ``ExperimentConfig.from_yaml`` ignores (unknown top-level keys are dropped)
+    and this reader consumes.  A missing file or block yields ``{}`` — the
+    default-off behaviour.
+    """
+    if not config_path:
+        return {}
+    path = Path(config_path)
+    if not path.exists():
+        return {}
+    import yaml
+
+    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    block = raw.get("phase2", {})
+    if block is None:
+        return {}
+    if not isinstance(block, dict):
+        raise ValueError(
+            f"phase2: block in {config_path} must be a mapping, got "
+            f"{type(block).__name__}"
+        )
+    return block
+
+
+def _parse_zero_input_channels(
+    value: Optional[Union[str, Sequence[int]]], config: ExperimentConfig,
+) -> Tuple[int, ...]:
+    """Parse and validate a ``zero_input_channels`` declaration.
+
+    *value* is either a comma-separated CLI string (e.g. ``"2,3"``) or a
+    sequence of ints from a YAML ``phase2:`` block.  Each entry must be an
+    integer indexing a *physical sensory* column ``[0, sensory_dim)``.  The
+    MCMC prior columns (``sensory_dim`` onward) are refused: they are
+    validated to form a probability simplex and are never part of the history
+    ablation.  ``None`` (nothing declared) yields ``()``.
+    """
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        raw: List[Any] = [tok.strip() for tok in value.split(",")]
+        raw = [tok for tok in raw if tok]
+    elif isinstance(value, Sequence):
+        raw = list(value)
+    else:
+        raise ValueError(
+            "zero_input_channels must be a comma string or a list of ints, "
+            f"got {type(value).__name__}"
+        )
+    channels: List[int] = []
+    for tok in raw:
+        if isinstance(value, str):
+            # CLI comma string: coerce each token to an int (rejecting bools
+            # and floats via the int() contract).
+            if isinstance(tok, bool):
+                raise ValueError(
+                    f"zero_input_channels entry {tok!r} must be an integer"
+                )
+            try:
+                ch = int(tok)
+            except ValueError as exc:
+                raise ValueError(
+                    f"zero_input_channels token {tok!r} is not an integer"
+                ) from exc
+        else:
+            if isinstance(tok, bool) or not isinstance(tok, int):
+                raise ValueError(
+                    f"zero_input_channels entry {tok!r} must be an integer"
+                )
+            ch = int(tok)
+        if not 0 <= ch < config.model.sensory_dim:
+            raise ValueError(
+                f"zero_input_channels column {ch} must index a physical "
+                f"sensory column in [0, {config.model.sensory_dim})"
+            )
+        if ch in channels:
+            raise ValueError(
+                f"zero_input_channels contains a duplicate column {ch}"
+            )
+        channels.append(ch)
+    return tuple(channels)
+
 
 # Default split for the loader and public standalone target-stat helper.
 # train() fits eager statistics directly from its selected loader dataset.
@@ -1756,6 +2373,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Fixed causal persistence skip scalar k in [0, 1]. 0 disables (default). "
              "Restricted to normalize_targets=False and target_clip_cm_s=0.0.",
     )
+    parser.add_argument(
+        "--zero_input_channels",
+        type=str,
+        default=None,
+        help="Comma-separated per-frame sensory feature columns to force to 0.0 "
+             "(history ablation), e.g. '2,3'. Default: none (no column zeroed). "
+             "Only physical sensory columns [0, sensory_dim) are addressable.",
+    )
+    parser.add_argument(
+        "--selection_metric",
+        type=str,
+        default=None,
+        choices=["total", "mse"],
+        help="Metric that selects best_model.pth and drives early stopping: "
+             "'total' (default, full validation objective) or 'mse' (masked "
+             "MSE term alone over the ALIGNED eligible frames, t>=1).",
+    )
 
     # ── Adaptive latent refinement (architecture v1) ──────────
     parser.add_argument(
@@ -1870,6 +2504,25 @@ def build_config(argv: Optional[Sequence[str]] = None) -> Tuple[ExperimentConfig
         config.training.target_clip_cm_s = args.target_clip_cm_s
     if getattr(args, "persistence_skip", None) is not None:
         config.model.persistence_skip = args.persistence_skip
+    # ── Phase-2 controls (kept OUT of the protected config schema) ──
+    # ``data.zero_input_channels`` (history ablation) and
+    # ``checkpoint.selection_metric`` (MSE-based checkpoint selection) are
+    # resolved here into script-owned module state rather than added to the
+    # protected ``nsmor/config_parser.py`` dataclasses.  Both default to the
+    # current behaviour, so ``ExperimentConfig.to_dict()`` — and hence every
+    # existing config and checkpoint — is byte-unchanged.  They are consumed
+    # by ``build_dataloaders`` (ablation), ``train`` (selection) and recorded
+    # as additive checkpoint provenance keys.
+    global _ZERO_INPUT_CHANNELS, _SELECTION_METRIC
+    phase2 = _read_phase2_block(args.config)
+    _zero_decl = getattr(args, "zero_input_channels", None)
+    if _zero_decl is None:
+        _zero_decl = phase2.get("zero_input_channels")
+    _ZERO_INPUT_CHANNELS = _parse_zero_input_channels(_zero_decl, config)
+    _sel_decl = getattr(args, "selection_metric", None)
+    if _sel_decl is None:
+        _sel_decl = phase2.get("selection_metric")
+    _SELECTION_METRIC = _parse_selection_metric(_sel_decl)
     if getattr(args, "refinement_mode", None) is not None:
         config.model.refinement_mode = args.refinement_mode
     if getattr(args, "refinement_max_steps", None) is not None:
@@ -2128,6 +2781,62 @@ def check_routing_aux_active(
     return False
 
 
+def zero_input_channels_inplace(
+    dataset: Any, channels: Sequence[int],
+    sensory_dim: Optional[int] = None,
+) -> None:
+    """History-ablation control: zero declared feature columns in a dataset.
+
+    Writes ``0.0`` into ``dataset.sequences[i][0][:, ch]`` for every declared
+    physical sensory column ``ch``.  ``NSMoRDataset`` deep-copies each
+    sequence at construction (``nsmor_dataloader.NSMoRDataset.__init__``), so
+    this mutates only the loader's private copies — the stored dataset bytes
+    and the caller's arrays are untouched.  No-op for an empty *channels*
+    (the historical behaviour).  Only the physical sensory columns are
+    addressable; the MCMC prior columns are validated upstream by the
+    ``--zero_input_channels`` parser against ``model.sensory_dim``.
+
+    *sensory_dim* is the SINGLE authoritative bound (the same
+    ``config.model.sensory_dim`` the CLI parser validates against); when
+    omitted it falls back to the dataset's ``per_frame_physical_dim``.  Both
+    are 4 for the frozen corpus, but only ``sensory_dim`` is the quantity the
+    parse path bounds, so callers that hold the config must pass it.
+    """
+    chans = tuple(int(c) for c in channels)
+    if not chans:
+        return
+    sequences = getattr(dataset, "sequences", None)
+    if sequences is None:
+        raise ValueError(
+            "zero_input_channels requires a dataset exposing .sequences"
+        )
+    if sensory_dim is None:
+        feature_config = getattr(dataset, "feature_config", None)
+        sensory_dim = getattr(feature_config, "per_frame_physical_dim", None)
+    if sensory_dim is not None:
+        for ch in chans:
+            if not 0 <= ch < sensory_dim:
+                raise ValueError(
+                    f"zero_input_channels column {ch} must index a physical "
+                    f"sensory column in [0, {sensory_dim})"
+                )
+    for i, (x_seq, y_seq, _label) in enumerate(sequences):
+        assert x_seq.ndim == 2, (
+            f"sequence {i} X must be (T, F); got shape {x_seq.shape}"
+        )
+        assert x_seq.shape[0] == y_seq.shape[0], (
+            f"sequence {i} X/Y length mismatch: {x_seq.shape[0]} vs "
+            f"{y_seq.shape[0]}"
+        )
+        for ch in chans:
+            assert ch < x_seq.shape[1], (
+                f"sequence {i} channel {ch} out of range for {x_seq.shape[1]} "
+                f"feature columns"
+            )
+            x_seq[:, ch] = 0.0
+    logger.info("History ablation applied: zeroed channels %s", list(chans))
+
+
 def assert_finite_targets(Y_seqs: Sequence[Any]) -> None:
     """Fail closed on any non-finite target value.
 
@@ -2163,6 +2872,7 @@ def build_dataloaders(
     use_lazy_loading: bool = False,
     nested_prior_artifact: Optional[str] = None,
     trusted_historical_artifact_sha256: Optional[str] = None,
+    zero_input_channels: Optional[Sequence[int]] = None,
 ) -> Tuple[Optional[torch.utils.data.DataLoader], Optional[torch.utils.data.DataLoader]]:
     """
     Build train and validation dataloaders from the prepared dataset.
@@ -2208,6 +2918,21 @@ def build_dataloaders(
             "--nested_prior_artifact requires ETL mode: lazy loading rebuilds "
             "rows on demand and cannot guarantee the persisted outer split "
             "aligns with the artifact. Refusing to run (fail closed)."
+        )
+
+    # The history-ablation control zeroes columns on the eager NSMoRDataset.
+    # Lazy rows are rebuilt on demand through a different path that does not
+    # apply the ablation, so a lazy run with the option set would silently be
+    # the UNABLATED control.  Refuse rather than mislabel the arm (fail closed).
+    _zero_requested = (
+        zero_input_channels if zero_input_channels is not None
+        else _ZERO_INPUT_CHANNELS
+    )
+    if use_lazy_loading and _zero_requested:
+        raise ValueError(
+            "data.zero_input_channels (history ablation) is unsupported in "
+            "lazy loading mode; use ETL mode or clear the option. Refusing to "
+            "run a silently-unablated history control (fail closed)."
         )
 
     from nsmor.model_utils import validate_dataset_provenance
@@ -2532,6 +3257,21 @@ def build_dataloaders(
 
     max_seq_len = getattr(config.training, "max_seq_len", None)
 
+    # History-ablation control: resolve the declared zeroed feature columns
+    # once.  ``zero_input_channels`` (the explicit parameter) takes precedence
+    # over the module-level ``_ZERO_INPUT_CHANNELS`` (set by build_config from
+    # the CLI); both default to empty, so a caller that passes neither gets the
+    # historical datasets bitwise unchanged.
+    if zero_input_channels is None:
+        zero_input_channels = tuple(_ZERO_INPUT_CHANNELS)
+    else:
+        zero_input_channels = tuple(zero_input_channels)
+    if zero_input_channels:
+        logger.info(
+            "History ablation active: zeroing input channels %s",
+            list(zero_input_channels),
+        )
+
     train_dataset = NSMoRDataset(
         sequences=train_sequences,
         mcmc_priors=train_priors,
@@ -2560,6 +3300,19 @@ def build_dataloaders(
     val_dataset.mcmc_prior_train_serve_consistency = prior_consistency
     if nested_prior_artifact is not None:
         val_dataset.nested_prior_info = nested_info
+
+    # ── History-ablation control (no-op by default) ──────────
+    # Zero the declared sensory columns in the datasets' deep-copied
+    # sequences.  Applied AFTER construction and BEFORE the loaders, so both
+    # splits see the identical ablation and the stored dataset bytes are never
+    # modified.  ``zero_input_channels`` is empty unless explicitly set.
+    _sensory_dim = getattr(getattr(config, "model", None), "sensory_dim", None)
+    zero_input_channels_inplace(
+        train_dataset, zero_input_channels, sensory_dim=_sensory_dim,
+    )
+    zero_input_channels_inplace(
+        val_dataset, zero_input_channels, sensory_dim=_sensory_dim,
+    )
 
     # ── Create dataloaders (via factory) ──────────────────────
     # Delegates to dataloader_factory for unified worker auto-scaling,
@@ -3179,6 +3932,7 @@ def validate(
     wind_only_mask_full: Optional[np.ndarray] = None,
     routing_aux_margin: float = 0.024,
     lambda_compute: float = 0.0,
+    selection_metric: str = "total",
 ) -> float:
     """
     Run validation (no gradient computation).
@@ -3205,12 +3959,38 @@ def validate(
         lambda_routing_aux: Auxiliary routing loss weight for modality differentiation.
         wind_only_mask_full: Optional full-split boolean array for pure-wind trials.
         routing_aux_margin: Hinge margin for routing auxiliary loss.
+        selection_metric: ``"total"`` (default) selects on the full validation
+            objective; ``"mse"`` selects on the **frame-weighted pooled** masked
+            MSE over the aligned eligible frames (t >= 1) alone (sum of aligned
+            squared errors / total aligned frames, not a per-batch
+            macro-average), so the selected checkpoint minimises the pooled
+            quantity the scored primary metric divides by.  The returned float
+            is the selected metric, so a caller's checkpoint-selection /
+            patience comparison is unchanged in shape.
 
     Returns:
-        Average validation loss.
+        Average validation loss under ``selection_metric`` (``"mse"`` returns
+        the pooled masked MSE, or ``inf`` if no aligned frame was seen).  The
+        pooled masked-MSE diagnostic (t >= 1) is additionally exposed as
+        :attr:`validate.last_val_mse` (``None`` when no batch ran), mirroring
+        :attr:`train_one_epoch.last_skip_counts`.
     """
+    if selection_metric not in ("total", "mse"):
+        raise ValueError(
+            f"selection_metric must be 'total' or 'mse', got {selection_metric!r}"
+        )
+    validate.last_val_mse = None
     model.eval()
     total_loss = 0.0
+    # Frame-weighted pooled masked MSE (sum of aligned squared errors / total
+    # aligned frames).  Accumulate the raw sums here and divide once at the end
+    # so the selected metric is the POOLED quantity the scored primary
+    # (``1 - MSE_model/MSE_persist``) divides by, not a per-batch macro-average
+    # (which would over-weight the small last batch).  Only the
+    # ``selection_metric="mse"`` path consumes this; the ``"total"`` default
+    # return is unchanged.
+    total_se_sum = 0.0
+    total_se_frames = 0
     n_batches = 0
 
     pbar = tqdm(loader, desc="Validation", leave=False, dynamic_ncols=True)
@@ -3276,10 +4056,48 @@ def validate(
             )
 
         total_loss += loss.item()
+        # Masked-MSE-only selection diagnostic on the ALIGNED eligible frames
+        # (t >= 1, padding excluded) — the phase-2 protocol's checkpoint-
+        # selection metric.  The loss' own MSE term is over t >= 0; the
+        # single t=0 frame per trial has no persistence predecessor, so the
+        # aligned partition is the honest one for selecting weights against the
+        # skill-vs-persistence primary metric.  The t=0 exclusion is exact
+        # (one frame per trial, ~0.04% of frames).  Used when
+        # selection_metric == "mse".
+        with torch.no_grad():
+            B_t, T_t = y_pred.shape
+            assert y_pred.shape == y_batch.shape == (B_t, T_t), (
+                f"selection MSE shape mismatch: y_pred {tuple(y_pred.shape)} "
+                f"vs y_true {tuple(y_batch.shape)}"
+            )
+            assert lengths.shape == (B_t,), (
+                f"lengths shape {tuple(lengths.shape)} != ({B_t},)"
+            )
+            arange_t = torch.arange(T_t, device=y_pred.device).unsqueeze(0)
+            _mask = (
+                (arange_t >= 1) & (arange_t < lengths.unsqueeze(1))
+            ).to(y_pred.dtype)
+            assert _mask.shape == (B_t, T_t), (
+                f"selection mask shape {tuple(_mask.shape)} != ({B_t}, {T_t})"
+            )
+            _se = (y_pred - y_batch) ** 2
+            assert _se.shape == (B_t, T_t), (
+                f"selection squared-error shape {tuple(_se.shape)} != "
+                f"({B_t}, {T_t})"
+            )
+            total_se_sum += float((_se * _mask).sum())
+            total_se_frames += int(_mask.sum().item())
         n_batches += 1
         pbar.set_postfix({"val_loss": f"{loss.item():.4f}"})
 
     avg_loss = total_loss / max(n_batches, 1)
+    # Frame-weighted pooled masked MSE over the WHOLE split (one divide).
+    pooled_mse = (
+        total_se_sum / total_se_frames if total_se_frames > 0 else None
+    )
+    validate.last_val_mse = pooled_mse
+    if selection_metric == "mse":
+        return pooled_mse if pooled_mse is not None else float("inf")
     return avg_loss
 
 
@@ -4335,6 +5153,12 @@ def train(
         train_loader, val_loader,
         checkpoint_interval=config.training.checkpoint_interval,
     )
+    # Resume precondition (§11.1): bitwise continuation is guaranteed only when
+    # the dataset __getitem__ and collate consume no worker-side RNG.  Enforced
+    # on resume only (a fresh run is untouched), and AFTER the zero-worker
+    # reliable guard so the two refusals do not overlap.
+    if config.checkpoint.resume_from is not None:
+        _require_bitwise_resume_loader_rng(train_loader, val_loader)
     _resolved_workers = _resolved_loader_workers(train_loader, val_loader)
 
     # Ticket #16: stimulus condition metadata for routing auxiliary loss
@@ -4401,6 +5225,15 @@ def train(
             "include eventual outer-validation labels. Scores are contaminated "
             "diagnostics, ineligible for strict QC/release gates; use a nested artifact."
         )
+    # Phase-2 script-owned controls, stamped additively into every checkpoint
+    # (they are NOT part of ``config.to_dict()``, which stays byte-unchanged).
+    # A resume refuses a switch of ``selection_metric`` (see
+    # ``_require_architecture_config_match``); ``zero_input_channels`` names
+    # the history ablation a checkpoint was trained under.
+    phase2_provenance: Dict[str, Any] = {
+        "selection_metric": _SELECTION_METRIC,
+        "zero_input_channels": list(_ZERO_INPUT_CHANNELS),
+    }
     active_lineage: Dict[str, Any] = dict(nested_provenance)
     active_lineage["dataset_path"] = str(resolved_dataset_path)
     dataset_source_sha256 = getattr(train_loader.dataset, "dataset_source_sha256", None)
@@ -4567,6 +5400,13 @@ def train(
         resume_payload = ckpt_path.read_bytes()
         ckpt_peek = load_artifact_bytes(resume_payload, map_location="cpu")
         validate_checkpoint_clock(ckpt_peek, model.dt_ms, require_dt_ms=True)
+        # §11.1 authorizes resuming only from the run's LAST complete-epoch
+        # checkpoint.  ``train.py`` enforces this itself — not only the resume
+        # launcher — so a bare ``--resume`` cannot silently re-train completed
+        # epochs: ``best_model.pth`` is never a resume source, and a source
+        # older than a newer last-epoch family file in the same run dir is
+        # refused.  Runs before any state restoration or epoch.
+        _require_resume_source_is_newest_complete_epoch(ckpt_path, ckpt_peek, output_dir)
         # A current-schema parent claims an exact continuation, so its full
         # canonical state must be present before anything restores from it.
         # This runs FIRST in the resume preflight (before any epoch or any
@@ -5029,6 +5869,11 @@ def train(
     # ``None`` marks an epoch at which the series recorded nothing (e.g. no
     # validation), so the axis stays intact.
     history: Dict[str, List[Any]] = {"train_loss": [], "val_loss": []}
+    # Masked-MSE-only validation diagnostic on the ALIGNED eligible frames
+    # (t >= 1), recorded alongside the selected ``val_loss`` but NOT persisted
+    # through the recovery payload (whose ``training_history`` schema is frozen
+    # to {train_loss, val_loss}).
+    val_mse_history: List[Optional[float]] = []
     train_loss: float = float("nan")
     val_loss: float = float("nan")
 
@@ -5061,6 +5906,10 @@ def train(
     # the resumed epoch).  Consumed after the loop to finalize without an
     # epoch.  See the terminal decision below.
     _terminal_on_resume = False
+    # Set when a safe-pause sentinel (``STOP``) was observed at a completed
+    # epoch boundary.  Consumed after the loop to finalize this segment without
+    # executing further epochs.  See the sentinel check at the loop tail.
+    _paused_on_sentinel = False
     if config.checkpoint.resume_from is not None:
         _ewi, _history, _np_state, history_start_epoch = _restore_recovery_state(
             ckpt_peek, ckpt_path, resume_epoch=start_epoch,
@@ -5170,8 +6019,40 @@ def train(
         resolved_workers=_resolved_workers,
     )
 
+    # ── Consume a stale safe-pause sentinel on resume ─────────
+    # A resume from this run's OWN checkpoint can still find the ``STOP``
+    # sentinel that requested the pause.  Consume it HERE, at the training
+    # layer and before any epoch, so the pause/resume contract is closed no
+    # matter how the resume was launched — including a direct
+    # ``train.py --resume`` that never goes through the resume launcher.
+    # Without this, a direct resume would observe the stale sentinel at the
+    # next epoch boundary and silently re-pause after one epoch.
+    if config.checkpoint.resume_from is not None and _pause_requested(output_dir):
+        try:
+            (output_dir / _PAUSE_SENTINEL_NAME).unlink()
+        except FileNotFoundError:  # pragma: no cover - raced with an operator
+            pass
+        logger.info(
+            "Consumed safe-pause sentinel %s on resume; the run will not "
+            "re-pause until a NEW STOP file appears.",
+            output_dir / _PAUSE_SENTINEL_NAME,
+        )
+
     # ── Bio-loss warmup schedule ─────────────────────────────
     warmup_epochs = config.loss.warmup_epochs
+
+    # ── RNG-exact loader re-entry on resume ───────────────────
+    # A persistent multi-worker loader owns a live iterator whose FIRST
+    # construction drew extra seeds from the global RNG; every later epoch
+    # reuses it via ``_reset`` and draws only the per-epoch sampler seed.  A
+    # resumed process that builds a FRESH iterator would re-draw those seeds,
+    # shifting the global stream (and the shuffle order) so the resumed
+    # trajectory diverges from the uninterrupted run.  Re-establish the
+    # persistent iterator(s) here, around a save/restore of the global RNG, so
+    # the resumed loader re-enters at the SAME boundary state the uninterrupted
+    # run had — bitwise.  Guarded to a resume so a fresh run is untouched.
+    if config.checkpoint.resume_from is not None:
+        _prewarm_persistent_loaders([train_loader, val_loader])
 
     epoch = start_epoch - 1
     for epoch in range(start_epoch, config.training.num_epochs):
@@ -5362,8 +6243,10 @@ def train(
                 wind_only_mask_full=val_is_pure_wind,
                 routing_aux_margin=config.loss.routing_aux_margin,
                 lambda_compute=config.loss.lambda_compute,
+                selection_metric=_SELECTION_METRIC,
             )
             history["val_loss"].append(val_loss)
+            val_mse_history.append(getattr(validate, "last_val_mse", None))
         else:
             # No validation loader: the epoch was still EXECUTED, so its
             # position on the shared epoch axis must exist.  ``None`` records
@@ -5373,6 +6256,7 @@ def train(
             # behind ``math.isfinite(val_loss)`` and val_loss stays ``inf``
             # here, so patience does not advance on an unvalidated epoch.
             history["val_loss"].append(None)
+            val_mse_history.append(None)
 
         elapsed = time.time() - t0
         logger.info(
@@ -5444,6 +6328,7 @@ def train(
                     epochs_without_improvement, history, history_start_epoch,
                 ),
                 **nested_provenance,
+                **phase2_provenance,
             )
             generated_checkpoint_shas[best_path] = hashlib.sha256(
                 best_path.read_bytes(),
@@ -5478,6 +6363,7 @@ def train(
                     epochs_without_improvement, history, history_start_epoch,
                 ),
                 **nested_provenance,
+                **phase2_provenance,
             )
             logger.info("Saved periodic checkpoint: %s", epoch_path)
 
@@ -5499,6 +6385,25 @@ def train(
                 early_stopping_patience,
                 best_val_loss,
                 epoch - epochs_without_improvement,
+            )
+            break
+
+        # ── Safe pause (epoch-boundary STOP sentinel) ─────────
+        # Reached only AFTER this epoch's best and periodic checkpoints are
+        # fully written (temp + fsync + atomic rename), so a pause never
+        # interrupts a save.  The sentinel is left in place for the resume
+        # launcher to consume; the run finalizes this segment (writing
+        # ``final_model.pth``) exactly as an early stop would, so the resumed
+        # segment's ``start_epoch`` is the next epoch and the trajectory
+        # continues bitwise.  An early stop (checked above) is terminal and
+        # takes precedence over a pause.
+        if _pause_requested(output_dir):
+            _paused_on_sentinel = True
+            logger.info(
+                "Safe pause requested (STOP sentinel at %s): stopping at the "
+                "completed epoch %d boundary after checkpointing; resume from "
+                "this segment's checkpoint to continue.",
+                output_dir / _PAUSE_SENTINEL_NAME, epoch,
             )
             break
 
@@ -5527,6 +6432,7 @@ def train(
             epochs_without_improvement, history, history_start_epoch,
         ),
         **nested_provenance,
+        **phase2_provenance,
     )
     generated_checkpoint_shas[final_path] = hashlib.sha256(
         final_path.read_bytes(),
@@ -5535,7 +6441,10 @@ def train(
 
     logger.info("Final LR: %.2e", scheduler.get_last_lr()[0])
     logger.info("=" * 60)
-    logger.info("Training complete.  Best val loss: %.6f", best_val_loss)
+    logger.info(
+        "Training complete.  Best val %s: %.6f",
+        _SELECTION_METRIC, best_val_loss,
+    )
     logger.info("=" * 60)
 
     # ── Plot loss curve ──────────────────────────────────────────
@@ -5655,6 +6564,10 @@ def train(
         "metrics": metrics,
         "eval_provenance": eval_provenance,
         "history": history,
+        # Masked-MSE-only validation diagnostic on the ALIGNED eligible frames
+        # (t >= 1), positionally aligned with ``history["val_loss"]``.  NOT
+        # persisted through resume.
+        "val_mse_history": val_mse_history,
         # True 0-based epoch of history entry 0 (0 for a fresh run; the
         # resume epoch for a legacy resume whose earlier history is unknown).
         "history_start_epoch": history_start_epoch,
@@ -5671,6 +6584,10 @@ def train(
         "animal_identity_status": nested_provenance["animal_identity_status"],
         "dataset_source_sha256": dataset_source_sha256,
         "dataset_source_binding": dataset_source_binding,
+        # True when this segment stopped on a safe-pause STOP sentinel (not on
+        # an early stop or the epoch budget).  Additive: an uninterrupted run
+        # reports False, so existing consumers are unaffected.
+        "paused": _paused_on_sentinel,
     }
 
 
@@ -5683,6 +6600,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     CLI entry point.
 
     Parses arguments, loads config, and runs :func:`train`.
+
+    A run that stopped at an epoch boundary on a safe-pause STOP sentinel
+    exits with :data:`PAUSE_EXIT_CODE` so a launcher can distinguish a pause
+    from a normal completion (0) or a failure (nonzero).  All other exits keep
+    their existing status.
 
     Args:
         argv: Argument list (defaults to ``sys.argv[1:]``).
@@ -5710,6 +6632,13 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     with open(train_log_path, "w") as f:
         json.dump(results, f, indent=2)
     logger.info("Results: %s. Saved: %s", results, train_log_path)
+    if results.get("paused"):
+        logger.info(
+            "Safe pause: exiting with distinct code %d (not a completion, "
+            "not a failure) so the launcher can report it as a pause.",
+            PAUSE_EXIT_CODE,
+        )
+        sys.exit(PAUSE_EXIT_CODE)
 
 
 if __name__ == "__main__":

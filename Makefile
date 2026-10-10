@@ -41,7 +41,7 @@ DT_MS ?= $(shell $(PYTHON) -c 'import yaml; cfg = yaml.safe_load(open("$(CONFIG)
 # every target below works from a bare clone, installed or not.
 export PYTHONPATH := $(CURDIR)$(if $(PYTHONPATH),:$(PYTHONPATH),)
 
-.PHONY: install test data nested-prior check-checkpoint check-nested-prior train analyze analyze-torch jacobian-torch pipeline clean help
+.PHONY: install test data nested-prior check-checkpoint check-nested-prior train analyze analyze-torch jacobian-torch behavior pipeline clean help
 
 # ── Default target ───────────────────────────────────────────
 help: ## Show available targets
@@ -126,6 +126,15 @@ psychophysics: check-checkpoint check-nested-prior ## Run visual-noise sensitivi
 cluster: check-checkpoint check-nested-prior ## Run unsupervised gating strategy clustering
 	$(PYTHON) scripts/analyze_gating.py --checkpoint "$(BEST)" --dataset "$(DATA)" --config "$(CONFIG)" --output_dir "$(OUTPUT)" --nested_prior_artifact "$(NESTED_PRIOR_ARTIFACT)"
 
+# ── Model-free behavior ──────────────────────────────────────
+# Race model, escape modes, accumulation, trigger rule.  Needs only the
+# processed dataset (no checkpoint, no trained model).  The nested-prior
+# artifact is optional: when present it supplies recording_prefix_keys as
+# the bootstrap cluster unit, otherwise the script derives prefixes from
+# the dataset session_ids.
+behavior: ## Model-free behavior analyses (race model, escape modes, accumulation, trigger rule)
+	$(PYTHON) scripts/analyze_behavior.py --dataset "$(DATA)" --dt_ms $(DT_MS) --seed $(SEED) --output_dir "$(OUTPUT)/behavior" $(if $(wildcard $(NESTED_PRIOR_ARTIFACT)),--nested_prior_artifact "$(NESTED_PRIOR_ARTIFACT)",)
+
 # ── Autoregressive Generation ────────────────────────────────
 generate: check-checkpoint ## Run autoregressive closed-loop generation
 	$(PYTHON) scripts/simulate_autoregressive.py --checkpoint "$(BEST)" --output_dir "$(OUTPUT)/sim_session" --dt_ms $(DT_MS)
@@ -140,6 +149,11 @@ pipeline: ## Execute full end-to-end experimental pipeline
 	EPOCHS="$(EPOCHS)" PHASE1_EPOCHS="$(PHASE1_EPOCHS)" \
 	BATCH_SIZE="$(BATCH_SIZE)" LR="$(LR)" SEED="$(SEED)" \
 	NESTED_PRIOR_ARTIFACT="$(NESTED_PRIOR_ARTIFACT)" bash run_pipeline.sh
+	@if [ "$$DRY_RUN" = "1" ]; then \
+		echo "DRY_RUN=1 — skipping behavior"; \
+	else \
+		$(MAKE) behavior; \
+	fi
 
 # ── Cleanup ──────────────────────────────────────────────────
 clean: ## Remove caches, build artefacts, and old runs

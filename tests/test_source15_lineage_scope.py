@@ -274,11 +274,19 @@ def test_historical_resume_requires_pin_and_accepts_saved_checkpoint_bytes(tmp_p
     monkeypatch.setattr(trainer, "train_one_epoch", lambda *a, **k: (1.0, {}))
     monkeypatch.setattr(trainer, "validate", lambda *a, **k: .1)
     trainer.train(initial, dataset_path=str(source))
+    # Resume from the segment's last complete-epoch checkpoint (final_model.pth);
+    # best_model.pth is NOT a resume source and is refused by
+    # _require_resume_source_is_newest_complete_epoch.  Both the source AND the
+    # companion best (which reconciliation certifies) are historical, so both
+    # SHAs must be pinned.
+    last_epoch = Path(initial.checkpoint.output_dir) / "final_model.pth"
     best = Path(initial.checkpoint.output_dir) / "best_model.pth"
-    checkpoint_sha = hashlib.sha256(best.read_bytes()).hexdigest()
+    checkpoint_sha = tuple(
+        hashlib.sha256(p.read_bytes()).hexdigest() for p in (last_epoch, best)
+    )
     resumed = _make_config(tmp_path, epochs=2, warmup_epochs=0)
     resumed.checkpoint.output_dir = str(tmp_path / "resumed")
-    resumed.checkpoint.resume_from = str(best)
+    resumed.checkpoint.resume_from = str(last_epoch)
     with pytest.raises(ValueError, match="trusted_historical_checkpoint_sha256"):
         trainer.train(resumed, dataset_path=str(source))
     result = trainer.train(resumed, dataset_path=str(source),
