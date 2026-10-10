@@ -42,6 +42,7 @@ seed and re-seeds the sampler, shifting the whole resumed trajectory.
 from __future__ import annotations
 
 import hashlib
+import platform
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
@@ -587,21 +588,17 @@ def _weights_sha(state: dict) -> str:
 _FRESH_WEIGHTS_SHA = (
     "6a8a43517d1985a5c3732df026cdb39c0d097c3389fab8d797e08bd2a72052a0"
 )
+# The SHA is a float-bit fingerprint, so it is only meaningful in the
+# environment it was measured in (CPython minor version + torch build); other
+# environments check the portable invariants below instead.
+_FRESH_PIN_ENV = ("3.14", "2.14.0+cu132")
 
 
-def test_fresh_training_weights_are_unchanged(tmp_path: Path) -> None:
-    """Fresh (non-resumed) training is bitwise pinned (S2 regression guard).
-
-    The amendment claims 'no default behaviour changed'.  This asserts the
-    exact final-weights SHA-256 of a fresh run, which was measured equal on the
-    pre-amendment base commit (8ed5edb) and on this code, so a future change
-    cannot silently break the fresh-training comparability the amendment rests
-    on.  The config is representative (dropout + sensory noise so the RNG
-    stream advances; workers=1, interval=2) and deterministic on CPU.
-    """
+def _fresh_run(tmp_path: Path, name: str) -> str:
+    """Train the fixed fresh config once and return its final-weights SHA."""
     ds = _make_synthetic_dataset(tmp_path)
     torch.manual_seed(0)
-    config = _real_config(tmp_path, epochs=6, name="fresh_pin")
+    config = _real_config(tmp_path, epochs=6, name=name)
     config.training.num_workers = 1
     config.training.persistent_workers = True
     config.training.checkpoint_interval = 2
@@ -619,10 +616,43 @@ def test_fresh_training_weights_are_unchanged(tmp_path: Path) -> None:
         trainer.train(config, dataset_path=str(ds))
 
     ckpt = _load_state(Path(config.checkpoint.output_dir) / "final_model.pth")
-    assert _weights_sha(ckpt) == _FRESH_WEIGHTS_SHA, (
+    return _weights_sha(ckpt)
+
+
+def test_fresh_training_weights_are_unchanged(tmp_path: Path) -> None:
+    """Fresh (non-resumed) training is bitwise pinned (S2 regression guard).
+
+    The amendment claims 'no default behaviour changed'.  In the pinned
+    environment this asserts the exact final-weights SHA-256 of a fresh run,
+    measured equal on the pre-amendment base commit (8ed5edb) and on this code
+    (CPU, single thread, checkpoint interval 2).  Float bits differ across
+    CPython/torch builds, so elsewhere the pin is skipped and
+    ``test_fresh_training_never_prewarms_and_is_deterministic`` carries the
+    portable guarantee.
+    """
+    env = (".".join(platform.python_version_tuple()[:2]), torch.__version__)
+    if env != _FRESH_PIN_ENV:
+        pytest.skip(f"fresh-weights SHA pinned for {_FRESH_PIN_ENV}, running {env}")
+    assert _fresh_run(tmp_path, "fresh_pin") == _FRESH_WEIGHTS_SHA, (
         "fresh training weights changed; the amendment's fresh-training "
         "equivalence claim no longer holds for the base commit 8ed5edb."
     )
+
+
+def test_fresh_training_never_prewarms_and_is_deterministic(
+    tmp_path: Path,
+) -> None:
+    """Portable fresh-training guard: the resume-only pre-warm never runs on a
+    fresh run, and two fresh runs are bitwise identical in any environment."""
+    from scripts import train as trainer
+
+    with mock.patch.object(
+        trainer, "_prewarm_persistent_loaders",
+        side_effect=AssertionError("pre-warm called on a fresh run"),
+    ):
+        first = _fresh_run(tmp_path, "fresh_a")
+        second = _fresh_run(tmp_path, "fresh_b")
+    assert first == second
 
 
 def _arm_config(
