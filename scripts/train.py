@@ -33,7 +33,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 # Prefer the checkout's own ``nsmor`` package over any editable install that
 # points at a different worktree/main checkout.  Running ``scripts/train.py``
@@ -134,6 +134,11 @@ _PROVENANCE_KEYS = frozenset({
     "mcmc_prior_provenance",
     "animal_identity_status",
     "best_val_loss",
+    # Phase-2 script-owned controls (NOT part of the protected config
+    # schema).  Recorded additively so a checkpoint names the exact
+    # selection metric / history ablation it was trained under.
+    "selection_metric",
+    "zero_input_channels",
     # Epoch-boundary recovery state (see the recovery helpers below).  These
     # ride the same pop-then-patch seam so nsmor/checkpoint.py stays untouched.
     "recovery_state_version",
@@ -482,6 +487,33 @@ def _require_architecture_config_match(
             mismatches.append(
                 f"{section}.{leaf}: checkpoint={recorded!r} vs active={current!r}"
             )
+    # ``selection_metric`` (a script-owned phase-2 control, NOT part of the
+    # protected config schema) changes the meaning of the persisted
+    # ``best_val_loss`` scalar (total objective vs masked MSE).  A resume that
+    # switched it would compare a restored best under one metric against
+    # candidates under the other, so refuse the mixed-metric continuation.
+    # It is recorded as an additive top-level checkpoint key; legacy
+    # checkpoints without it default to "total".
+    recorded_sel = ckpt.get("selection_metric", "total")
+    active_sel = _SELECTION_METRIC
+    if recorded_sel != active_sel:
+        mismatches.append(
+            f"selection_metric: checkpoint={recorded_sel!r} vs "
+            f"active={active_sel!r}"
+        )
+    # ``zero_input_channels`` (the history ablation) is likewise script-owned
+    # and not part of the protected config schema, but it changes the ARM
+    # identity (R2 zeroes channels 2-3).  A resume that switched it would
+    # silently continue an arm under a different ablation, so refuse it
+    # alongside the selection_metric guard.  Legacy checkpoints without the
+    # key default to the unablated control ([]).
+    recorded_zic = sorted(int(c) for c in ckpt.get("zero_input_channels", []))
+    active_zic = sorted(int(c) for c in _ZERO_INPUT_CHANNELS)
+    if recorded_zic != active_zic:
+        mismatches.append(
+            f"zero_input_channels: checkpoint={recorded_zic} vs "
+            f"active={active_zic}"
+        )
     if mismatches:
         raise ValueError(
             f"Resume checkpoint {ckpt_path} was trained with a different "
@@ -1548,6 +1580,115 @@ logger = logging.getLogger(__name__)
 # --sweep_escape_band and consumed by train().  ``None`` disables (default).
 _SWEEP_BANDS: Optional[List[float]] = None
 
+# ── Phase-2 controls, resolved by build_config() ──────────────
+# Kept as script-owned module state (NOT added to the protected
+# ``nsmor/config_parser.py`` schema, so ``ExperimentConfig.to_dict()`` and
+# every existing config/checkpoint stay byte-unchanged).  Both default to the
+# current behaviour: ``()`` = no column zeroed, ``"total"`` = full-objective
+# selection.  build_config() sets them from the CLI/YAML; tests may set them
+# directly or pass the explicit arguments to build_dataloaders()/validate().
+_ZERO_INPUT_CHANNELS: Tuple[int, ...] = ()
+_SELECTION_METRIC: str = "total"
+
+
+def _parse_selection_metric(value: Optional[str]) -> str:
+    """Validate a ``--selection_metric`` value; ``None`` keeps ``'total'``."""
+    if value is None:
+        return "total"
+    if value not in ("total", "mse"):
+        raise ValueError(
+            f"--selection_metric must be 'total' or 'mse', got {value!r}"
+        )
+    return value
+
+
+def _read_phase2_block(config_path: Optional[str]) -> Dict[str, Any]:
+    """Read the script-owned ``phase2:`` block from a config YAML.
+
+    The two phase-2 controls live OUTSIDE the protected
+    ``nsmor/config_parser.py`` schema, so they cannot ride the dataclass YAML
+    keys.  They are declared in a top-level ``phase2:`` mapping instead, which
+    ``ExperimentConfig.from_yaml`` ignores (unknown top-level keys are dropped)
+    and this reader consumes.  A missing file or block yields ``{}`` — the
+    default-off behaviour.
+    """
+    if not config_path:
+        return {}
+    path = Path(config_path)
+    if not path.exists():
+        return {}
+    import yaml
+
+    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    block = raw.get("phase2", {})
+    if block is None:
+        return {}
+    if not isinstance(block, dict):
+        raise ValueError(
+            f"phase2: block in {config_path} must be a mapping, got "
+            f"{type(block).__name__}"
+        )
+    return block
+
+
+def _parse_zero_input_channels(
+    value: Optional[Union[str, Sequence[int]]], config: ExperimentConfig,
+) -> Tuple[int, ...]:
+    """Parse and validate a ``zero_input_channels`` declaration.
+
+    *value* is either a comma-separated CLI string (e.g. ``"2,3"``) or a
+    sequence of ints from a YAML ``phase2:`` block.  Each entry must be an
+    integer indexing a *physical sensory* column ``[0, sensory_dim)``.  The
+    MCMC prior columns (``sensory_dim`` onward) are refused: they are
+    validated to form a probability simplex and are never part of the history
+    ablation.  ``None`` (nothing declared) yields ``()``.
+    """
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        raw: List[Any] = [tok.strip() for tok in value.split(",")]
+        raw = [tok for tok in raw if tok]
+    elif isinstance(value, Sequence):
+        raw = list(value)
+    else:
+        raise ValueError(
+            "zero_input_channels must be a comma string or a list of ints, "
+            f"got {type(value).__name__}"
+        )
+    channels: List[int] = []
+    for tok in raw:
+        if isinstance(value, str):
+            # CLI comma string: coerce each token to an int (rejecting bools
+            # and floats via the int() contract).
+            if isinstance(tok, bool):
+                raise ValueError(
+                    f"zero_input_channels entry {tok!r} must be an integer"
+                )
+            try:
+                ch = int(tok)
+            except ValueError as exc:
+                raise ValueError(
+                    f"zero_input_channels token {tok!r} is not an integer"
+                ) from exc
+        else:
+            if isinstance(tok, bool) or not isinstance(tok, int):
+                raise ValueError(
+                    f"zero_input_channels entry {tok!r} must be an integer"
+                )
+            ch = int(tok)
+        if not 0 <= ch < config.model.sensory_dim:
+            raise ValueError(
+                f"zero_input_channels column {ch} must index a physical "
+                f"sensory column in [0, {config.model.sensory_dim})"
+            )
+        if ch in channels:
+            raise ValueError(
+                f"zero_input_channels contains a duplicate column {ch}"
+            )
+        channels.append(ch)
+    return tuple(channels)
+
+
 # Default split for the loader and public standalone target-stat helper.
 # train() fits eager statistics directly from its selected loader dataset.
 _VAL_SPLIT = 0.2
@@ -1756,6 +1897,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Fixed causal persistence skip scalar k in [0, 1]. 0 disables (default). "
              "Restricted to normalize_targets=False and target_clip_cm_s=0.0.",
     )
+    parser.add_argument(
+        "--zero_input_channels",
+        type=str,
+        default=None,
+        help="Comma-separated per-frame sensory feature columns to force to 0.0 "
+             "(history ablation), e.g. '2,3'. Default: none (no column zeroed). "
+             "Only physical sensory columns [0, sensory_dim) are addressable.",
+    )
+    parser.add_argument(
+        "--selection_metric",
+        type=str,
+        default=None,
+        choices=["total", "mse"],
+        help="Metric that selects best_model.pth and drives early stopping: "
+             "'total' (default, full validation objective) or 'mse' (masked "
+             "MSE term alone over the ALIGNED eligible frames, t>=1).",
+    )
 
     # ── Adaptive latent refinement (architecture v1) ──────────
     parser.add_argument(
@@ -1870,6 +2028,25 @@ def build_config(argv: Optional[Sequence[str]] = None) -> Tuple[ExperimentConfig
         config.training.target_clip_cm_s = args.target_clip_cm_s
     if getattr(args, "persistence_skip", None) is not None:
         config.model.persistence_skip = args.persistence_skip
+    # ── Phase-2 controls (kept OUT of the protected config schema) ──
+    # ``data.zero_input_channels`` (history ablation) and
+    # ``checkpoint.selection_metric`` (MSE-based checkpoint selection) are
+    # resolved here into script-owned module state rather than added to the
+    # protected ``nsmor/config_parser.py`` dataclasses.  Both default to the
+    # current behaviour, so ``ExperimentConfig.to_dict()`` — and hence every
+    # existing config and checkpoint — is byte-unchanged.  They are consumed
+    # by ``build_dataloaders`` (ablation), ``train`` (selection) and recorded
+    # as additive checkpoint provenance keys.
+    global _ZERO_INPUT_CHANNELS, _SELECTION_METRIC
+    phase2 = _read_phase2_block(args.config)
+    _zero_decl = getattr(args, "zero_input_channels", None)
+    if _zero_decl is None:
+        _zero_decl = phase2.get("zero_input_channels")
+    _ZERO_INPUT_CHANNELS = _parse_zero_input_channels(_zero_decl, config)
+    _sel_decl = getattr(args, "selection_metric", None)
+    if _sel_decl is None:
+        _sel_decl = phase2.get("selection_metric")
+    _SELECTION_METRIC = _parse_selection_metric(_sel_decl)
     if getattr(args, "refinement_mode", None) is not None:
         config.model.refinement_mode = args.refinement_mode
     if getattr(args, "refinement_max_steps", None) is not None:
@@ -2128,6 +2305,62 @@ def check_routing_aux_active(
     return False
 
 
+def zero_input_channels_inplace(
+    dataset: Any, channels: Sequence[int],
+    sensory_dim: Optional[int] = None,
+) -> None:
+    """History-ablation control: zero declared feature columns in a dataset.
+
+    Writes ``0.0`` into ``dataset.sequences[i][0][:, ch]`` for every declared
+    physical sensory column ``ch``.  ``NSMoRDataset`` deep-copies each
+    sequence at construction (``nsmor_dataloader.NSMoRDataset.__init__``), so
+    this mutates only the loader's private copies — the stored dataset bytes
+    and the caller's arrays are untouched.  No-op for an empty *channels*
+    (the historical behaviour).  Only the physical sensory columns are
+    addressable; the MCMC prior columns are validated upstream by the
+    ``--zero_input_channels`` parser against ``model.sensory_dim``.
+
+    *sensory_dim* is the SINGLE authoritative bound (the same
+    ``config.model.sensory_dim`` the CLI parser validates against); when
+    omitted it falls back to the dataset's ``per_frame_physical_dim``.  Both
+    are 4 for the frozen corpus, but only ``sensory_dim`` is the quantity the
+    parse path bounds, so callers that hold the config must pass it.
+    """
+    chans = tuple(int(c) for c in channels)
+    if not chans:
+        return
+    sequences = getattr(dataset, "sequences", None)
+    if sequences is None:
+        raise ValueError(
+            "zero_input_channels requires a dataset exposing .sequences"
+        )
+    if sensory_dim is None:
+        feature_config = getattr(dataset, "feature_config", None)
+        sensory_dim = getattr(feature_config, "per_frame_physical_dim", None)
+    if sensory_dim is not None:
+        for ch in chans:
+            if not 0 <= ch < sensory_dim:
+                raise ValueError(
+                    f"zero_input_channels column {ch} must index a physical "
+                    f"sensory column in [0, {sensory_dim})"
+                )
+    for i, (x_seq, y_seq, _label) in enumerate(sequences):
+        assert x_seq.ndim == 2, (
+            f"sequence {i} X must be (T, F); got shape {x_seq.shape}"
+        )
+        assert x_seq.shape[0] == y_seq.shape[0], (
+            f"sequence {i} X/Y length mismatch: {x_seq.shape[0]} vs "
+            f"{y_seq.shape[0]}"
+        )
+        for ch in chans:
+            assert ch < x_seq.shape[1], (
+                f"sequence {i} channel {ch} out of range for {x_seq.shape[1]} "
+                f"feature columns"
+            )
+            x_seq[:, ch] = 0.0
+    logger.info("History ablation applied: zeroed channels %s", list(chans))
+
+
 def assert_finite_targets(Y_seqs: Sequence[Any]) -> None:
     """Fail closed on any non-finite target value.
 
@@ -2163,6 +2396,7 @@ def build_dataloaders(
     use_lazy_loading: bool = False,
     nested_prior_artifact: Optional[str] = None,
     trusted_historical_artifact_sha256: Optional[str] = None,
+    zero_input_channels: Optional[Sequence[int]] = None,
 ) -> Tuple[Optional[torch.utils.data.DataLoader], Optional[torch.utils.data.DataLoader]]:
     """
     Build train and validation dataloaders from the prepared dataset.
@@ -2208,6 +2442,21 @@ def build_dataloaders(
             "--nested_prior_artifact requires ETL mode: lazy loading rebuilds "
             "rows on demand and cannot guarantee the persisted outer split "
             "aligns with the artifact. Refusing to run (fail closed)."
+        )
+
+    # The history-ablation control zeroes columns on the eager NSMoRDataset.
+    # Lazy rows are rebuilt on demand through a different path that does not
+    # apply the ablation, so a lazy run with the option set would silently be
+    # the UNABLATED control.  Refuse rather than mislabel the arm (fail closed).
+    _zero_requested = (
+        zero_input_channels if zero_input_channels is not None
+        else _ZERO_INPUT_CHANNELS
+    )
+    if use_lazy_loading and _zero_requested:
+        raise ValueError(
+            "data.zero_input_channels (history ablation) is unsupported in "
+            "lazy loading mode; use ETL mode or clear the option. Refusing to "
+            "run a silently-unablated history control (fail closed)."
         )
 
     from nsmor.model_utils import validate_dataset_provenance
@@ -2532,6 +2781,21 @@ def build_dataloaders(
 
     max_seq_len = getattr(config.training, "max_seq_len", None)
 
+    # History-ablation control: resolve the declared zeroed feature columns
+    # once.  ``zero_input_channels`` (the explicit parameter) takes precedence
+    # over the module-level ``_ZERO_INPUT_CHANNELS`` (set by build_config from
+    # the CLI); both default to empty, so a caller that passes neither gets the
+    # historical datasets bitwise unchanged.
+    if zero_input_channels is None:
+        zero_input_channels = tuple(_ZERO_INPUT_CHANNELS)
+    else:
+        zero_input_channels = tuple(zero_input_channels)
+    if zero_input_channels:
+        logger.info(
+            "History ablation active: zeroing input channels %s",
+            list(zero_input_channels),
+        )
+
     train_dataset = NSMoRDataset(
         sequences=train_sequences,
         mcmc_priors=train_priors,
@@ -2560,6 +2824,19 @@ def build_dataloaders(
     val_dataset.mcmc_prior_train_serve_consistency = prior_consistency
     if nested_prior_artifact is not None:
         val_dataset.nested_prior_info = nested_info
+
+    # ── History-ablation control (no-op by default) ──────────
+    # Zero the declared sensory columns in the datasets' deep-copied
+    # sequences.  Applied AFTER construction and BEFORE the loaders, so both
+    # splits see the identical ablation and the stored dataset bytes are never
+    # modified.  ``zero_input_channels`` is empty unless explicitly set.
+    _sensory_dim = getattr(getattr(config, "model", None), "sensory_dim", None)
+    zero_input_channels_inplace(
+        train_dataset, zero_input_channels, sensory_dim=_sensory_dim,
+    )
+    zero_input_channels_inplace(
+        val_dataset, zero_input_channels, sensory_dim=_sensory_dim,
+    )
 
     # ── Create dataloaders (via factory) ──────────────────────
     # Delegates to dataloader_factory for unified worker auto-scaling,
@@ -3179,6 +3456,7 @@ def validate(
     wind_only_mask_full: Optional[np.ndarray] = None,
     routing_aux_margin: float = 0.024,
     lambda_compute: float = 0.0,
+    selection_metric: str = "total",
 ) -> float:
     """
     Run validation (no gradient computation).
@@ -3205,12 +3483,38 @@ def validate(
         lambda_routing_aux: Auxiliary routing loss weight for modality differentiation.
         wind_only_mask_full: Optional full-split boolean array for pure-wind trials.
         routing_aux_margin: Hinge margin for routing auxiliary loss.
+        selection_metric: ``"total"`` (default) selects on the full validation
+            objective; ``"mse"`` selects on the **frame-weighted pooled** masked
+            MSE over the aligned eligible frames (t >= 1) alone (sum of aligned
+            squared errors / total aligned frames, not a per-batch
+            macro-average), so the selected checkpoint minimises the pooled
+            quantity the scored primary metric divides by.  The returned float
+            is the selected metric, so a caller's checkpoint-selection /
+            patience comparison is unchanged in shape.
 
     Returns:
-        Average validation loss.
+        Average validation loss under ``selection_metric`` (``"mse"`` returns
+        the pooled masked MSE, or ``inf`` if no aligned frame was seen).  The
+        pooled masked-MSE diagnostic (t >= 1) is additionally exposed as
+        :attr:`validate.last_val_mse` (``None`` when no batch ran), mirroring
+        :attr:`train_one_epoch.last_skip_counts`.
     """
+    if selection_metric not in ("total", "mse"):
+        raise ValueError(
+            f"selection_metric must be 'total' or 'mse', got {selection_metric!r}"
+        )
+    validate.last_val_mse = None
     model.eval()
     total_loss = 0.0
+    # Frame-weighted pooled masked MSE (sum of aligned squared errors / total
+    # aligned frames).  Accumulate the raw sums here and divide once at the end
+    # so the selected metric is the POOLED quantity the scored primary
+    # (``1 - MSE_model/MSE_persist``) divides by, not a per-batch macro-average
+    # (which would over-weight the small last batch).  Only the
+    # ``selection_metric="mse"`` path consumes this; the ``"total"`` default
+    # return is unchanged.
+    total_se_sum = 0.0
+    total_se_frames = 0
     n_batches = 0
 
     pbar = tqdm(loader, desc="Validation", leave=False, dynamic_ncols=True)
@@ -3276,10 +3580,48 @@ def validate(
             )
 
         total_loss += loss.item()
+        # Masked-MSE-only selection diagnostic on the ALIGNED eligible frames
+        # (t >= 1, padding excluded) — the phase-2 protocol's checkpoint-
+        # selection metric.  The loss' own MSE term is over t >= 0; the
+        # single t=0 frame per trial has no persistence predecessor, so the
+        # aligned partition is the honest one for selecting weights against the
+        # skill-vs-persistence primary metric.  The t=0 exclusion is exact
+        # (one frame per trial, ~0.04% of frames).  Used when
+        # selection_metric == "mse".
+        with torch.no_grad():
+            B_t, T_t = y_pred.shape
+            assert y_pred.shape == y_batch.shape == (B_t, T_t), (
+                f"selection MSE shape mismatch: y_pred {tuple(y_pred.shape)} "
+                f"vs y_true {tuple(y_batch.shape)}"
+            )
+            assert lengths.shape == (B_t,), (
+                f"lengths shape {tuple(lengths.shape)} != ({B_t},)"
+            )
+            arange_t = torch.arange(T_t, device=y_pred.device).unsqueeze(0)
+            _mask = (
+                (arange_t >= 1) & (arange_t < lengths.unsqueeze(1))
+            ).to(y_pred.dtype)
+            assert _mask.shape == (B_t, T_t), (
+                f"selection mask shape {tuple(_mask.shape)} != ({B_t}, {T_t})"
+            )
+            _se = (y_pred - y_batch) ** 2
+            assert _se.shape == (B_t, T_t), (
+                f"selection squared-error shape {tuple(_se.shape)} != "
+                f"({B_t}, {T_t})"
+            )
+            total_se_sum += float((_se * _mask).sum())
+            total_se_frames += int(_mask.sum().item())
         n_batches += 1
         pbar.set_postfix({"val_loss": f"{loss.item():.4f}"})
 
     avg_loss = total_loss / max(n_batches, 1)
+    # Frame-weighted pooled masked MSE over the WHOLE split (one divide).
+    pooled_mse = (
+        total_se_sum / total_se_frames if total_se_frames > 0 else None
+    )
+    validate.last_val_mse = pooled_mse
+    if selection_metric == "mse":
+        return pooled_mse if pooled_mse is not None else float("inf")
     return avg_loss
 
 
@@ -4401,6 +4743,15 @@ def train(
             "include eventual outer-validation labels. Scores are contaminated "
             "diagnostics, ineligible for strict QC/release gates; use a nested artifact."
         )
+    # Phase-2 script-owned controls, stamped additively into every checkpoint
+    # (they are NOT part of ``config.to_dict()``, which stays byte-unchanged).
+    # A resume refuses a switch of ``selection_metric`` (see
+    # ``_require_architecture_config_match``); ``zero_input_channels`` names
+    # the history ablation a checkpoint was trained under.
+    phase2_provenance: Dict[str, Any] = {
+        "selection_metric": _SELECTION_METRIC,
+        "zero_input_channels": list(_ZERO_INPUT_CHANNELS),
+    }
     active_lineage: Dict[str, Any] = dict(nested_provenance)
     active_lineage["dataset_path"] = str(resolved_dataset_path)
     dataset_source_sha256 = getattr(train_loader.dataset, "dataset_source_sha256", None)
@@ -5029,6 +5380,11 @@ def train(
     # ``None`` marks an epoch at which the series recorded nothing (e.g. no
     # validation), so the axis stays intact.
     history: Dict[str, List[Any]] = {"train_loss": [], "val_loss": []}
+    # Masked-MSE-only validation diagnostic on the ALIGNED eligible frames
+    # (t >= 1), recorded alongside the selected ``val_loss`` but NOT persisted
+    # through the recovery payload (whose ``training_history`` schema is frozen
+    # to {train_loss, val_loss}).
+    val_mse_history: List[Optional[float]] = []
     train_loss: float = float("nan")
     val_loss: float = float("nan")
 
@@ -5362,8 +5718,10 @@ def train(
                 wind_only_mask_full=val_is_pure_wind,
                 routing_aux_margin=config.loss.routing_aux_margin,
                 lambda_compute=config.loss.lambda_compute,
+                selection_metric=_SELECTION_METRIC,
             )
             history["val_loss"].append(val_loss)
+            val_mse_history.append(getattr(validate, "last_val_mse", None))
         else:
             # No validation loader: the epoch was still EXECUTED, so its
             # position on the shared epoch axis must exist.  ``None`` records
@@ -5373,6 +5731,7 @@ def train(
             # behind ``math.isfinite(val_loss)`` and val_loss stays ``inf``
             # here, so patience does not advance on an unvalidated epoch.
             history["val_loss"].append(None)
+            val_mse_history.append(None)
 
         elapsed = time.time() - t0
         logger.info(
@@ -5444,6 +5803,7 @@ def train(
                     epochs_without_improvement, history, history_start_epoch,
                 ),
                 **nested_provenance,
+                **phase2_provenance,
             )
             generated_checkpoint_shas[best_path] = hashlib.sha256(
                 best_path.read_bytes(),
@@ -5478,6 +5838,7 @@ def train(
                     epochs_without_improvement, history, history_start_epoch,
                 ),
                 **nested_provenance,
+                **phase2_provenance,
             )
             logger.info("Saved periodic checkpoint: %s", epoch_path)
 
@@ -5527,6 +5888,7 @@ def train(
             epochs_without_improvement, history, history_start_epoch,
         ),
         **nested_provenance,
+        **phase2_provenance,
     )
     generated_checkpoint_shas[final_path] = hashlib.sha256(
         final_path.read_bytes(),
@@ -5535,7 +5897,10 @@ def train(
 
     logger.info("Final LR: %.2e", scheduler.get_last_lr()[0])
     logger.info("=" * 60)
-    logger.info("Training complete.  Best val loss: %.6f", best_val_loss)
+    logger.info(
+        "Training complete.  Best val %s: %.6f",
+        _SELECTION_METRIC, best_val_loss,
+    )
     logger.info("=" * 60)
 
     # ── Plot loss curve ──────────────────────────────────────────
@@ -5655,6 +6020,10 @@ def train(
         "metrics": metrics,
         "eval_provenance": eval_provenance,
         "history": history,
+        # Masked-MSE-only validation diagnostic on the ALIGNED eligible frames
+        # (t >= 1), positionally aligned with ``history["val_loss"]``.  NOT
+        # persisted through resume.
+        "val_mse_history": val_mse_history,
         # True 0-based epoch of history entry 0 (0 for a fresh run; the
         # resume epoch for a legacy resume whose earlier history is unknown).
         "history_start_epoch": history_start_epoch,

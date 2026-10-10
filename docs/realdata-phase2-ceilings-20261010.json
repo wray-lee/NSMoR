@@ -1,0 +1,39 @@
+{
+  "split": "nested_outer_validation",
+  "n_trials": 432,
+  "dt_ms": 4.0,
+  "escape_threshold_cm_s": 10.0,
+  "multistep_starts": 8,
+  "onset_win_ms": 200.0,
+  "dataset_sha256": "b1bd5578025fb5eaa6f4eb3e355c097b6576d44dbedaa001027f1de5447e06b2",
+  "nested_prior_sha256": "f25856304a5857695945bf5083ca54745f47fe5dffe915111f6ba28d524ddf94",
+  "provenance": "measured on the canonical nested validation split with the exact per-scope persistence arithmetic of scripts/evaluate_realdata_phase2.py; horizon scopes hold persistence at y_true[start-1] over the whole rollout",
+  "frame_partition": "every ceiling uses the SAME per-trial frame partition and frame-weighting the scorer's _pooled_mse skill uses (sum over per-trial eligible frames weighted by their own counts), NOT a single global pool: aligned/onset use t>=1 aligned frames; escape (b) uses the t>=1 frames with |y_true[t]|>=10 cm/s per trial; h5/h25/h125 use the (start,k) rollout frames over 8 evenly-spaced starts, and their *_escape variants restrict the SAME (start,k) pairs to |y_true|>=10 cm/s",
+  "reconciliation": "scripts/evaluate_realdata_phase2.py recomputes each scope's persistence MSE on the scored data and asserts it matches these frozen values at rel 1e-3, emitting ceiling_vs_measured_delta and failing closed on a mismatch (M3)",
+  "held_at_start": {
+    "aligned_pooled": {"r2": 0.927, "mse": 1.9095814255513812, "n_frames": 1036316, "n_trials": 432},
+    "escape": {"r2": 0.857, "mse": 53.04822217670105, "n_frames": 26210, "n_trials": 346},
+    "h5": {"r2": 0.7406166082193277, "mse": 0.9249395686632145, "n_frames": 17280, "n_trials": 432},
+    "h5_escape": {"r2": -0.20504783845306696, "mse": 41.444310774530564, "n_frames": 169, "n_trials": 43},
+    "h25": {"r2": 0.42401024647635777, "mse": 2.2886781808458836, "n_frames": 86400, "n_trials": 432},
+    "h25_escape": {"r2": -1.2772096900628074, "mse": 132.13232850370457, "n_frames": 827, "n_trials": 75},
+    "h125": {"r2": -0.3048889777586674, "mse": 8.125121881466008, "n_frames": 432000, "n_trials": 432},
+    "h125_escape": {"r2": -2.000674587969781, "mse": 366.9529745849529, "n_frames": 5233, "n_trials": 158},
+    "onset": {"r2": 0.8798307504920184, "mse": 26.65081656805779, "n_frames": 31845, "n_trials": 317}
+  },
+  "pure_lag_reference_only": {
+    "h5": {"r2": 0.615, "mse": 10.06831100045261},
+    "h5_escape": {"r2": 0.179, "mse": 303.6503345068095},
+    "h25": {"r2": -0.246, "mse": 32.853081303130544},
+    "h25_escape": {"r2": -1.157, "mse": 798.3361539536575},
+    "h125": {"r2": -0.770, "mse": 48.49818873234514},
+    "h125_escape": {"r2": -1.401, "mse": 890.2560261536161}
+  },
+  "observed_peak_cm_s": {
+    "scored_split_mean_over_trials": 55.60123671687864,
+    "scored_split_max_over_trials": 139.7801055908203,
+    "n_trials": 432,
+    "step1_event_level_362_paired_trials": 65.8
+  },
+  "note": "The h=5 held-at-start ceiling (0.925) is the comparator the scorer divides by; the step-1 audit's pure lag-5 value (10.07) is a different comparator and scores no phase-2 slot. The setup audit (docs/realdata-exploratory-step1-20261010.md) reports the pure lag-N values only; this artifact adds the held-at-start values and the onset ceiling the phase-2 scorer uses."
+}

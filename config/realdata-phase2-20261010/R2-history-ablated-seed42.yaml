@@ -1,0 +1,98 @@
+model:
+  sensory_dim: 4
+  mcmc_dim: 4
+  hidden_dim: 64
+  num_gru_layers: 1
+  dropout: 0.1
+  dt_ms: 4.0
+  lif_alpha: 0.9587
+  lif_threshold: 0.5
+  lif_beta: 2.0
+  lif_abs_refract_ms: 0.0
+  lif_rel_refract_ms: 20.0
+  lif_tau_syn: 5.0
+  lif_v_rest: 0.0
+  lif_v_reset: null
+  lif_tau_w: 100.0
+  lif_b_adapt: 0.5
+  lif_tau_fac: 0.0
+  lif_tau_rec: 0.0
+  lif_U_stp_init: 0.5
+  lif_lateral_inhibition: 0.1
+  lif_inhib_tau_ms: 50.0
+  lif_dendritic_tau: 0.0
+  gru_neuromod_gain: 0.0
+  sensory_noise_std: 0.01
+  lif_tbptt_steps: 32
+  activation: swiglu
+  refinement_mode: 'off'
+  refinement_max_steps: 4
+  refinement_eps: 0.01
+  refinement_update_scale: 1.0
+training:
+  learning_rate: 0.0005
+  weight_decay: 0.0001
+  num_epochs: 300
+  batch_size: 128
+  grad_clip_norm: 1.0
+  log_interval: 10
+  checkpoint_interval: 10
+  early_stopping_patience: 20
+  random_seed: 42
+  max_seq_len: 2400
+  lr_warmup_epochs: 0
+  normalize_targets: false
+  target_clip_cm_s: 0
+  num_workers: -1
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2
+  escape_band_cm_s: 10.0
+loss:
+  reduction: mean
+  target_rate: 0.05
+  lambda_reg: 0.2
+  lambda_energy: 0.001
+  lambda_sparse: 0.005
+  lambda_jerk: 0.005
+  lambda_routing_aux: 0.0
+  routing_aux_margin: 0.024
+  jerk_threshold: 0.1
+  warmup_epochs: 20
+  lambda_compute: 0.0
+data:
+  train_kinematics:
+  - data/session_0/kinematics.csv
+  - data/session_1/kinematics.csv
+  train_events:
+  - data/session_0/events.csv
+  - data/session_1/events.csv
+  val_kinematics:
+  - data/val/kinematics.csv
+  val_events:
+  - data/val/events.csv
+  test_kinematics: []
+  test_events: []
+finetune:
+  freeze_modules: []
+  unfreeze_after_epoch: 10
+checkpoint:
+  output_dir: .scratch/realdata-phase2-20261010/R2-history-ablated-seed42
+  resume_from: null
+cluster_gating:
+  n_clusters: 4
+  n_clusters_range:
+  - 2
+  - 3
+  - 4
+  - 5
+  random_state: 42
+  use_umap: true
+  fingerprint_dim: 16
+  entropy_bins: 20
+  interp_length: 200
+phase2:
+  selection_metric: mse
+  zero_input_channels:
+  - 2
+  - 3

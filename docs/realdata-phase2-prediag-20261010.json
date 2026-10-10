@@ -1,0 +1,29 @@
+{
+  "EXPLORATORY": true,
+  "not_preregistered": true,
+  "arm": "A1-swiglu-off",
+  "checkpoint_sha256": "4a43fb0afb3f67e0a86ab3565d0d6fcf7f0f3c7aa55d8e5745e125922c3ed579",
+  "n_trials": 432,
+  "config": {
+    "sensory_noise_std": 0.01,
+    "dropout": 0.1,
+    "persistence_skip": 0.0,
+    "activation": "swiglu",
+    "eval_mode": true
+  },
+  "aligned_t_ge_1": {
+    "mse_model": 2.3662142574944918,
+    "mse_persistence": 1.9095002961806744,
+    "mse_zero": 27.350063753429875,
+    "skill_vs_persistence": -0.2391798326647674
+  },
+  "lagged_input_gain_ch2": {
+    "mean": 0.07369739913249662,
+    "median": 0.23539055611669596,
+    "interpretation": "gain ~ 1 => output copies the lagged-speed input; gain ~ 0 => output ignores its own observed history"
+  },
+  "cause_checks": {
+    "sensory_noise_off_in_eval": true,
+    "dropout_off_in_eval": true
+  }
+}

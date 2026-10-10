@@ -1,0 +1,387 @@
+{
+  "reference": "config/realdata-preliminary-20261009/A1-swiglu-off.yaml",
+  "reference_sha256": "ab3b57ad033a86fca186afd85d523ff015da63385f7b5df55d6220499c1403f9",
+  "seeds": [
+    42,
+    43,
+    44
+  ],
+  "arms": {
+    "R0-control-seed42": {
+      "arm": "R0-control",
+      "seed": 42,
+      "arm_keys": {
+        "persistence_skip": 0.0,
+        "zero_input_channels": [],
+        "lambda_jerk": 0.005
+      },
+      "phase2_resolved": {
+        "selection_metric": "mse",
+        "zero_input_channels": []
+      },
+      "changed_leaves": [
+        [
+          "checkpoint.output_dir",
+          ".scratch/realdata-preliminary-20261009/A1-swiglu-off",
+          ".scratch/realdata-phase2-20261010/R0-control-seed42"
+        ]
+      ],
+      "added_leaves": [],
+      "missing_leaves": [],
+      "yaml_sha256": "f46b74fecfa9d763145d6f565d5842edaffd028c16c47af91b694238b1b16634",
+      "yaml_path": "config/realdata-phase2-20261010/R0-control-seed42.yaml"
+    },
+    "R0-control-seed43": {
+      "arm": "R0-control",
+      "seed": 43,
+      "arm_keys": {
+        "persistence_skip": 0.0,
+        "zero_input_channels": [],
+        "lambda_jerk": 0.005
+      },
+      "phase2_resolved": {
+        "selection_metric": "mse",
+        "zero_input_channels": []
+      },
+      "changed_leaves": [
+        [
+          "checkpoint.output_dir",
+          ".scratch/realdata-preliminary-20261009/A1-swiglu-off",
+          ".scratch/realdata-phase2-20261010/R0-control-seed43"
+        ],
+        [
+          "training.random_seed",
+          42,
+          43
+        ]
+      ],
+      "added_leaves": [],
+      "missing_leaves": [],
+      "yaml_sha256": "8420e1ef011703aaddeabb833279d8ccfd51de5604b3edbb8da637a22685ee4b",
+      "yaml_path": "config/realdata-phase2-20261010/R0-control-seed43.yaml"
+    },
+    "R0-control-seed44": {
+      "arm": "R0-control",
+      "seed": 44,
+      "arm_keys": {
+        "persistence_skip": 0.0,
+        "zero_input_channels": [],
+        "lambda_jerk": 0.005
+      },
+      "phase2_resolved": {
+        "selection_metric": "mse",
+        "zero_input_channels": []
+      },
+      "changed_leaves": [
+        [
+          "checkpoint.output_dir",
+          ".scratch/realdata-preliminary-20261009/A1-swiglu-off",
+          ".scratch/realdata-phase2-20261010/R0-control-seed44"
+        ],
+        [
+          "training.random_seed",
+          42,
+          44
+        ]
+      ],
+      "added_leaves": [],
+      "missing_leaves": [],
+      "yaml_sha256": "a1ce52249210363a792e46c89f8de9e27e2440db2eeab8ca12b654f52ae0754e",
+      "yaml_path": "config/realdata-phase2-20261010/R0-control-seed44.yaml"
+    },
+    "R1-residual-persistence-seed42": {
+      "arm": "R1-residual-persistence",
+      "seed": 42,
+      "arm_keys": {
+        "persistence_skip": 1.0,
+        "zero_input_channels": [],
+        "lambda_jerk": 0.005
+      },
+      "phase2_resolved": {
+        "selection_metric": "mse",
+        "zero_input_channels": []
+      },
+      "changed_leaves": [
+        [
+          "checkpoint.output_dir",
+          ".scratch/realdata-preliminary-20261009/A1-swiglu-off",
+          ".scratch/realdata-phase2-20261010/R1-residual-persistence-seed42"
+        ],
+        [
+          "model.persistence_skip",
+          0.0,
+          1.0
+        ]
+      ],
+      "added_leaves": [],
+      "missing_leaves": [],
+      "yaml_sha256": "0c50febb25ad31d5f1a1247f2a61ddfee3f58564903b17e020a73b827032908c",
+      "yaml_path": "config/realdata-phase2-20261010/R1-residual-persistence-seed42.yaml"
+    },
+    "R1-residual-persistence-seed43": {
+      "arm": "R1-residual-persistence",
+      "seed": 43,
+      "arm_keys": {
+        "persistence_skip": 1.0,
+        "zero_input_channels": [],
+        "lambda_jerk": 0.005
+      },
+      "phase2_resolved": {
+        "selection_metric": "mse",
+        "zero_input_channels": []
+      },
+      "changed_leaves": [
+        [
+          "checkpoint.output_dir",
+          ".scratch/realdata-preliminary-20261009/A1-swiglu-off",
+          ".scratch/realdata-phase2-20261010/R1-residual-persistence-seed43"
+        ],
+        [
+          "model.persistence_skip",
+          0.0,
+          1.0
+        ],
+        [
+          "training.random_seed",
+          42,
+          43
+        ]
+      ],
+      "added_leaves": [],
+      "missing_leaves": [],
+      "yaml_sha256": "9eeccfa0b8d567579f47fc2de592bc4151bd73ae119bea891c92a8e02b7ffcec",
+      "yaml_path": "config/realdata-phase2-20261010/R1-residual-persistence-seed43.yaml"
+    },
+    "R1-residual-persistence-seed44": {
+      "arm": "R1-residual-persistence",
+      "seed": 44,
+      "arm_keys": {
+        "persistence_skip": 1.0,
+        "zero_input_channels": [],
+        "lambda_jerk": 0.005
+      },
+      "phase2_resolved": {
+        "selection_metric": "mse",
+        "zero_input_channels": []
+      },
+      "changed_leaves": [
+        [
+          "checkpoint.output_dir",
+          ".scratch/realdata-preliminary-20261009/A1-swiglu-off",
+          ".scratch/realdata-phase2-20261010/R1-residual-persistence-seed44"
+        ],
+        [
+          "model.persistence_skip",
+          0.0,
+          1.0
+        ],
+        [
+          "training.random_seed",
+          42,
+          44
+        ]
+      ],
+      "added_leaves": [],
+      "missing_leaves": [],
+      "yaml_sha256": "6ee356e0ae1126ad9d9ec55f26db3eda7a36a4ecb326551ba9f3327fc401b627",
+      "yaml_path": "config/realdata-phase2-20261010/R1-residual-persistence-seed44.yaml"
+    },
+    "R2-history-ablated-seed42": {
+      "arm": "R2-history-ablated",
+      "seed": 42,
+      "arm_keys": {
+        "persistence_skip": 0.0,
+        "zero_input_channels": [
+          2,
+          3
+        ],
+        "lambda_jerk": 0.005
+      },
+      "phase2_resolved": {
+        "selection_metric": "mse",
+        "zero_input_channels": [
+          2,
+          3
+        ]
+      },
+      "changed_leaves": [
+        [
+          "checkpoint.output_dir",
+          ".scratch/realdata-preliminary-20261009/A1-swiglu-off",
+          ".scratch/realdata-phase2-20261010/R2-history-ablated-seed42"
+        ]
+      ],
+      "added_leaves": [],
+      "missing_leaves": [],
+      "yaml_sha256": "ade5d826475fcfea8c97dc2f900f9adcda584f571921edd8bcb66b83a700379e",
+      "yaml_path": "config/realdata-phase2-20261010/R2-history-ablated-seed42.yaml"
+    },
+    "R2-history-ablated-seed43": {
+      "arm": "R2-history-ablated",
+      "seed": 43,
+      "arm_keys": {
+        "persistence_skip": 0.0,
+        "zero_input_channels": [
+          2,
+          3
+        ],
+        "lambda_jerk": 0.005
+      },
+      "phase2_resolved": {
+        "selection_metric": "mse",
+        "zero_input_channels": [
+          2,
+          3
+        ]
+      },
+      "changed_leaves": [
+        [
+          "checkpoint.output_dir",
+          ".scratch/realdata-preliminary-20261009/A1-swiglu-off",
+          ".scratch/realdata-phase2-20261010/R2-history-ablated-seed43"
+        ],
+        [
+          "training.random_seed",
+          42,
+          43
+        ]
+      ],
+      "added_leaves": [],
+      "missing_leaves": [],
+      "yaml_sha256": "d65634b09e5e4d322e61b59e760d4f642d553052b32305ff4cf8451a91267ed9",
+      "yaml_path": "config/realdata-phase2-20261010/R2-history-ablated-seed43.yaml"
+    },
+    "R2-history-ablated-seed44": {
+      "arm": "R2-history-ablated",
+      "seed": 44,
+      "arm_keys": {
+        "persistence_skip": 0.0,
+        "zero_input_channels": [
+          2,
+          3
+        ],
+        "lambda_jerk": 0.005
+      },
+      "phase2_resolved": {
+        "selection_metric": "mse",
+        "zero_input_channels": [
+          2,
+          3
+        ]
+      },
+      "changed_leaves": [
+        [
+          "checkpoint.output_dir",
+          ".scratch/realdata-preliminary-20261009/A1-swiglu-off",
+          ".scratch/realdata-phase2-20261010/R2-history-ablated-seed44"
+        ],
+        [
+          "training.random_seed",
+          42,
+          44
+        ]
+      ],
+      "added_leaves": [],
+      "missing_leaves": [],
+      "yaml_sha256": "87e47cd59b68f3aecd5b3f60c2aa102b1d92ba3d9b200a18e05a22454e8d911c",
+      "yaml_path": "config/realdata-phase2-20261010/R2-history-ablated-seed44.yaml"
+    },
+    "R3-jerk-ablated-seed42": {
+      "arm": "R3-jerk-ablated",
+      "seed": 42,
+      "arm_keys": {
+        "persistence_skip": 0.0,
+        "zero_input_channels": [],
+        "lambda_jerk": 0.0
+      },
+      "phase2_resolved": {
+        "selection_metric": "mse",
+        "zero_input_channels": []
+      },
+      "changed_leaves": [
+        [
+          "checkpoint.output_dir",
+          ".scratch/realdata-preliminary-20261009/A1-swiglu-off",
+          ".scratch/realdata-phase2-20261010/R3-jerk-ablated-seed42"
+        ],
+        [
+          "loss.lambda_jerk",
+          0.005,
+          0.0
+        ]
+      ],
+      "added_leaves": [],
+      "missing_leaves": [],
+      "yaml_sha256": "fcd349773b244ac9187e396f6475b1fe993591149ecdba261dbb30b3e81c0b11",
+      "yaml_path": "config/realdata-phase2-20261010/R3-jerk-ablated-seed42.yaml"
+    },
+    "R3-jerk-ablated-seed43": {
+      "arm": "R3-jerk-ablated",
+      "seed": 43,
+      "arm_keys": {
+        "persistence_skip": 0.0,
+        "zero_input_channels": [],
+        "lambda_jerk": 0.0
+      },
+      "phase2_resolved": {
+        "selection_metric": "mse",
+        "zero_input_channels": []
+      },
+      "changed_leaves": [
+        [
+          "checkpoint.output_dir",
+          ".scratch/realdata-preliminary-20261009/A1-swiglu-off",
+          ".scratch/realdata-phase2-20261010/R3-jerk-ablated-seed43"
+        ],
+        [
+          "loss.lambda_jerk",
+          0.005,
+          0.0
+        ],
+        [
+          "training.random_seed",
+          42,
+          43
+        ]
+      ],
+      "added_leaves": [],
+      "missing_leaves": [],
+      "yaml_sha256": "569680bbcd5b9d2f7d2dc1a51a8d30047d5b165c8172929fd2077403f444269e",
+      "yaml_path": "config/realdata-phase2-20261010/R3-jerk-ablated-seed43.yaml"
+    },
+    "R3-jerk-ablated-seed44": {
+      "arm": "R3-jerk-ablated",
+      "seed": 44,
+      "arm_keys": {
+        "persistence_skip": 0.0,
+        "zero_input_channels": [],
+        "lambda_jerk": 0.0
+      },
+      "phase2_resolved": {
+        "selection_metric": "mse",
+        "zero_input_channels": []
+      },
+      "changed_leaves": [
+        [
+          "checkpoint.output_dir",
+          ".scratch/realdata-preliminary-20261009/A1-swiglu-off",
+          ".scratch/realdata-phase2-20261010/R3-jerk-ablated-seed44"
+        ],
+        [
+          "loss.lambda_jerk",
+          0.005,
+          0.0
+        ],
+        [
+          "training.random_seed",
+          42,
+          44
+        ]
+      ],
+      "added_leaves": [],
+      "missing_leaves": [],
+      "yaml_sha256": "b6704a8db7c9eb2777ce92a2aa272269544019165f05696d2d989c1c46ae9f95",
+      "yaml_path": "config/realdata-phase2-20261010/R3-jerk-ablated-seed44.yaml"
+    }
+  }
+}
