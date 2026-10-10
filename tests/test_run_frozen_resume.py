@@ -521,3 +521,30 @@ def test_dry_run_returns_decision_without_writing(tmp_path: Path) -> None:
     assert "next epoch 50" in err.getvalue(), err.getvalue()
     after = {p.name: p.read_bytes() for p in out.iterdir()}
     assert after == before, "dry run must not write to the run dir"
+
+
+def test_dry_run_marks_same_commit_path_too(tmp_path: Path) -> None:
+    """m2: --dry-run must emit the [dry-run] chosen-source marker on the
+    SAME-commit path (recorded_head == frozen), not only the successor path.
+
+    On the same-commit path the recorded module/config roots are the worktree
+    itself, so the decider never enters the successor branch; the chosen-source
+    ``_report`` still runs and must carry the ``[dry-run]`` marker, so a
+    ``--dry-run`` never prints a bare path with no dry-run indication.
+    """
+    cfg = tmp_path / "arm.yaml"
+    cfg.write_text("training:\n  num_epochs: 10\n")
+    out = tmp_path / "arm"
+    _write_prov(out, cfg, _FROZEN, f"{_WT}/nsmor/__init__.py")
+    _write_ckpt(out / "epoch_4.pth", 4)
+    mod = _helper()
+    err = StringIO()
+    buf = StringIO()
+    with redirect_stdout(buf), redirect_stderr(err):
+        rc = mod.decide(
+            str(out), _WT, _FROZEN, str(cfg), "10", None, dry_run=True,
+        )
+    assert rc == 0, buf.getvalue()
+    assert buf.getvalue().strip().endswith("epoch_4.pth")
+    assert "[dry-run]" in err.getvalue(), err.getvalue()
+    assert "chosen source" in err.getvalue(), err.getvalue()

@@ -39,6 +39,13 @@
 #                      the new segment to the run started under C.
 #   DRY_RUN=1          run the decider with --dry-run and report the decision;
 #                      writes NOTHING to the run dir and launches no training.
+#                      The guarantee is precisely "the DECIDER writes nothing"
+#                      (proven by the same-commit and successor dry-run tests);
+#                      the launcher's OUT_ROOT/--output_dir and sentinel-consume
+#                      logic are not exercised end-to-end under DRY_RUN=1, so it
+#                      is NOT claimed that the whole launcher path writes
+#                      nothing.  For the successor case OUT_ROOT points at the
+#                      origin worktree's existing run dir, so this is limited.
 #
 # `pause` drops an empty STOP sentinel in each arm's output dir.  The training
 # loop checks for it ONLY after that epoch's best/periodic checkpoint is fully
@@ -140,6 +147,9 @@ for ARM in "$@"; do
     DECIDE_ARGS=("$OUT" "$WT" "$FROZEN" "$CFG" "$NUM_EPOCHS")
     if [ -n "$ORIGIN_COMMIT" ]; then DECIDE_ARGS+=("$ORIGIN_COMMIT"); fi
     if [ "$DRY_RUN" = "1" ]; then DECIDE_ARGS+=(--dry-run); fi
+    # A plain assignment from a command substitution takes the SUBSTITUTION's
+    # exit status (POSIX; verified on bash — a decider crash yields rc != 0 and
+    # is refused below), so a decider crash is fail-closed, not read as rc=0.
     DECISION=$(python "$HELPER" decide "${DECIDE_ARGS[@]}")
     rc=$?
     if [ $rc -ne 0 ]; then
