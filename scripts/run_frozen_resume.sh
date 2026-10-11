@@ -9,7 +9,12 @@
 # list entirely inside the worktree); otherwise it still REFUSES.  The resume
 # source is the newest LAST-epoch checkpoint (final_model.pth / epoch_*.pth);
 # best_model.pth is NEVER used (the best epoch can be far older than the last
-# executed epoch) and a dir holding only best_model.pth is refused.
+# executed epoch) and a dir holding only best_model.pth is refused.  F1
+# no-silent-rollback (§11.1, 2026-10-11): the decider ALSO refuses a source
+# whose stored epoch is OLDER than the last epoch the run actually executed
+# (read from the run's own progress logs / segment records / last-epoch
+# checkpoints), so a run killed before writing a newer last-epoch file is never
+# silently re-trained.  No override flag.
 #
 # On CPU with a fixed seed the resumed arm is BITWISE-equivalent to the
 # uninterrupted run: train.py re-establishes the persistent loader iterator

@@ -550,6 +550,95 @@ def test_dry_run_marks_same_commit_path_too(tmp_path: Path) -> None:
     assert "chosen source" in err.getvalue(), err.getvalue()
 
 
+def _write_log(out: Path, last_epoch_1based: int, budget: int = 300) -> None:
+    """A minimal progress log whose last line is ``Epoch N/<budget>``."""
+    (out / "train.stdout.log").write_text(
+        f"[t] INFO - Epoch {last_epoch_1based}/{budget}  train_loss=1.0\n"
+    )
+
+
+def test_refuses_silent_rollback_when_log_reached_newer_epoch(
+    tmp_path: Path,
+) -> None:
+    """F1: a source older than the run's LAST EXECUTED epoch is refused.
+
+    Synthetic seed-43 shape: periodics only through ``epoch_50.pth`` (stored 49)
+    but the log's last line is ``Epoch 58/300`` (0-based epoch 57 executed).  The
+    newest-complete-epoch rule would pick ``epoch_50.pth``; F1 must refuse it and
+    NAME both epochs, so the completed epochs 50..57 are never silently
+    re-trained.
+    """
+    cfg = tmp_path / "arm.yaml"
+    cfg.write_text("training:\n  num_epochs: 300\n")
+    out = tmp_path / "arm"
+    _write_prov(out, cfg, _FROZEN, f"{_WT}/nsmor/__init__.py")
+    _write_ckpt(out / "epoch_50.pth", 49)      # newest EXISTING checkpoint
+    _write_ckpt(out / "best_model.pth", 57)    # best epoch, not a source
+    _write_log(out, last_epoch_1based=58)      # 0-based epoch 57 was executed
+    rc, msg = _decide(out, cfg, n=300)
+    assert rc == 1, msg
+    assert "no-silent-rollback" in msg, msg
+    assert "49" in msg and "57" in msg, msg
+
+
+def test_accepts_clean_boundary_when_log_matches_newest(
+    tmp_path: Path,
+) -> None:
+    """F1: a source whose stored epoch equals the last executed epoch is OK.
+
+    Synthetic seed-44 shape: the newest checkpoint is ``epoch_150.pth`` (stored
+    149) and the log's last line is ``Epoch 150/300`` — a clean boundary with no
+    rollback, so the resume is ACCEPTED and selects ``epoch_150.pth``.
+    """
+    cfg = tmp_path / "arm.yaml"
+    cfg.write_text("training:\n  num_epochs: 300\n")
+    out = tmp_path / "arm"
+    _write_prov(out, cfg, _FROZEN, f"{_WT}/nsmor/__init__.py")
+    _write_ckpt(out / "epoch_150.pth", 149)
+    _write_ckpt(out / "best_model.pth", 142)
+    _write_log(out, last_epoch_1based=150)
+    rc, msg = _decide(out, cfg, n=300)
+    assert rc == 0, msg
+    assert msg.endswith("epoch_150.pth"), msg
+
+
+def test_dry_run_refusal_writes_nothing(tmp_path: Path) -> None:
+    """F1: a dry-run refusal names both epochs and writes NOTHING to the dir."""
+    cfg = tmp_path / "arm.yaml"
+    cfg.write_text("training:\n  num_epochs: 300\n")
+    out = tmp_path / "arm"
+    _write_prov(out, cfg, _FROZEN, f"{_WT}/nsmor/__init__.py")
+    _write_ckpt(out / "epoch_50.pth", 49)
+    _write_log(out, last_epoch_1based=57)
+    before = {p.name: p.read_bytes() for p in out.iterdir()}
+    mod = _helper()
+    err = StringIO()
+    buf = StringIO()
+    with redirect_stdout(buf), redirect_stderr(err):
+        rc = mod.decide(str(out), _WT, _FROZEN, str(cfg), "300", None, dry_run=True)
+    assert rc == 1, buf.getvalue()
+    assert "no-silent-rollback" in buf.getvalue(), buf.getvalue()
+    after = {p.name: p.read_bytes() for p in out.iterdir()}
+    assert after == before, "dry run must not write to the run dir"
+
+
+def test_segment_starting_epoch_is_a_witness(tmp_path: Path) -> None:
+    """F1: a segment record's ``starting_epoch`` also witnesses execution.
+
+    Even with NO progress log, a resumed segment whose ``starting_epoch`` is
+    newer than the selected source is a rollback and is refused.
+    """
+    cfg = tmp_path / "arm.yaml"
+    cfg.write_text("training:\n  num_epochs: 300\n")
+    out = tmp_path / "arm"
+    _write_prov(out, cfg, _FROZEN, f"{_WT}/nsmor/__init__.py")
+    _write_ckpt(out / "epoch_50.pth", 49)
+    (out / "segment_0001.json").write_text(json.dumps({"starting_epoch": 57}))
+    rc, msg = _decide(out, cfg, n=300)
+    assert rc == 1, msg
+    assert "no-silent-rollback" in msg and "57" in msg, msg
+
+
 def test_git_ancestor_real_repository() -> None:
     """R1-minor: the ancestry gate is exercised against a REAL repository.
 

@@ -1047,6 +1047,76 @@ def _checkpoint_lineage_identity(payload: bytes, path: Path) -> Dict[str, Any]:
 # completed epochs.
 _LAST_EPOCH_FAMILIES = ("final_model.pth",)
 _EPOCH_PERIODIC_RE = re.compile(r"epoch_(\d+)\.pth$")
+# The last "Epoch N/<budget>" progress line train.py's logger emits, once per
+# executed epoch.  Read only as a SECOND witness to how far a run actually got
+# (the newest complete-epoch checkpoint is the primary record); a fresh run's
+# log and a resume's segment log both carry these lines.
+_EPOCH_PROGRESS_RE = re.compile(r"\bEpoch\s+(\d+)\s*/")
+# The one-part checkpoints carry no resumable state; they must never be read as
+# evidence of an executed epoch.
+_NON_RESUME_FAMILIES = frozenset({"best_model.pth", "final_model.pth"})
+
+
+def _checkpoint_stored_epoch(path: Path) -> Optional[int]:
+    """The checkpoint's own stored ``epoch`` (0-based), or ``None`` if absent.
+
+    ``None`` covers a truncated / wrong-schema / epoch-less payload: the caller
+    treats an undecodable record as carrying no evidence rather than a guess.
+    """
+    try:
+        state = load_artifact_bytes(path.read_bytes(), map_location="cpu")
+    except Exception:  # noqa: BLE001 - an undecodable record is not evidence
+        return None
+    epoch = state.get("epoch")
+    return epoch if isinstance(epoch, int) and not isinstance(epoch, bool) else None
+
+
+def _last_executed_epoch(output_dir: Path, *, resume_path: Path) -> Optional[int]:
+    """The highest 0-based epoch the run is evidenced to have EXECUTED.
+
+    Three records witness how far a run actually got, and the rule below takes
+    the MAX so it can only make the guard STRICTER, never laxer:
+
+    * the run's progress logs — every ``train.stdout.log`` / ``train.segment*.log``
+      in the output dir, reading the last ``Epoch N/<budget>`` line (N is 1-based);
+    * the 0-based ``starting_epoch`` of every ``segment_XXXX.json`` (a resumed
+      segment's own start is itself an executed epoch);
+    * the last-epoch family checkpoints (``final_model.pth`` / ``epoch_*.pth``).
+
+    ``best_model.pth`` is EXCLUDED here (as everywhere): it stores the best
+    SELECTED epoch, which may be far OLDER than the last executed one, so it is
+    not a witness to how far the run got.  Returns ``None`` when NO record
+    exists (a fresh dir, a test fixture, a renamed artifact) — the caller then
+    leaves the resume untouched, matching the pre-amendment behaviour.
+    """
+    witnesses: list[int] = []
+    for name in sorted(p.name for p in output_dir.glob("train.*.log")):
+        try:
+            text = (output_dir / name).read_text(errors="ignore")
+        except OSError:
+            continue
+        for m in _EPOCH_PROGRESS_RE.finditer(text):
+            witnesses.append(int(m.group(1)) - 1)  # "Epoch N" is 1-based
+    for rec in sorted(output_dir.glob("segment_*.json")):
+        try:
+            data = json.loads(rec.read_text())
+        except (OSError, ValueError):
+            continue
+        start = data.get("starting_epoch")
+        if isinstance(start, int) and not isinstance(start, bool):
+            witnesses.append(start)
+    for cand in sorted(output_dir.glob("*.pth")):
+        if cand.name in _NON_RESUME_FAMILIES:
+            continue
+        if (
+            cand.name not in _LAST_EPOCH_FAMILIES
+            and not _EPOCH_PERIODIC_RE.match(cand.name)
+        ):
+            continue
+        epoch = _checkpoint_stored_epoch(cand)
+        if epoch is not None:
+            witnesses.append(epoch)
+    return max(witnesses) if witnesses else None
 
 
 def _require_resume_source_is_newest_complete_epoch(
@@ -1067,21 +1137,27 @@ def _require_resume_source_is_newest_complete_epoch(
       unconditionally, regardless of what else is in the directory — matching
       the launcher helper (``resume_decision.py``), which excludes it too.
     * IN-PLACE recovery (the source lives in the run's OWN output dir — the
-      launcher's mode and exactly what §11.1 governs): when that dir holds a
-      last-epoch family file (``final_model.pth`` / ``epoch_*.pth``) whose
-      stored epoch is NEWER than the source's, the source is stale.  Refused.
+      launcher's mode and exactly what §11.1 governs): the source is stale —
+      and refused — when EITHER a last-epoch family file (``final_model.pth`` /
+      ``epoch_*.pth``) stores a NEWER epoch, OR the run's own records witness a
+      NEWER executed epoch (its progress logs, its segment ``starting_epoch``
+      entries, its last-epoch checkpoints).  The log/segment witness is the F1
+      no-silent-rollback rule (§11.1, 2026-10-11): a run killed before writing a
+      newer last-epoch file (reached epoch 58 but the newest periodic is
+      ``epoch_50.pth``) previously slipped through and silently re-trained the
+      completed epochs; the records close that hole.  There is NO override flag.
 
-    The newest-epoch rule is scoped to IN-PLACE recovery because §11.1 is a
-    statement about a run resuming from ITS OWN last checkpoint; a resume into
-    a DIFFERENT output dir from an explicitly chosen source is a deliberate
+    Both rules are scoped to IN-PLACE recovery because §11.1 is a statement
+    about a run resuming from ITS OWN last checkpoint; a resume into a DIFFERENT
+    output dir from an explicitly chosen source is a deliberate
     fork/continuation (exercised by the phase-boundary resume tests) and is not
     the silent-re-train risk this rule targets.  That exemption is intentional,
     not a hole: forking an older source into a NEW dir is a deliberate
     continuation the operator names explicitly, whereas the in-place case is a
     run re-entering its own dir where a stale source would silently re-train.
-    A source in a dir with no decodable last-epoch file (a fresh dir, a test
-    fixture, a renamed artifact) is accepted unchanged.  ``peek`` is the
-    already-decoded source (never re-read).
+    A source in a dir with no record at all (a fresh dir, a test fixture, a
+    renamed artifact) is accepted unchanged.  ``peek`` is the already-decoded
+    source (never re-read).
     """
     if resume_path.name == "best_model.pth":
         raise ValueError(
@@ -1128,6 +1204,27 @@ def _require_resume_source_is_newest_complete_epoch(
             "resuming only from the run's LAST complete-epoch checkpoint; "
             "resuming from an older one would silently re-train completed "
             "epochs (fail closed)."
+        )
+
+    # F1 no-silent-rollback (§11.1, 2026-10-11).  The run's own records — its
+    # progress logs, its segment ``starting_epoch`` entries, and its last-epoch
+    # checkpoints — witness how far it actually got.  If the selected source's
+    # stored epoch is OLDER than that last executed epoch, resuming from it
+    # silently re-trains the completed epochs in between: the exact
+    # silent-re-train §11.1 forbids.  The pre-amendment rule caught this only
+    # when a NEWER last-epoch FILE existed; a run killed before writing one
+    # (e.g. reached epoch 58 but the newest periodic is epoch_50.pth) slipped
+    # through.  The log/segment records close that hole.  No override flag.
+    last_executed = _last_executed_epoch(resume_path.parent, resume_path=resume_path)
+    if last_executed is not None and src_epoch < last_executed:
+        raise ValueError(
+            f"Refusing to resume from {resume_path} (stored epoch {src_epoch}): "
+            f"the run actually executed through epoch {last_executed} (its "
+            "progress log / segment records / last-epoch checkpoints), so "
+            "resuming from an older checkpoint would silently re-train the "
+            "already-completed epochs "
+            f"{src_epoch + 1}..{last_executed} (no-silent-rollback, §11.1; no "
+            "override; fail closed)."
         )
 
 

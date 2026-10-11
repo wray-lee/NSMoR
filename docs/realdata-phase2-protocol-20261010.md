@@ -697,11 +697,10 @@ addition to 1–5 above (condition 1's "same frozen commit" is thereby relaxed t
   committed in-tree test"** — it is NOT "C's own in-tree harness produced the
   value", because no such harness exists at C. It is **CPU-only**: the arm
   cadence that is asserted bitwise is the CPU cadence, and no GPU trajectory is
-  asserted bitwise anywhere in this document. For `R0-control-seed43`
-  specifically the arm is a GPU run, so
-  the CPU arm-cadence result is **moot for it**: its continuation is authorized
-  only as state-exact (GPU clause below), and the fresh-identity condition is
-  satisfied on the CPU code path, not on the GPU one. The C<->C' fresh-identity
+  asserted bitwise anywhere in this document. For a GPU arm the CPU
+  arm-cadence result is **moot**: its continuation is authorized only as
+  state-exact (GPU clause below), and the fresh-identity condition is satisfied
+  on the CPU code path, not on the GPU one. The C<->C' fresh-identity
   claim is therefore scoped to CPU at cadence 2 (pinned) and CPU at the arm
   cadence (measured), and must not be presented as a GPU-cadence equality it
   never measured. It is further corroborated by (a) `nsmor/` being byte-identical
@@ -768,18 +767,19 @@ A phase-2 arm that RAN on CUDA (its `train.stdout.log` records `Device: cuda`
 and its checkpoint carries a non-empty `cuda_rng_state`) resumes state-exact
 but trajectory-unverified, exactly as two uninterrupted GPU runs differ — and
 a GPU resume is **explicitly unsupported** for producing a phase-2 result (the
-GPU clause above). This is the device resolution the successor-commit clause
-requires before an ACCEPT: `R0-control-seed43`, started on C=`8ed5edb`, IS a
-GPU run (verified: its `train.stdout.log` records `Device: cuda`, and
-`epoch_50.pth` carries a non-empty `cuda_rng_state`). Its successor-commit
-resume is therefore authorized ONLY as a **state-exact** continuation whose
-result is reported as **GPU / trajectory-unverified** and must NOT be used to
-produce a phase-2 result, nor represented as a bitwise-continuous continuation
-of the interrupted run. The GPU clause and this clause are now consistent: the
+GPU clause above). A GPU arm that is interrupted must therefore be **re-run CPU
+from scratch** to yield a phase-2 result; a GPU resume is authorized ONLY as a
+**state-exact** continuation whose result is reported as **GPU /
+trajectory-unverified** and must NOT be used to produce a phase-2 result, nor
+represented as a bitwise-continuous continuation of the interrupted run. The
 resume continues the interrupted STATE, while the bitwise-continuation claim
 that would make the result a phase-2 result is explicitly withheld. Where a
 phase-2 result requires a bitwise-verified trajectory, the arm must be re-run
-CPU, not resumed on GPU.
+CPU, not resumed on GPU. `R0-control-seed43`, started on C=`8ed5edb`, IS such a
+GPU run (its `train.stdout.log` records `Device: cuda`, and `epoch_50.pth`
+carries a non-empty `cuda_rng_state`); per this rule it is **NOT resumed** — it
+is re-run from scratch CPU in a new dir (`R0-control-seed43-rerun`), and its
+original dir is retained as evidence (see the amendment log).
 
 This clause has a CODE CARRIER and a machine-readable record, not only prose:
 
@@ -804,20 +804,46 @@ This clause has a CODE CARRIER and a machine-readable record, not only prose:
 The opt-in is explicit and fail-closed: without `ORIGIN_COMMIT=<C>` a
 provenance head != C' is still refused as a cross-code-version resume, and with
 it a head != C is refused (the opt-in must name the run's OWN recorded head).
-The `R0-control-seed43` run (started on C=`8ed5edb`, interrupted by a WSL
-restart after epoch 58, periodic `epoch_10..epoch_50` + `best_model.pth`
-retained) is resumed on a successor commit C' that contains the mechanism
-(`ef3c3aa`, or a descendant such as the amendment branch commit). The resume
-SOURCE is chosen by the deterministic, interruption-independent rule the
-launcher and `scripts/train.py` already implement: **the run's newest
+
+The resume SOURCE is chosen by the deterministic, interruption-independent rule
+the launcher and `scripts/train.py` already implement: **the run's newest
 complete-epoch checkpoint, ordered by the checkpoint's OWN stored epoch across
 the last-epoch families (`final_model.pth` / `epoch_*.pth`, never
-`best_model.pth`), whatever its epoch.** Applied to this run dir that rule
-deterministically selects `epoch_50.pth` (stored epoch 49, next epoch 50); the
-specific checkpoint is an OUTCOME of the rule, not a pre-registered constant.
-Because the launcher pins HEAD == C', the frozen commit passed to it is
-whichever successor commit the resume actually runs at; the RUN commit is the
-amendment branch commit `297ba1f`, not the mechanism commit `ef3c3aa`.
+`best_model.pth`), whatever its epoch** — AND, per F1 below, it must not be
+OLDER than the last epoch the run actually executed. The specific checkpoint is
+an OUTCOME of the rule, not a pre-registered constant. Because the launcher pins
+HEAD == C', the frozen commit passed to it is whichever successor commit the
+resume actually runs at.
+
+**F1 no-silent-rollback (§11.1, 2026-10-11).** A resume is REFUSED when the
+selected source's stored epoch is OLDER than the last epoch the run actually
+EXECUTED, determined from the run's OWN records: the last `Epoch N/<budget>`
+line in its progress logs (`train.stdout.log` / `train.segment*.log`), the
+0-based `starting_epoch` of its `segment_XXXX.json` records, and its last-epoch
+checkpoints (`final_model.pth` / `epoch_*.pth`; `best_model.pth` is never a
+witness — it stores the best SELECTED epoch, which may be far older). The rule
+takes the MAX witness so it can only be STRICTER. This closes a hole the
+newest-complete-epoch rule alone left open: a run killed BEFORE writing a newer
+last-epoch file (reached epoch 58 but the newest periodic is `epoch_50.pth`)
+previously slipped through and silently re-trained the completed epochs in
+between. The refusal message names BOTH epochs (the source's stored epoch and
+the last executed epoch). There is **no override flag**. Both the launcher
+decider (`scripts/resume_decision.py::decide`) and `scripts/train.py`'s own
+resume preflight (`_require_resume_source_is_newest_complete_epoch`) enforce it,
+so a bare `train.py --resume` is covered too. Tests:
+`tests/test_run_frozen_resume.py::{test_refuses_silent_rollback_when_log_reached_newer_epoch,
+test_accepts_clean_boundary_when_log_matches_newest,test_dry_run_refusal_writes_nothing,test_segment_starting_epoch_is_a_witness}`
+and `tests/test_epoch_recovery.py::{test_no_silent_rollback_refuses_source_older_than_log,
+test_no_silent_rollback_accepts_clean_boundary,test_no_silent_rollback_ignores_best_model_epoch}`.
+
+**First intended use of the successor-commit resume: `R0-control-seed44`.** It
+was started on C=`8ed5edb` and died right AFTER writing `epoch_150.pth` (its
+`train.stdout.log`'s last epoch line is `Epoch 150/300`, i.e. stored epoch 149),
+so its newest complete-epoch checkpoint (`epoch_150.pth`, stored 149) equals the
+last executed epoch — a CLEAN BOUNDARY with no rollback, which F1 ACCEPTS. Its
+successor-commit resume is the first intended use of this clause. `R0-control-seed43`
+is NOT resumed (it is re-run from scratch CPU, per the GPU clause above); its
+original dir is retained as evidence.
 
 Resume equivalence to uninterrupted training is established at code level
 (CPU, fixed seed): model weights, optimizer state, LR scheduler state, NumPy
@@ -1176,6 +1202,40 @@ has a committed REAL-repository test
 (`test_git_ancestor_real_repository`, `git init` + commits, unstubbed); and the
 launcher example command uses the current worktree head `6ebb1f6`. The
 preliminary conclusions remain untouched.
+
+**Amendment log — 2026-10-11 (round-8: F1 no-silent-rollback; seed-43 rerun,
+seed-44 first use).** Reason: the successor-commit resume amendment (`b46ccd1`)
+was REJECTED because the seed-43 resume would SILENTLY roll back from the run's
+reached epoch 58 to `epoch_50.pth` (stored 49) and re-train epochs 50–58. USER
+DECISION: seed 43 is **NOT resumed** — it is re-run from scratch CPU in a new
+dir `R0-control-seed43-rerun`; the original `R0-control-seed43` dir is retained
+as evidence (its `train.stdout.log` still ends at `Epoch 58/300`, its periodics
+through `epoch_50.pth` and `best_model.pth` untouched). New situation: the
+`R0-control-seed44` run (started on `8ed5edb`) died right AFTER writing
+`epoch_150.pth` (its `train.stdout.log`'s last epoch line is `Epoch 150/300`,
+i.e. stored epoch 149), so its newest complete-epoch checkpoint equals the last
+executed epoch — a CLEAN BOUNDARY with no rollback, and the first intended use
+of the successor-commit clause.
+
+(F1, BLOCKER fix) The successor-commit clause, the decider
+(`scripts/resume_decision.py::decide`) and `train.py`'s resume preflight
+(`_require_resume_source_is_newest_complete_epoch`) now REFUSE when the selected
+source's stored epoch is OLDER than the last epoch the run actually EXECUTED,
+determined from the run's OWN records (the last `Epoch N/<budget>` line in its
+progress logs, the `starting_epoch` of its segment records, and its last-epoch
+checkpoints; `best_model.pth` is never a witness). The refusal message names
+BOTH epochs. No override flag. This is stated in §11.1. (F2) The seed-43-specific
+text in the successor clause is removed/replaced: the clause is generic, seed 43
+is recorded as rerun-not-resumed (its original dir retained as evidence), and
+`R0-control-seed44` is documented as the first intended use. (F3) Dry runs
+(decider `--dry-run`, writes nothing): seed 44 selects `epoch_150.pth` (stored
+149, next epoch 150) and passes every check including F1, `ORIGIN_COMMIT=8ed5edb`
+ancestor of this branch HEAD, config sha, device (`cuda`), RNG/loader
+preconditions; `train.py`'s preflight accepts it (driven against the real
+checkpoint read-only). The original seed-43 dir is now REFUSED by F1 (dry run).
+Everything else from `b46ccd1` (expect-device gate, OUT_ROOT, ancestry check via
+git.exe, record of both commits) is kept. Tests: focused + full suite (CPU)
+pass. The preliminary conclusions remain untouched.
 
 *This amendment's text is bound to the reviewed worktree commit by the
 `sha256` of `docs/realdata-phase2-protocol-20261010.md` recorded in each run's

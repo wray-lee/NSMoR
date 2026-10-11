@@ -15,6 +15,15 @@ Two subcommands, both CPU-only and side-effect-free except where noted:
       ``epoch_*.pth``) qualify, and a dir holding only ``best_model.pth`` is
       refused.
 
+      F1 no-silent-rollback (§11.1, 2026-10-11): the selected source must not
+      be OLDER than the last epoch the run actually EXECUTED, as witnessed by
+      the run's own records (the last ``Epoch N/…`` line in its progress logs,
+      the ``starting_epoch`` of its segment records, its last-epoch
+      checkpoints).  A run killed before writing a newer last-epoch file would
+      otherwise silently re-train the completed epochs in between; the refusal
+      names both epochs.  No override flag.  ``scripts/train.py`` enforces the
+      same rule in its own resume preflight.
+
       SUCCESSOR-COMMIT RESUME (protocol amendment §11.1, 2026-10-11): a run
       started on commit C may be resumed on a DIFFERENT commit C' only when the
       opt-in ``origin_commit`` (the launcher's ``ORIGIN_COMMIT=<C>``) is given
@@ -121,6 +130,12 @@ def _tie_break(name: str) -> tuple:
 # (``final_model.pth`` / ``epoch_*.pth``) are.
 _RESUME_EXCLUDED = frozenset({"best_model.pth"})
 
+# The LAST-EPOCH checkpoint families (mirrors ``scripts/train.py``): the segment
+# ``final_model.pth`` and the periodic ``epoch_<n>.pth``.  Used both to order
+# resume candidates and to witness the run's last executed epoch (F1).
+_LAST_EPOCH_FAMILIES = ("final_model.pth",)
+_EPOCH_PERIODIC_RE = re.compile(r"epoch_(\d+)\.pth$")
+
 
 def _resume_candidates(out: Path) -> list[tuple[Path, dict | None, str]]:
     """Recovery candidates ordered by the checkpoint's OWN stored epoch, newest first.
@@ -164,6 +179,59 @@ def _resume_candidates(out: Path) -> list[tuple[Path, dict | None, str]]:
         )
 
     return sorted(triples, key=_key)
+
+
+def _last_executed_epoch(out: Path) -> int | None:
+    """The highest 0-based epoch the run's OWN RECORDS witness as executed.
+
+    F1 no-silent-rollback (§11.1, 2026-10-11): a resume whose selected source is
+    OLDER than the last epoch the run actually executed would silently re-train
+    the completed epochs in between.  The newest complete-epoch checkpoint does
+    not always reveal that (a run killed before writing one leaves only an older
+    periodic), so this reads the run's records directly:
+
+    * the progress logs — every ``train.*.log`` in the run dir, taking the last
+      ``Epoch N/<budget>`` line (N is 1-based);
+    * the 0-based ``starting_epoch`` of every ``segment_XXXX.json`` (a resumed
+      segment's own start is an executed epoch);
+    * the last-epoch family checkpoints (``final_model.pth`` / ``epoch_*.pth``).
+
+    ``best_model.pth`` is EXCLUDED (it is the best SELECTED epoch, which may be
+    far older, so it is not a witness).  The MAX is taken so the rule can only
+    be STRICTER.  ``None`` when no record exists — the caller then leaves the
+    resume untouched.
+    """
+    witnesses: list[int] = []
+    for name in sorted(p.name for p in out.glob("train.*.log")):
+        try:
+            text = (out / name).read_text(errors="ignore")
+        except OSError:
+            continue
+        for m in re.finditer(r"\bEpoch\s+(\d+)\s*/", text):
+            witnesses.append(int(m.group(1)) - 1)
+    for rec in sorted(out.glob("segment_*.json")):
+        try:
+            data = json.loads(rec.read_text())
+        except (OSError, ValueError):
+            continue
+        start = data.get("starting_epoch")
+        if isinstance(start, int) and not isinstance(start, bool):
+            witnesses.append(start)
+    for cand in sorted(out.glob("*.pth")):
+        if cand.name in _RESUME_EXCLUDED:
+            continue
+        if cand.name not in _LAST_EPOCH_FAMILIES and not _EPOCH_PERIODIC_RE.match(
+            cand.name
+        ):
+            continue
+        try:
+            state = _load_checkpoint(cand)
+        except Exception:  # noqa: BLE001 - an undecodable record is not evidence
+            continue
+        epoch = state.get("epoch")
+        if isinstance(epoch, int) and not isinstance(epoch, bool):
+            witnesses.append(epoch)
+    return max(witnesses) if witnesses else None
 
 
 def _active_phase2_controls(config_path: Path) -> tuple:
@@ -346,6 +414,25 @@ def decide(out_dir: str, worktree: str, frozen: str, config_path: str,
             "checkpoint is a non-nested historical payload requiring an "
             "explicit trusted_historical_checkpoint_sha256; the launcher does "
             "not pass one, so the resume would fail closed at train() time"
+        )
+        return 1
+
+    # F1 no-silent-rollback (§11.1, 2026-10-11).  The newest-complete-epoch rule
+    # above returns the newest checkpoint that EXISTS, but a run killed before
+    # writing a newer last-epoch file (reached epoch 58 while the newest
+    # periodic is epoch_50.pth) leaves the rule selecting an OLDER source — a
+    # silent re-train of the completed epochs in between.  The run's own records
+    # (progress logs / segment records / last-epoch checkpoints) witness how far
+    # it actually got; refuse when the selected source is older.  No override.
+    last_executed = _last_executed_epoch(out)
+    if last_executed is not None and state.get("epoch") < last_executed:
+        print(
+            f"selected source {ckpt.name} (stored epoch {state.get('epoch')}) is "
+            f"older than the last executed epoch {last_executed} evidenced by the "
+            "run's records (train.*.log / segment_*.json / last-epoch "
+            f"checkpoints): resuming would silently re-train epochs "
+            f"{state.get('epoch') + 1}..{last_executed} (no-silent-rollback, "
+            "§11.1; no override; refusing)"
         )
         return 1
 

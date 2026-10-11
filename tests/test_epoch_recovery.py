@@ -3892,3 +3892,73 @@ def test_resume_from_stale_periodic_is_refused_by_engine(tmp_path: Path) -> None
                 newer, src_dir / "best_model.pth"),
         )
     assert result is not None
+
+
+# ═════════════════════════════════════════════════════════════
+# F1 no-silent-rollback (§11.1, 2026-10-11): the run's OWN records witness the
+# last executed epoch, so a source older than that is refused even when NO
+# newer last-epoch checkpoint file exists (the seed-43 interruption shape:
+# reached epoch 58 but the newest periodic is epoch_50.pth).
+# ═════════════════════════════════════════════════════════════
+
+
+def _ckpt(path: Path, epoch: int) -> None:
+    import torch
+
+    torch.save({"recovery_state_version": 2, "epoch": epoch}, path)
+
+
+def test_no_silent_rollback_refuses_source_older_than_log(tmp_path: Path) -> None:
+    """A source older than the log's last executed epoch is refused (names both).
+
+    Only ``epoch_50.pth`` (stored 49) exists, but the run's ``train.stdout.log``
+    shows it executed through ``Epoch 57/300``.  No newer last-epoch FILE exists,
+    so the pre-amendment rule would accept the source and silently re-train
+    epochs 50..57; F1 refuses and names both epochs.
+    """
+    from scripts import train as trainer
+
+    run_dir = tmp_path / "arm"
+    run_dir.mkdir()
+    src = run_dir / "epoch_50.pth"
+    _ckpt(src, 49)
+    # "Epoch N/300" is 1-based: the last line "Epoch 58/300" means the run
+    # EXECUTED the 0-based epoch 57 (matching seed-43's real log).
+    (run_dir / "train.stdout.log").write_text(
+        "[t] INFO - Epoch 57/300  train_loss=1.0\n"
+        "[t] INFO - Epoch 58/300  train_loss=1.0\n"
+    )
+    peek = {"epoch": 49}
+    with pytest.raises(ValueError, match="no-silent-rollback") as exc:
+        trainer._require_resume_source_is_newest_complete_epoch(src, peek, run_dir)
+    msg = str(exc.value)
+    assert "49" in msg and "57" in msg, msg
+
+
+def test_no_silent_rollback_accepts_clean_boundary(tmp_path: Path) -> None:
+    """The source equal to the last executed epoch is a clean boundary — accepted."""
+    from scripts import train as trainer
+
+    run_dir = tmp_path / "arm"
+    run_dir.mkdir()
+    src = run_dir / "epoch_150.pth"
+    _ckpt(src, 149)
+    (run_dir / "train.stdout.log").write_text("[t] INFO - Epoch 150/300  train_loss=1.0\n")
+    peek = {"epoch": 149}
+    # Must NOT raise: stored 149 == last executed 149 (a clean boundary).
+    trainer._require_resume_source_is_newest_complete_epoch(src, peek, run_dir)
+
+
+def test_no_silent_rollback_ignores_best_model_epoch(tmp_path: Path) -> None:
+    """``best_model.pth`` is NOT a witness (its stored epoch can be far older)."""
+    from scripts import train as trainer
+
+    run_dir = tmp_path / "arm"
+    run_dir.mkdir()
+    src = run_dir / "epoch_10.pth"
+    _ckpt(src, 9)
+    # best_model.pth stores the best SELECTED epoch (here OLDER than the source).
+    _ckpt(run_dir / "best_model.pth", 3)
+    peek = {"epoch": 9}
+    # Must NOT raise: best_model.pth must not be read as a newer executed epoch.
+    trainer._require_resume_source_is_newest_complete_epoch(src, peek, run_dir)
