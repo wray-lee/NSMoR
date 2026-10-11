@@ -977,7 +977,7 @@ def test_resume_preserves_best_validation_score_and_checkpoint(tmp_path: Path) -
     assert best_ckpt_1.exists()
     # The resume source is the segment's last complete-epoch checkpoint
     # (final_model.pth); best_model.pth is NOT a resume source and is refused
-    # by _require_resume_source_is_newest_complete_epoch.
+    # by _resolve_resume_source_and_rollback.
     final_ckpt_1 = Path(config1.checkpoint.output_dir) / "final_model.pth"
     assert final_ckpt_1.exists()
 

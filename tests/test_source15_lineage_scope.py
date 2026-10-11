@@ -276,7 +276,7 @@ def test_historical_resume_requires_pin_and_accepts_saved_checkpoint_bytes(tmp_p
     trainer.train(initial, dataset_path=str(source))
     # Resume from the segment's last complete-epoch checkpoint (final_model.pth);
     # best_model.pth is NOT a resume source and is refused by
-    # _require_resume_source_is_newest_complete_epoch.  Both the source AND the
+    # _resolve_resume_source_and_rollback.  Both the source AND the
     # companion best (which reconciliation certifies) are historical, so both
     # SHAs must be pinned.
     last_epoch = Path(initial.checkpoint.output_dir) / "final_model.pth"

@@ -2,7 +2,8 @@
 
 Two subcommands, both CPU-only and side-effect-free except where noted:
 
-  decide <out_dir> <worktree> <frozen_commit> <config_path> <num_epochs>
+  decide <out_dir> <worktree> <frozen_commit> <config_path> <num_epochs> \\
+         [origin_commit] [--dry-run]
       Print the checkpoint path to resume from (exit 0), or an explanation to
       stdout with exit 1 when the run must be REFUSED.  A non-empty output dir
       resumes ONLY when a recoverable current-schema checkpoint exists AND its
@@ -14,10 +15,44 @@ Two subcommands, both CPU-only and side-effect-free except where noted:
       ``epoch_*.pth``) qualify, and a dir holding only ``best_model.pth`` is
       refused.
 
-  record <out_dir> <checkpoint> <head>
-      Append {time, checkpoint, checkpoint_epoch, source, head} to the run's
-      provenance.json ``resume_log`` (creating it if absent) and print one
-      status.log line.  This is the only writing subcommand.
+      DISCLOSED ROLLBACK (§11.1, amendment 2026-10-11): when the selected
+      source is OLDER than the last epoch the run actually EXECUTED (as
+      witnessed by the run's own records — see ``nsmor/pipeline/resume_rollback.py``),
+      the resume is ALLOWED but the re-trained range ``[source + 1,
+      last_executed]`` is DISCLOSED (printed loudly here and recorded by the
+      ``record`` subcommand into the ``resume_log`` + status.log).  With
+      ``checkpoint_interval: 10`` a crash between periodics always loses up to 9
+      completed epochs, so refusing the rollback would make resume unusable; what
+      is forbidden is a SILENT rollback, not the rollback itself.  The
+      abandoned-branch artifacts are moved aside by ``scripts/train.py`` (the
+      single writer of the run dir — so a bare ``--resume`` is covered too),
+      never overwritten.  ``scripts/train.py`` enforces the SAME rule — same
+      witness set, shared from ``nsmor/pipeline/resume_rollback.py`` — in its own
+      resume preflight.
+
+      SUCCESSOR-COMMIT RESUME (protocol amendment §11.1, 2026-10-11): a run
+      started on commit C may be resumed on a DIFFERENT commit C' only when the
+      opt-in ``origin_commit`` (the launcher's ``ORIGIN_COMMIT=<C>``) is given
+      AND git confirms C is an ancestor of the frozen commit C'.  The recorded
+      modules and config are then bound to C's worktree (the run's
+      ``code_worktree``) and re-rooted, so a head mismatch is accepted ONLY on
+      that proven ancestry.  Without the opt-in a head != frozen is still
+      refused as a cross-code-version resume (fail closed).
+
+  record <out_dir> <checkpoint> <head> [origin_commit] [--resume-id ID]
+      Append {time, checkpoint, checkpoint_epoch, source, head, origin_commit,
+      resume_id} to the run's provenance.json ``resume_log`` (creating it if
+      absent) and print one status.log line.  This is the only writing
+      subcommand.  When a successor-commit resume is used BOTH commits (origin C
+      and the frozen C') are recorded.  ``--resume-id`` is the launcher's
+      per-invocation resume IDENTITY (a UUID); it is the key ``train.py`` uses
+      to skip its OWN duplicate entry for the SAME resume (see
+      ``resume_rollback.launcher_already_recorded``), so two distinct resumes
+      that reuse the same checkpoint + range are BOTH recorded.
+
+``--dry-run`` is accepted on ``decide`` and is a no-op on the filesystem: it
+prints the chosen source and the checks passed to stderr and still prints only
+the checkpoint path to stdout, so a dry run writes NOTHING to the run dir.
 """
 from __future__ import annotations
 
@@ -25,11 +60,60 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+# The helper may be run directly (``python scripts/resume_decision.py``), which
+# puts ``scripts/`` on ``sys.path[0]`` — not the repo root — so add the repo root
+# so ``import nsmor.pipeline.resume_rollback`` (the SHARED witness/rollback logic)
+# resolves.  The launcher sets ``PYTHONPATH=$WT`` already; this is belt-and-braces.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 RECOVERY_STATE_VERSION = 2
+
+
+def _to_windows_path(path: str) -> str:
+    """Translate a WSL path to a Windows path for ``git.exe``.
+
+    The worktrees' ``.git`` files point at Windows paths
+    (``gitdir: C:/disk/...``), so the WSL ``git`` cannot resolve them; the
+    launcher pattern is ``git.exe`` on the ``wslpath -w`` form (mirroring
+    ``run_frozen2.sh``'s ``git.exe`` + ``tr -d '\\r'``).
+    """
+    out = subprocess.run(
+        ["wslpath", "-w", path], capture_output=True, text=True, check=True,
+    )
+    return out.stdout.strip()
+
+
+def _git_ancestor(worktree: str, ancestor: str, descendant: str) -> bool:
+    """True iff *ancestor* is an ancestor of *descendant* in *worktree*'s repo.
+
+    Uses ``git.exe -C <windows path> merge-base --is-ancestor`` (the WSL ``git``
+    cannot read the worktree's Windows ``.git``).  Exit 0 = ancestor, exit 1 =
+    not an ancestor; any other status — or a missing ``git.exe`` / ``wslpath`` —
+    is an infrastructure failure and raises so the caller fails closed rather
+    than guessing.
+    """
+    try:
+        win = _to_windows_path(worktree)
+        proc = subprocess.run(
+            ["git.exe", "-C", win, "merge-base", "--is-ancestor",
+             ancestor, descendant],
+            capture_output=True, text=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise RuntimeError(f"git ancestry check could not run: {exc}") from exc
+    if proc.returncode == 0:
+        return True
+    if proc.returncode == 1:
+        return False
+    raise RuntimeError(
+        f"git ancestry check failed (rc={proc.returncode}): "
+        f"{proc.stderr.strip() or proc.stdout.strip()}"
+    )
 
 
 def _load_checkpoint(path: Path) -> dict:
@@ -61,6 +145,17 @@ def _tie_break(name: str) -> tuple:
 # guarantee, so it is never a resume candidate — only the last-epoch families
 # (``final_model.pth`` / ``epoch_*.pth``) are.
 _RESUME_EXCLUDED = frozenset({"best_model.pth"})
+
+# The disclosed-rollback witness logic is SHARED with ``scripts/train.py`` (and
+# its regression suite) via ``nsmor/pipeline/resume_rollback.py`` so the two enforcers
+# cannot drift.  The names below are re-exported for the drift-pin tests.
+from nsmor.pipeline.resume_rollback import (  # noqa: E402
+    _CHECKPOINT_WITNESS_FAMILIES,
+    _EPOCH_PERIODIC_RE,
+    _EPOCH_PROGRESS_RE,
+    last_executed_epoch as _last_executed_epoch,
+    rollback_retrained_range,
+)
 
 
 def _resume_candidates(out: Path) -> list[tuple[Path, dict | None, str]]:
@@ -124,10 +219,15 @@ def _active_phase2_controls(config_path: Path) -> tuple:
 
 
 def decide(out_dir: str, worktree: str, frozen: str, config_path: str,
-           num_epochs: str) -> int:
+           num_epochs: str, origin_commit: str | None = None,
+           dry_run: bool = False) -> int:
     out = Path(out_dir)
     cfg = Path(config_path)
     n_epochs = int(num_epochs)
+
+    def _report(line: str) -> None:
+        if dry_run:
+            print(f"[dry-run] {line}", file=sys.stderr)
 
     prov_path = out / "provenance.json"
     if not prov_path.exists():
@@ -135,30 +235,76 @@ def decide(out_dir: str, worktree: str, frozen: str, config_path: str,
         return 1
     prov = json.loads(prov_path.read_text())
 
-    if str(prov.get("head")) != frozen:
-        print(f"provenance head {prov.get('head')!r} != frozen {frozen!r} "
-              "(cross-code-version resume refused)")
-        return 1
-    # The recorded module paths are what binds the run's code to THIS worktree.
+    recorded_head = str(prov.get("head"))
+    # ── Successor-commit resume gate (protocol §11.1, 2026-10-11) ──
+    # A head != frozen is a cross-code-version resume and is refused UNLESS the
+    # caller opts in with the run's ORIGIN_COMMIT C and git confirms C is an
+    # ancestor of the frozen commit C'.  The recorded modules/config are then
+    # bound to C's worktree and re-rooted onto the C' worktree.
+    if recorded_head != frozen:
+        if not origin_commit:
+            print(f"provenance head {recorded_head!r} != frozen {frozen!r} "
+                  "(cross-code-version resume refused; pass ORIGIN_COMMIT=<C> "
+                  "to opt in to a proven successor-commit resume)")
+            return 1
+        if recorded_head != origin_commit:
+            print(f"provenance head {recorded_head!r} != ORIGIN_COMMIT "
+                  f"{origin_commit!r} (the opt-in names a different origin)")
+            return 1
+        try:
+            is_ancestor = _git_ancestor(worktree, origin_commit, frozen)
+        except RuntimeError as exc:  # noqa: BLE001 - fail closed on git failure
+            print(f"git ancestry check could not be performed: {exc}")
+            return 1
+        if not is_ancestor:
+            print(f"ORIGIN_COMMIT {origin_commit!r} is not an ancestor of the "
+                  f"frozen commit {frozen!r} (successor-commit resume refused)")
+            return 1
+        origin_wt = str(prov.get("code_worktree", "")).rstrip("/")
+        if not origin_wt:
+            print("provenance records no code_worktree to re-root the origin "
+                  "config/modules onto (successor-commit resume refused)")
+            return 1
+        # Re-root the config lookup: the run's provenance keys the config by its
+        # path inside C's worktree, but the active YAML lives in C''s worktree.
+        try:
+            rel_cfg = cfg.resolve().relative_to(Path(worktree).resolve())
+        except ValueError:
+            print(f"config {str(cfg)!r} is not inside the worktree "
+                  f"{worktree!r} (cannot re-root the origin config)")
+            return 1
+        cfg_lookup = str(Path(origin_wt) / rel_cfg)
+        module_root = origin_wt
+        _report(
+            f"successor-commit resume: origin {origin_commit} is an ancestor of "
+            f"frozen {frozen}; modules re-rooted to {origin_wt}"
+        )
+    else:
+        cfg_lookup = str(cfg)
+        module_root = worktree
+
+    # The recorded module paths are what binds the run's code to a worktree.
     # An empty / absent / whitespace-only field would make the loop below a
     # no-op and let an untrusted or cross-worktree run resume as if verified —
     # a FAIL-OPEN.  Refuse unless the field resolves to at least one path, all
-    # inside the worktree.
+    # inside the origin worktree.
     modules = str(prov.get("resolved_modules", "")).split()
     if not modules:
         print("provenance resolved_modules is empty/absent (cannot verify the "
               "run's modules resolved inside the worktree; refusing fail-closed)")
         return 1
     for mod in modules:
-        if not mod.startswith(worktree + "/"):
-            print(f"recorded module {mod!r} is outside the worktree")
+        if not mod.startswith(module_root + "/"):
+            print(f"recorded module {mod!r} is outside the worktree "
+                  f"{module_root!r}")
             return 1
     recorded = prov.get("sha256", {})
     cfg_sha = hashlib.sha256(cfg.read_bytes()).hexdigest()
-    if recorded.get(str(cfg)) != cfg_sha:
-        print(f"config sha mismatch: provenance {recorded.get(str(cfg))!r} "
-              f"vs current {cfg_sha!r}")
+    if recorded.get(cfg_lookup) != cfg_sha:
+        print(f"config sha mismatch: provenance {recorded.get(cfg_lookup)!r} "
+              f"vs current {cfg_sha!r} (key {cfg_lookup!r})")
         return 1
+    _report("config sha256 matches the recorded origin config")
 
     active_sel, active_zic = _active_phase2_controls(cfg)
 
@@ -239,6 +385,39 @@ def decide(out_dir: str, worktree: str, frozen: str, config_path: str,
         )
         return 1
 
+    # DISCLOSED ROLLBACK (§11.1, amendment 2026-10-11).  The newest-complete-epoch
+    # rule above returns the newest checkpoint that EXISTS, but a run killed before
+    # writing a newer last-epoch file (reached epoch 58 while the newest periodic
+    # is epoch_50.pth) leaves the rule selecting an OLDER source.  With
+    # ``checkpoint_interval: 10`` a crash between periodics always loses up to 9
+    # completed epochs, so this is ALLOWED (refusing would make resume unusable) —
+    # but it is DISCLOSED, never silent: the re-trained range is printed loudly
+    # here and recorded (by ``record``) into the resume_log + status.log.  The
+    # abandoned-branch artifacts are moved aside by ``train.py`` (never
+    # overwritten).  ``last_executed_epoch`` reads the run's own records.
+    last_executed = _last_executed_epoch(out)
+    rollback = rollback_retrained_range(state.get("epoch"), last_executed)
+    if rollback is not None:
+        lo, hi = rollback
+        # LOUD, but on STDERR: stdout carries ONLY the checkpoint path (the
+        # launcher captures it verbatim).  A dry run writes NOTHING.
+        print(
+            f"{'[dry-run] ' if dry_run else ''}DISCLOSED ROLLBACK: source "
+            f"{ckpt.name} (stored epoch {state.get('epoch')}) is older than the "
+            f"last executed epoch {last_executed} (train.*.log / segment_*.json "
+            f"/ checkpoints); epochs {lo}..{hi} will be re-trained and their "
+            "abandoned-branch artifacts moved to abandoned_branch_<k>/ (never "
+            "overwritten)",
+            file=sys.stderr,
+        )
+
+    _report(
+        f"chosen source {ckpt.name} (stored epoch {state.get('epoch')}, next "
+        f"epoch {int(state.get('epoch')) + 1} of {n_epochs}); controls and "
+        f"config sha verified; source is the newest complete-epoch checkpoint"
+        + (f"; DISCLOSED ROLLBACK re-trains {rollback[0]}..{rollback[1]}"
+           if rollback is not None else "")
+    )
     print(str(ckpt))
     return 0
 
@@ -262,23 +441,57 @@ def _atomic_write_json(path: Path, payload: dict) -> None:
     os.replace(tmp, path)
 
 
-def record(out_dir: str, checkpoint: str, head: str) -> int:
+def record(out_dir: str, checkpoint: str, head: str,
+           origin_commit: str | None = None,
+           resume_id: str | None = None) -> int:
     out = Path(out_dir)
     ckpt = Path(checkpoint)
     prov_path = out / "provenance.json"
     prov = json.loads(prov_path.read_text()) if prov_path.exists() else {}
     epoch = _load_checkpoint(ckpt).get("epoch")
+    # DISCLOSED ROLLBACK (§11.1 amendment 2026-10-11): if the source is older
+    # than the run's last executed epoch, record the re-trained range so the
+    # rollback is auditable, never silent.  The abandoned-branch artifacts are
+    # MOVED by ``scripts/train.py`` when the resume actually runs (so a bare
+    # ``--resume`` is covered too); this subcommand only RECORDS the disclosure.
+    # A non-int epoch (a legacy / malformed payload) has nothing to compare; the
+    # ``int(epoch)`` below then fails closed as before.
+    rollback = (
+        rollback_retrained_range(epoch, _last_executed_epoch(out))
+        if isinstance(epoch, int) and not isinstance(epoch, bool) else None
+    )
     entry = {
         "time": datetime.now(timezone.utc).astimezone().isoformat(),
         "checkpoint": str(ckpt),
         "checkpoint_epoch": int(epoch),
         "source": "run_frozen_resume.sh",
+        # ``head`` is the frozen commit C' the resume RAN on; ``origin_commit``
+        # is the run's own starting commit C (recorded only for a
+        # successor-commit resume, else null).  Both are recorded so a run
+        # resumed across a code version names both commits (§11.1).
         "head": head,
+        "origin_commit": origin_commit,
+        # ``resume_id`` is the launcher's per-invocation IDENTITY.  train.py
+        # keys its own-entry skip on it (NOT on checkpoint + range equality), so
+        # two DISTINCT resumes reusing the same checkpoint + range are both
+        # recorded (D4's auditable interruption count).
+        "resume_id": resume_id,
+        # ``[lo, hi]`` re-trained range when this resume rolls back past the last
+        # executed epoch; null on a clean boundary.
+        "disclosed_rollback": (
+            [int(rollback[0]), int(rollback[1])] if rollback is not None else None
+        ),
     }
     prov.setdefault("resume_log", []).append(entry)
     _atomic_write_json(prov_path, prov)
+    origin_note = f" origin={origin_commit}" if origin_commit else ""
+    rollback_note = (
+        f" DISCLOSED-ROLLBACK re-train {rollback[0]}..{rollback[1]}"
+        if rollback is not None else ""
+    )
     print(f"{entry['time']} {out.name} RESUME from {ckpt.name} "
-          f"(epoch {epoch}) source={entry['source']}")
+          f"(epoch {epoch}) source={entry['source']} head={head}{origin_note}"
+          f"{rollback_note}")
     return 0
 
 
@@ -288,9 +501,18 @@ def main(argv: list) -> int:
         return 2
     cmd, args = argv[0], argv[1:]
     if cmd == "decide":
-        return decide(*args)
+        dry_run = "--dry-run" in args
+        args = [a for a in args if a != "--dry-run"]
+        return decide(*args, dry_run=dry_run)
     if cmd == "record":
-        return record(*args)
+        # ``--resume-id ID`` (the launcher's per-invocation identity) is the only
+        # flag on ``record``; strip it before the positional call.
+        resume_id = None
+        if "--resume-id" in args:
+            i = args.index("--resume-id")
+            resume_id = args[i + 1]
+            args = args[:i] + args[i + 2:]
+        return record(*args, resume_id=resume_id)
     print(f"unknown subcommand {cmd!r}")
     return 2
 

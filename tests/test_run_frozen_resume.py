@@ -17,8 +17,10 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import os
+import shutil
 import sys
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from typing import Any
@@ -237,9 +239,44 @@ def test_record_appends_resume_log(tmp_path: Path) -> None:
     assert entry["checkpoint_epoch"] == 4
     assert entry["source"] == "run_frozen_resume.sh"
     assert entry["head"] == _FROZEN
+    assert entry["origin_commit"] is None
     assert "time" in entry
     # Atomic write leaves no temp file behind.
     assert not (out / "provenance.json.tmp").exists()
+
+
+def test_record_writes_both_commits_on_successor_resume(tmp_path: Path) -> None:
+    """A successor-commit resume records BOTH C (origin) and C' (head) (§11.1)."""
+    cfg = tmp_path / "arm.yaml"
+    cfg.write_text("training:\n  num_epochs: 10\n")
+    out = tmp_path / "arm"
+    _write_prov(out, cfg, _FROZEN, f"{_WT}/nsmor/__init__.py")
+    ckpt = out / "epoch_4.pth"
+    _write_ckpt(ckpt, 4)
+
+    mod = _helper()
+    mod.record(str(out), str(ckpt), _FROZEN_C, _ORIGIN)
+    entry = json.loads((out / "provenance.json").read_text())["resume_log"][0]
+    assert entry["head"] == _FROZEN_C
+    assert entry["origin_commit"] == _ORIGIN
+
+
+def test_record_cli_parses_resume_id(tmp_path: Path) -> None:
+    """K2: ``record ... --resume-id ID`` records the launcher's resume identity."""
+    cfg = tmp_path / "arm.yaml"
+    cfg.write_text("training:\n  num_epochs: 10\n")
+    out = tmp_path / "arm"
+    _write_prov(out, cfg, _FROZEN, f"{_WT}/nsmor/__init__.py")
+    ckpt = out / "epoch_4.pth"
+    _write_ckpt(ckpt, 4)
+
+    mod = _helper()
+    rc = mod.main(["record", str(out), str(ckpt), _FROZEN, "--resume-id", "id-X"])
+    assert rc == 0
+    entry = json.loads((out / "provenance.json").read_text())["resume_log"][0]
+    assert entry["resume_id"] == "id-X"
+    assert entry["head"] == _FROZEN
+    assert entry["origin_commit"] is None
 
 
 def test_resume_from_final_model_when_no_periodic(tmp_path: Path) -> None:
@@ -376,3 +413,556 @@ def test_refuses_non_nested_historical_without_trusted_pin(tmp_path: Path) -> No
     rc, msg = _decide(out, cfg)
     assert rc == 1, msg
     assert "trusted_historical_checkpoint_sha256" in msg, msg
+
+
+# ── Successor-commit resume (§11.1 amendment, 2026-10-11) ─────────────
+# A run started on commit C may be resumed on a successor commit C' only with
+# the ORIGIN_COMMIT=<C> opt-in AND git confirming C is an ancestor of C'.  These
+# tests exercise the decision logic hermetically: ``_git_ancestor`` is
+# monkeypatched so ancestry is controlled without a real repository (the WSL git
+# cannot read the worktrees' Windows ``.git``).
+
+_ORIGIN = "8ed5edb994ef105db0551aedc50f6003b97fe87f"
+_FROZEN_C = "ef3c3aac51f1f60f926cc1b47ad27041f31464b0"
+
+
+def _successor_fixture(tmp_path: Path) -> tuple:
+    """A (cprime_worktree, origin_worktree, out, cfg) tuple for a successor run.
+
+    The active worktree (C') holds the config; the run's ``code_worktree`` (C)
+    is a DIFFERENT directory, so the config key and the recorded modules must be
+    re-rooted onto the origin worktree to match.
+    """
+    cprime_wt = tmp_path / "wt_prime"
+    origin_wt = tmp_path / "wt_origin"
+    (cprime_wt / "config").mkdir(parents=True)
+    origin_wt.mkdir()
+    cfg = cprime_wt / "config" / "arm.yaml"
+    cfg.write_text("training:\n  num_epochs: 10\n")
+    out = tmp_path / "arm"
+    out.mkdir(parents=True)
+    (out / "provenance.json").write_text(json.dumps({
+        "arm": out.name,
+        "head": _ORIGIN,
+        "code_worktree": str(origin_wt),
+        "resolved_modules": f"{origin_wt}/nsmor/__init__.py",
+        "sha256": {
+            str(origin_wt / "config" / "arm.yaml"):
+                hashlib.sha256(cfg.read_bytes()).hexdigest(),
+        },
+        "resume_log": [],
+    }, indent=2) + "\n")
+    _write_ckpt(out / "epoch_50.pth", 49)
+    return cprime_wt, origin_wt, out, cfg
+
+
+def _decide_successor(
+    out: Path, cprime_wt: Path, cfg: Path, *, origin: str | None,
+    ancestor: bool, n: int = 300,
+) -> tuple:
+    mod = _helper()
+    mod._git_ancestor = lambda wt, a, d: ancestor  # type: ignore[assignment]
+    buf = StringIO()
+    with redirect_stdout(buf):
+        rc = mod.decide(
+            str(out), str(cprime_wt), _FROZEN_C, str(cfg), str(n), origin,
+        )
+    return rc, buf.getvalue().strip()
+
+
+def test_successor_resume_accepted_when_origin_is_ancestor(tmp_path: Path) -> None:
+    """head==C, C an ancestor of C', ORIGIN_COMMIT given → accepted, re-rooted."""
+    cprime_wt, _origin_wt, out, cfg = _successor_fixture(tmp_path)
+    rc, msg = _decide_successor(out, cprime_wt, cfg, origin=_ORIGIN, ancestor=True)
+    assert rc == 0, msg
+    assert msg.endswith("epoch_50.pth"), msg
+
+
+def test_successor_resume_refused_when_origin_not_ancestor(tmp_path: Path) -> None:
+    """ORIGIN_COMMIT given but C is NOT an ancestor of C' → refused."""
+    cprime_wt, _origin_wt, out, cfg = _successor_fixture(tmp_path)
+    rc, msg = _decide_successor(out, cprime_wt, cfg, origin=_ORIGIN, ancestor=False)
+    assert rc == 1, msg
+    assert "not an ancestor" in msg, msg
+
+
+def test_successor_resume_refused_without_optin(tmp_path: Path) -> None:
+    """head != frozen with NO ORIGIN_COMMIT → refused as cross-code-version."""
+    cprime_wt, _origin_wt, out, cfg = _successor_fixture(tmp_path)
+    rc, msg = _decide_successor(out, cprime_wt, cfg, origin=None, ancestor=True)
+    assert rc == 1, msg
+    assert "cross-code-version" in msg, msg
+
+
+def test_successor_resume_refused_when_optin_names_other_head(
+    tmp_path: Path,
+) -> None:
+    """ORIGIN_COMMIT must name the run's OWN recorded head, not any ancestor."""
+    cprime_wt, _origin_wt, out, cfg = _successor_fixture(tmp_path)
+    rc, msg = _decide_successor(
+        out, cprime_wt, cfg, origin="deadbeef" * 5, ancestor=True,
+    )
+    assert rc == 1, msg
+    assert "different origin" in msg, msg
+
+
+def test_successor_resume_refused_when_git_check_fails(tmp_path: Path) -> None:
+    """A git infrastructure failure (no git.exe / bad repo) fails closed."""
+    cprime_wt, _origin_wt, out, cfg = _successor_fixture(tmp_path)
+    mod = _helper()
+
+    def boom(wt: str, a: str, d: str) -> bool:
+        raise RuntimeError("git.exe not found")
+
+    mod._git_ancestor = boom  # type: ignore[assignment]
+    buf = StringIO()
+    with redirect_stdout(buf):
+        rc = mod.decide(str(out), str(cprime_wt), _FROZEN_C, str(cfg), "300",
+                        _ORIGIN)
+    assert rc == 1, buf.getvalue()
+    assert "could not be performed" in buf.getvalue(), buf.getvalue()
+
+
+def test_dry_run_returns_decision_without_writing(tmp_path: Path) -> None:
+    """--dry-run reports the decision and writes NOTHING to the run dir."""
+    cprime_wt, _origin_wt, out, cfg = _successor_fixture(tmp_path)
+    before = {p.name: p.read_bytes() for p in out.iterdir()}
+    mod = _helper()
+    mod._git_ancestor = lambda wt, a, d: True  # type: ignore[assignment]
+    err = StringIO()
+    buf = StringIO()
+    with redirect_stdout(buf), redirect_stderr(err):
+        rc = mod.decide(
+            str(out), str(cprime_wt), _FROZEN_C, str(cfg), "300", _ORIGIN,
+            dry_run=True,
+        )
+    assert rc == 0, buf.getvalue()
+    assert buf.getvalue().strip().endswith("epoch_50.pth")
+    assert "next epoch 50" in err.getvalue(), err.getvalue()
+    after = {p.name: p.read_bytes() for p in out.iterdir()}
+    assert after == before, "dry run must not write to the run dir"
+
+
+def test_dry_run_marks_same_commit_path_too(tmp_path: Path) -> None:
+    """m2: --dry-run must emit the [dry-run] chosen-source marker on the
+    SAME-commit path (recorded_head == frozen), not only the successor path.
+
+    On the same-commit path the recorded module/config roots are the worktree
+    itself, so the decider never enters the successor branch; the chosen-source
+    ``_report`` still runs and must carry the ``[dry-run]`` marker, so a
+    ``--dry-run`` never prints a bare path with no dry-run indication.
+    """
+    cfg = tmp_path / "arm.yaml"
+    cfg.write_text("training:\n  num_epochs: 10\n")
+    out = tmp_path / "arm"
+    _write_prov(out, cfg, _FROZEN, f"{_WT}/nsmor/__init__.py")
+    _write_ckpt(out / "epoch_4.pth", 4)
+    mod = _helper()
+    err = StringIO()
+    buf = StringIO()
+    with redirect_stdout(buf), redirect_stderr(err):
+        rc = mod.decide(
+            str(out), _WT, _FROZEN, str(cfg), "10", None, dry_run=True,
+        )
+    assert rc == 0, buf.getvalue()
+    assert buf.getvalue().strip().endswith("epoch_4.pth")
+    assert "[dry-run]" in err.getvalue(), err.getvalue()
+    assert "chosen source" in err.getvalue(), err.getvalue()
+
+
+def _write_log(out: Path, last_epoch_1based: int, budget: int = 300) -> None:
+    """A minimal progress log whose last line is ``Epoch N/<budget>``."""
+    (out / "train.stdout.log").write_text(
+        f"[t] INFO - Epoch {last_epoch_1based}/{budget}  train_loss=1.0\n"
+    )
+
+
+def _write_segment(out: Path, starting_epoch: int, index: int = 1) -> None:
+    """A minimal segment record: ``starting_epoch`` = the NEXT epoch to run."""
+    (out / f"segment_{index:04d}.json").write_text(
+        json.dumps({"starting_epoch": starting_epoch})
+    )
+
+
+def test_discloses_rollback_when_log_reached_newer_epoch(
+    tmp_path: Path,
+) -> None:
+    """D1: a source older than the run's LAST EXECUTED epoch is DISCLOSED, not refused.
+
+    Synthetic seed-43 shape: periodics only through ``epoch_50.pth`` (stored 49)
+    but the log's last line is ``Epoch 58/300`` (0-based epoch 57 executed).  The
+    newest-complete-epoch rule picks ``epoch_50.pth``; the rollback of epochs
+    50..57 is AUTHORIZED normal recovery (checkpoint_interval 10 always loses up
+    to 9 epochs), so the decider ACCEPTS and prints a LOUD DISCLOSED ROLLBACK
+    naming both epochs — never silent.
+    """
+    cfg = tmp_path / "arm.yaml"
+    cfg.write_text("training:\n  num_epochs: 300\n")
+    out = tmp_path / "arm"
+    _write_prov(out, cfg, _FROZEN, f"{_WT}/nsmor/__init__.py")
+    _write_ckpt(out / "epoch_50.pth", 49)      # newest EXISTING checkpoint
+    _write_ckpt(out / "best_model.pth", 57)    # best epoch, not a source
+    _write_log(out, last_epoch_1based=58)      # 0-based epoch 57 was executed
+    mod = _helper()
+    err = StringIO()
+    buf = StringIO()
+    with redirect_stdout(buf), redirect_stderr(err):
+        rc = mod.decide(str(out), _WT, _FROZEN, str(cfg), "300")
+    assert rc == 0, buf.getvalue()
+    assert buf.getvalue().strip().endswith("epoch_50.pth"), buf.getvalue()
+    assert "DISCLOSED ROLLBACK" in err.getvalue(), err.getvalue()
+    assert "50..57" in err.getvalue(), err.getvalue()
+
+
+def test_accepts_clean_boundary_when_log_matches_newest(
+    tmp_path: Path,
+) -> None:
+    """D1: a source whose stored epoch equals the last executed epoch is OK.
+
+    Synthetic seed-44 shape: the newest checkpoint is ``epoch_150.pth`` (stored
+    149) and the log's last line is ``Epoch 150/300`` — a clean boundary with no
+    rollback, so the resume is ACCEPTED and selects ``epoch_150.pth`` with NO
+    disclosure.
+    """
+    cfg = tmp_path / "arm.yaml"
+    cfg.write_text("training:\n  num_epochs: 300\n")
+    out = tmp_path / "arm"
+    _write_prov(out, cfg, _FROZEN, f"{_WT}/nsmor/__init__.py")
+    _write_ckpt(out / "epoch_150.pth", 149)
+    _write_ckpt(out / "best_model.pth", 142)
+    _write_log(out, last_epoch_1based=150)
+    mod = _helper()
+    err = StringIO()
+    buf = StringIO()
+    with redirect_stdout(buf), redirect_stderr(err):
+        rc = mod.decide(str(out), _WT, _FROZEN, str(cfg), "300")
+    assert rc == 0, buf.getvalue()
+    assert buf.getvalue().strip().endswith("epoch_150.pth"), buf.getvalue()
+    assert "DISCLOSED ROLLBACK" not in err.getvalue(), err.getvalue()
+
+
+def test_dry_run_rollback_writes_nothing(tmp_path: Path) -> None:
+    """D1: a dry-run rollback discloses both epochs and writes NOTHING to the dir."""
+    cfg = tmp_path / "arm.yaml"
+    cfg.write_text("training:\n  num_epochs: 300\n")
+    out = tmp_path / "arm"
+    _write_prov(out, cfg, _FROZEN, f"{_WT}/nsmor/__init__.py")
+    _write_ckpt(out / "epoch_50.pth", 49)
+    _write_log(out, last_epoch_1based=58)
+    before = {p.name: p.read_bytes() for p in out.iterdir()}
+    mod = _helper()
+    err = StringIO()
+    buf = StringIO()
+    with redirect_stdout(buf), redirect_stderr(err):
+        rc = mod.decide(str(out), _WT, _FROZEN, str(cfg), "300", None, dry_run=True)
+    assert rc == 0, buf.getvalue()
+    assert buf.getvalue().strip().endswith("epoch_50.pth"), buf.getvalue()
+    assert "DISCLOSED ROLLBACK" in err.getvalue(), err.getvalue()
+    assert "50..57" in err.getvalue(), err.getvalue()
+    after = {p.name: p.read_bytes() for p in out.iterdir()}
+    assert after == before, "dry run must not write to the run dir"
+
+
+def test_segment_starting_epoch_is_a_witness(tmp_path: Path) -> None:
+    """D1: a segment record witnesses the epoch BEFORE its ``starting_epoch``.
+
+    ``_write_segment_record`` stores ``starting_epoch = stored_epoch + 1`` (the
+    NEXT epoch to execute, written before the loop), so a segment whose
+    ``starting_epoch`` is S proves the run executed through S-1.  Here S=58, so
+    the run executed through 57 while the newest checkpoint is ``epoch_50.pth``
+    (stored 49): a DISCLOSED rollback re-training 50..57.
+    """
+    cfg = tmp_path / "arm.yaml"
+    cfg.write_text("training:\n  num_epochs: 300\n")
+    out = tmp_path / "arm"
+    _write_prov(out, cfg, _FROZEN, f"{_WT}/nsmor/__init__.py")
+    _write_ckpt(out / "epoch_50.pth", 49)
+    _write_segment(out, 58)
+    mod = _helper()
+    err = StringIO()
+    buf = StringIO()
+    with redirect_stdout(buf), redirect_stderr(err):
+        rc = mod.decide(str(out), _WT, _FROZEN, str(cfg), "300")
+    assert rc == 0, buf.getvalue()
+    assert "DISCLOSED ROLLBACK" in err.getvalue(), err.getvalue()
+    assert "50..57" in err.getvalue(), err.getvalue()
+
+
+def test_h1_clean_boundary_with_resumed_segment_is_accepted(tmp_path: Path) -> None:
+    """H1 BLOCKER repro: a segment record must NOT over-claim by one.
+
+    A run killed before completing its resumed segment's FIRST epoch leaves
+    ``epoch_150.pth`` (stored 149), the log's last line ``Epoch 150/300``, and
+    ``segment_0001.json``{``starting_epoch``: 150}.  The segment witnesses only
+    epoch 149 (its start is the NEXT epoch to run), so the last executed epoch is
+    149 — equal to the source's stored epoch: a CLEAN BOUNDARY that MUST be
+    ACCEPTED.  The pre-fix code read ``starting_epoch`` RAW (150) and refused
+    with no override, bricking the seed-44 resume (F1 round-4 BLOCKER).
+    """
+    cfg = tmp_path / "arm.yaml"
+    cfg.write_text("training:\n  num_epochs: 300\n")
+    out = tmp_path / "arm"
+    _write_prov(out, cfg, _FROZEN, f"{_WT}/nsmor/__init__.py")
+    _write_ckpt(out / "epoch_150.pth", 149)
+    _write_ckpt(out / "best_model.pth", 142)
+    _write_log(out, last_epoch_1based=150)
+    _write_segment(out, 150)
+    rc, msg = _decide(out, cfg, n=300)
+    assert rc == 0, msg
+    assert msg.endswith("epoch_150.pth"), msg
+
+
+def test_h1_segment_offbyone_still_discloses_real_rollback(tmp_path: Path) -> None:
+    """H1/D1: the start-1 correction must NOT hide a real rollback.
+
+    A segment that started at 58 (so executed through 57) with the newest
+    checkpoint ``epoch_50.pth`` (stored 49) is a rollback of epochs 50..57: the
+    start-1 correction leaves 49 < 57, so it is still a REAL rollback — now
+    DISCLOSED (re-training 50..57), not silently accepted.  The fix narrows false
+    disclosures; it does not hide true ones.
+    """
+    cfg = tmp_path / "arm.yaml"
+    cfg.write_text("training:\n  num_epochs: 300\n")
+    out = tmp_path / "arm"
+    _write_prov(out, cfg, _FROZEN, f"{_WT}/nsmor/__init__.py")
+    _write_ckpt(out / "epoch_50.pth", 49)
+    _write_segment(out, 58)
+    mod = _helper()
+    err = StringIO()
+    buf = StringIO()
+    with redirect_stdout(buf), redirect_stderr(err):
+        rc = mod.decide(str(out), _WT, _FROZEN, str(cfg), "300")
+    assert rc == 0, buf.getvalue()
+    assert "DISCLOSED ROLLBACK" in err.getvalue(), err.getvalue()
+    assert "50..57" in err.getvalue(), err.getvalue()
+
+
+def test_final_model_is_a_witness_in_the_decider(tmp_path: Path) -> None:
+    """H2: the decider's witness set includes ``final_model.pth`` (same as train.py).
+
+    A completed/paused run writes ``final_model.pth`` with that run's last
+    executed epoch, so it IS a valid executed-epoch witness.  Driven through the
+    helper directly (the full ``decide`` path would select the newer
+    ``final_model.pth`` itself as the source, masking the witness role).
+    """
+    mod = _helper()
+    out = tmp_path / "arm"
+    out.mkdir()
+    _write_ckpt(out / "epoch_50.pth", 49)
+    _write_ckpt(out / "final_model.pth", 57)  # last executed epoch of a segment
+    assert mod._last_executed_epoch(out) == 57
+
+
+def test_decider_and_train_share_the_checkpoint_witness_set() -> None:
+    """D1: the two rollback enforcers must use the SAME checkpoint witness set.
+
+    Round-4 MAJOR: the decider treated ``final_model.pth`` as a witness while
+    train.py excluded it — the 'same rule' claim was false.  Both now import the
+    SAME shared ``nsmor.pipeline.resume_rollback`` constants, so pin them equal AND pin
+    the shared-source identity so they cannot silently drift apart again.
+    """
+    mod = _helper()
+    from scripts import train as T
+    from nsmor.pipeline import resume_rollback as RR
+
+    assert tuple(mod._CHECKPOINT_WITNESS_FAMILIES) == tuple(
+        T._CHECKPOINT_WITNESS_FAMILIES
+    )
+    assert tuple(mod._CHECKPOINT_WITNESS_FAMILIES) == tuple(
+        RR._CHECKPOINT_WITNESS_FAMILIES
+    )
+    # ``best_model.pth`` IS an executed-epoch witness (its stored epoch was
+    # executed) but is NEVER a resume source: the decider's source-exclusion set
+    # and train.py's witness family are therefore DIFFERENT concepts now.
+    assert mod._RESUME_EXCLUDED == frozenset({"best_model.pth"})
+    assert "best_model.pth" in tuple(mod._CHECKPOINT_WITNESS_FAMILIES)
+    # The witness logic is the SAME function object on both enforcers.
+    assert mod._last_executed_epoch is RR.last_executed_epoch
+    assert T._last_executed_epoch is RR.last_executed_epoch
+
+
+def test_decider_and_train_share_the_epoch_progress_regex() -> None:
+    """R2 minor: the two F1 enforcers must share the SAME log-parse pattern.
+
+    The decider previously compiled its epoch-progress pattern INLINE, so a
+    future edit to one enforcer's literal would silently change the witness on
+    that one only — the exact drift the H2 shared-witness-set fix exists to
+    eliminate, but unpinned for the log regex.  Both now use a named
+    ``_EPOCH_PROGRESS_RE``; pin the two literals identical.
+    """
+    mod = _helper()
+    from scripts import train as T
+
+    assert mod._EPOCH_PROGRESS_RE.pattern == T._EPOCH_PROGRESS_RE.pattern
+
+
+def test_decider_accepts_post_resume_dir_with_segment_log(tmp_path: Path) -> None:
+    """Round-5 BLOCKER: the decider must ACCEPT the dir after the first resume.
+
+    The first resume writes the resumed segment's OWN ``train.segment1.log``
+    (``Epoch 151/300`` once its first epoch completes) and ``epoch_160.pth`` (the
+    next periodic after stored epoch 159).  The run has genuinely executed
+    through 150, so the newer ``epoch_160.pth`` IS the newest complete-epoch
+    checkpoint and the resume is a CLEAN BOUNDARY — accepted.  This is the
+    decider counterpart of the state-independent real-dir test, on a synthetic
+    dir (fast, and independent of the live seed-44 dir's mutable state).
+    """
+    cfg = tmp_path / "arm.yaml"
+    cfg.write_text("training:\n  num_epochs: 300\n")
+    out = tmp_path / "arm"
+    _write_prov(out, cfg, _FROZEN, f"{_WT}/nsmor/__init__.py")
+    _write_ckpt(out / "epoch_150.pth", 149)
+    _write_ckpt(out / "epoch_160.pth", 159)
+    _write_ckpt(out / "best_model.pth", 142)
+    _write_log(out, last_epoch_1based=150)  # the first segment's log
+    (out / "train.segment1.log").write_text(
+        "[t] INFO - Epoch 151/300  train_loss=1.0\n"
+    )
+    _write_segment(out, 150)  # the first resume's segment record
+    rc, msg = _decide(out, cfg, n=300)
+    assert rc == 0, msg
+    assert msg.endswith("epoch_160.pth"), msg
+
+
+def test_git_ancestor_real_repository() -> None:
+    """R1-minor: the ancestry gate is exercised against a REAL repository.
+
+    The other ancestry cases monkeypatch ``_git_ancestor`` (they pin the
+    DECISION logic).  This test drives the UNSTUBBED ``_git_ancestor`` against
+    the real worktree repository: the ancestor direction (``HEAD~1`` is an
+    ancestor of ``HEAD``) is true, the reverse is false, and an invalid SHA
+    raises (fail closed) rather than returning a guess.  Skips cleanly where
+    ``git.exe`` / ``wslpath`` are unavailable or the repo has no parent commit.
+    """
+    repo = str(Path(__file__).resolve().parents[1])
+    mod = _helper()
+    try:
+        assert mod._git_ancestor(repo, "HEAD~1", "HEAD") is True
+        assert mod._git_ancestor(repo, "HEAD", "HEAD~1") is False
+    except RuntimeError as exc:  # pragma: no cover - env without git.exe/wslpath
+        pytest.skip(f"git.exe/wslpath unavailable from this environment: {exc}")
+    with pytest.raises(RuntimeError):
+        mod._git_ancestor(repo, "deadbeef" * 5, "HEAD")
+
+
+# ── Real seed-44 end-to-end decider regression (round-4 H4 minor) ──────────
+# The accepted-path real evidence was previously the developer's manual dry run
+# plus synthetic-dir tests; this drives the UNSTUBBED decider against the REAL
+# seed-44 run dir, READ-ONLY (dry run writes nothing).  Skips when the
+# read-only corpus / run dir is absent (a machine without the phase-2 artifacts).
+_REAL_ROOT = Path(
+    "/mnt/d/Projects/NSMoR-phase2-8ed5edb/.scratch/realdata-phase2-20261010"
+)
+_REAL_SEED44 = _REAL_ROOT / "R0-control-seed44"
+_REAL_CORPUS = Path(
+    "/mnt/d/Projects/NSMoR/.scratch/clock-corpus-r4/exploratory-chain-tiZddw2c"
+)
+_REAL_ORIGIN = "8ed5edb994ef105db0551aedc50f6003b97fe87f"
+
+
+@pytest.mark.skipif(
+    not (_REAL_SEED44 / "epoch_150.pth").exists()
+    or not (_REAL_CORPUS / "etl-causal-final-zp12m0fa/nsmor_dataset.pt").exists(),
+    reason="real seed-44 run dir / corpus absent (READ-ONLY inputs not on this machine)",
+)
+def test_real_seed44_dir_decider_accepts_clean_boundary_dry_run() -> None:
+    """F3/round-4: the UNSTUBBED decider ACCEPTS the real seed-44 dir, writing nothing.
+
+    Drives the REAL ``decide`` (real ``_git_ancestor`` via git.exe, real config
+    sha, real checkpoint decode, real F1 witness) with the arm's frozen commit
+    (this worktree HEAD) and ``ORIGIN_COMMIT=8ed5edb``; asserts it selects the
+    newest complete-epoch checkpoint and, being a dry run, leaves the run dir
+    byte-identical.  The run dir is READ-ONLY: nothing here writes to it.
+
+    STATE-INDEPENDENT (round-5 BLOCKER): the previous version hard-pinned
+    ``epoch_150.pth``, which the first resume this amendment authorizes
+    invalidates — the resumed segment writes ``epoch_160.pth`` (the next periodic
+    after stored epoch 159), which is then the newest complete-epoch checkpoint
+    and the correct source.  The assertion accepts ``epoch_150.pth`` (pre-resume)
+    or ``epoch_160.pth`` (post-resume), so it holds in either state; the
+    byte-identical check is valid in both.
+    """
+    import subprocess
+
+    mod = _helper()
+    cfg = Path(__file__).resolve().parents[1] / (
+        "config/realdata-phase2-20261010/R0-control-seed44.yaml"
+    )
+    wt = str(Path(__file__).resolve().parents[1])
+    # The worktree's ``.git`` file points at a Windows gitdir the WSL git cannot
+    # read; resolve HEAD via git.exe on the wslpath -w form, exactly as the
+    # module's own ``_git_ancestor`` does.
+    frozen = subprocess.run(
+        ["git.exe", "-C", mod._to_windows_path(wt), "rev-parse", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+    before = {p.name: (p.stat().st_size, p.stat().st_mtime_ns)
+              for p in _REAL_SEED44.iterdir()}
+    err = StringIO()
+    buf = StringIO()
+    with redirect_stdout(buf), redirect_stderr(err):
+        rc = mod.decide(
+            str(_REAL_SEED44), wt, frozen, str(cfg), "300", _REAL_ORIGIN,
+            dry_run=True,
+        )
+    assert rc == 0, f"stdout={buf.getvalue()!r} stderr={err.getvalue()!r}"
+    selected = buf.getvalue().strip()
+    expected = "epoch_160.pth" if (_REAL_SEED44 / "epoch_160.pth").exists() else "epoch_150.pth"
+    assert selected.endswith(expected), (
+        f"decider selected {selected!r}, expected the newest complete-epoch "
+        f"checkpoint {expected!r}"
+    )
+    after = {p.name: (p.stat().st_size, p.stat().st_mtime_ns)
+             for p in _REAL_SEED44.iterdir()}
+    assert after == before, "the dry-run decider must not write to the run dir"
+
+
+
+# ── Launcher DRY_RUN writes-nothing guarantee (round-7 MINOR) ──────────────
+# The D5 claim is that a launcher DRY_RUN writes nothing to the run dir.  The
+# decider-level byte-identical test above exercises only the decider; this drives
+# the REAL launcher (``bash run_frozen_resume.sh``) under ``DRY_RUN=1`` and pins
+# that its OWN pre-decider steps + provenance branch leave the run dir untouched.
+_LAUNCHER = Path(__file__).resolve().parents[1] / "scripts" / "run_frozen_resume.sh"
+
+
+def _bash() -> str:
+    for cand in ("bash", "wsl.exe"):
+        if shutil.which(cand):
+            return cand
+    return ""
+
+
+@pytest.mark.skipif(
+    not _LAUNCHER.exists() or not _bash() or os.name != "posix",
+    reason="launcher / bash / POSIX filesystem unavailable from this environment",
+)
+def test_launcher_dry_run_writes_nothing_on_empty_dir(tmp_path: Path) -> None:
+    """A launcher ``DRY_RUN=1`` on an ABSENT run dir writes nothing to it.
+
+    The launcher short-circuits an empty/absent run dir BEFORE any worktree step
+    or provenance branch, so no run dir is created and only a status.log line
+    (next to the script, redirected here) is written.  A future refactor that
+    wrote to the run dir would be caught here.
+    """
+    import subprocess
+
+    out_root = tmp_path / "root"
+    out_root.mkdir()
+    arm = out_root / "R0-arm"  # deliberately absent
+    status = tmp_path / "status.log"
+    before_root = sorted(p.name for p in out_root.iterdir())
+    env = dict(os.environ, DRY_RUN="1", OUT_ROOT=str(out_root),
+               STATUS_LOG=str(status))
+    # A bogus frozen commit is fine: the empty-dir short-circuit precedes the
+    # HEAD check, so nothing about the worktree is consulted.
+    proc = subprocess.run(
+        [_bash(), str(_LAUNCHER), "deadbeef" * 5, str(_LAUNCHER.parents[1]),
+         "R0-arm"],
+        capture_output=True, text=True, env=env,
+    )
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    assert not arm.exists(), "the launcher must not create the run dir on DRY_RUN"
+    assert sorted(p.name for p in out_root.iterdir()) == before_root
+    assert "DRY-RUN" in status.read_text()

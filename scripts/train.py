@@ -1125,46 +1125,65 @@ def _checkpoint_lineage_identity(payload: bytes, path: Path) -> Dict[str, Any]:
 
 # The LAST-EPOCH checkpoint families: ``final_model.pth`` (the segment's last
 # executed epoch) and ``epoch_<n>.pth`` (a periodic).  ``best_model.pth`` is
-# NOT one of them — it stores the best SELECTED epoch, which can be far older
-# than the last executed epoch, so resuming from it would silently re-train
-# completed epochs.
+# NOT a resume SOURCE (it stores the best SELECTED epoch, which can be far older
+# than the last executed epoch), though it IS an executed-epoch WITNESS.
 _LAST_EPOCH_FAMILIES = ("final_model.pth",)
-_EPOCH_PERIODIC_RE = re.compile(r"epoch_(\d+)\.pth$")
+
+# The disclosed-rollback witness logic is SHARED with ``scripts/resume_decision.py``
+# (and its regression suite) via ``nsmor/pipeline/resume_rollback.py`` so the two
+# enforcers cannot drift.  These names are re-exported for backward compatibility
+# and for the drift-pin tests.
+from nsmor.pipeline.resume_rollback import (  # noqa: E402
+    _CHECKPOINT_WITNESS_FAMILIES,
+    _EPOCH_PERIODIC_RE,
+    _EPOCH_PROGRESS_RE,
+    _NON_RESUME_WITNESS_FAMILIES,
+    archive_abandoned_branch,
+    has_best_model_archive,
+    launcher_already_recorded,
+    last_executed_epoch as _last_executed_epoch,
+    list_abandoned_branch,
+    rollback_retrained_range,
+)
 
 
-def _require_resume_source_is_newest_complete_epoch(
+def _resolve_resume_source_and_rollback(
     resume_path: Path,
     peek: Dict[str, Any],
     output_dir: Path,
-) -> None:
-    """Refuse a resume source that is not the newest complete-epoch checkpoint.
+) -> Tuple[Optional[Tuple[int, int]], List[str]]:
+    """Validate the resume source and DISCLOSE (never refuse) a rollback.
 
-    §11.1 authorizes resuming ONLY from a run's LAST complete-epoch checkpoint.
-    ``scripts/train.py`` must enforce that itself — not delegate it to the
-    launcher helper — so a bare ``train.py --resume`` cannot silently re-train
-    completed epochs by picking a stale source:
+    §11.1 (amendment 2026-10-11) authorizes resuming from a run's LAST
+    complete-epoch checkpoint, and — because ``checkpoint_interval: 10`` means a
+    crash between periodics always loses up to 9 completed epochs — a rollback to
+    the newest existing checkpoint is AUTHORIZED normal recovery.  What is
+    forbidden is a SILENT rollback or an OVERWRITE of the abandoned branch's
+    artifacts.  This function therefore:
 
-    * ``best_model.pth`` is NEVER a valid resume source.  It is the best
-      SELECTED epoch, which may be far older than the last executed epoch;
-      resuming from it re-trains every epoch after the best one.  Refused
-      unconditionally, regardless of what else is in the directory — matching
-      the launcher helper (``resume_decision.py``), which excludes it too.
-    * IN-PLACE recovery (the source lives in the run's OWN output dir — the
-      launcher's mode and exactly what §11.1 governs): when that dir holds a
-      last-epoch family file (``final_model.pth`` / ``epoch_*.pth``) whose
-      stored epoch is NEWER than the source's, the source is stale.  Refused.
+    * REFUSES ``best_model.pth`` as a source (unconditionally).  It is the best
+      SELECTED epoch, which can be far older than the last executed epoch;
+      resuming from it would re-train every epoch after the best one.
+    * REFUSES an IN-PLACE source older than a newer last-epoch family file
+      (``final_model.pth`` / ``epoch_*.pth``) in the same run dir — the source
+      must be the newest EXISTING complete-epoch checkpoint.  (``best_model.pth``
+      is excluded from this comparison; it is never a source.)
+    * DISCLOSES a rollback: when the source's stored epoch is OLDER than the last
+      epoch the run's own records witness as executed (``last_executed_epoch``),
+      the re-trained range ``[source + 1, last_executed]`` is returned AND every
+      abandoned-branch artifact that would be overwritten (a run-dir ``*.pth``
+      whose own stored epoch is GREATER than the source's) is MOVED aside into
+      ``output_dir/abandoned_branch_<k>/`` with a manifest — never deleted, never
+      overwritten.  Logs and ``segment_*.json`` records are never moved.
 
-    The newest-epoch rule is scoped to IN-PLACE recovery because §11.1 is a
-    statement about a run resuming from ITS OWN last checkpoint; a resume into
-    a DIFFERENT output dir from an explicitly chosen source is a deliberate
-    fork/continuation (exercised by the phase-boundary resume tests) and is not
-    the silent-re-train risk this rule targets.  That exemption is intentional,
-    not a hole: forking an older source into a NEW dir is a deliberate
-    continuation the operator names explicitly, whereas the in-place case is a
-    run re-entering its own dir where a stale source would silently re-train.
-    A source in a dir with no decodable last-epoch file (a fresh dir, a test
-    fixture, a renamed artifact) is accepted unchanged.  ``peek`` is the
-    already-decoded source (never re-read).
+    Both REFUSAL rules are scoped to IN-PLACE recovery (``resume_path.parent ==
+    output_dir``) because §11.1 governs a run re-entering its OWN dir; a fork
+    into a DIFFERENT dir from an explicitly chosen source is a deliberate
+    continuation.  A dir with no record at all (fresh dir, fixture, renamed
+    artifact) is accepted unchanged.  Returns ``(disclosed_range, archived_names)``
+    where ``disclosed_range`` is the ``(lo, hi)`` re-trained range or ``None`` (a
+    clean boundary / no record) and ``archived_names`` lists the abandoned-branch
+    files moved aside.  ``peek`` is the already-decoded source (never re-read).
     """
     if resume_path.name == "best_model.pth":
         raise ValueError(
@@ -1176,11 +1195,11 @@ def _require_resume_source_is_newest_complete_epoch(
         )
 
     if resume_path.parent.resolve() != Path(output_dir).resolve():
-        return  # a fork into a different dir: not the in-place recovery §11.1 governs
+        return None, []  # a fork into a different dir: not the in-place recovery §11.1 governs
 
     src_epoch = peek.get("epoch")
     if not isinstance(src_epoch, int) or isinstance(src_epoch, bool):
-        return  # undecodable source epoch: nothing to compare against
+        return None, []  # undecodable source epoch: nothing to compare against
 
     newest_name: Optional[str] = None
     newest_epoch = src_epoch
@@ -1212,6 +1231,31 @@ def _require_resume_source_is_newest_complete_epoch(
             "resuming from an older one would silently re-train completed "
             "epochs (fail closed)."
         )
+
+    # DISCLOSED ROLLBACK (§11.1, amendment 2026-10-11).  The run's own records —
+    # its progress logs, its segment ``starting_epoch`` entries, and its
+    # checkpoints — witness how far it actually got.  If the selected source is
+    # OLDER, the resume is ALLOWED (refusing it would make resume unusable) but is
+    # DISCLOSED and the abandoned-branch artifacts are MOVED aside (never
+    # overwritten), so no silent rollback and no overwrite can occur.
+    last_executed = _last_executed_epoch(resume_path.parent)
+    rollback = rollback_retrained_range(src_epoch, last_executed)
+    if rollback is None:
+        return None, []
+    lo, hi = rollback
+    # PURE: only LIST the abandoned-branch artifacts here.  The actual MOVE
+    # (``archive_abandoned_branch``) happens LATER, after every fail-closed
+    # resume check has passed, so a REFUSED resume never mutates the run dir.
+    abandoned = [p.name for p in list_abandoned_branch(resume_path.parent, src_epoch)]
+    logger.warning(
+        "DISCLOSED ROLLBACK (§11.1): resume source %s stored epoch %d is older "
+        "than the last executed epoch %d; epochs %d..%d will be RE-TRAINED.  "
+        "%d abandoned-branch artifact(s) will be moved to "
+        "%s/abandoned_branch_*/ (never overwritten): %s",
+        resume_path.name, src_epoch, last_executed, lo, hi, len(abandoned),
+        resume_path.parent, ", ".join(abandoned) or "(none)",
+    )
+    return rollback, abandoned
 
 
 def _parent_training_controls(
@@ -1451,6 +1495,7 @@ def _write_segment_record(
     resumed: bool,
     resume_path: Optional[Path] = None,
     resolved_workers: Optional[Dict[str, Optional[int]]] = None,
+    disclosed_rollback: Optional[Tuple[int, int]] = None,
 ) -> Path:
     """Write one immutable restart-segment record; never overwrite a prior one.
 
@@ -1481,6 +1526,14 @@ def _write_segment_record(
         "written_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "resumed": resumed,
         "starting_epoch": int(start_epoch),
+        # The DISCLOSED re-trained range ``[lo, hi]`` when this segment rolled
+        # back past the run's last executed epoch (§11.1 amendment 2026-10-11);
+        # ``null`` on a clean boundary or a fresh run.  Recorded so the rollback
+        # is auditable and never silent.
+        "disclosed_rollback": (
+            [int(disclosed_rollback[0]), int(disclosed_rollback[1])]
+            if disclosed_rollback is not None else None
+        ),
         "parent_checkpoint": parent,
         "config_sha256": hashlib.sha256(
             json.dumps(config.to_dict(), sort_keys=True, default=str).encode()
@@ -1530,6 +1583,85 @@ def _write_segment_record(
                 pass
         break
     return record_path
+
+
+def _record_disclosed_rollback(
+    output_dir: Path,
+    ckpt_path: Path,
+    start_epoch: int,
+    rollback: Tuple[int, int],
+    resume_id: Optional[str] = None,
+) -> None:
+    """Record a DISCLOSED rollback in ``provenance.json`` and a status.log line.
+
+    §11.1 (amendment 2026-10-11) forbids a SILENT rollback: on a bare
+    ``train.py --resume`` (which bypasses the launcher's ``record`` subcommand)
+    the re-trained range must still be recorded.  This extends the run's
+    ``resume_log`` in place (atomic temp + fsync + rename; prior fields and prior
+    entries preserved — never truncated) and appends one line to a
+    ``status.log`` in the run dir.  The provenance path is
+    ``output_dir/provenance.json`` (the run's own dir).
+
+    The ``resume_log`` entry is written ONLY when the LAUNCHER's own entry for
+    THIS resume IDENTITY is absent (round-7/round-12 blockers):
+    ``run_frozen_resume.sh`` mints a per-invocation ``resume_id`` and calls
+    ``record`` before launching ``train.py --resume --resume-id <id>``, so an
+    unconditional append would double-count one resume — and D4 makes the
+    interruption count auditable.  The key is the resume IDENTITY, not
+    checkpoint + range equality: two DISTINCT resumes that reuse the same source
+    checkpoint and re-trained range are BOTH recorded.  A bare
+    ``train.py --resume`` (no ``--resume-id``) has no launcher entry, so it
+    always records.
+
+    The run-dir ``status.log`` line is appended on EVERY path (K3): when the
+    launcher's ``resume_log`` entry already exists the entry append is skipped,
+    but the run dir's OWN ``status.log`` still receives its line — the launcher's
+    ``record`` writes to a DIFFERENT file (``$JOBDIR/status.log``, overridable via
+    ``STATUS_LOG``), so §11.1 condition 4's "each resume appends an entry to
+    status.log" must not depend on which file the launcher happened to target.
+    """
+    lo, hi = int(rollback[0]), int(rollback[1])
+    entry = {
+        "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "checkpoint": str(ckpt_path),
+        "checkpoint_epoch": int(start_epoch) - 1,
+        "source": "train.py",
+        "resume_id": resume_id,
+        "disclosed_rollback": [lo, hi],
+        "note": (
+            f"source older than last executed epoch; epochs {lo}..{hi} "
+            "re-trained (abandoned-branch artifacts archived)"
+        ),
+    }
+    prov_path = output_dir / "provenance.json"
+    try:
+        prov = json.loads(prov_path.read_text()) if prov_path.exists() else {}
+    except (OSError, ValueError):
+        prov = {}
+    if not launcher_already_recorded(prov, resume_id):
+        # The launcher has NOT recorded this resume identity: append our own
+        # entry (a bare --resume, or a launcher resume whose id we cannot match).
+        prov.setdefault("resume_log", []).append(entry)
+        tmp = prov_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(prov, indent=2, allow_nan=False) + "\n")
+        try:
+            fd = os.open(tmp, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        except OSError:  # pragma: no cover - filesystems without fsync
+            pass
+        os.replace(tmp, prov_path)
+    # ALWAYS append the run-dir status.log line (K3), even when the launcher's
+    # resume_log entry already exists: the run dir's own status.log is a
+    # distinct audit target from the launcher's $JOBDIR/status.log.
+    with open(output_dir / "status.log", "a", encoding="utf-8") as handle:
+        handle.write(
+            f"{entry['time']} {output_dir.name} DISCLOSED-ROLLBACK from "
+            f"{ckpt_path.name} (source epoch {start_epoch - 1}): re-train epochs "
+            f"{lo}..{hi} (source=train.py)\n"
+        )
 
 
 def _atomic_save_checkpoint(**kwargs) -> Path:
@@ -2156,6 +2288,14 @@ _SWEEP_BANDS: Optional[List[float]] = None
 _ZERO_INPUT_CHANNELS: Tuple[int, ...] = ()
 _SELECTION_METRIC: str = "total"
 
+# The launcher's per-invocation resume IDENTITY (``--resume-id``), set by
+# build_config().  train.py uses it ONLY to skip its OWN duplicate
+# ``resume_log`` entry for a resume the launcher already recorded; ``None``
+# (a bare ``train.py --resume``) always records.  Script-owned module state,
+# mirroring ``_ZERO_INPUT_CHANNELS``/``_SELECTION_METRIC`` — never part of the
+# protected config schema, so every config/checkpoint stays byte-unchanged.
+_RESUME_ID: Optional[str] = None
+
 
 def _parse_selection_metric(value: Optional[str]) -> str:
     """Validate a ``--selection_metric`` value; ``None`` keeps ``'total'``."""
@@ -2579,6 +2719,26 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Override periodic checkpoint interval (epochs).",
     )
     parser.add_argument(
+        "--expect-device",
+        type=str,
+        default=None,
+        choices=["cpu", "cuda"],
+        help="On a resume, refuse unless the resolved device matches this "
+             "value.  Enforces the §11.1 device clause: a CPU arm must not "
+             "silently resume on GPU (trajectory-unverified).  Unset = no "
+             "constraint (a bare --resume is unchanged).",
+    )
+    parser.add_argument(
+        "--resume-id",
+        type=str,
+        default=None,
+        help="The launcher's per-invocation resume IDENTITY (a UUID).  train.py "
+             "uses it to skip its OWN duplicate provenance resume_log entry for "
+             "a resume the launcher already recorded; a bare --resume (no id) "
+             "always records.  Unset = no constraint (a bare --resume is "
+             "unchanged).",
+    )
+    parser.add_argument(
         "--sweep_escape_band",
         type=str,
         default=None,
@@ -2649,7 +2809,7 @@ def build_config(argv: Optional[Sequence[str]] = None) -> Tuple[ExperimentConfig
     # state_dict keys remain byte-identical.)  They are consumed
     # by ``build_dataloaders`` (ablation), ``train`` (selection) and recorded
     # as additive checkpoint provenance keys.
-    global _ZERO_INPUT_CHANNELS, _SELECTION_METRIC
+    global _ZERO_INPUT_CHANNELS, _SELECTION_METRIC, _RESUME_ID
     phase2 = _read_phase2_block(args.config)
     _zero_decl = getattr(args, "zero_input_channels", None)
     if _zero_decl is None:
@@ -2659,6 +2819,9 @@ def build_config(argv: Optional[Sequence[str]] = None) -> Tuple[ExperimentConfig
     if _sel_decl is None:
         _sel_decl = phase2.get("selection_metric")
     _SELECTION_METRIC = _parse_selection_metric(_sel_decl)
+    # The launcher's per-invocation resume identity (K2).  Script-owned state,
+    # never part of the protected config schema; ``None`` for a bare --resume.
+    _RESUME_ID = getattr(args, "resume_id", None)
     if getattr(args, "refinement_mode", None) is not None:
         config.model.refinement_mode = args.refinement_mode
     if getattr(args, "refinement_max_steps", None) is not None:
@@ -5264,6 +5427,7 @@ def train(
     require_nested_validation: bool = False,
     trusted_historical_checkpoint_sha256=None,
     trusted_historical_artifact_sha256=None,
+    expect_device: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Full training pipeline.
@@ -5353,6 +5517,24 @@ def train(
 
     # ── Device ────────────────────────────────────────────────
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # §11.1 device clause, MACHINE-ENFORCED: a resume must not silently run on
+    # a different device class than the caller intends.  The bitwise guarantee
+    # is CPU-only; a GPU resume is state-exact but trajectory-unverified, so a
+    # CPU arm resumed on a CUDA host would silently produce exactly the
+    # forbidden 'phase-2 result'.  ``--expect-device`` fails closed before any
+    # epoch when the resolved device disagrees.  A FRESH run is unconstrained
+    # (the opt-in is a resume-time gate) and an unset flag leaves a bare
+    # ``--resume`` unchanged.
+    if (expect_device is not None
+            and config.checkpoint.resume_from is not None
+            and device.type != expect_device):
+        raise ValueError(
+            f"Refusing to resume on device {device.type!r}: the caller "
+            f"required {expect_device!r} (--expect-device).  The bitwise "
+            "resume guarantee is CPU-only; a GPU resume is state-exact and "
+            "trajectory-unverified and must not produce a phase-2 result "
+            "(§11.1 device clause, fail closed)."
+        )
     logger.info("Device: %s", device)
     logger.info("lambda_reg: %.4f", lambda_reg)
     logger.info("lambda_routing_aux=%.4f", config.loss.lambda_routing_aux)
@@ -5716,6 +5898,15 @@ def train(
     # updates left, so it finalizes at the parent's saved executed epoch.
     # See the equality branch below.
     _terminal_at_total_budget = False
+    # Set to the DISCLOSED re-trained range ``[source + 1, last_executed]`` when
+    # this resume rolls back past the run's last executed epoch (§11.1,
+    # amendment 2026-10-11).  Recorded in the segment record + resume_log +
+    # status.log, so the rollback is never silent.  ``None`` on a clean boundary.
+    _disclosed_rollback: Optional[Tuple[int, int]] = None
+    # Names of abandoned-branch artifacts moved aside by the rollback (empty when
+    # none).  Used to tolerate the deliberately-absent companion best model in the
+    # best-reconciliation below (it was archived, not lost).
+    _archived_abandoned: List[str] = []
 
     if config.checkpoint.resume_from is not None:
         ckpt_path = Path(config.checkpoint.resume_from)
@@ -5732,13 +5923,23 @@ def train(
         resume_payload = ckpt_path.read_bytes()
         ckpt_peek = load_artifact_bytes(resume_payload, map_location="cpu")
         validate_checkpoint_clock(ckpt_peek, model.dt_ms, require_dt_ms=True)
-        # §11.1 authorizes resuming only from the run's LAST complete-epoch
-        # checkpoint.  ``train.py`` enforces this itself — not only the resume
-        # launcher — so a bare ``--resume`` cannot silently re-train completed
-        # epochs: ``best_model.pth`` is never a resume source, and a source
-        # older than a newer last-epoch family file in the same run dir is
-        # refused.  Runs before any state restoration or epoch.
-        _require_resume_source_is_newest_complete_epoch(ckpt_path, ckpt_peek, output_dir)
+        # §11.1 authorizes resuming from the run's LAST complete-epoch checkpoint.
+        # ``train.py`` enforces the source rules itself — not only the resume
+        # launcher — so a bare ``--resume`` cannot pick ``best_model.pth`` or an
+        # older periodic when a newer one exists.  A source OLDER than the run's
+        # last EXECUTED epoch is ALLOWED (normal recovery) but DISCLOSED, and its
+        # abandoned-branch artifacts are MOVED aside (never overwritten).  Runs
+        # before any state restoration or epoch.
+        _disclosed_rollback, _archived_abandoned = (
+            _resolve_resume_source_and_rollback(ckpt_path, ckpt_peek, output_dir)
+        )
+        # PURE preflight list of the abandoned-branch artifacts THIS invocation
+        # will move aside.  ``best_model.pth`` in that list means the abandoned
+        # best is (about to be) archived, so the best-model reconciliation must
+        # treat it as ABSENT rather than read/consume it — and the reconciliation
+        # can then run BEFORE the physical MOVE without reading the abandoned
+        # best.  See the moved-aside step below (after every fail-closed check).
+        _best_will_be_archived = "best_model.pth" in _archived_abandoned
         # A current-schema parent claims an exact continuation, so its full
         # canonical state must be present before anything restores from it.
         # This runs FIRST in the resume preflight (before any epoch or any
@@ -6016,7 +6217,16 @@ def train(
                 src_cand_val = certify_best_checkpoint(
                     ckpt_peek, ckpt_path, resume_payload,
                 )
-        elif companion.exists() and companion.resolve() != ckpt_path.resolve():
+        elif (
+            companion.exists()
+            and companion.resolve() != ckpt_path.resolve()
+            # The companion best belongs to the ABANDONED branch (its stored
+            # epoch exceeds the source's) and is about to be MOVED aside by the
+            # disclosed rollback.  Treat it as ABSENT here so the reconciliation
+            # never reads or re-installs the abandoned best; it is archived
+            # (never lost) after every fail-closed check has passed.
+            and not _best_will_be_archived
+        ):
             companion_payload = companion.read_bytes()
             comp_peek = load_artifact_bytes(companion_payload, map_location="cpu")
             validate_checkpoint_clock(comp_peek, model.dt_ms, require_dt_ms=True)
@@ -6040,7 +6250,13 @@ def train(
         dest_val: Optional[float] = None
         dest_stale = False
         destination_payload: Optional[bytes] = None
-        if best_target.exists():
+        # A destination best that belongs to the ABANDONED branch (about to be
+        # MOVED aside) is treated as ABSENT: it must not be read, ranked, or
+        # re-installed here — it is archived (never lost) after every fail-closed
+        # check.  Without this the reconciliation would consume the abandoned
+        # best, and the archive step (now positioned later) would move it out from
+        # under the run.
+        if best_target.exists() and not _best_will_be_archived:
             if best_target.resolve() == ckpt_path.resolve():
                 destination_payload = resume_payload
                 dest_peek = ckpt_peek
@@ -6183,19 +6399,59 @@ def train(
                 src_cand_path, best_target, best_val_loss,
             )
         else:
-            # Neither source candidate nor destination candidate exists
-            if claimed_best is not None:
+            # Neither source candidate nor destination candidate exists.  This is
+            # tolerated ONLY when the run's best was archived to
+            # ``abandoned_branch_*/`` on THIS invocation (``_best_will_be_archived``)
+            # OR on a PRIOR one (``has_best_model_archive``).  The latter is what
+            # makes a chained SECOND resume survive: the first rollback moved the
+            # best OUT of the run dir, and the resumed segment can legitimately
+            # fail to produce a new best (its val never beats the seeded
+            # ``best_val_loss``), so keying the tolerance on THIS invocation's own
+            # rollback alone would fail closed on a legitimate second interruption.
+            _best_in_archive = (
+                _best_will_be_archived or has_best_model_archive(output_dir)
+            )
+            if claimed_best is not None and not _best_in_archive:
                 raise ValueError(
                     f"Cannot resume checkpoint {ckpt_path} into fresh directory {output_dir}: "
                     f"absent historical best model {ckpt_path.parent / 'best_model.pth'} (fail closed)."
                 )
-            if dest_stale:
-                best_target.unlink()
-            best_val_loss = float("inf")
-            logger.warning(
-                "Checkpoint %s lacks historical best model; best_val_loss initialized to inf.",
-                ckpt_path,
-            )
+            if _best_in_archive:
+                # DISCLOSED ROLLBACK: the companion best_model.pth was archived
+                # (it belonged to the abandoned branch and the resumed run would
+                # overwrite it).  The retained epochs [0, source] still have a
+                # legitimate best — the SOURCE checkpoint's own recorded
+                # ``best_val_loss`` — so seed from THAT, not from the archived
+                # (abandoned) best and not from inf.  The re-trained range
+                # [lo, hi] regenerates a best_model.pth as soon as it beats it.
+                if claimed_best is not None:
+                    best_val_loss = claimed_best
+                    logger.warning(
+                        "DISCLOSED ROLLBACK: historical best_model.pth was "
+                        "archived to abandoned_branch_*/; best_val_loss seeded "
+                        "from the resume source's own recorded value (%.6f) for "
+                        "the retained epochs; the re-trained epochs %d..%d will "
+                        "regenerate a best if they beat it.",
+                        best_val_loss, _disclosed_rollback[0],
+                        _disclosed_rollback[1],
+                    )
+                else:
+                    best_val_loss = float("inf")
+                if dest_stale:
+                    best_target.unlink()
+                logger.warning(
+                    "Checkpoint %s lacks historical best model (archived by the "
+                    "disclosed rollback); best_val_loss initialized to %.6f.",
+                    ckpt_path, best_val_loss,
+                )
+            else:
+                if dest_stale:
+                    best_target.unlink()
+                best_val_loss = float("inf")
+                logger.warning(
+                    "Checkpoint %s lacks historical best model; best_val_loss initialized to inf.",
+                    ckpt_path,
+                )
 
     # ── Training loop ─────────────────────────────────────────
     logger.info("=" * 60)
@@ -6334,6 +6590,26 @@ def train(
             )
             val_loss = _term_val if _term_val is not None else float("inf")
 
+    # ── DISCLOSED ROLLBACK: MOVE the abandoned branch aside ───
+    # Runs only AFTER every fail-closed resume check has passed (source rules,
+    # complete-current-schema, architecture/lineage match, ``load_checkpoint``,
+    # the best-model reconciliation, ``_restore_recovery_state`` and the
+    # bitwise-loader-RNG guard) AND before the training loop writes anything, so
+    # a resume REFUSED at ANY fail-closed check never mutates the run dir (§11.1
+    # D2: 'before an in-place rollback resume writes anything').  The preflight
+    # was a pure LIST; this is the MOVE.  RENAMES only; nothing is deleted, and a
+    # move that would overwrite an existing archive path is refused.  The run-dir
+    # best/final that belong to the abandoned branch were treated as ABSENT by the
+    # reconciliation above (``_best_will_be_archived``), so nothing here reads or
+    # consumes them.
+    if _disclosed_rollback is not None:
+        archive_abandoned_branch(
+            ckpt_path.parent,
+            source_epoch=int(ckpt_peek.get("epoch")),
+            last_executed=int(_disclosed_rollback[1]),
+            source_name=ckpt_path.name,
+        )
+
     # ── Restart-segment lineage record ────────────────────────
     # One immutable record per invocation, written once training is
     # committed to (all preflight validation has passed) and before the
@@ -6355,7 +6631,16 @@ def train(
         resumed=config.checkpoint.resume_from is not None,
         resume_path=ckpt_path if config.checkpoint.resume_from is not None else None,
         resolved_workers=_resolved_workers,
+        disclosed_rollback=_disclosed_rollback,
     )
+    # A disclosed rollback must be recorded on EVERY resume path — including a
+    # bare ``train.py --resume`` that never goes through the launcher — so it is
+    # never silent.  Append it to provenance.json's ``resume_log`` (extending, not
+    # truncating, the prior entries) and to a status.log line in the run dir.
+    if _disclosed_rollback is not None:
+        _record_disclosed_rollback(
+            output_dir, ckpt_path, start_epoch, _disclosed_rollback, _RESUME_ID,
+        )
 
     # ── Consume a stale safe-pause sentinel on resume ─────────
     # A resume from this run's OWN checkpoint can still find the ``STOP``
@@ -6940,6 +7225,19 @@ def train(
         # an early stop or the epoch budget).  Additive: an uninterrupted run
         # reports False, so existing consumers are unaffected.
         "paused": _paused_on_sentinel,
+        # The DISCLOSED re-trained epoch range ``[lo, hi]`` when this segment
+        # rolled back past the run's last executed epoch (§11.1 amendment
+        # 2026-10-11); ``None`` on a clean boundary or a fresh run.  Reported so
+        # a run's rollback is listed, never silent.
+        "disclosed_rollback": (
+            [int(_disclosed_rollback[0]), int(_disclosed_rollback[1])]
+            if _disclosed_rollback is not None else None
+        ),
+        # The device this segment actually ran on ('cpu'/'cuda'), recorded so
+        # §11.1's device clause is machine-checkable after the fact: a
+        # CUDA-started arm must be reported GPU / trajectory-unverified, and
+        # the bitwise guarantee is scoped to 'cpu'.
+        "device": device.type,
     }
 
 
@@ -6979,6 +7277,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         require_nested_validation=not args.diagnostic_only,
         trusted_historical_checkpoint_sha256=args.trusted_historical_checkpoint_sha256,
         trusted_historical_artifact_sha256=args.trusted_historical_artifact_sha256,
+        expect_device=args.expect_device,
     )
     train_log_path = output_dir / "train.log"
     with open(train_log_path, "w") as f:
