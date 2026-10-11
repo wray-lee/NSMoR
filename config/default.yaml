@@ -45,6 +45,23 @@ model:
   refinement_eps: 0.01           # ACT halt when cumulative p >= 1 - eps
   refinement_update_scale: 1.0   # bound on per-step residual update
 
+  # ── Time-consuming recursion (phase-3 mechanism line, ADR 0009) ──
+  # An opt-in mode where processing depth CONSUMES model-grid time: a frame
+  # whose adaptive depth is d is emitted (d - 1) frames later (a strictly
+  # causal shift; trailing frames are truncated).  Representational timing
+  # ONLY — NOT measured neural latency, work, or ATP.
+  #   off         (default) — no module; historical numerics unchanged.
+  #   depth_delay — adaptive halt depth sets the emission delay.
+  #   accumulate  — a learned accumulator to a threshold sets the delay.
+  # Raw JAX / Flax backends reject an enabled mode (not implemented there).
+  time_consuming_mode: "off"
+  time_consuming_max_steps: 4        # max recursion depth / delay steps K
+  time_consuming_eps: 0.01           # depth_delay halt threshold [1e-6, 1)
+  time_consuming_update_scale: 1.0   # bound on per-step residual update
+  time_consuming_delay_scale: 1.0    # frames of delay per recursion step
+                                     # (phase-3 arms set 10.0 -> 120 ms at K=4)
+  time_consuming_threshold: 1.0      # accumulate-mode threshold, in (0, 1]
+
   # Physical model-grid interval (ms). All lif_tau_* below are declared
   # in PHYSICAL ms and converted internally via alpha = exp(-dt/tau).
   # Reviewer Round-1 BLOCKER-1: changing the model-grid interval can no

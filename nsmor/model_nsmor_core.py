@@ -36,6 +36,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
+from nsmor.config_parser import MIN_TIME_CONSUMING_EPS
+
 
 # Valid activation names for the encoder / decoder projections.
 # ``relu`` preserves the historical architecture and state_dict keys;
@@ -299,6 +301,98 @@ def _validate_refinement_options(
     return mode, int(max_steps), float(eps), float(update_scale)
 
 
+# Valid time-consuming recursion modes (phase-3 mechanism line, ADR 0009).
+# ``off`` (default) constructs no module and leaves historical numerics,
+# parameters and RNG byte-unchanged.  ``depth_delay`` ties the output time of
+# each frame to its adaptive processing depth; ``accumulate`` ties it to the
+# first step at which a learned scalar accumulator reaches a threshold.
+_VALID_TIME_CONSUMING_MODES = ("off", "depth_delay", "accumulate")
+
+
+def _validate_time_consuming_options(
+    *, mode: Any, max_steps: Any, eps: Any, update_scale: Any,
+    delay_scale: Any, threshold: Any, context: str,
+) -> Tuple[str, int, float, float, float, float]:
+    """Validate ORIGINAL time-consuming-recursion options independently.
+
+    Mirrors :func:`_validate_refinement_options`: the option contract holds at
+    every public trust boundary, including ``mode == "off"`` where no module is
+    constructed, so a bool/NaN/negative/illegal setting is refused even when
+    the mechanism is disabled.  ``eps`` and ``update_scale`` therefore share
+    the refinement contract and are validated here too (findings R1-M2 /
+    R2-m1: an off-mode constructor previously accepted ``eps=nan`` and
+    ``update_scale=-1.0``).
+
+    ``threshold`` is bounded to ``(0, 1]``.  The ``accumulate`` estimator is
+    the convex mixture ``sum_{j<N} g_j u_j + R u_N`` with
+    ``R = 1 - sum_{j<N} g_j``; with ``threshold <= 1`` the pre-crossing
+    accumulator is ``< threshold <= 1`` in both the crossed and never-crossed
+    branches, so ``R`` stays in ``(0, 1]`` and the mixture remains inside the
+    convex hull of the iterates (findings R1-m3 / R2-B4).  A ``threshold > 1``
+    would permit ``R < 0`` (an extrapolation, not a mixture).
+
+    Returns the validated ``(mode, int(max_steps), float(eps),
+    float(update_scale), float(delay_scale), float(threshold))``.
+
+    Raises:
+        ValueError: On any malformed option.
+    """
+    if mode not in _VALID_TIME_CONSUMING_MODES:
+        raise ValueError(
+            f"{context}: time_consuming_mode must be 'off'/'depth_delay'/"
+            f"'accumulate', got {mode!r}"
+        )
+    if isinstance(max_steps, bool) or not isinstance(max_steps, int) or max_steps < 1:
+        raise ValueError(
+            f"{context}: time_consuming_max_steps must be an int >= 1, got "
+            f"{max_steps!r}"
+        )
+    if (
+        isinstance(eps, bool)
+        or not isinstance(eps, (int, float))
+        or not math.isfinite(eps)
+        or not (MIN_TIME_CONSUMING_EPS <= float(eps) < 1.0)
+    ):
+        raise ValueError(
+            f"{context}: time_consuming_eps must be in "
+            f"[{MIN_TIME_CONSUMING_EPS}, 1), got {eps!r}"
+        )
+    if (
+        isinstance(update_scale, bool)
+        or not isinstance(update_scale, (int, float))
+        or not math.isfinite(update_scale)
+        or update_scale <= 0.0
+    ):
+        raise ValueError(
+            f"{context}: time_consuming_update_scale must be finite > 0, got "
+            f"{update_scale!r}"
+        )
+    if (
+        isinstance(delay_scale, bool)
+        or not isinstance(delay_scale, (int, float))
+        or not math.isfinite(delay_scale)
+        or delay_scale <= 0.0
+    ):
+        raise ValueError(
+            f"{context}: time_consuming_delay_scale must be finite > 0, got "
+            f"{delay_scale!r}"
+        )
+    if (
+        isinstance(threshold, bool)
+        or not isinstance(threshold, (int, float))
+        or not math.isfinite(threshold)
+        or not (0.0 < float(threshold) <= 1.0)
+    ):
+        raise ValueError(
+            f"{context}: time_consuming_threshold must be in (0, 1], got "
+            f"{threshold!r}"
+        )
+    return (
+        mode, int(max_steps), float(eps), float(update_scale),
+        float(delay_scale), float(threshold),
+    )
+
+
 def assert_mechanism_tree_consistent(source: Any, *, context: str) -> None:
     """Fail closed if an ENABLED mechanism lacks its required parameter leaves.
 
@@ -373,6 +467,34 @@ def refinement_module_present(source: Any) -> bool:
         return True
     for holder in (source, backend):
         mode = getattr(holder, "refinement_mode", None)
+        if mode not in (None, "off"):
+            return True
+    return False
+
+
+def time_consuming_module_present(source: Any) -> bool:
+    """Return True if the executed backend carries a time-consuming recursion.
+
+    ADR 0009: the Flax / raw-JAX backends do not implement time-consuming
+    recursion (the delayed/accumulated output map is not reproduced there), so
+    every known-live converter must refuse such a model rather than silently
+    drop it and return undelayed predictions.  Like
+    :func:`refinement_module_present`, this inspects the EXECUTED child
+    (``backend.time_consuming``), not the stale ``time_consuming_mode`` string:
+    a mode mutated to ``"off"`` after construction still executes the module.
+
+    Args:
+        source: A ``NSMoRCore``, a ``BioDecisionCore``, or a config object.
+
+    Returns:
+        True when a time-consuming module (or a non-``"off"``/``None`` mode
+        alias) is present on the source or its ``backend``.
+    """
+    backend = getattr(source, "backend", source)
+    if getattr(backend, "time_consuming", None) is not None:
+        return True
+    for holder in (source, backend):
+        mode = getattr(holder, "time_consuming_mode", None)
         if mode not in (None, "off"):
             return True
     return False
@@ -2442,6 +2564,345 @@ class AdaptiveLatentRefinement(nn.Module):
         return out, depth, updates_scalar, ponder, weights
 
 
+def _emit_delayed(
+    refined: torch.Tensor,
+    source_delay: torch.Tensor,
+    valid: torch.Tensor,
+    lengths: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, int, int, int, torch.Tensor]:
+    """Causally shift ``refined`` by ``source_delay`` with injective arbitration.
+
+    Source frame ``t`` is written to target ``t + round(source_delay[t])``,
+    never earlier (causal).  The map is **not injective**: when depth varies
+    within a trial a long-delay (deep) source can overtake a shallow one and
+    two sources collide on the same target.  Collisions are arbitrated
+    **deterministically** — the source with the smallest delay wins, ties
+    broken by the earliest source frame — so the emitted value is never
+    "whichever frame was processed last".  ``out_valid`` is a pure function of
+    the surviving targets, so the ``out`` / ``out_valid`` pair cannot disagree.
+
+    Sources whose target falls outside the trial are **truncated**; sources
+    whose target is in-trial but lose arbitration are **collisions**.  Both are
+    counted and reported (never silently dropped).
+
+    Note (rounding collisions): the shift uses ``round(source_delay)``.  A
+    NON-INTEGER ``delay_scale`` maps two distinct depths onto the same integer
+    target frame, manufacturing spurious collisions that are indistinguishable
+    from genuine overtaking; the pre-registered phase-3 scale (10.0) is an
+    integer, so this does not affect the frozen arms, but the invariant is
+    stated here rather than left implicit (finding R1-minor).
+
+    Args:
+        refined: ``(B, T, H)`` per-source refined value.
+        source_delay: ``(B, T)`` nonnegative per-source delay in frames.
+        valid: ``(B, T)`` bool source mask (padding is never emitted).
+        lengths: ``(B,)`` true per-sample lengths.
+
+    Returns:
+        ``(out, out_valid, max_delay, n_collisions, n_truncated,
+        realized_delay)``: ``out`` ``(B, T, H)`` (unwritten frames are exact
+        zeros), ``out_valid`` ``(B, T)`` bool, ``max_delay`` int, the two
+        dropped-source counts, and ``realized_delay`` ``(B, T)`` — the
+        POST-ARBITRATION delay of the surviving source, indexed by TARGET
+        frame (0 at frames that received no write).  ``realized_delay`` is the
+        quantity the phase-3 R6 latency statistic uses, so a collided target
+        reports the delay the model actually emitted (never the losing
+        source's double-counted delay) (finding R1-M1).
+
+    Raises:
+        ValueError: If the shapes are inconsistent.
+    """
+    B, T, H = refined.shape
+    if source_delay.shape != (B, T):
+        raise ValueError(
+            f"source_delay shape {tuple(source_delay.shape)} != (B={B}, T={T})"
+        )
+    if valid.shape != (B, T):
+        raise ValueError(f"valid shape {tuple(valid.shape)} != (B={B}, T={T})")
+    if lengths.shape != (B,):
+        raise ValueError(f"lengths shape {tuple(lengths.shape)} != (B={B},)")
+    device = refined.device
+    src = torch.arange(T, device=device).unsqueeze(0).expand(B, T)   # (B, T)
+    delay_int = source_delay.round().to(torch.long)
+    # An out-of-trial source's ``tgt`` is only ever used for the ``tgt < L``
+    # comparison, so clamp the (possibly huge) integer delay to ``T`` first:
+    # this keeps every key/``big`` comfortably inside int64 for any finite
+    # ``delay_scale`` without changing which sources are in-trial.
+    delay_int = delay_int.clamp(max=T)
+    tgt = src + delay_int                                            # (B, T)
+    in_trial = valid & (tgt < lengths.unsqueeze(1))                  # (B, T)
+    # Sortable key = delay * (T + 1) + src, monotone in (delay, src), so the
+    # ``amin`` winner is the smallest delay with the earliest tie-break.
+    # ``big`` is a TRUE upper bound on any real key, so out-of-trial sentinels
+    # never win a target.
+    dmax = int(delay_int.max().item()) if delay_int.numel() > 0 else 0
+    big = dmax * (T + 1) + T + 1
+    key = torch.where(
+        in_trial, delay_int * (T + 1) + src, torch.full_like(src, big),
+    )
+    flat_tp = tgt.clamp(0, T - 1)
+    # Reduce over T target columns plus one DUMP column (index T) that absorbs
+    # the out-of-trial sentinels, so a truncated source never pollutes a real
+    # target's minimum.
+    scatter_idx = torch.where(in_trial, flat_tp, torch.full_like(flat_tp, T))
+    min_key = torch.full((B, T + 1), big, device=device, dtype=torch.long)
+    min_key = min_key.scatter_reduce(
+        1, scatter_idx, key, reduce="amin", include_self=True,
+    )
+    min_key = min_key[:, :T]
+    # Winner at source t's TARGET (gather min_key by the target, not the source).
+    winner_key = min_key.gather(1, flat_tp)                          # (B, T)
+    emitted = in_trial & (key == winner_key)                         # (B, T)
+
+    out = torch.zeros(B, T, H, device=device, dtype=refined.dtype)
+    out_valid = torch.zeros(B, T, dtype=torch.bool, device=device)
+    # POST-ARBITRATION delay of the surviving source, indexed by TARGET frame
+    # (0 at frames with no write).  This is what the model actually emitted,
+    # so a collided target never reports the losing source's delay.
+    realized_delay = torch.zeros(B, T, device=device, dtype=source_delay.dtype)
+    b_idx, s_idx = emitted.nonzero(as_tuple=True)
+    if b_idx.numel() > 0:
+        # Each surviving target is written exactly once (distinct keys per
+        # target), so the advanced-index scatter cannot silently overwrite.
+        out[b_idx, tgt[b_idx, s_idx], :] = refined[b_idx, s_idx, :]
+        out_valid[b_idx, tgt[b_idx, s_idx]] = True
+        realized_delay[b_idx, tgt[b_idx, s_idx]] = source_delay[b_idx, s_idx]
+    max_delay = (
+        int(source_delay[emitted].max().item()) if bool(emitted.any()) else 0
+    )
+    # Dropped sources: in-trial sources that lost arbitration (collisions) and
+    # valid sources whose target fell outside the trial (truncation).
+    n_dropped = int((valid & ~emitted).sum().item())
+    n_truncated = int((valid & ~in_trial).sum().item())
+    n_collisions = n_dropped - n_truncated
+    return out, out_valid, max_delay, n_collisions, n_truncated, realized_delay
+
+
+class TimeConsumingRecursion(nn.Module):
+    """Time-consuming adaptive recursion (opt-in, ADR 0009).
+
+    Unlike :class:`AdaptiveLatentRefinement`, which refines the post-fusion
+    latent at a fixed external timestep and never advances biological time,
+    this module makes processing depth CONSUME time: a frame whose adaptive
+    processing needs ``d`` steps is emitted ``(d - 1)`` frames later on the
+    model's own grid, so model depth becomes directly comparable with the
+    animal's response latency and its variability.  The delayed map is a
+    strictly CAUSAL shift (frame ``t`` is written to ``t + (d - 1)``, never
+    earlier), so no future information leaks backward; the last ``d`` frames
+    of each trial are truncated, shrinking the effective output length by up
+    to ``max_steps - 1`` frames.
+
+    Two modes share the SAME parameter tree (capacity-matched controls):
+
+    * ``"depth_delay"`` — each valid frame runs the shared bounded block
+      exactly ``max_steps`` times; the shared halt head's first crossing
+      ``d = min{k : cumsum_j<=k sigmoid(halt(u_j)) >= 1 - eps}`` (else
+      ``max_steps``) sets the emission delay ``d - 1``.  This is the
+      "stop after ``d`` recursions" reading.
+    * ``"accumulate"`` — a shared scalar accumulator integrates a learned
+      gate ``sigmoid(halt(u_k))`` of each frame's fused feature; the frame is
+      emitted at the first step ``d`` at which the accumulator reaches
+      ``threshold`` (else ``max_steps``).  This is the "accumulate to a
+      threshold before emitting" reading.
+
+    Identifiability (ADR 0009): the two modes are behaviorally nearly
+    indistinguishable, so the strongest licensable claim is that an adaptive
+    processing duration exists and MoR is one discrete approximation — never
+    that the cricket has MoR.  The module is a representational timing device,
+    NOT measured neural latency, work, or ATP.
+
+    Padding / empty rows never recurse (depth 0, no delay, not emitted).
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        *,
+        mode: str = "off",
+        max_steps: int = 4,
+        eps: float = 0.01,
+        update_scale: float = 1.0,
+        delay_scale: float = 1.0,
+        threshold: float = 1.0,
+    ) -> None:
+        super().__init__()
+        # Validate the ORIGINAL time-consuming options first (so a malformed
+        # off-mode request fails on the option itself), then refuse "off"
+        # (this is the ENABLED module; "off" means the module is absent).
+        # ``eps`` / ``update_scale`` share the refinement contract and are
+        # validated here too, so the enabled module and the off-mode boundary
+        # cannot diverge.  There is deliberately no ``dropout`` argument: this
+        # module has no dropout layer, so accepting one would be a silently
+        # unused knob and would make the "identical topology / capacity-matched"
+        # claim (vs AdaptiveLatentRefinement) imprecise.
+        (mode, max_steps, eps, update_scale, delay_scale, threshold) = (
+            _validate_time_consuming_options(
+                mode=mode, max_steps=max_steps, eps=eps,
+                update_scale=update_scale, delay_scale=delay_scale,
+                threshold=threshold, context="TimeConsumingRecursion",
+            )
+        )
+        if mode == "off":
+            raise ValueError(
+                "TimeConsumingRecursion is the ENABLED time-consuming module and "
+                "does not accept mode='off'; 'off' means the module is absent "
+                "(BioDecisionCore builds it only for 'depth_delay'/'accumulate')."
+            )
+        self.mode = mode
+        self.max_steps = int(max_steps)
+        self.eps = float(eps)
+        self.update_scale = float(update_scale)
+        self.delay_scale = float(delay_scale)
+        self.threshold = float(threshold)
+        self.hidden_dim = int(hidden_dim)
+
+        # Shared bounded residual block (identical topology to
+        # AdaptiveLatentRefinement, so the two are capacity-matched).
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.fc1 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        # Shared halt head (depth_delay) / accumulator gate (accumulate).
+        self.halt = nn.Linear(hidden_dim, 1)
+
+    def _block(self, u: torch.Tensor) -> torch.Tensor:
+        h = self.norm(u)
+        h = torch.tanh(self.fc1(h))
+        h = self.fc2(h)
+        # Bounded residual: |delta| <= update_scale (LayerNorm alone is not a
+        # stability proof; the bounded increment controls per-step drift).
+        delta = self.update_scale * torch.tanh(h)
+        return u + delta
+
+    def forward(
+        self, h_fused: torch.Tensor, valid: torch.Tensor,
+    ) -> Tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int,
+        torch.Tensor, int, int, torch.Tensor,
+    ]:
+        """Consume time on ``h_fused`` (B, T, H).
+
+        Returns ``(out, depth, updates, delays, max_delay, out_valid,
+        n_collisions, n_truncated, realized_delay)`` where
+
+        * ``out`` ``(B, T, H)`` — delayed/truncated output (frames with no
+          source write are exact zeros);
+        * ``depth`` ``(B, T)`` int — per-frame recursion depth (0 for padding);
+        * ``updates`` int scalar — ACTUAL executed block AND halt rows
+          (``n_valid * K``).  Both the shared block and the halt head run on
+          every one of the ``K`` steps for every valid row (there is no early
+          exit), so ``block_rows == halt_rows == updates`` and the protocol
+          §5 budget identity holds;
+        * ``delays`` ``(B, T)`` — per-frame emission delay in frames
+          (``delay_scale * (depth - 1)``, 0 for padding), indexed by SOURCE;
+        * ``max_delay`` int — the largest delay in the batch;
+        * ``out_valid`` ``(B, T)`` bool — frames that received a source write;
+        * ``n_collisions`` int — in-trial sources that lost arbitration;
+        * ``n_truncated`` int — sources whose target fell outside the trial;
+        * ``realized_delay`` ``(B, T)`` — the POST-ARBITRATION delay of the
+          surviving source, indexed by TARGET frame (0 where no write
+          happened).  This is the R6 latency statistic's quantity (finding
+          R1-M1): a collided target reports the delay actually emitted, not
+          the losing source's delay.
+        """
+        B, T, H = h_fused.shape
+        assert h_fused.shape == (B, T, H)
+        assert valid.shape == (B, T)
+        K = self.max_steps
+        device = h_fused.device
+        dt = h_fused.dtype
+
+        depth = torch.zeros(B, T, dtype=torch.long, device=device)
+        # ACT full-prefix mixture (differentiable in the shared block and halt
+        # head): ``out = sum_{j<N} g_j u_j + R u_N`` with ``R = 1 - sum_{j<N} g_j``
+        # (``N = K`` for never-crossing rows).  Weights are nonnegative and sum
+        # to one; ``N == 1`` gives ``out = u_1``.  This keeps the halt-head
+        # gradient alive while the integer depth ``N`` (used only for the
+        # emission delay) stays detached.
+        # Compute the crossing threshold in float64 and compare the (float32)
+        # accumulator promoted to float64.  ``1.0 - eps`` evaluated in float32
+        # for a tiny ``eps`` rounds to exactly 1.0, which would force the
+        # never-crossed branch and a degenerate max depth even though the
+        # ``eps in (0, 1)`` validator accepted it (finding R1-m2).  The
+        # validator additionally enforces a declared lower bound
+        # (``MIN_TIME_CONSUMING_EPS``); this float64 comparison is the
+        # correctness fix (the emitted VALUE stays float32, so no output
+        # numerics change).
+        cross_target = float(
+            (1.0 - self.eps) if self.mode == "depth_delay" else self.threshold
+        )
+        refined = torch.zeros(B, T, H, device=device, dtype=dt)
+        for t in range(T):
+            act = valid[:, t]                              # (B,) bool
+            n_active = int(act.sum().item())
+            if n_active == 0:
+                continue
+            idx = act.nonzero(as_tuple=True)[0]
+            cur = h_fused[:, t, :].index_select(0, idx)    # (n_active, H)
+            d = torch.full((n_active,), K, dtype=torch.long, device=device)
+            crossed = torch.zeros(n_active, dtype=torch.bool, device=device)
+            acc = torch.zeros(n_active, device=device, dtype=dt)
+            prefix = torch.zeros(n_active, H, device=device, dtype=dt)
+            R = torch.zeros(n_active, device=device, dtype=dt)
+            u_cross = torch.zeros(n_active, H, device=device, dtype=dt)
+            sum_before_last = torch.zeros(n_active, device=device, dtype=dt)
+            for k in range(1, K + 1):
+                if self.mode == "depth_delay":
+                    cur = self._block(cur)
+                    g = torch.sigmoid(self.halt(cur)).squeeze(-1)
+                else:  # accumulate: gate the current iterate, then step
+                    g = torch.sigmoid(self.halt(cur)).squeeze(-1)
+                    cur = self._block(cur)
+                sum_before_last = acc
+                new_acc = acc + g
+                # Compare in float64 so ``1 - eps`` cannot be rounded to 1.0
+                # by float32 for a small ``eps`` (finding R1-m2).
+                just = (~crossed) & (new_acc.double() >= cross_target)
+                R = torch.where(just, 1.0 - acc, R)
+                u_cross = torch.where(just.unsqueeze(-1), cur, u_cross)
+                d = torch.where(just, torch.full_like(d, k), d)
+                crossed = crossed | just
+                accum = (~crossed) & (k < K)
+                prefix = prefix + torch.where(
+                    accum.unsqueeze(-1), g.unsqueeze(-1) * cur,
+                    torch.zeros_like(cur),
+                )
+                acc = new_acc
+            never = ~crossed
+            R = torch.where(never, 1.0 - sum_before_last, R)
+            u_final = torch.where(never.unsqueeze(-1), cur, u_cross)
+            refined[:, t, :] = torch.zeros(
+                B, H, device=device, dtype=dt,
+            ).index_copy(0, idx, prefix + R.unsqueeze(-1) * u_final)
+            # Scatter ``d`` (n_active,) back into the full (B,) column.  A
+            # ``torch.where(act, d, zeros)`` broadcast would fail whenever
+            # ``n_active`` is neither 0 nor B (an ordinary mixed-length padded
+            # batch, e.g. B=128 with variable trial lengths) with a size
+            # mismatch (finding R2-B1).
+            depth_col = torch.zeros(B, dtype=torch.long, device=device)
+            depth[:, t] = depth_col.index_copy(0, idx, d)
+
+        # Emission delay in frames: delay_scale * (depth - 1); padding (depth 0)
+        # maps to 0 and is never emitted.  Indexed by SOURCE frame t.
+        source_delay = (depth.to(dt) - 1.0).clamp(min=0.0) * self.delay_scale
+        assert source_delay.shape == (B, T)
+
+        lengths = valid.sum(dim=1)                         # (B,)
+        (out, out_valid, max_delay, n_collisions,
+         n_truncated, realized_delay) = _emit_delayed(
+            refined, source_delay, valid, lengths,
+        )
+
+        updates = torch.tensor(
+            int(valid.sum().item()) * K, dtype=torch.long, device=device,
+        )
+        assert out.shape == (B, T, H)
+        assert realized_delay.shape == (B, T)
+        return (
+            out, depth, updates, source_delay, max_delay, out_valid,
+            n_collisions, n_truncated, realized_delay,
+        )
+
+
 class BioDecisionCore(nn.Module):
     """
     Bio-decision core for the Hybrid Funnel architecture.
@@ -2499,6 +2960,12 @@ class BioDecisionCore(nn.Module):
         refinement_max_steps: int = 4,
         refinement_eps: float = 0.01,
         refinement_update_scale: float = 1.0,
+        time_consuming_mode: str = "off",
+        time_consuming_max_steps: int = 4,
+        time_consuming_eps: float = 0.01,
+        time_consuming_update_scale: float = 1.0,
+        time_consuming_delay_scale: float = 1.0,
+        time_consuming_threshold: float = 1.0,
     ) -> None:
         """
         Args:
@@ -2535,6 +3002,18 @@ class BioDecisionCore(nn.Module):
                 cumulative halt probability reaches ``1 - eps``.
             refinement_update_scale: Bound on the per-step residual update
                 (``|delta| <= update_scale``).
+            time_consuming_mode: ``"off"`` (default; module absent, historical
+                numerics unchanged), ``"depth_delay"`` (adaptive depth delays
+                each frame's emission), or ``"accumulate"`` (a learned
+                accumulator to a threshold sets the delay).  ADR 0009.
+            time_consuming_max_steps: Maximum recursion depth / delay steps K.
+            time_consuming_eps: ``depth_delay`` halting threshold; a frame is
+                emitted when its cumulative halt probability reaches
+                ``1 - eps``.
+            time_consuming_update_scale: Bound on the per-step residual update.
+            time_consuming_delay_scale: Frames of delay per recursion step
+                (``delay = delay_scale * (depth - 1)``).
+            time_consuming_threshold: ``accumulate`` accumulator threshold.
         """
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -2588,6 +3067,36 @@ class BioDecisionCore(nn.Module):
                 eps=refinement_eps,
                 update_scale=refinement_update_scale,
                 dropout=dropout,
+            )
+
+        # ── Opt-in time-consuming recursion (phase-3 mechanism line, ADR 0009) ──
+        # ``off`` leaves the parameter tree / numerics / RNG bitwise unchanged;
+        # the module is only constructed for ``depth_delay`` / ``accumulate``.
+        # ALL six options (mode, max_steps, eps, update_scale, delay_scale,
+        # threshold) are validated BEFORE the off branch, mirroring refinement,
+        # so an off model still refuses a malformed eps/update_scale at the
+        # trust boundary (findings R1-M2 / R2-m1).
+        (time_consuming_mode, time_consuming_max_steps, time_consuming_eps,
+         time_consuming_update_scale, time_consuming_delay_scale,
+         time_consuming_threshold) = _validate_time_consuming_options(
+            mode=time_consuming_mode, max_steps=time_consuming_max_steps,
+            eps=time_consuming_eps, update_scale=time_consuming_update_scale,
+            delay_scale=time_consuming_delay_scale,
+            threshold=time_consuming_threshold,
+            context="BioDecisionCore",
+        )
+        self.time_consuming_mode = time_consuming_mode
+        if time_consuming_mode == "off":
+            self.time_consuming = None
+        else:
+            self.time_consuming = TimeConsumingRecursion(
+                hidden_dim,
+                mode=time_consuming_mode,
+                max_steps=time_consuming_max_steps,
+                eps=time_consuming_eps,
+                update_scale=time_consuming_update_scale,
+                delay_scale=time_consuming_delay_scale,
+                threshold=time_consuming_threshold,
             )
 
         # ── Neuromodulatory gain for GRU pathway (Gap C) ──
@@ -2921,8 +3430,57 @@ class BioDecisionCore(nn.Module):
                 refinement_ponder_cost = torch.zeros((), device=device)
                 refinement_weights = h_out.new_zeros((B, T, 0))
 
+            # ── Opt-in time-consuming recursion (ADR 0009) ──
+            # Applied to the refined latent, BEFORE the direction head.  In
+            # ``depth_delay``/``accumulate`` the output frame ``t`` is emitted
+            # at ``t + delay`` (a strictly causal shift; trailing frames are
+            # truncated), so processing depth consumes model-grid time.  The
+            # refinement module, if any, is representational only; this is the
+            # separate, opt-in timing device.
+            time_consuming_max_delay = 0
+            time_consuming_collisions = torch.zeros(
+                (), dtype=torch.long, device=device,
+            )
+            time_consuming_truncated = torch.zeros(
+                (), dtype=torch.long, device=device,
+            )
+            if self.time_consuming is not None:
+                (h_emitted, time_consuming_depth, time_consuming_updates,
+                 time_consuming_delays, time_consuming_max_delay,
+                 time_consuming_out_valid, _n_coll, _n_trunc,
+                 time_consuming_realized_delay) = (
+                    self.time_consuming(h_refined, valid)
+                )
+                # ``h_emitted`` is the delayed emission; the direction head
+                # decodes it.  The delayed map is not injective, so sources can
+                # lose per-target arbitration (collisions) and sources can be
+                # truncated at the trial tail.  Both are reported exactly, so
+                # the alignment is honest (finding R2-B1).
+                time_consuming_collisions = torch.tensor(
+                    _n_coll, dtype=torch.long, device=device,
+                )
+                time_consuming_truncated = torch.tensor(
+                    _n_trunc, dtype=torch.long, device=device,
+                )
+            else:
+                h_emitted = h_refined
+                time_consuming_depth = torch.zeros(
+                    (B, T), dtype=torch.long, device=device,
+                )
+                time_consuming_updates = torch.zeros(
+                    (), dtype=torch.long, device=device,
+                )
+                time_consuming_delays = torch.zeros((B, T), device=device)
+                time_consuming_out_valid = valid
+                time_consuming_realized_delay = torch.zeros((B, T), device=device)
+
             # ── Decode ──
-            y_pred = self.direction_head(h_refined)
+            # The time-consuming module changes the SCORED quantity (the
+            # delayed emission), so it is that quantity the head decodes and
+            # the loss scores.  The undelayed refinement readout is retained
+            # separately (``refined_hidden``) when refinement is enabled, so
+            # the two never alias (finding R2-B3).
+            y_pred = self.direction_head(h_emitted)
 
         assert y_pred.shape == (B, T), (
             f"y_pred shape {tuple(y_pred.shape)} != (B={B}, T={T})"
@@ -2974,6 +3532,49 @@ class BioDecisionCore(nn.Module):
             internals["refinement_updates"] = refinement_updates
             internals["refinement_ponder_cost"] = refinement_ponder_cost
             internals["refinement_weights"] = refinement_weights
+
+        # ── Time-consuming recursion internals (ADR 0009) ──
+        # Present ONLY when the module is enabled, so an ``off`` model's
+        # internals dict is bitwise/structurally unchanged.  ``output_delay``
+        # is the emission delay per SOURCE frame; ``out_valid`` marks frames
+        # that received a delayed write (the alignment mask for scoring);
+        # ``time_consuming_hidden`` is the delayed emission that the head
+        # decodes (distinct from ``refined_hidden``); ``..._collisions`` counts
+        # sources dropped by per-target arbitration (in-trial collisions), and
+        # ``..._truncated`` counts sources whose target fell outside the trial.
+        if self.time_consuming is not None:
+            assert time_consuming_depth.shape == (B, T), (
+                f"time_consuming_depth shape {tuple(time_consuming_depth.shape)} "
+                f"!= (B={B}, T={T})"
+            )
+            assert time_consuming_delays.shape == (B, T), (
+                f"time_consuming_delays shape {tuple(time_consuming_delays.shape)} "
+                f"!= (B={B}, T={T})"
+            )
+            assert time_consuming_out_valid.shape == (B, T), (
+                f"out_valid shape {tuple(time_consuming_out_valid.shape)} "
+                f"!= (B={B}, T={T})"
+            )
+            assert time_consuming_realized_delay.shape == (B, T), (
+                f"realized_delay shape "
+                f"{tuple(time_consuming_realized_delay.shape)} != (B={B}, T={T})"
+            )
+            internals["output_delay"] = time_consuming_delays
+            # POST-ARBITRATION delay of the surviving source, indexed by TARGET
+            # frame.  The phase-3 R6 latency statistic uses THIS quantity (not
+            # the per-source ``output_delay``, which double-counts collided
+            # targets), so the pre-registered "depth vs animal latency"
+            # statistic is computable as frozen (finding R1-M1).
+            internals["realized_delay"] = time_consuming_realized_delay
+            internals["time_consuming_depth"] = time_consuming_depth
+            internals["time_consuming_updates"] = time_consuming_updates
+            internals["time_consuming_max_delay"] = torch.tensor(
+                int(time_consuming_max_delay), dtype=torch.long, device=device,
+            )
+            internals["out_valid"] = time_consuming_out_valid
+            internals["time_consuming_hidden"] = h_emitted
+            internals["time_consuming_collisions"] = time_consuming_collisions
+            internals["time_consuming_truncated"] = time_consuming_truncated
 
         if states is not None:
             states_out: Dict[str, torch.Tensor] = {
@@ -3183,6 +3784,7 @@ _FREEZABLE_MODULES = frozenset({
     "router",
     "direction_head",
     "refinement",
+    "time_consuming",
 })
 
 
@@ -3246,6 +3848,12 @@ class NSMoRCore(nn.Module):
         refinement_max_steps: int = 4,
         refinement_eps: float = 0.01,
         refinement_update_scale: float = 1.0,
+        time_consuming_mode: str = "off",
+        time_consuming_max_steps: int = 4,
+        time_consuming_eps: float = 0.01,
+        time_consuming_update_scale: float = 1.0,
+        time_consuming_delay_scale: float = 1.0,
+        time_consuming_threshold: float = 1.0,
     ) -> None:
         super().__init__()
         if (
@@ -3263,6 +3871,7 @@ class NSMoRCore(nn.Module):
         self.persistence_skip: float = float(persistence_skip)
         self.activation = activation
         self.refinement_mode = refinement_mode
+        self.time_consuming_mode = time_consuming_mode
         self.sensory_dim = sensory_dim
         self.mcmc_dim = mcmc_dim
         self.hidden_dim = hidden_dim
@@ -3305,6 +3914,12 @@ class NSMoRCore(nn.Module):
             refinement_max_steps=refinement_max_steps,
             refinement_eps=refinement_eps,
             refinement_update_scale=refinement_update_scale,
+            time_consuming_mode=time_consuming_mode,
+            time_consuming_max_steps=time_consuming_max_steps,
+            time_consuming_eps=time_consuming_eps,
+            time_consuming_update_scale=time_consuming_update_scale,
+            time_consuming_delay_scale=time_consuming_delay_scale,
+            time_consuming_threshold=time_consuming_threshold,
         )
 
         # ── Backward-compatible attribute aliases ──

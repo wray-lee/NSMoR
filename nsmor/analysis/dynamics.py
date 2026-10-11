@@ -108,6 +108,23 @@ def assert_no_adaptive_refinement_for_full_jacobian(
             f"derivative at an unstated coordinate. Analyse the raw GRU "
             f"coordinate instead, or construct with refinement_mode='off'."
         )
+    # Time-consuming recursion (ADR 0009): the output map becomes a per-frame
+    # emission DELAY (a discrete shift), so dh_out/dx at a fixed frame is not
+    # the model's readout derivative.  Refuse rather than report a partial
+    # derivative at an unstated coordinate.
+    from nsmor.model_nsmor_core import time_consuming_module_present
+
+    if time_consuming_module_present(model):
+        backend = getattr(model, "backend", model)
+        mode = getattr(backend, "time_consuming_mode", None)
+        raise ValueError(
+            f"{context}: full-system Jacobian is refused while the model "
+            f"carries a time-consuming recursion module "
+            f"(time_consuming_mode={mode!r}). The output frame is a delayed "
+            f"emission of an earlier internal frame, so dh_out/dx is a partial "
+            f"derivative at an unstated (delayed) coordinate. Analyse the raw "
+            f"GRU coordinate instead, or construct with time_consuming_mode='off'."
+        )
 
 
 def raw_gru_trajectory(
