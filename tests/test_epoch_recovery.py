@@ -4056,3 +4056,44 @@ def test_h2_train_and_decider_share_checkpoint_witness_set() -> None:
         trainer._CHECKPOINT_WITNESS_FAMILIES
     )
     assert set(mod._RESUME_EXCLUDED) == set(trainer._NON_RESUME_WITNESS_FAMILIES)
+    # The log-parse pattern must ALSO be shared, not two inline literals that
+    # can drift (round-5 R2 minor).
+    assert mod._EPOCH_PROGRESS_RE.pattern == trainer._EPOCH_PROGRESS_RE.pattern
+
+
+def test_h1_resumed_segment_log_advances_the_boundary(tmp_path: Path) -> None:
+    """Round-5 BLOCKER: the resumed segment's OWN log advances the witness.
+
+    The launcher writes the resumed segment's log (``train.segment1.log``), so
+    once that segment's first epoch completes the run has genuinely executed
+    through 150 — the old ``epoch_150.pth`` (stored 149) is then a rollback and
+    is REFUSED.  This is the state a live-dir exact-equality test cannot pin
+    (round-5 BLOCKER: the first resume invalidates a hard ``== 149`` /
+    ``epoch_150.pth`` pin on the mutable dir).  Part (2) then adds the resumed
+    segment's newer periodic (``epoch_160.pth``, stored 159), which becomes the
+    correct clean-boundary source.
+    """
+    from scripts import train as trainer
+
+    run_dir = tmp_path / "arm"
+    run_dir.mkdir()
+    _ckpt(run_dir / "epoch_150.pth", 149)
+
+    # (1) The resumed segment's first epoch completes: only the LOG (not any new
+    # checkpoint) advances the witness to 150, so the old source is refused.
+    (run_dir / "train.segment1.log").write_text(
+        "[t] INFO - Epoch 151/300  train_loss=1.0\n"
+    )
+    assert trainer._last_executed_epoch(run_dir) == 150
+    with pytest.raises(ValueError, match="no-silent-rollback"):
+        trainer._require_resume_source_is_newest_complete_epoch(
+            run_dir / "epoch_150.pth", {"epoch": 149}, run_dir,
+        )
+
+    # (2) The resumed segment writes its next periodic: it is now the newest
+    # complete-epoch checkpoint (159) and the correct clean-boundary source.
+    _ckpt(run_dir / "epoch_160.pth", 159)
+    assert trainer._last_executed_epoch(run_dir) == 159
+    trainer._require_resume_source_is_newest_complete_epoch(
+        run_dir / "epoch_160.pth", {"epoch": 159}, run_dir,
+    )

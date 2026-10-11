@@ -24,6 +24,16 @@ A checkpoint that disagreed with the artifact would therefore be refused by
 The test SKIPS when the READ-ONLY corpus / run dirs are absent (a machine
 without the phase-2 artifacts), so it never fails a checkout that lacks them.
 It never writes to the run dir.
+
+STATE-INDEPENDENCE: the seed-44 dir is MUTATED by the resume this amendment
+authorizes (it gains ``segment_0001.json`` and ``train.segment1.log``).  Every
+assertion on that dir is therefore written to hold in BOTH the pre-resume and
+the post-resume state — the real-dir test SIMULATES the resume's own writes on a
+copy (``test_real_seed44_dir_stays_a_clean_boundary_across_first_resume``), and
+the end-to-end test's source-selection assertion accepts ``epoch_150.pth`` OR the
+next periodic ``epoch_160.pth`` the resumed segment writes.  A hard pin on the
+live dir's exact current state (round-5 BLOCKER: an ``== 149`` / ``epoch_150.pth``
+pin that the first resume invalidates) is deliberately NOT used.
 """
 
 from __future__ import annotations
@@ -209,24 +219,68 @@ def test_preflight_scope_is_disclosed_not_overstated() -> None:
     assert peek["dataset_source_sha256"] == compute_source_fingerprint(_DATASET)
 
 
-def test_real_seed44_dir_is_a_clean_boundary() -> None:
-    """The seed-44 dir's last executed epoch (149) equals its newest checkpoint.
+def test_real_seed44_dir_stays_a_clean_boundary_across_first_resume(
+    tmp_path: Path,
+) -> None:
+    """The REAL seed-44 dir is a CLEAN BOUNDARY and STAYS one across the resume.
 
-    ``_last_executed_epoch`` reads the run's OWN records; for seed-44 the log's
-    last line is ``Epoch 150/300`` (0-based 149) and the newest periodic is
-    ``epoch_150.pth`` (stored 149), so the boundary is clean and the source is
-    accepted (no rollback).
+    State-independent (round-5 BLOCKER): the previous version pinned
+    ``_last_executed_epoch(_RUN_DIR) == 149`` on the LIVE seed-44 dir, which the
+    resume this amendment authorizes MUTATES — it gains ``segment_0001.json``
+    {``starting_epoch``: 150} AND the resumed segment's own ``train.segment1.log``
+    (``Epoch 151/300`` once its first epoch completes), so the witness reads 150
+    and the ``== 149`` pin FAILS.  The test was invalidated by the very action it
+    gated.
 
-    STABLE ACROSS THE FIRST RESUME: seed-44's ``segment_0000.json`` records
-    ``starting_epoch`` 0 (-> -1).  The first resume this commit authorizes writes
-    ``segment_0001.json``{``starting_epoch``: 150}, which under the H1 start-1
-    rule witnesses only epoch 149 — so this assertion (149) is NOT invalidated
-    by the very action it gates (round-4 MAJOR: a raw start witness returned 150
-    and broke the pin).
+    Here the resume's exact writes are SIMULATED on a READ-ONLY COPY of the real
+    dir (the live dir is only read):
+      * first resume IN PROGRESS (segment start 150 written, first epoch not yet
+        complete) — the start-1 rule keeps the boundary at 149, so the real
+        ``epoch_150.pth`` (stored 149) is ACCEPTED (the round-5 hazard: the raw
+        start over-claimed to 150 and falsely refused);
+      * first resume's first epoch COMPLETE (log ``Epoch 151/300``) — the run has
+        genuinely executed through 150, so the old ``epoch_150.pth`` is now
+        correctly REFUSED and the resumed segment's newer periodic is the source.
     """
+    import json
+    import shutil
+
     from scripts import train as T
 
-    assert T._last_executed_epoch(_RUN_DIR) == 149
+    # The live dir's CURRENT state is never a rollback (state-independent: 149
+    # pre-resume, 150 once the resumed segment's first epoch completes).  Read-only.
+    assert T._last_executed_epoch(_RUN_DIR) >= 149
+
+    work = tmp_path / "seed44"
+    shutil.copytree(_RUN_DIR, work)
+    src = work / "epoch_150.pth"
+    src_epoch = T._checkpoint_stored_epoch(src)
+    assert src_epoch == 149, src_epoch  # the clean-boundary source
+    peek = {"epoch": src_epoch}
+
+    # Pre-resume: last executed == newest checkpoint == 149 -> clean boundary.
+    assert T._last_executed_epoch(work) == 149
+    T._require_resume_source_is_newest_complete_epoch(src, peek, work)
+
+    # The first resume IN PROGRESS writes its segment record (start = 149 + 1);
+    # its first epoch has not completed, so no post-150 log line exists yet.
+    (work / "segment_0001.json").write_text(
+        json.dumps({"starting_epoch": 150})
+    )
+    assert T._last_executed_epoch(work) == 149, (
+        "the resumed segment's start over-claimed the last executed epoch "
+        "(round-5 hazard): the clean-boundary recovery would be falsely refused"
+    )
+    T._require_resume_source_is_newest_complete_epoch(src, peek, work)
+
+    # The resumed segment's FIRST epoch completes: the run has now executed
+    # through 150, so the old epoch_150.pth (149) is correctly refused.
+    (work / "train.segment1.log").write_text(
+        "[t] INFO - Epoch 151/300  train_loss=1.0\n"
+    )
+    assert T._last_executed_epoch(work) == 150
+    with pytest.raises(ValueError, match="no-silent-rollback"):
+        T._require_resume_source_is_newest_complete_epoch(src, peek, work)
 
 
 def test_real_seed43_dir_is_refused_by_f1_no_silent_rollback() -> None:

@@ -724,6 +724,49 @@ def test_decider_and_train_share_the_checkpoint_witness_set() -> None:
     assert set(mod._RESUME_EXCLUDED) == set(T._NON_RESUME_WITNESS_FAMILIES)
 
 
+def test_decider_and_train_share_the_epoch_progress_regex() -> None:
+    """R2 minor: the two F1 enforcers must share the SAME log-parse pattern.
+
+    The decider previously compiled its epoch-progress pattern INLINE, so a
+    future edit to one enforcer's literal would silently change the witness on
+    that one only — the exact drift the H2 shared-witness-set fix exists to
+    eliminate, but unpinned for the log regex.  Both now use a named
+    ``_EPOCH_PROGRESS_RE``; pin the two literals identical.
+    """
+    mod = _helper()
+    from scripts import train as T
+
+    assert mod._EPOCH_PROGRESS_RE.pattern == T._EPOCH_PROGRESS_RE.pattern
+
+
+def test_decider_accepts_post_resume_dir_with_segment_log(tmp_path: Path) -> None:
+    """Round-5 BLOCKER: the decider must ACCEPT the dir after the first resume.
+
+    The first resume writes the resumed segment's OWN ``train.segment1.log``
+    (``Epoch 151/300`` once its first epoch completes) and ``epoch_160.pth`` (the
+    next periodic after stored epoch 159).  The run has genuinely executed
+    through 150, so the newer ``epoch_160.pth`` IS the newest complete-epoch
+    checkpoint and the resume is a CLEAN BOUNDARY — accepted.  This is the
+    decider counterpart of the state-independent real-dir test, on a synthetic
+    dir (fast, and independent of the live seed-44 dir's mutable state).
+    """
+    cfg = tmp_path / "arm.yaml"
+    cfg.write_text("training:\n  num_epochs: 300\n")
+    out = tmp_path / "arm"
+    _write_prov(out, cfg, _FROZEN, f"{_WT}/nsmor/__init__.py")
+    _write_ckpt(out / "epoch_150.pth", 149)
+    _write_ckpt(out / "epoch_160.pth", 159)
+    _write_ckpt(out / "best_model.pth", 142)
+    _write_log(out, last_epoch_1based=150)  # the first segment's log
+    (out / "train.segment1.log").write_text(
+        "[t] INFO - Epoch 151/300  train_loss=1.0\n"
+    )
+    _write_segment(out, 150)  # the first resume's segment record
+    rc, msg = _decide(out, cfg, n=300)
+    assert rc == 0, msg
+    assert msg.endswith("epoch_160.pth"), msg
+
+
 def test_git_ancestor_real_repository() -> None:
     """R1-minor: the ancestry gate is exercised against a REAL repository.
 
@@ -770,9 +813,17 @@ def test_real_seed44_dir_decider_accepts_clean_boundary_dry_run() -> None:
 
     Drives the REAL ``decide`` (real ``_git_ancestor`` via git.exe, real config
     sha, real checkpoint decode, real F1 witness) with the arm's frozen commit
-    (this worktree HEAD) and ``ORIGIN_COMMIT=8ed5edb``; asserts it selects
-    ``epoch_150.pth`` and, being a dry run, leaves the run dir byte-identical.
-    The run dir is READ-ONLY: nothing here writes to it.
+    (this worktree HEAD) and ``ORIGIN_COMMIT=8ed5edb``; asserts it selects the
+    newest complete-epoch checkpoint and, being a dry run, leaves the run dir
+    byte-identical.  The run dir is READ-ONLY: nothing here writes to it.
+
+    STATE-INDEPENDENT (round-5 BLOCKER): the previous version hard-pinned
+    ``epoch_150.pth``, which the first resume this amendment authorizes
+    invalidates — the resumed segment writes ``epoch_160.pth`` (the next periodic
+    after stored epoch 159), which is then the newest complete-epoch checkpoint
+    and the correct source.  The assertion accepts ``epoch_150.pth`` (pre-resume)
+    or ``epoch_160.pth`` (post-resume), so it holds in either state; the
+    byte-identical check is valid in both.
     """
     import subprocess
 
@@ -799,7 +850,12 @@ def test_real_seed44_dir_decider_accepts_clean_boundary_dry_run() -> None:
             dry_run=True,
         )
     assert rc == 0, f"stdout={buf.getvalue()!r} stderr={err.getvalue()!r}"
-    assert buf.getvalue().strip().endswith("epoch_150.pth"), buf.getvalue()
+    selected = buf.getvalue().strip()
+    expected = "epoch_160.pth" if (_REAL_SEED44 / "epoch_160.pth").exists() else "epoch_150.pth"
+    assert selected.endswith(expected), (
+        f"decider selected {selected!r}, expected the newest complete-epoch "
+        f"checkpoint {expected!r}"
+    )
     after = {p.name: (p.stat().st_size, p.stat().st_mtime_ns)
              for p in _REAL_SEED44.iterdir()}
     assert after == before, "the dry-run decider must not write to the run dir"

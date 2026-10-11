@@ -868,16 +868,31 @@ source lives in the run's OWN dir is covered too, but a bare
 `train.py --resume <path> --output_dir <other>` (a fork into a DIFFERENT dir
 from an explicitly chosen source) is a deliberate continuation, **not** covered
 by train.py's F1 — only the launcher/decider path covers a cross-dir resume. The
-claim that the bare cross-dir path is covered is NOT made. Tests:
+claim that the bare cross-dir path is covered is NOT made.
+
+The log-parse pattern is a SHARED named constant (`_EPOCH_PROGRESS_RE`) in BOTH
+enforcers, not two inline literals that can silently drift (a drift would change
+the witness on one enforcer only — the failure mode the shared witness set was
+created to eliminate); the drift-pin test cross-checks the two literals. The
+real-dir tests are **state-independent**: the seed-44 dir is MUTATED by the
+resume this amendment authorizes (it gains `segment_0001.json` and
+`train.segment1.log`, and the resumed segment writes `epoch_160.pth`), so no test
+pins the live dir's exact current state — the real-dir tests SIMULATE the
+resume's writes on a copy (or accept either the pre-resume `epoch_150.pth` or the
+post-resume `epoch_160.pth`), and the synthetic tests cover the post-resume
+boundary explicitly. Tests:
 `tests/test_run_frozen_resume.py::{test_refuses_silent_rollback_when_log_reached_newer_epoch,
 test_accepts_clean_boundary_when_log_matches_newest,test_dry_run_refusal_writes_nothing,
 test_segment_starting_epoch_is_a_witness,test_h1_clean_boundary_with_resumed_segment_is_accepted,
 test_h1_segment_offbyone_still_refuses_real_rollback,test_final_model_is_a_witness_in_the_decider,
 test_decider_and_train_share_the_checkpoint_witness_set,
+test_decider_and_train_share_the_epoch_progress_regex,
+test_decider_accepts_post_resume_dir_with_segment_log,
 test_real_seed44_dir_decider_accepts_clean_boundary_dry_run}` and
 `tests/test_epoch_recovery.py::{test_no_silent_rollback_refuses_source_older_than_log,
 test_no_silent_rollback_accepts_clean_boundary,test_no_silent_rollback_ignores_best_model_epoch,
 test_h1_resumed_segment_start_does_not_overclaim,test_h1_segment_start_still_refuses_real_rollback,
+test_h1_resumed_segment_log_advances_the_boundary,
 test_h2_final_model_is_a_witness,test_h2_train_and_decider_share_checkpoint_witness_set}`.
 
 **First intended use of the successor-commit resume: `R0-control-seed44`.** It
@@ -1318,6 +1333,36 @@ that would fail open) is documented in both code and §11.1. The seed-44 decider
 + launcher DRY_RUN still accept `epoch_150.pth` and write nothing; the seed-43
 refusal is unchanged. Focused + full suite (CPU) pass. The preliminary
 conclusions remain untouched.
+
+**Amendment log — 2026-10-11 (round-10: state-independent real-dir tests, shared
+log regex).** Reason: the round-9 F1 amendment (`29215fc`) was REJECTED on one
+review. (BLOCKER) The committed real seed-44 tests hard-pinned the LIVE, MUTABLE
+seed-44 dir's exact state (`_last_executed_epoch == 149`;
+`test_run_frozen_resume.py` selecting `epoch_150.pth`), but the first resume this
+amendment authorizes WRITES the resumed segment's own `train.segment1.log`
+(`Epoch 151/300` once its first epoch completes) and `epoch_160.pth` (the next
+periodic after stored epoch 159). The launcher globs `train.*.log`, so the
+witness advances to 150 and both pins break — the tests are invalidated by the
+very action they gate. FIX: the real-dir tests are made state-independent — the
+train.py-side test SIMULATES the resume's exact writes on a READ-ONLY COPY of the
+real dir (pre-resume clean boundary accepted; the in-progress segment start
+stays 149; the first completed epoch advances to 150 and refuses the old source),
+the decider-side end-to-end test accepts `epoch_150.pth` OR `epoch_160.pth`, and
+two synthetic tests pin the post-resume boundary on both enforcers
+(`test_h1_resumed_segment_log_advances_the_boundary`,
+`test_decider_accepts_post_resume_dir_with_segment_log`). (MAJOR) The
+newly-introduced comment claimed `final_model.pth` "is never a resume SOURCE";
+it IS a valid source (the decider lists it as a candidate and train.py never
+refuses it as a source — `_require_resume_source_is_newest_complete_epoch`
+refuses only `best_model.pth` unconditionally). FIX: the false comment is
+corrected in `scripts/train.py` (both occurrences). (MINOR) The decider compiled
+its epoch-progress regex INLINE; it now uses a named `_EPOCH_PROGRESS_RE` shared
+with train.py, cross-pinned by `test_decider_and_train_share_the_epoch_progress_regex`
+(and the train.py-side mirror). The pre-epoch `lambda_routing_aux` banner over-
+claim remains the accepted, disclosed, fail-closed residual risk (inert for the
+phase-2 corpus). The seed-44 decider + launcher DRY_RUN still accept the newest
+complete-epoch checkpoint and write nothing; the seed-43 refusal is unchanged.
+Focused + full suite (CPU) pass. The preliminary conclusions remain untouched.
 
 *This amendment's text is bound to the reviewed worktree commit by the
 `sha256` of `docs/realdata-phase2-protocol-20261010.md` recorded in each run's

@@ -1051,15 +1051,16 @@ _EPOCH_PERIODIC_RE = re.compile(r"epoch_(\d+)\.pth$")
 # ``scripts/resume_decision.py::_CHECKPOINT_WITNESS_FAMILIES`` — the two
 # enforcers are the SAME rule, so their witness sets must not drift.  Written at
 # the end of a completed/paused run with that run's last executed epoch, so
-# ``final_model.pth`` IS a valid witness (it is never a resume SOURCE — see
-# ``_require_resume_source_is_newest_complete_epoch`` — but it is a witness);
-# ``best_model.pth`` stores the best SELECTED epoch (possibly far older) and is
-# NEVER a witness.
+# ``final_model.pth`` IS a valid witness AND a valid resume SOURCE (the decider
+# lists it as a candidate, and ``_require_resume_source_is_newest_complete_epoch``
+# never refuses it AS a source — that function refuses only ``best_model.pth``
+# unconditionally); ``best_model.pth`` stores the best SELECTED epoch (possibly
+# far older) and is NEVER a witness.
 _CHECKPOINT_WITNESS_FAMILIES = ("final_model.pth",)
 # Files that are NEVER read as evidence of an executed epoch.  ``best_model.pth``
-# is the best SELECTED epoch, which may be far OLDER than the last executed one.
-# (``final_model.pth`` IS a witness — see above — and is only excluded as a
-# resume SOURCE, by ``_require_resume_source_is_newest_complete_epoch``.)
+# is the best SELECTED epoch, which may be far OLDER than the last executed one,
+# so it is neither a witness nor a resume source.  (``final_model.pth`` IS both a
+# witness and a valid source — see above.)
 _NON_RESUME_WITNESS_FAMILIES = frozenset({"best_model.pth"})
 # The last "Epoch N/<budget>" progress line train.py's logger emits, once per
 # executed epoch.  Read only as a SECOND witness to how far a run actually got

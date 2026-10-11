@@ -136,6 +136,15 @@ _RESUME_EXCLUDED = frozenset({"best_model.pth"})
 # ``*.pth``; this set only bounds the F1 witness.)
 _EPOCH_PERIODIC_RE = re.compile(r"epoch_(\d+)\.pth$")
 
+# The last "Epoch N/<budget>" progress line in a run's log, read only as a
+# SECOND F1 witness to how far the run actually got.  IDENTICAL to
+# ``scripts/train.py::_EPOCH_PROGRESS_RE`` — the two enforcers are the SAME rule,
+# so this literal must not drift (the drift-pin test cross-checks the two).  See
+# train.py's ``_EPOCH_PROGRESS_RE`` for the fail-closed pre-epoch-banner
+# assumption (it also matches the ``lambda_routing_aux`` banner; MAX keeps the
+# witness fail-CLOSED, never laxer).
+_EPOCH_PROGRESS_RE = re.compile(r"\bEpoch\s+(\d+)\s*/")
+
 # The checkpoint files that witness an EXECUTED epoch (F1).  IDENTICAL to
 # ``scripts/train.py::_CHECKPOINT_WITNESS_FAMILIES`` — the two enforcers are the
 # SAME rule, so their witness sets must not drift (a divergence is a latent hole
@@ -219,7 +228,7 @@ def _last_executed_epoch(out: Path) -> int | None:
             text = (out / name).read_text(errors="ignore")
         except OSError:
             continue
-        for m in re.finditer(r"\bEpoch\s+(\d+)\s*/", text):
+        for m in _EPOCH_PROGRESS_RE.finditer(text):
             witnesses.append(int(m.group(1)) - 1)
     for rec in sorted(out.glob("segment_*.json")):
         try:
