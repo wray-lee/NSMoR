@@ -1507,6 +1507,7 @@ def _record_disclosed_rollback(
     ckpt_path: Path,
     start_epoch: int,
     rollback: Tuple[int, int],
+    resume_id: Optional[str] = None,
 ) -> None:
     """Record a DISCLOSED rollback in ``provenance.json`` and a status.log line.
 
@@ -1518,12 +1519,23 @@ def _record_disclosed_rollback(
     ``status.log`` in the run dir.  The provenance path is
     ``output_dir/provenance.json`` (the run's own dir).
 
-    The entry is written ONLY when the LAUNCHER's own entry for THIS checkpoint +
-    range is absent (round-7 blocker): ``run_frozen_resume.sh`` already calls
-    ``record`` before launching ``train.py --resume``, so an unconditional append
-    would double-count one resume — and D4 makes the interruption count
-    auditable.  A bare ``train.py --resume`` has no launcher entry, so it still
-    records.
+    The ``resume_log`` entry is written ONLY when the LAUNCHER's own entry for
+    THIS resume IDENTITY is absent (round-7/round-12 blockers):
+    ``run_frozen_resume.sh`` mints a per-invocation ``resume_id`` and calls
+    ``record`` before launching ``train.py --resume --resume-id <id>``, so an
+    unconditional append would double-count one resume — and D4 makes the
+    interruption count auditable.  The key is the resume IDENTITY, not
+    checkpoint + range equality: two DISTINCT resumes that reuse the same source
+    checkpoint and re-trained range are BOTH recorded.  A bare
+    ``train.py --resume`` (no ``--resume-id``) has no launcher entry, so it
+    always records.
+
+    The run-dir ``status.log`` line is appended on EVERY path (K3): when the
+    launcher's ``resume_log`` entry already exists the entry append is skipped,
+    but the run dir's OWN ``status.log`` still receives its line — the launcher's
+    ``record`` writes to a DIFFERENT file (``$JOBDIR/status.log``, overridable via
+    ``STATUS_LOG``), so §11.1 condition 4's "each resume appends an entry to
+    status.log" must not depend on which file the launcher happened to target.
     """
     lo, hi = int(rollback[0]), int(rollback[1])
     entry = {
@@ -1531,6 +1543,7 @@ def _record_disclosed_rollback(
         "checkpoint": str(ckpt_path),
         "checkpoint_epoch": int(start_epoch) - 1,
         "source": "train.py",
+        "resume_id": resume_id,
         "disclosed_rollback": [lo, hi],
         "note": (
             f"source older than last executed epoch; epochs {lo}..{hi} "
@@ -1542,23 +1555,24 @@ def _record_disclosed_rollback(
         prov = json.loads(prov_path.read_text()) if prov_path.exists() else {}
     except (OSError, ValueError):
         prov = {}
-    if launcher_already_recorded(prov, str(ckpt_path), rollback):
-        # The launcher already recorded this resume's rollback; appending again
-        # would double-count the interruption.  Skip BOTH the resume_log entry
-        # and the status.log line (the launcher wrote its own status.log line).
-        return
-    prov.setdefault("resume_log", []).append(entry)
-    tmp = prov_path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(prov, indent=2, allow_nan=False) + "\n")
-    try:
-        fd = os.open(tmp, os.O_RDONLY)
+    if not launcher_already_recorded(prov, resume_id):
+        # The launcher has NOT recorded this resume identity: append our own
+        # entry (a bare --resume, or a launcher resume whose id we cannot match).
+        prov.setdefault("resume_log", []).append(entry)
+        tmp = prov_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(prov, indent=2, allow_nan=False) + "\n")
         try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-    except OSError:  # pragma: no cover - filesystems without fsync
-        pass
-    os.replace(tmp, prov_path)
+            fd = os.open(tmp, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        except OSError:  # pragma: no cover - filesystems without fsync
+            pass
+        os.replace(tmp, prov_path)
+    # ALWAYS append the run-dir status.log line (K3), even when the launcher's
+    # resume_log entry already exists: the run dir's own status.log is a
+    # distinct audit target from the launcher's $JOBDIR/status.log.
     with open(output_dir / "status.log", "a", encoding="utf-8") as handle:
         handle.write(
             f"{entry['time']} {output_dir.name} DISCLOSED-ROLLBACK from "
@@ -2184,6 +2198,14 @@ _SWEEP_BANDS: Optional[List[float]] = None
 _ZERO_INPUT_CHANNELS: Tuple[int, ...] = ()
 _SELECTION_METRIC: str = "total"
 
+# The launcher's per-invocation resume IDENTITY (``--resume-id``), set by
+# build_config().  train.py uses it ONLY to skip its OWN duplicate
+# ``resume_log`` entry for a resume the launcher already recorded; ``None``
+# (a bare ``train.py --resume``) always records.  Script-owned module state,
+# mirroring ``_ZERO_INPUT_CHANNELS``/``_SELECTION_METRIC`` — never part of the
+# protected config schema, so every config/checkpoint stays byte-unchanged.
+_RESUME_ID: Optional[str] = None
+
 
 def _parse_selection_metric(value: Optional[str]) -> str:
     """Validate a ``--selection_metric`` value; ``None`` keeps ``'total'``."""
@@ -2574,6 +2596,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
              "constraint (a bare --resume is unchanged).",
     )
     parser.add_argument(
+        "--resume-id",
+        type=str,
+        default=None,
+        help="The launcher's per-invocation resume IDENTITY (a UUID).  train.py "
+             "uses it to skip its OWN duplicate provenance resume_log entry for "
+             "a resume the launcher already recorded; a bare --resume (no id) "
+             "always records.  Unset = no constraint (a bare --resume is "
+             "unchanged).",
+    )
+    parser.add_argument(
         "--sweep_escape_band",
         type=str,
         default=None,
@@ -2641,7 +2673,7 @@ def build_config(argv: Optional[Sequence[str]] = None) -> Tuple[ExperimentConfig
     # existing config and checkpoint — is byte-unchanged.  They are consumed
     # by ``build_dataloaders`` (ablation), ``train`` (selection) and recorded
     # as additive checkpoint provenance keys.
-    global _ZERO_INPUT_CHANNELS, _SELECTION_METRIC
+    global _ZERO_INPUT_CHANNELS, _SELECTION_METRIC, _RESUME_ID
     phase2 = _read_phase2_block(args.config)
     _zero_decl = getattr(args, "zero_input_channels", None)
     if _zero_decl is None:
@@ -2651,6 +2683,9 @@ def build_config(argv: Optional[Sequence[str]] = None) -> Tuple[ExperimentConfig
     if _sel_decl is None:
         _sel_decl = phase2.get("selection_metric")
     _SELECTION_METRIC = _parse_selection_metric(_sel_decl)
+    # The launcher's per-invocation resume identity (K2).  Script-owned state,
+    # never part of the protected config schema; ``None`` for a bare --resume.
+    _RESUME_ID = getattr(args, "resume_id", None)
     if getattr(args, "refinement_mode", None) is not None:
         config.model.refinement_mode = args.refinement_mode
     if getattr(args, "refinement_max_steps", None) is not None:
@@ -6266,7 +6301,7 @@ def train(
     # truncating, the prior entries) and to a status.log line in the run dir.
     if _disclosed_rollback is not None:
         _record_disclosed_rollback(
-            output_dir, ckpt_path, start_epoch, _disclosed_rollback,
+            output_dir, ckpt_path, start_epoch, _disclosed_rollback, _RESUME_ID,
         )
 
     # ── Consume a stale safe-pause sentinel on resume ─────────

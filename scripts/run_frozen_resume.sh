@@ -201,10 +201,15 @@ PY
       continue
     fi
     RESUME_CKPT=$DECISION
+    # Per-invocation resume IDENTITY (K2): train.py keys its own-entry skip on
+    # THIS id (NOT on checkpoint + range equality), so two DISTINCT resumes that
+    # reuse the same source checkpoint and range are BOTH recorded.  The id is
+    # recorded with the launcher's entry and passed to train.py verbatim.
+    RESUME_ID=$(python -c "import uuid;print(uuid.uuid4())")
     if [ -n "$ORIGIN_COMMIT" ]; then
-      python "$HELPER" record "$OUT" "$RESUME_CKPT" "$FROZEN" "$ORIGIN_COMMIT" >> "$LOG"
+      python "$HELPER" record "$OUT" "$RESUME_CKPT" "$FROZEN" "$ORIGIN_COMMIT" --resume-id "$RESUME_ID" >> "$LOG"
     else
-      python "$HELPER" record "$OUT" "$RESUME_CKPT" "$FROZEN" >> "$LOG"
+      python "$HELPER" record "$OUT" "$RESUME_CKPT" "$FROZEN" --resume-id "$RESUME_ID" >> "$LOG"
     fi
     # Consume the pause sentinel now that we are resuming from its checkpoint,
     # so the resumed run does not immediately re-pause.
@@ -249,10 +254,15 @@ PY
     # §11.1 device clause: a recorded start device pins the resume's device.
     DEVICE_ARGS=()
     if [ -n "$EXPECT_DEVICE" ]; then DEVICE_ARGS=(--expect-device "$EXPECT_DEVICE"); fi
+    # K2: pass the SAME resume identity we just recorded, so train.py skips its
+    # OWN duplicate entry for THIS resume (and a distinct resume reusing the same
+    # checkpoint + range still records).
+    RESUME_ID_ARGS=()
+    if [ -n "$RESUME_ID" ]; then RESUME_ID_ARGS=(--resume-id "$RESUME_ID"); fi
     echo "$(date -Is) $ARM START (resume from $RESUME_CKPT, frozen $FROZEN, origin ${ORIGIN_COMMIT:-none}, device ${EXPECT_DEVICE:-unpinned}, log $RUNLOG)" >> "$LOG"
     python "$WT/scripts/train.py" --config "$CFG" --dataset "$DATASET" \
       --nested_prior_artifact "$PRIOR" "${OUTDIR_ARGS[@]}" \
-      "${DEVICE_ARGS[@]}" \
+      "${DEVICE_ARGS[@]}" "${RESUME_ID_ARGS[@]}" \
       --resume "$RESUME_CKPT" > "$RUNLOG" 2>&1
   else
     RUNLOG=$OUT/train.stdout.log

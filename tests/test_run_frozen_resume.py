@@ -261,6 +261,24 @@ def test_record_writes_both_commits_on_successor_resume(tmp_path: Path) -> None:
     assert entry["origin_commit"] == _ORIGIN
 
 
+def test_record_cli_parses_resume_id(tmp_path: Path) -> None:
+    """K2: ``record ... --resume-id ID`` records the launcher's resume identity."""
+    cfg = tmp_path / "arm.yaml"
+    cfg.write_text("training:\n  num_epochs: 10\n")
+    out = tmp_path / "arm"
+    _write_prov(out, cfg, _FROZEN, f"{_WT}/nsmor/__init__.py")
+    ckpt = out / "epoch_4.pth"
+    _write_ckpt(ckpt, 4)
+
+    mod = _helper()
+    rc = mod.main(["record", str(out), str(ckpt), _FROZEN, "--resume-id", "id-X"])
+    assert rc == 0
+    entry = json.loads((out / "provenance.json").read_text())["resume_log"][0]
+    assert entry["resume_id"] == "id-X"
+    assert entry["head"] == _FROZEN
+    assert entry["origin_commit"] is None
+
+
 def test_resume_from_final_model_when_no_periodic(tmp_path: Path) -> None:
     """checkpoint_interval=10 + a non-multiple-of-10 pause writes only final_model.pth.
 

@@ -649,18 +649,23 @@ timing, or to survive a WSL failure / memory reclaim — and resumed from its
      the `provenance.json` `resume_log` entry, a `status.log` line, and the
      result dict (`train.log`'s `disclosed_rollback`), on **BOTH** the launcher
      and a bare `train.py --resume` path;
-   * every abandoned-branch artifact the resume would overwrite (a run-dir
-     `*.pth` whose own stored epoch is GREATER than the source's) is **MOVED**
-     (rename, never delete, never overwrite) into `run_dir/abandoned_branch_<k>/`
-     with a `manifest.json` (file, sha256, stored epoch, reason), BEFORE the
-     best-model reconciliation reads it; a move that would overwrite an existing
+   * every abandoned-branch artifact the resume would overwrite — a run-dir
+     `*.pth` in the ARCHIVED FAMILIES (`best_model.pth` / `final_model.pth` only)
+     whose own stored epoch is GREATER than the source's — is **MOVED** (rename,
+     never delete, never overwrite) into `run_dir/abandoned_branch_<k>/` with a
+     `manifest.json` (file, sha256, stored epoch, reason); a periodic
+     `epoch_<n>.pth` is NOT archived (the resumed run regenerates it at the SAME
+     epoch, so moving it aside would discard a valid recovery point without
+     preventing an overwrite), and a move that would overwrite an existing
      archive path is refused. The run's logs and `segment_*.json` records are
-     never moved. The preflight (source selection + witness) is a pure LIST: the
-     MOVE happens only AFTER every fail-closed resume check has passed, so a
-     resume refused at preflight never mutates the run dir. (A fail-closed error
-     in the LATER restoration/reconciliation — e.g. a corrupt payload — would
-     leave the archive in place; the artifacts are preserved with their manifest,
-     never lost, so this is a recoverable, documented state, not a data loss.)
+     never moved. The MOVE happens only AFTER every fail-closed resume check has
+     passed (`load_checkpoint`, the best-model reconciliation,
+     `_restore_recovery_state`, the bitwise-loader-RNG guard) and BEFORE the
+     training loop writes anything; the preflight (source selection + witness) is
+     a pure LIST, so a resume refused at any check never mutates the run dir.
+     (A fail-closed error in a LATER check — e.g. a corrupt payload — would leave
+     the archive in place; the artifacts are preserved with their manifest, never
+     lost, so this is a recoverable, documented state, not a data loss.)
 
    The shared witness/rollback logic lives in `nsmor/pipeline/resume_rollback.py` and is
    imported by BOTH `scripts/train.py` and `scripts/resume_decision.py`, so the
@@ -676,11 +681,22 @@ timing, or to survive a WSL failure / memory reclaim — and resumed from its
    `resume_log` extended, so its prior fields and prior entries are preserved —
    it is never truncated to a partial or empty file. The launcher
    (`run_frozen_resume.sh` + `resume_decision.py`) writes the richer `resume_log`
-   / `status.log` entry; a bare `train.py --resume` writes its own `resume_log`
-   entry and `status.log` line in the run dir (so a disclosed rollback is
-   recorded even without the launcher), but does NOT write the launcher's
-   `head`/`origin_commit` fields, so condition 5's full per-run interruption
-   reporting remains guaranteed only on the launcher path.
+   entry, keyed by a per-invocation `resume_id` (a UUID the launcher mints and
+   passes to `train.py` as `--resume-id`); `train.py` appends its OWN `resume_log`
+   entry only when the launcher's entry for THAT EXACT resume identity is absent,
+   so one launcher resume appends exactly ONE `resume_log` entry (a doubled count
+   would make the interruption count ambiguous) while a bare `train.py --resume`
+   (no id) always records. The de-dup key is the resume IDENTITY, not
+   checkpoint + range equality: two DISTINCT resumes that reuse the same source
+   checkpoint and re-trained range are BOTH recorded (D4). On EVERY path — the
+   launcher path included — `train.py` appends a `status.log` line to the RUN
+   DIR's own `status.log` (a distinct audit target from the launcher's
+   `$JOBDIR/status.log`, which is overridable via `STATUS_LOG`), so condition 4's
+   "each resume appends an entry to `status.log`" holds for the run dir
+   regardless of which file the launcher targeted. A bare `train.py --resume`
+   does NOT write the launcher's `head`/`origin_commit` fields, so condition 5's
+   full per-run interruption reporting remains guaranteed only on the launcher
+   path.
 5. **Results report interruptions.** For every run, the results report the
    number of interruptions, the interruption epochs, the resume sources, the
    re-trained epoch range of any disclosed rollback, and the archived
@@ -757,11 +773,16 @@ addition to 1–5 above (condition 1's "same frozen commit" is thereby relaxed t
   for that diff:
   * RESUME-ONLY (inside a `resume_from is not None` guard, or reached only from
     one): `_require_bitwise_resume_loader_rng`, the
-    `_require_resume_source_is_newest_complete_epoch` call, the safe-pause
+    `_resolve_resume_source_and_rollback` call, the safe-pause
     sentinel consume, `_prewarm_persistent_loaders`, the
     `_capture_rng_state`/`_restore_rng_state` helpers, and the new
-    `_require_resume_source_is_newest_complete_epoch`/`_pause_requested`
-    helpers.
+    `_resolve_resume_source_and_rollback`/`_pause_requested` helpers. (This
+    enumeration names the CURRENT successor symbols; the committed diff artifact
+    `docs/amendments/successor-resume-8ed5edb-to-ef3c3aa.diff` is bound to
+    C'=`ef3c3aa`, where this helper was still named
+    `_require_resume_source_is_newest_complete_epoch` — a name that no longer
+    exists in the tree. The symbol was renamed to
+    `_resolve_resume_source_and_rollback`; see F1.)
   * FRESH-REACHABLE, no-ops on a fresh MODEL TRAJECTORY: the
     `_require_reliable_recovery_loaders` docstring/comment edits; the `import
     re`; the `_LAST_EPOCH_FAMILIES`/`_EPOCH_PERIODIC_RE` constants; the additive
@@ -845,11 +866,12 @@ The resume SOURCE is chosen by the deterministic, interruption-independent rule
 the launcher and `scripts/train.py` already implement: **the run's newest
 complete-epoch checkpoint, ordered by the checkpoint's OWN stored epoch across
 the last-epoch families (`final_model.pth` / `epoch_*.pth`, never
-`best_model.pth`), whatever its epoch** — AND, per F1 below, it must not be
-OLDER than the last epoch the run actually executed. The specific checkpoint is
-an OUTCOME of the rule, not a pre-registered constant. Because the launcher pins
-HEAD == C', the frozen commit passed to it is whichever successor commit the
-resume actually runs at.
+`best_model.pth`), whatever its epoch** — AND, per F1 below, a source whose
+stored epoch is OLDER than the last epoch the run actually executed is ALLOWED
+but DISCLOSED (a disclosed rollback, never a refusal). The specific checkpoint
+is an OUTCOME of the rule, not a pre-registered constant. Because the launcher
+pins HEAD == C', the frozen commit passed to it is whichever successor commit
+the resume actually runs at.
 
 **F1 disclosed rollback (§11.1, 2026-10-11; SUPERSEDES the round-8/9/10
 no-silent-rollback REFUSAL).** A resume from the run's newest complete-epoch
@@ -1564,6 +1586,58 @@ current name `_resolve_resume_source_and_rollback`, and the §11.1 test list is
 updated to the tests that actually pin the rule. The dated amendment-log entries
 (rounds 8–11) are HISTORICAL records of the state at those commits and are
 retained verbatim. The preliminary conclusions remain untouched.
+
+**Amendment log — 2026-10-11 (round-13: close the round-12 double-blind
+findings; K1 doc, K2 identity de-dup, K3 status.log).** Reason: the merged
+double-blind review of `1cd8049` raised a BLOCKER (K1) and a MAJOR (K2) plus
+MINORs.
+
+(K1, BLOCKER doc) The NORMATIVE §11.1 body still stated the SUPERSEDED rules in
+several LIVE sentences (not historical logs): the sentence above F1 ('...it must
+not be OLDER than the last epoch the run actually executed' — the exact
+opposite of F1's disclosed-rollback rule); the condition-3 DISCLOSED-ROLLBACK
+bullet, which described the OLD over-broad archive scope (every `*.pth`) and the
+OLD pre-reconciliation MOVE ordering; and the successor-commit clause condition
+(iii), which named the removed helper
+`_require_resume_source_is_newest_complete_epoch` (0 occurrences in
+`scripts/`, `nsmor/`, `tests/*.py`). FIX: the F1-contradicting clause now states
+the disclosed-rollback rule; the condition-3 bullet now states the archived
+scope (`best_model.pth` / `final_model.pth` ONLY) and the post-fail-closed-check
+MOVE ordering; and the condition-(iii) enumeration names the CURRENT helper
+`_resolve_resume_source_and_rollback`, explicitly noting the committed diff
+artifact is bound to C'=`ef3c3aa` where the old name existed. A final grep
+confirms NO live normative sentence contradicts F1/D2 or names a non-existent
+symbol. The dated amendment-log entries (rounds 4–12; the occurrences at lines
+~1182, 1215, 1261, 1381, 1456, 1582) are HISTORICAL records of the state at
+those commits; they are retained verbatim as history, and the reader is told
+ONCE here that **rounds 8–10's F1 REFUSAL and the helper name
+`_require_resume_source_is_newest_complete_epoch` are SUPERSEDED** by the round-11
+disclosed rollback and the current helper `_resolve_resume_source_and_rollback`
+(renamed; the round-4/5 logs also name the old helper).
+
+(K2, MAJOR code) `launcher_already_recorded` keyed de-duplication on
+checkpoint + range EQUALITY, so a genuinely-NEW resume reusing the same source
+checkpoint and re-trained range (e.g. a bare `train.py --resume <epoch_50.pth>`
+after a prior LAUNCHER resume from that same `epoch_50.pth`/range) was silently
+NOT recorded — under-reporting D4's auditable interruption count. FIX: the
+launcher now mints a per-invocation `resume_id` (a UUID) and passes it to
+`train.py` as `--resume-id`; `resume_decision.py::record` writes it into the
+launcher's `resume_log` entry; `train.py` skips its OWN entry ONLY when that
+exact id is present, and a bare `train.py --resume` (no id) always records. New
+tests: two resumes from the same checkpoint + range are BOTH recorded
+(`test_bare_resume_same_checkpoint_range_still_records`,
+`test_record_disclosed_rollback_keys_on_identity`), and the launcher path still
+appends exactly ONE entry per resume
+(`test_launcher_path_records_rollback_once_end_to_end`,
+`test_train_skips_rollback_record_when_launcher_recorded`).
+
+(K3, MINOR code) On the launcher path `train.py` skipped the run-dir
+`status.log` line when it skipped the `resume_log` entry, but the launcher's
+`record` writes to a DIFFERENT file (`$JOBDIR/status.log`, overridable via
+`STATUS_LOG`). FIX: `train.py` now ALWAYS appends the run-dir `status.log` line,
+on every path, even when the launcher's `resume_log` entry already exists — so
+§11.1 condition 4's "each resume appends an entry to `status.log`" holds for the
+run dir itself. The preliminary conclusions remain untouched.
 
 *This amendment's text is bound to the reviewed worktree commit by the
 `sha256` of `docs/realdata-phase2-protocol-20261010.md` recorded in each run's

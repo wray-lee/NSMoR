@@ -39,12 +39,16 @@ Two subcommands, both CPU-only and side-effect-free except where noted:
       that proven ancestry.  Without the opt-in a head != frozen is still
       refused as a cross-code-version resume (fail closed).
 
-  record <out_dir> <checkpoint> <head> [origin_commit]
-      Append {time, checkpoint, checkpoint_epoch, source, head, origin_commit}
-      to the run's provenance.json ``resume_log`` (creating it if absent) and
-      print one status.log line.  This is the only writing subcommand.  When a
-      successor-commit resume is used BOTH commits (origin C and the frozen C')
-      are recorded.
+  record <out_dir> <checkpoint> <head> [origin_commit] [--resume-id ID]
+      Append {time, checkpoint, checkpoint_epoch, source, head, origin_commit,
+      resume_id} to the run's provenance.json ``resume_log`` (creating it if
+      absent) and print one status.log line.  This is the only writing
+      subcommand.  When a successor-commit resume is used BOTH commits (origin C
+      and the frozen C') are recorded.  ``--resume-id`` is the launcher's
+      per-invocation resume IDENTITY (a UUID); it is the key ``train.py`` uses
+      to skip its OWN duplicate entry for the SAME resume (see
+      ``resume_rollback.launcher_already_recorded``), so two distinct resumes
+      that reuse the same checkpoint + range are BOTH recorded.
 
 ``--dry-run`` is accepted on ``decide`` and is a no-op on the filesystem: it
 prints the chosen source and the checks passed to stderr and still prints only
@@ -438,7 +442,8 @@ def _atomic_write_json(path: Path, payload: dict) -> None:
 
 
 def record(out_dir: str, checkpoint: str, head: str,
-           origin_commit: str | None = None) -> int:
+           origin_commit: str | None = None,
+           resume_id: str | None = None) -> int:
     out = Path(out_dir)
     ckpt = Path(checkpoint)
     prov_path = out / "provenance.json"
@@ -466,6 +471,11 @@ def record(out_dir: str, checkpoint: str, head: str,
         # resumed across a code version names both commits (§11.1).
         "head": head,
         "origin_commit": origin_commit,
+        # ``resume_id`` is the launcher's per-invocation IDENTITY.  train.py
+        # keys its own-entry skip on it (NOT on checkpoint + range equality), so
+        # two DISTINCT resumes reusing the same checkpoint + range are both
+        # recorded (D4's auditable interruption count).
+        "resume_id": resume_id,
         # ``[lo, hi]`` re-trained range when this resume rolls back past the last
         # executed epoch; null on a clean boundary.
         "disclosed_rollback": (
@@ -495,7 +505,14 @@ def main(argv: list) -> int:
         args = [a for a in args if a != "--dry-run"]
         return decide(*args, dry_run=dry_run)
     if cmd == "record":
-        return record(*args)
+        # ``--resume-id ID`` (the launcher's per-invocation identity) is the only
+        # flag on ``record``; strip it before the positional call.
+        resume_id = None
+        if "--resume-id" in args:
+            i = args.index("--resume-id")
+            resume_id = args[i + 1]
+            args = args[:i] + args[i + 2:]
+        return record(*args, resume_id=resume_id)
     print(f"unknown subcommand {cmd!r}")
     return 2
 

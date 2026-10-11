@@ -4456,7 +4456,8 @@ def test_launcher_path_records_rollback_once_end_to_end(tmp_path: Path) -> None:
         "[t] INFO - Epoch 1/2  train_loss=1.0\n"
         "[t] INFO - Epoch 2/2  train_loss=1.0\n"
     )
-    # The launcher already recorded THIS resume (checkpoint + range [1, 1]).
+    # The launcher already recorded THIS resume (its per-invocation id + range
+    # [1, 1]); train.py runs with the SAME resume id (as the launcher passes it).
     src = d / "epoch_1.pth"
     prov = json.loads((d / "provenance.json").read_text()) if (
         d / "provenance.json"
@@ -4468,32 +4469,96 @@ def test_launcher_path_records_rollback_once_end_to_end(tmp_path: Path) -> None:
         "source": "run_frozen_resume.sh",
         "head": "deadbeef",
         "origin_commit": None,
+        "resume_id": "launcher-resume-id-1",
         "disclosed_rollback": [1, 1],
     })
     (d / "provenance.json").write_text(json.dumps(prov))
 
     resumed = _real_config(tmp_path, epochs=2, name="lr1")
     resumed.checkpoint.resume_from = str(src)
-    with mock.patch.object(trainer, "validate", return_value=0.5):
-        trainer.train(
-            resumed, dataset_path=str(ds),
-            trusted_historical_checkpoint_sha256=_existing_shas(src),
-        )
+    with mock.patch.object(trainer, "_RESUME_ID", "launcher-resume-id-1"):
+        with mock.patch.object(trainer, "validate", return_value=0.5):
+            trainer.train(
+                resumed, dataset_path=str(ds),
+                trusted_historical_checkpoint_sha256=_existing_shas(src),
+            )
     prov = json.loads((d / "provenance.json").read_text())
     rb = [e for e in prov["resume_log"] if e.get("disclosed_rollback")]
     assert len(rb) == 1, rb
     assert rb[0]["source"] == "run_frozen_resume.sh", rb
+    # K3: the run dir's OWN status.log still got its line on the skip path.
+    assert "DISCLOSED-ROLLBACK" in (d / "status.log").read_text()
     # The archive still happened (the MOVE is independent of the record).
     assert (d / "abandoned_branch_0" / "best_model.pth").exists()
 
 
-def test_train_skips_rollback_record_when_launcher_recorded(tmp_path: Path) -> None:
-    """R1 BLOCKER: train.py must not DOUBLE-record a launcher-recorded rollback.
+def test_bare_resume_same_checkpoint_range_still_records(tmp_path: Path) -> None:
+    """K2: a SECOND resume reusing the same checkpoint + range is still recorded.
 
-    On the primary launcher path ``run_frozen_resume.sh`` records the disclosed
-    rollback BEFORE launching ``train.py --resume``.  train.py consults
-    ``launcher_already_recorded`` and records ONLY when that launcher entry for
-    THIS checkpoint + range is absent, so one resume appends exactly one
+    A bare ``train.py --resume`` (no ``--resume-id``) that reuses the SAME source
+    checkpoint and re-trained range as an earlier LAUNCHER-recorded resume must
+    append its OWN entry — the old checkpoint+range-equality key silently dropped
+    it, under-reporting the mandated interruption count (D4).
+    """
+    from scripts import train as trainer
+
+    ds = _make_synthetic_dataset(tmp_path)
+    source = _real_config(tmp_path, epochs=2, name="k2")
+    with mock.patch.object(trainer, "validate", return_value=0.5):
+        trainer.train(source, dataset_path=str(ds))
+    d = Path(source.checkpoint.output_dir)
+    (d / "epoch_2.pth").unlink()
+    (d / "final_model.pth").unlink()
+    best = load_artifact_bytes((d / "best_model.pth").read_bytes(), map_location="cpu")
+    best["epoch"] = 1
+    torch.save(best, d / "best_model.pth")
+    (d / "train.stdout.log").write_text(
+        "[t] INFO - Epoch 1/2  train_loss=1.0\n"
+        "[t] INFO - Epoch 2/2  train_loss=1.0\n"
+    )
+    src = d / "epoch_1.pth"
+    # A prior LAUNCHER resume from THIS SAME checkpoint + range [1, 1].
+    prov = json.loads((d / "provenance.json").read_text()) if (
+        d / "provenance.json"
+    ).exists() else {}
+    prov.setdefault("resume_log", []).append({
+        "time": "2026-10-11T00:00:00Z",
+        "checkpoint": str(src),
+        "checkpoint_epoch": 0,
+        "source": "run_frozen_resume.sh",
+        "head": "deadbeef",
+        "origin_commit": None,
+        "resume_id": "launcher-resume-id-1",
+        "disclosed_rollback": [1, 1],
+    })
+    (d / "provenance.json").write_text(json.dumps(prov))
+
+    resumed = _real_config(tmp_path, epochs=2, name="k2")
+    resumed.checkpoint.resume_from = str(src)
+    # A BARE resume: no --resume-id -> _RESUME_ID is None.
+    with mock.patch.object(trainer, "_RESUME_ID", None):
+        with mock.patch.object(trainer, "validate", return_value=0.5):
+            trainer.train(
+                resumed, dataset_path=str(ds),
+                trusted_historical_checkpoint_sha256=_existing_shas(src),
+            )
+    prov = json.loads((d / "provenance.json").read_text())
+    rb = [e for e in prov["resume_log"] if e.get("disclosed_rollback")]
+    # BOTH the launcher's and the bare resume's entry survive (2 distinct resumes).
+    assert len(rb) == 2, rb
+    assert [e["source"] for e in rb] == [
+        "run_frozen_resume.sh", "train.py",
+    ], rb
+
+
+def test_train_skips_rollback_record_when_launcher_recorded(tmp_path: Path) -> None:
+    """R1 BLOCKER / K2: train.py must not DOUBLE-record a launcher-recorded resume.
+
+    On the primary launcher path ``run_frozen_resume.sh`` mints a per-invocation
+    ``resume_id`` and records the disclosed rollback BEFORE launching
+    ``train.py --resume --resume-id <id>``.  train.py consults
+    ``launcher_already_recorded`` and records ONLY when the launcher entry for
+    THIS resume IDENTITY is absent — so one resume appends exactly one
     ``disclosed_rollback`` entry (D4's auditable interruption count).
     """
     from nsmor.pipeline import resume_rollback as RR
@@ -4502,17 +4567,57 @@ def test_train_skips_rollback_record_when_launcher_recorded(tmp_path: Path) -> N
     prov = {
         "resume_log": [{
             "source": "run_frozen_resume.sh",
+            "resume_id": "id-A",
             "checkpoint": ckpt,
             "disclosed_rollback": [50, 57],
         }],
     }
-    assert RR.launcher_already_recorded(prov, ckpt, (50, 57)) is True
-    # A different range / checkpoint is NOT this resume's launcher entry.
-    assert RR.launcher_already_recorded(prov, ckpt, (51, 57)) is False
-    assert RR.launcher_already_recorded(prov, "/other.pth", (50, 57)) is False
+    # The launcher's entry for THIS resume identity is present -> skip.
+    assert RR.launcher_already_recorded(prov, "id-A") is True
+    # K2: a DIFFERENT resume identity (even reusing the same ckpt+range) is a
+    # DISTINCT resume and must NOT be deduped away.
+    assert RR.launcher_already_recorded(prov, "id-B") is False
+    # A bare ``train.py --resume`` (no id) ALWAYS records.
+    assert RR.launcher_already_recorded(prov, None) is False
+    assert RR.launcher_already_recorded(prov, "") is False
     # A train.py entry does not count as the launcher's.
     assert RR.launcher_already_recorded(
-        {"resume_log": [{"source": "train.py", "checkpoint": ckpt,
-                         "disclosed_rollback": [50, 57]}]},
-        ckpt, (50, 57),
+        {"resume_log": [{"source": "train.py", "resume_id": "id-A"}]},
+        "id-A",
     ) is False
+
+
+def test_record_disclosed_rollback_keys_on_identity(tmp_path: Path) -> None:
+    """K2/D4 + K3: identity-keyed de-dup; run-dir status.log written on both paths.
+
+    Two DISTINCT resumes that reuse the SAME source checkpoint and re-trained
+    range must BOTH be recorded (the old checkpoint+range-equality key silently
+    dropped the second, under-reporting D4's interruption count).  And the
+    run-dir ``status.log`` line is appended on EVERY path, including the one
+    where the launcher's ``resume_log`` entry already exists (K3).
+    """
+    from scripts import train as trainer
+
+    d = tmp_path / "arm"
+    d.mkdir()
+    ckpt = d / "epoch_50.pth"
+    ckpt.write_bytes(b"ckpt")
+    # First resume: the launcher recorded id-A; train.py runs with the SAME id.
+    (d / "provenance.json").write_text(json.dumps({"resume_log": [{
+        "source": "run_frozen_resume.sh",
+        "resume_id": "id-A",
+        "checkpoint": str(ckpt),
+        "disclosed_rollback": [50, 57],
+    }]}))
+    trainer._record_disclosed_rollback(d, ckpt, 51, (50, 57), "id-A")
+    prov = json.loads((d / "provenance.json").read_text())
+    rb = [e for e in prov["resume_log"] if e.get("disclosed_rollback")]
+    assert len(rb) == 1, rb  # train.py skipped its duplicate for id-A
+    # K3: the run-dir status.log line is written even on the skip path.
+    assert "DISCLOSED-ROLLBACK" in (d / "status.log").read_text()
+    # Second resume: a bare train.py --resume (no id), SAME ckpt+range -> RECORDS.
+    trainer._record_disclosed_rollback(d, ckpt, 51, (50, 57), None)
+    prov = json.loads((d / "provenance.json").read_text())
+    rb = [e for e in prov["resume_log"] if e.get("disclosed_rollback")]
+    assert len(rb) == 2, rb  # both distinct resumes recorded
+    assert {e["source"] for e in rb} == {"run_frozen_resume.sh", "train.py"}

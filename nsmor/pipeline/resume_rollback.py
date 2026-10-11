@@ -222,38 +222,36 @@ def has_best_model_archive(output_dir: Path) -> bool:
 
 
 def launcher_already_recorded(
-    provenance: Dict[str, Any], checkpoint: str, rollback: Tuple[int, int],
+    provenance: Dict[str, Any], resume_id: Optional[str],
 ) -> bool:
-    """True iff ``resume_log`` already holds the LAUNCHER's entry for this resume.
+    """True iff ``resume_log`` already holds the LAUNCHER's entry for THIS resume.
 
-    On the primary launcher path ``scripts/run_frozen_resume.sh`` calls
-    ``resume_decision.py record`` (which appends a ``disclosed_rollback`` entry)
-    and THEN launches ``train.py --resume`` (which would append a SECOND entry for
-    the same resume — the round-7 double-record blocker).  train.py consults this
-    to record ONLY when the launcher's entry for THIS checkpoint + range is
-    absent, so a bare ``train.py --resume`` (which bypasses the launcher) still
-    records while the launcher path records exactly once.  Pure: reads only.
+    On the primary launcher path ``scripts/run_frozen_resume.sh`` mints a
+    per-invocation ``resume_id`` (a UUID), calls ``resume_decision.py record``
+    (which appends a ``disclosed_rollback`` entry carrying that id) and THEN
+    launches ``train.py --resume --resume-id <id>`` (which would otherwise append
+    a SECOND entry for the same resume — the round-7 double-record blocker).
+    train.py consults this to record ONLY when the launcher's entry for THIS
+    exact ``resume_id`` is absent.
+
+    The key is the resume IDENTITY, NOT checkpoint + range EQUALITY: two
+    genuinely DISTINCT resumes that happen to reuse the same source checkpoint
+    and re-trained range (e.g. a bare ``train.py --resume <epoch_50.pth>`` after
+    a prior launcher resume from that same ``epoch_50.pth``/range) must BOTH be
+    recorded — D4 makes the interruption count auditable, and keying on
+    ckpt+range equality silently dropped the second one.  A bare
+    ``train.py --resume`` (which bypasses the launcher and has no id) therefore
+    ALWAYS records: ``resume_id`` is ``None``/empty here and this returns False.
+    Pure: reads only.
     """
-    lo, hi = int(rollback[0]), int(rollback[1])
-    try:
-        want = Path(checkpoint).resolve()
-    except OSError:  # pragma: no cover - an unresolvable path compares by string
-        want = None
+    if not resume_id:
+        return False
     for entry in provenance.get("resume_log", []):
         if not isinstance(entry, dict):
             continue
         if entry.get("source") != "run_frozen_resume.sh":
             continue
-        rec = str(entry.get("checkpoint"))
-        same_path = rec == str(checkpoint)
-        if not same_path and want is not None:
-            try:
-                same_path = Path(rec).resolve() == want
-            except OSError:  # pragma: no cover
-                same_path = False
-        if not same_path:
-            continue
-        if entry.get("disclosed_rollback") == [lo, hi]:
+        if entry.get("resume_id") == resume_id:
             return True
     return False
 
