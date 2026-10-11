@@ -62,11 +62,20 @@ _NON_RESUME_WITNESS_FAMILIES: frozenset = frozenset()
 # completion line's ``train_loss=`` suffix, which would fail OPEN if it changed.
 _EPOCH_PROGRESS_RE = re.compile(r"\bEpoch\s+(\d+)\s*/")
 
-# Files that belong to the ABANDONED branch and are moved aside on a disclosed
-# rollback.  ``*.pth`` only: the run's logs and ``segment_*.json`` records are
-# NEVER truncated or moved (§11.1 condition 4).
+# The abandoned-branch artifact FAMILIES that are moved aside on a disclosed
+# rollback (§11.1 D2 names "at least ``best_model.pth`` and
+# ``final_model.pth``").  A periodic ``epoch_<n>.pth`` is deliberately NOT
+# archived: the resume source is always the run's NEWEST complete-epoch
+# checkpoint (the preflight refuses a source older than any existing newer
+# last-epoch file), so no periodic and no ``final_model.pth`` can carry a stored
+# epoch greater than the source's, and any periodic the resumed run re-trains is
+# regenerated at the SAME epoch — moving it aside would discard a valid
+# post-rollback recovery point without preventing an overwrite the resumed run
+# does not itself perform.  ``*.pth`` only: the run's logs and ``segment_*.json``
+# records are NEVER truncated or moved (§11.1 condition 4).
 ARCHIVE_DIR_PREFIX = "abandoned_branch_"
 _MANIFEST_NAME = "manifest.json"
+_ARCHIVE_FAMILIES = ("best_model.pth", "final_model.pth")
 
 
 def _stored_epoch(path: Path) -> Optional[int]:
@@ -172,19 +181,81 @@ def list_abandoned_branch(
 ) -> List[Path]:
     """The run-dir ``*.pth`` files that belong to the ABANDONED branch.
 
-    An abandoned-branch artifact is a ``*.pth`` whose OWN stored epoch is GREATER
-    than *source_epoch* — the run wrote it while continuing past the checkpoint
-    we are rolling back to, so the resumed run (re-training ``[source_epoch + 1,
-    last_executed]``) would overwrite it.  Pure: never moves or writes.  Logs and
-    ``segment_*.json`` records are never included (§11.1 condition 4).
+    An abandoned-branch artifact is a run-dir ``*.pth`` in the ARCHIVED FAMILIES
+    (``best_model.pth`` / ``final_model.pth`` — §11.1 D2) whose OWN stored epoch
+    is GREATER than *source_epoch* — the run wrote it while continuing past the
+    checkpoint we are rolling back to, so the resumed run would overwrite it.  A
+    periodic ``epoch_<n>.pth`` is NOT an abandoned-branch artifact (it is
+    regenerated at the same epoch by the resumed run; moving it aside would
+    discard a valid recovery point without preventing an overwrite).  Pure: never
+    moves or writes.  Logs and ``segment_*.json`` records are never included
+    (§11.1 condition 4).
     """
     output_dir = Path(output_dir)
     out: List[Path] = []
     for cand in sorted(output_dir.glob("*.pth")):
+        if cand.name not in _ARCHIVE_FAMILIES:
+            continue
         epoch = _stored_epoch(cand)
         if epoch is not None and epoch > source_epoch:
             out.append(cand)
     return out
+
+
+def has_best_model_archive(output_dir: Path) -> bool:
+    """True iff some ``abandoned_branch_*/`` holds a ``best_model.pth``.
+
+    The disclosed-rollback reconciliation tolerates the deliberately-absent
+    companion best ONLY when the run's best was archived to
+    ``abandoned_branch_*/`` on a prior invocation (this one OR an earlier one).
+    The archive step moves the abandoned best OUT of the run dir, and the resumed
+    segment can legitimately fail to produce a new best (its val never beats the
+    seeded ``best_val_loss``), so keying the tolerance on THIS invocation's own
+    rollback made a chained SECOND resume fail closed.  Pure: reads only.
+    """
+    output_dir = Path(output_dir)
+    return any(
+        (d / "best_model.pth").exists()
+        for d in output_dir.glob(f"{ARCHIVE_DIR_PREFIX}*")
+        if d.is_dir()
+    )
+
+
+def launcher_already_recorded(
+    provenance: Dict[str, Any], checkpoint: str, rollback: Tuple[int, int],
+) -> bool:
+    """True iff ``resume_log`` already holds the LAUNCHER's entry for this resume.
+
+    On the primary launcher path ``scripts/run_frozen_resume.sh`` calls
+    ``resume_decision.py record`` (which appends a ``disclosed_rollback`` entry)
+    and THEN launches ``train.py --resume`` (which would append a SECOND entry for
+    the same resume — the round-7 double-record blocker).  train.py consults this
+    to record ONLY when the launcher's entry for THIS checkpoint + range is
+    absent, so a bare ``train.py --resume`` (which bypasses the launcher) still
+    records while the launcher path records exactly once.  Pure: reads only.
+    """
+    lo, hi = int(rollback[0]), int(rollback[1])
+    try:
+        want = Path(checkpoint).resolve()
+    except OSError:  # pragma: no cover - an unresolvable path compares by string
+        want = None
+    for entry in provenance.get("resume_log", []):
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("source") != "run_frozen_resume.sh":
+            continue
+        rec = str(entry.get("checkpoint"))
+        same_path = rec == str(checkpoint)
+        if not same_path and want is not None:
+            try:
+                same_path = Path(rec).resolve() == want
+            except OSError:  # pragma: no cover
+                same_path = False
+        if not same_path:
+            continue
+        if entry.get("disclosed_rollback") == [lo, hi]:
+            return True
+    return False
 
 
 def archive_abandoned_branch(

@@ -17,6 +17,8 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import os
+import shutil
 import sys
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
@@ -897,3 +899,52 @@ def test_real_seed44_dir_decider_accepts_clean_boundary_dry_run() -> None:
              for p in _REAL_SEED44.iterdir()}
     assert after == before, "the dry-run decider must not write to the run dir"
 
+
+
+# ── Launcher DRY_RUN writes-nothing guarantee (round-7 MINOR) ──────────────
+# The D5 claim is that a launcher DRY_RUN writes nothing to the run dir.  The
+# decider-level byte-identical test above exercises only the decider; this drives
+# the REAL launcher (``bash run_frozen_resume.sh``) under ``DRY_RUN=1`` and pins
+# that its OWN pre-decider steps + provenance branch leave the run dir untouched.
+_LAUNCHER = Path(__file__).resolve().parents[1] / "scripts" / "run_frozen_resume.sh"
+
+
+def _bash() -> str:
+    for cand in ("bash", "wsl.exe"):
+        if shutil.which(cand):
+            return cand
+    return ""
+
+
+@pytest.mark.skipif(
+    not _LAUNCHER.exists() or not _bash() or os.name != "posix",
+    reason="launcher / bash / POSIX filesystem unavailable from this environment",
+)
+def test_launcher_dry_run_writes_nothing_on_empty_dir(tmp_path: Path) -> None:
+    """A launcher ``DRY_RUN=1`` on an ABSENT run dir writes nothing to it.
+
+    The launcher short-circuits an empty/absent run dir BEFORE any worktree step
+    or provenance branch, so no run dir is created and only a status.log line
+    (next to the script, redirected here) is written.  A future refactor that
+    wrote to the run dir would be caught here.
+    """
+    import subprocess
+
+    out_root = tmp_path / "root"
+    out_root.mkdir()
+    arm = out_root / "R0-arm"  # deliberately absent
+    status = tmp_path / "status.log"
+    before_root = sorted(p.name for p in out_root.iterdir())
+    env = dict(os.environ, DRY_RUN="1", OUT_ROOT=str(out_root),
+               STATUS_LOG=str(status))
+    # A bogus frozen commit is fine: the empty-dir short-circuit precedes the
+    # HEAD check, so nothing about the worktree is consulted.
+    proc = subprocess.run(
+        [_bash(), str(_LAUNCHER), "deadbeef" * 5, str(_LAUNCHER.parents[1]),
+         "R0-arm"],
+        capture_output=True, text=True, env=env,
+    )
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    assert not arm.exists(), "the launcher must not create the run dir on DRY_RUN"
+    assert sorted(p.name for p in out_root.iterdir()) == before_root
+    assert "DRY-RUN" in status.read_text()

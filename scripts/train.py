@@ -1056,6 +1056,8 @@ from nsmor.pipeline.resume_rollback import (  # noqa: E402
     _EPOCH_PROGRESS_RE,
     _NON_RESUME_WITNESS_FAMILIES,
     archive_abandoned_branch,
+    has_best_model_archive,
+    launcher_already_recorded,
     last_executed_epoch as _last_executed_epoch,
     list_abandoned_branch,
     rollback_retrained_range,
@@ -1514,9 +1516,14 @@ def _record_disclosed_rollback(
     ``resume_log`` in place (atomic temp + fsync + rename; prior fields and prior
     entries preserved — never truncated) and appends one line to a
     ``status.log`` in the run dir.  The provenance path is
-    ``output_dir/provenance.json`` (the run's own dir; on the launcher path the
-    launcher already records a richer entry there, and this adds the rollback
-    disclosure alongside it).
+    ``output_dir/provenance.json`` (the run's own dir).
+
+    The entry is written ONLY when the LAUNCHER's own entry for THIS checkpoint +
+    range is absent (round-7 blocker): ``run_frozen_resume.sh`` already calls
+    ``record`` before launching ``train.py --resume``, so an unconditional append
+    would double-count one resume — and D4 makes the interruption count
+    auditable.  A bare ``train.py --resume`` has no launcher entry, so it still
+    records.
     """
     lo, hi = int(rollback[0]), int(rollback[1])
     entry = {
@@ -1535,6 +1542,11 @@ def _record_disclosed_rollback(
         prov = json.loads(prov_path.read_text()) if prov_path.exists() else {}
     except (OSError, ValueError):
         prov = {}
+    if launcher_already_recorded(prov, str(ckpt_path), rollback):
+        # The launcher already recorded this resume's rollback; appending again
+        # would double-count the interruption.  Skip BOTH the resume_log entry
+        # and the status.log line (the launcher wrote its own status.log line).
+        return
     prov.setdefault("resume_log", []).append(entry)
     tmp = prov_path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(prov, indent=2, allow_nan=False) + "\n")
@@ -5554,6 +5566,13 @@ def train(
         _disclosed_rollback, _archived_abandoned = (
             _resolve_resume_source_and_rollback(ckpt_path, ckpt_peek, output_dir)
         )
+        # PURE preflight list of the abandoned-branch artifacts THIS invocation
+        # will move aside.  ``best_model.pth`` in that list means the abandoned
+        # best is (about to be) archived, so the best-model reconciliation must
+        # treat it as ABSENT rather than read/consume it — and the reconciliation
+        # can then run BEFORE the physical MOVE without reading the abandoned
+        # best.  See the moved-aside step below (after every fail-closed check).
+        _best_will_be_archived = "best_model.pth" in _archived_abandoned
         # A current-schema parent claims an exact continuation, so its full
         # canonical state must be present before anything restores from it.
         # This runs FIRST in the resume preflight (before any epoch or any
@@ -5762,23 +5781,6 @@ def train(
         if ckpt_path.name == "best_model.pth":
             certify_best_checkpoint(ckpt_peek, ckpt_path, resume_payload)
 
-        # ── DISCLOSED ROLLBACK: archive the abandoned branch NOW ──────────
-        # Every fail-closed resume check has passed above, so the resume is
-        # committed to.  Move the abandoned-branch artifacts (the run-dir ``*.pth``
-        # files this resume would overwrite: those whose own stored epoch exceeds
-        # the source's) aside into ``abandoned_branch_<k>/`` BEFORE the best-model
-        # reconciliation below reads ``best_model.pth`` — otherwise the
-        # reconciliation would consume the abandoned best, and the resumed run
-        # would overwrite it.  RENAMES only; nothing is deleted (§11.1).
-        if _disclosed_rollback is not None:
-            _moved = archive_abandoned_branch(
-                ckpt_path.parent,
-                source_epoch=int(ckpt_peek.get("epoch")),
-                last_executed=int(_disclosed_rollback[1]),
-                source_name=ckpt_path.name,
-            )
-            _archived_abandoned = [e["file"] for e in _moved]
-
         # Resume x two-phase: when the resume point is at/past the
         # phase-1→2 boundary, an uninterrupted run would have built a
         # FRESH phase-2 optimizer at the boundary (the phase-1 Adam
@@ -5842,7 +5844,16 @@ def train(
                 src_cand_val = certify_best_checkpoint(
                     ckpt_peek, ckpt_path, resume_payload,
                 )
-        elif companion.exists() and companion.resolve() != ckpt_path.resolve():
+        elif (
+            companion.exists()
+            and companion.resolve() != ckpt_path.resolve()
+            # The companion best belongs to the ABANDONED branch (its stored
+            # epoch exceeds the source's) and is about to be MOVED aside by the
+            # disclosed rollback.  Treat it as ABSENT here so the reconciliation
+            # never reads or re-installs the abandoned best; it is archived
+            # (never lost) after every fail-closed check has passed.
+            and not _best_will_be_archived
+        ):
             companion_payload = companion.read_bytes()
             comp_peek = load_artifact_bytes(companion_payload, map_location="cpu")
             validate_checkpoint_clock(comp_peek, model.dt_ms, require_dt_ms=True)
@@ -5866,7 +5877,13 @@ def train(
         dest_val: Optional[float] = None
         dest_stale = False
         destination_payload: Optional[bytes] = None
-        if best_target.exists():
+        # A destination best that belongs to the ABANDONED branch (about to be
+        # MOVED aside) is treated as ABSENT: it must not be read, ranked, or
+        # re-installed here — it is archived (never lost) after every fail-closed
+        # check.  Without this the reconciliation would consume the abandoned
+        # best, and the archive step (now positioned later) would move it out from
+        # under the run.
+        if best_target.exists() and not _best_will_be_archived:
             if best_target.resolve() == ckpt_path.resolve():
                 destination_payload = resume_payload
                 dest_peek = ckpt_peek
@@ -6009,19 +6026,24 @@ def train(
                 src_cand_path, best_target, best_val_loss,
             )
         else:
-            # Neither source candidate nor destination candidate exists
-            if (
-                claimed_best is not None
-                and not (
-                    _disclosed_rollback is not None
-                    and "best_model.pth" in _archived_abandoned
-                )
-            ):
+            # Neither source candidate nor destination candidate exists.  This is
+            # tolerated ONLY when the run's best was archived to
+            # ``abandoned_branch_*/`` on THIS invocation (``_best_will_be_archived``)
+            # OR on a PRIOR one (``has_best_model_archive``).  The latter is what
+            # makes a chained SECOND resume survive: the first rollback moved the
+            # best OUT of the run dir, and the resumed segment can legitimately
+            # fail to produce a new best (its val never beats the seeded
+            # ``best_val_loss``), so keying the tolerance on THIS invocation's own
+            # rollback alone would fail closed on a legitimate second interruption.
+            _best_in_archive = (
+                _best_will_be_archived or has_best_model_archive(output_dir)
+            )
+            if claimed_best is not None and not _best_in_archive:
                 raise ValueError(
                     f"Cannot resume checkpoint {ckpt_path} into fresh directory {output_dir}: "
                     f"absent historical best model {ckpt_path.parent / 'best_model.pth'} (fail closed)."
                 )
-            if _disclosed_rollback is not None and "best_model.pth" in _archived_abandoned:
+            if _best_in_archive:
                 # DISCLOSED ROLLBACK: the companion best_model.pth was archived
                 # (it belonged to the abandoned branch and the resumed run would
                 # overwrite it).  The retained epochs [0, source] still have a
@@ -6194,6 +6216,26 @@ def train(
                 series="val_loss", ckpt_path=ckpt_path,
             )
             val_loss = _term_val if _term_val is not None else float("inf")
+
+    # ── DISCLOSED ROLLBACK: MOVE the abandoned branch aside ───
+    # Runs only AFTER every fail-closed resume check has passed (source rules,
+    # complete-current-schema, architecture/lineage match, ``load_checkpoint``,
+    # the best-model reconciliation, ``_restore_recovery_state`` and the
+    # bitwise-loader-RNG guard) AND before the training loop writes anything, so
+    # a resume REFUSED at ANY fail-closed check never mutates the run dir (§11.1
+    # D2: 'before an in-place rollback resume writes anything').  The preflight
+    # was a pure LIST; this is the MOVE.  RENAMES only; nothing is deleted, and a
+    # move that would overwrite an existing archive path is refused.  The run-dir
+    # best/final that belong to the abandoned branch were treated as ABSENT by the
+    # reconciliation above (``_best_will_be_archived``), so nothing here reads or
+    # consumes them.
+    if _disclosed_rollback is not None:
+        archive_abandoned_branch(
+            ckpt_path.parent,
+            source_epoch=int(ckpt_peek.get("epoch")),
+            last_executed=int(_disclosed_rollback[1]),
+            source_name=ckpt_path.name,
+        )
 
     # ── Restart-segment lineage record ────────────────────────
     # One immutable record per invocation, written once training is

@@ -142,6 +142,16 @@ HELPER=$JOBDIR/resume_decision.py
 for ARM in "$@"; do
   OUT=$OUT_ROOT/$ARM
   CFG=$WT/$ARMS_DIR/$ARM.yaml
+  # DRY_RUN on an absent/empty run dir has nothing to resume, so short-circuit
+  # BEFORE any worktree step (HEAD/DIRTY/RESOLVED/NUM_EPOCHS/EXPECT_DEVICE) and
+  # before any mkdir/provenance branch: the launcher writes NOTHING to the run
+  # dir on this path (it only appends a status.log line next to the script).  A
+  # DRY_RUN on a NON-empty dir falls through to the decider's ``--dry-run``,
+  # which also writes nothing; the pre-decider steps it runs are all READS.
+  if [ "$DRY_RUN" = "1" ] && { [ ! -d "$OUT" ] || [ -z "$(ls -A "$OUT" 2>/dev/null)" ]; }; then
+    echo "$(date -Is) $ARM DRY-RUN: no non-empty run dir at $OUT (nothing to resume; nothing written)" >> "$LOG"
+    continue
+  fi
   HEAD=$(gitw "$WT" rev-parse HEAD)
   DIRTY=$(gitw "$WT" status --porcelain --untracked-files=no)
   if [ "$HEAD" != "$FROZEN" ] || [ -n "$DIRTY" ]; then
@@ -174,11 +184,6 @@ PY
 )
 
   RESUME_CKPT=""
-  if [ "$DRY_RUN" = "1" ] && { [ ! -d "$OUT" ] || [ -z "$(ls -A "$OUT" 2>/dev/null)" ]; }; then
-    # A dry run must write NOTHING, so never create an empty run dir for it.
-    echo "$(date -Is) $ARM DRY-RUN: no non-empty run dir at $OUT (nothing to resume; nothing written)" >> "$LOG"
-    continue
-  fi
   if [ -d "$OUT" ] && [ -n "$(ls -A "$OUT" 2>/dev/null)" ]; then
     DECIDE_ARGS=("$OUT" "$WT" "$FROZEN" "$CFG" "$NUM_EPOCHS")
     if [ -n "$ORIGIN_COMMIT" ]; then DECIDE_ARGS+=("$ORIGIN_COMMIT"); fi

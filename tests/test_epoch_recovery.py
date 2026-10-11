@@ -4275,3 +4275,244 @@ def test_bare_resume_disclosed_rollback_records_and_archives(
     assert [f["file"] for f in manifest["files"]] == ["best_model.pth"], manifest
     assert (src_dir / "abandoned_branch_0" / "best_model.pth").read_bytes() == best_before
     assert (src_dir / "epoch_1.pth").exists()
+
+
+def test_chained_second_resume_survives_archived_best(tmp_path: Path) -> None:
+    """D2/round-7 MAJOR: a chained SECOND rollback resume must NOT fail closed.
+
+    The first disclosed rollback MOVES the abandoned ``best_model.pth`` out of
+    the run dir, and the resumed segment can legitimately fail to produce a new
+    best (its val never beats the seeded ``best_val_loss``).  The pre-fix code
+    keyed the absent-companion tolerance on THIS invocation's own rollback
+    (``'best_model.pth' in _archived_abandoned``), so a SECOND interruption whose
+    source has no companion best raised ``ValueError: ... absent historical best
+    model ... (fail closed)``.  The tolerance is now keyed on the run's best
+    having been archived on ANY prior invocation (``has_best_model_archive``).
+    """
+    from scripts import train as trainer
+
+    ds = _make_synthetic_dataset(tmp_path)
+    source = _real_config(tmp_path, epochs=2, name="chain")
+    with mock.patch.object(trainer, "validate", return_value=0.5):
+        trainer.train(source, dataset_path=str(ds))
+    d = Path(source.checkpoint.output_dir)
+    # Model the seed-43 shape: newest last-epoch file is epoch_1.pth (stored 0)
+    # while the log witnesses epoch 1; best_model.pth (stored 1) is abandoned.
+    (d / "epoch_2.pth").unlink()
+    (d / "final_model.pth").unlink()
+    best = load_artifact_bytes((d / "best_model.pth").read_bytes(), map_location="cpu")
+    best["epoch"] = 1
+    torch.save(best, d / "best_model.pth")
+    (d / "train.stdout.log").write_text(
+        "[t] INFO - Epoch 1/2  train_loss=1.0\n"
+        "[t] INFO - Epoch 2/2  train_loss=1.0\n"
+    )
+
+    # ── Resume 1: rollback; the abandoned best is archived ──
+    r1 = _real_config(tmp_path, epochs=2, name="chain")
+    r1.checkpoint.resume_from = str(d / "epoch_1.pth")
+    with mock.patch.object(trainer, "validate", return_value=0.5):
+        res1 = trainer.train(
+            r1, dataset_path=str(ds),
+            trusted_historical_checkpoint_sha256=_existing_shas(d / "epoch_1.pth"),
+        )
+    assert res1["disclosed_rollback"] == [1, 1], res1["disclosed_rollback"]
+    assert (d / "abandoned_branch_0" / "best_model.pth").exists()
+
+    # ── Model a SECOND un-checkpointed interruption ──
+    # Drop the newer last-epoch files so epoch_1.pth is again the newest EXISTING
+    # source while the log witnesses a later executed epoch, and ensure NO
+    # best_model.pth companion survives in the run dir (the segment may never
+    # have produced one).
+    for p in list(d.glob("epoch_*.pth")):
+        if p.name != "epoch_1.pth":
+            p.unlink()
+    if (d / "final_model.pth").exists():
+        (d / "final_model.pth").unlink()
+    if (d / "best_model.pth").exists():
+        (d / "best_model.pth").unlink()
+    with open(d / "train.stdout.log", "a") as fh:
+        fh.write("[t] INFO - Epoch 3/2  train_loss=1.0\n")  # witness executed 2
+    assert not (d / "best_model.pth").exists()
+
+    r2 = _real_config(tmp_path, epochs=3, name="chain")
+    r2.checkpoint.resume_from = str(d / "epoch_1.pth")
+    with mock.patch.object(trainer, "validate", return_value=0.5):
+        res2 = trainer.train(
+            r2, dataset_path=str(ds),
+            trusted_historical_checkpoint_sha256=_existing_shas(d / "epoch_1.pth"),
+        )
+    assert res2["disclosed_rollback"] == [1, 2], res2["disclosed_rollback"]
+
+
+def test_list_abandoned_branch_archives_best_and_final_only(
+    tmp_path: Path,
+) -> None:
+    """round-7 MINOR: the archive scope is best/final, NOT a regenerated periodic.
+
+    A periodic ``epoch_<n>.pth`` whose stored epoch exceeds the source's is
+    regenerated at the SAME epoch by the resumed run (it re-trains through it),
+    so moving it aside discards a valid post-rollback recovery point without
+    preventing an overwrite the resumed run does not itself perform.  Only
+    ``best_model.pth`` / ``final_model.pth`` (§11.1 D2) are abandoned-branch
+    artifacts.
+    """
+    from nsmor.pipeline import resume_rollback as RR
+
+    run_dir = tmp_path / "arm"
+    run_dir.mkdir()
+    _ckpt(run_dir / "epoch_50.pth", 49)      # source
+    _ckpt(run_dir / "epoch_60.pth", 59)      # newer periodic -> NOT archived
+    _ckpt(run_dir / "best_model.pth", 57)    # abandoned best -> archived
+    _ckpt(run_dir / "final_model.pth", 58)   # abandoned final -> archived
+    _ckpt(run_dir / "epoch_40.pth", 39)      # older periodic -> retained
+    lst = sorted(p.name for p in RR.list_abandoned_branch(run_dir, 49))
+    assert lst == ["best_model.pth", "final_model.pth"], lst
+
+
+def test_has_best_model_archive_reads_prior_archive(tmp_path: Path) -> None:
+    """D2: ``has_best_model_archive`` detects a best archived on a PRIOR run."""
+    from nsmor.pipeline import resume_rollback as RR
+
+    run_dir = tmp_path / "arm"
+    run_dir.mkdir()
+    assert RR.has_best_model_archive(run_dir) is False
+    arch = run_dir / "abandoned_branch_0"
+    arch.mkdir()
+    (arch / "epoch_2.pth").write_bytes(b"X")
+    assert RR.has_best_model_archive(run_dir) is False  # no best in the archive
+    (arch / "best_model.pth").write_bytes(b"B")
+    assert RR.has_best_model_archive(run_dir) is True
+
+
+def test_refused_rollback_resume_does_not_mutate_run_dir(tmp_path: Path) -> None:
+    """D2 write ordering: a resume REFUSED at a LATER check must not MOVE anything.
+
+    The disclosed-rollback preflight LISTS the abandoned-branch artifacts but the
+    MOVE runs only AFTER every fail-closed check has passed.  A source that is
+    current-schema but missing required continuation state is refused by
+    ``_require_complete_current_schema`` (which runs AFTER the rollback
+    preflight); the abandoned ``best_model.pth`` must still be present and no
+    ``abandoned_branch_*`` dir may exist — the run dir is untouched.
+    """
+    from scripts import train as trainer
+
+    ds = _make_synthetic_dataset(tmp_path)
+    source = _real_config(tmp_path, epochs=2, name="refused")
+    with mock.patch.object(trainer, "validate", return_value=0.5):
+        trainer.train(source, dataset_path=str(ds))
+    d = Path(source.checkpoint.output_dir)
+    (d / "epoch_2.pth").unlink()
+    (d / "final_model.pth").unlink()
+    best = load_artifact_bytes((d / "best_model.pth").read_bytes(), map_location="cpu")
+    best["epoch"] = 1
+    torch.save(best, d / "best_model.pth")
+    (d / "train.stdout.log").write_text(
+        "[t] INFO - Epoch 1/2  train_loss=1.0\n"
+        "[t] INFO - Epoch 2/2  train_loss=1.0\n"
+    )
+    # Corrupt the SOURCE: current-schema but missing a required key, so the
+    # fail-closed schema check (after the rollback preflight) refuses the resume.
+    src = d / "epoch_1.pth"
+    payload = load_artifact_bytes(src.read_bytes(), map_location="cpu")
+    payload.pop("optimizer_state_dict", None)
+    torch.save(payload, src)
+
+    resumed = _real_config(tmp_path, epochs=2, name="refused")
+    resumed.checkpoint.resume_from = str(src)
+    with pytest.raises(ValueError, match="missing required continuation state"):
+        with mock.patch.object(trainer, "validate", return_value=0.5):
+            trainer.train(
+                resumed, dataset_path=str(ds),
+                trusted_historical_checkpoint_sha256=_existing_shas(src),
+            )
+    # NOTHING was moved: the abandoned best survives and no archive dir exists.
+    assert (d / "best_model.pth").exists()
+    assert not any(p.name.startswith("abandoned_branch") for p in d.iterdir())
+
+
+def test_launcher_path_records_rollback_once_end_to_end(tmp_path: Path) -> None:
+    """R1 BLOCKER (end-to-end): the launcher path records ONE rollback entry.
+
+    Models the primary launcher path: a ``run_frozen_resume.sh`` ``record`` entry
+    for THIS checkpoint + range is already in ``provenance.json`` when the bare
+    ``train.py --resume`` runs.  train.py must NOT append a second
+    ``disclosed_rollback`` entry (it would double-count the interruption), so
+    exactly ONE entry exists after the resume — the launcher's.
+    """
+    from scripts import train as trainer
+
+    ds = _make_synthetic_dataset(tmp_path)
+    source = _real_config(tmp_path, epochs=2, name="lr1")
+    with mock.patch.object(trainer, "validate", return_value=0.5):
+        trainer.train(source, dataset_path=str(ds))
+    d = Path(source.checkpoint.output_dir)
+    (d / "epoch_2.pth").unlink()
+    (d / "final_model.pth").unlink()
+    best = load_artifact_bytes((d / "best_model.pth").read_bytes(), map_location="cpu")
+    best["epoch"] = 1
+    torch.save(best, d / "best_model.pth")
+    (d / "train.stdout.log").write_text(
+        "[t] INFO - Epoch 1/2  train_loss=1.0\n"
+        "[t] INFO - Epoch 2/2  train_loss=1.0\n"
+    )
+    # The launcher already recorded THIS resume (checkpoint + range [1, 1]).
+    src = d / "epoch_1.pth"
+    prov = json.loads((d / "provenance.json").read_text()) if (
+        d / "provenance.json"
+    ).exists() else {}
+    prov.setdefault("resume_log", []).append({
+        "time": "2026-10-11T00:00:00Z",
+        "checkpoint": str(src),
+        "checkpoint_epoch": 0,
+        "source": "run_frozen_resume.sh",
+        "head": "deadbeef",
+        "origin_commit": None,
+        "disclosed_rollback": [1, 1],
+    })
+    (d / "provenance.json").write_text(json.dumps(prov))
+
+    resumed = _real_config(tmp_path, epochs=2, name="lr1")
+    resumed.checkpoint.resume_from = str(src)
+    with mock.patch.object(trainer, "validate", return_value=0.5):
+        trainer.train(
+            resumed, dataset_path=str(ds),
+            trusted_historical_checkpoint_sha256=_existing_shas(src),
+        )
+    prov = json.loads((d / "provenance.json").read_text())
+    rb = [e for e in prov["resume_log"] if e.get("disclosed_rollback")]
+    assert len(rb) == 1, rb
+    assert rb[0]["source"] == "run_frozen_resume.sh", rb
+    # The archive still happened (the MOVE is independent of the record).
+    assert (d / "abandoned_branch_0" / "best_model.pth").exists()
+
+
+def test_train_skips_rollback_record_when_launcher_recorded(tmp_path: Path) -> None:
+    """R1 BLOCKER: train.py must not DOUBLE-record a launcher-recorded rollback.
+
+    On the primary launcher path ``run_frozen_resume.sh`` records the disclosed
+    rollback BEFORE launching ``train.py --resume``.  train.py consults
+    ``launcher_already_recorded`` and records ONLY when that launcher entry for
+    THIS checkpoint + range is absent, so one resume appends exactly one
+    ``disclosed_rollback`` entry (D4's auditable interruption count).
+    """
+    from nsmor.pipeline import resume_rollback as RR
+
+    ckpt = "/run/dir/epoch_50.pth"
+    prov = {
+        "resume_log": [{
+            "source": "run_frozen_resume.sh",
+            "checkpoint": ckpt,
+            "disclosed_rollback": [50, 57],
+        }],
+    }
+    assert RR.launcher_already_recorded(prov, ckpt, (50, 57)) is True
+    # A different range / checkpoint is NOT this resume's launcher entry.
+    assert RR.launcher_already_recorded(prov, ckpt, (51, 57)) is False
+    assert RR.launcher_already_recorded(prov, "/other.pth", (50, 57)) is False
+    # A train.py entry does not count as the launcher's.
+    assert RR.launcher_already_recorded(
+        {"resume_log": [{"source": "train.py", "checkpoint": ckpt,
+                         "disclosed_rollback": [50, 57]}]},
+        ckpt, (50, 57),
+    ) is False
