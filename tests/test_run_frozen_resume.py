@@ -564,16 +564,17 @@ def _write_segment(out: Path, starting_epoch: int, index: int = 1) -> None:
     )
 
 
-def test_refuses_silent_rollback_when_log_reached_newer_epoch(
+def test_discloses_rollback_when_log_reached_newer_epoch(
     tmp_path: Path,
 ) -> None:
-    """F1: a source older than the run's LAST EXECUTED epoch is refused.
+    """D1: a source older than the run's LAST EXECUTED epoch is DISCLOSED, not refused.
 
     Synthetic seed-43 shape: periodics only through ``epoch_50.pth`` (stored 49)
     but the log's last line is ``Epoch 58/300`` (0-based epoch 57 executed).  The
-    newest-complete-epoch rule would pick ``epoch_50.pth``; F1 must refuse it and
-    NAME both epochs, so the completed epochs 50..57 are never silently
-    re-trained.
+    newest-complete-epoch rule picks ``epoch_50.pth``; the rollback of epochs
+    50..57 is AUTHORIZED normal recovery (checkpoint_interval 10 always loses up
+    to 9 epochs), so the decider ACCEPTS and prints a LOUD DISCLOSED ROLLBACK
+    naming both epochs — never silent.
     """
     cfg = tmp_path / "arm.yaml"
     cfg.write_text("training:\n  num_epochs: 300\n")
@@ -582,20 +583,26 @@ def test_refuses_silent_rollback_when_log_reached_newer_epoch(
     _write_ckpt(out / "epoch_50.pth", 49)      # newest EXISTING checkpoint
     _write_ckpt(out / "best_model.pth", 57)    # best epoch, not a source
     _write_log(out, last_epoch_1based=58)      # 0-based epoch 57 was executed
-    rc, msg = _decide(out, cfg, n=300)
-    assert rc == 1, msg
-    assert "no-silent-rollback" in msg, msg
-    assert "49" in msg and "57" in msg, msg
+    mod = _helper()
+    err = StringIO()
+    buf = StringIO()
+    with redirect_stdout(buf), redirect_stderr(err):
+        rc = mod.decide(str(out), _WT, _FROZEN, str(cfg), "300")
+    assert rc == 0, buf.getvalue()
+    assert buf.getvalue().strip().endswith("epoch_50.pth"), buf.getvalue()
+    assert "DISCLOSED ROLLBACK" in err.getvalue(), err.getvalue()
+    assert "50..57" in err.getvalue(), err.getvalue()
 
 
 def test_accepts_clean_boundary_when_log_matches_newest(
     tmp_path: Path,
 ) -> None:
-    """F1: a source whose stored epoch equals the last executed epoch is OK.
+    """D1: a source whose stored epoch equals the last executed epoch is OK.
 
     Synthetic seed-44 shape: the newest checkpoint is ``epoch_150.pth`` (stored
     149) and the log's last line is ``Epoch 150/300`` — a clean boundary with no
-    rollback, so the resume is ACCEPTED and selects ``epoch_150.pth``.
+    rollback, so the resume is ACCEPTED and selects ``epoch_150.pth`` with NO
+    disclosure.
     """
     cfg = tmp_path / "arm.yaml"
     cfg.write_text("training:\n  num_epochs: 300\n")
@@ -604,39 +611,46 @@ def test_accepts_clean_boundary_when_log_matches_newest(
     _write_ckpt(out / "epoch_150.pth", 149)
     _write_ckpt(out / "best_model.pth", 142)
     _write_log(out, last_epoch_1based=150)
-    rc, msg = _decide(out, cfg, n=300)
-    assert rc == 0, msg
-    assert msg.endswith("epoch_150.pth"), msg
+    mod = _helper()
+    err = StringIO()
+    buf = StringIO()
+    with redirect_stdout(buf), redirect_stderr(err):
+        rc = mod.decide(str(out), _WT, _FROZEN, str(cfg), "300")
+    assert rc == 0, buf.getvalue()
+    assert buf.getvalue().strip().endswith("epoch_150.pth"), buf.getvalue()
+    assert "DISCLOSED ROLLBACK" not in err.getvalue(), err.getvalue()
 
 
-def test_dry_run_refusal_writes_nothing(tmp_path: Path) -> None:
-    """F1: a dry-run refusal names both epochs and writes NOTHING to the dir."""
+def test_dry_run_rollback_writes_nothing(tmp_path: Path) -> None:
+    """D1: a dry-run rollback discloses both epochs and writes NOTHING to the dir."""
     cfg = tmp_path / "arm.yaml"
     cfg.write_text("training:\n  num_epochs: 300\n")
     out = tmp_path / "arm"
     _write_prov(out, cfg, _FROZEN, f"{_WT}/nsmor/__init__.py")
     _write_ckpt(out / "epoch_50.pth", 49)
-    _write_log(out, last_epoch_1based=57)
+    _write_log(out, last_epoch_1based=58)
     before = {p.name: p.read_bytes() for p in out.iterdir()}
     mod = _helper()
     err = StringIO()
     buf = StringIO()
     with redirect_stdout(buf), redirect_stderr(err):
         rc = mod.decide(str(out), _WT, _FROZEN, str(cfg), "300", None, dry_run=True)
-    assert rc == 1, buf.getvalue()
-    assert "no-silent-rollback" in buf.getvalue(), buf.getvalue()
+    assert rc == 0, buf.getvalue()
+    assert buf.getvalue().strip().endswith("epoch_50.pth"), buf.getvalue()
+    assert "DISCLOSED ROLLBACK" in err.getvalue(), err.getvalue()
+    assert "50..57" in err.getvalue(), err.getvalue()
     after = {p.name: p.read_bytes() for p in out.iterdir()}
     assert after == before, "dry run must not write to the run dir"
 
 
 def test_segment_starting_epoch_is_a_witness(tmp_path: Path) -> None:
-    """F1: a segment record witnesses the epoch BEFORE its ``starting_epoch``.
+    """D1: a segment record witnesses the epoch BEFORE its ``starting_epoch``.
 
     ``_write_segment_record`` stores ``starting_epoch = stored_epoch + 1`` (the
     NEXT epoch to execute, written before the loop), so a segment whose
     ``starting_epoch`` is S proves the run executed through S-1.  Here S=58, so
     the run executed through 57 while the newest checkpoint is ``epoch_50.pth``
-    (stored 49): a rollback, refused with BOTH epochs (49 and 57) named.
+    (stored 49): a DISCLOSED rollback re-training 50..57.
     """
     cfg = tmp_path / "arm.yaml"
     cfg.write_text("training:\n  num_epochs: 300\n")
@@ -644,9 +658,14 @@ def test_segment_starting_epoch_is_a_witness(tmp_path: Path) -> None:
     _write_prov(out, cfg, _FROZEN, f"{_WT}/nsmor/__init__.py")
     _write_ckpt(out / "epoch_50.pth", 49)
     _write_segment(out, 58)
-    rc, msg = _decide(out, cfg, n=300)
-    assert rc == 1, msg
-    assert "no-silent-rollback" in msg and "49" in msg and "57" in msg, msg
+    mod = _helper()
+    err = StringIO()
+    buf = StringIO()
+    with redirect_stdout(buf), redirect_stderr(err):
+        rc = mod.decide(str(out), _WT, _FROZEN, str(cfg), "300")
+    assert rc == 0, buf.getvalue()
+    assert "DISCLOSED ROLLBACK" in err.getvalue(), err.getvalue()
+    assert "50..57" in err.getvalue(), err.getvalue()
 
 
 def test_h1_clean_boundary_with_resumed_segment_is_accepted(tmp_path: Path) -> None:
@@ -673,13 +692,14 @@ def test_h1_clean_boundary_with_resumed_segment_is_accepted(tmp_path: Path) -> N
     assert msg.endswith("epoch_150.pth"), msg
 
 
-def test_h1_segment_offbyone_still_refuses_real_rollback(tmp_path: Path) -> None:
-    """H1: the start-1 correction must NOT turn a real rollback into an accept.
+def test_h1_segment_offbyone_still_discloses_real_rollback(tmp_path: Path) -> None:
+    """H1/D1: the start-1 correction must NOT hide a real rollback.
 
     A segment that started at 58 (so executed through 57) with the newest
     checkpoint ``epoch_50.pth`` (stored 49) is a rollback of epochs 50..57: the
-    start-1 correction leaves 49 < 57, so it is still REFUSED (the fix narrows
-    the false refusals, it does not weaken the true ones).
+    start-1 correction leaves 49 < 57, so it is still a REAL rollback — now
+    DISCLOSED (re-training 50..57), not silently accepted.  The fix narrows false
+    disclosures; it does not hide true ones.
     """
     cfg = tmp_path / "arm.yaml"
     cfg.write_text("training:\n  num_epochs: 300\n")
@@ -687,9 +707,14 @@ def test_h1_segment_offbyone_still_refuses_real_rollback(tmp_path: Path) -> None
     _write_prov(out, cfg, _FROZEN, f"{_WT}/nsmor/__init__.py")
     _write_ckpt(out / "epoch_50.pth", 49)
     _write_segment(out, 58)
-    rc, msg = _decide(out, cfg, n=300)
-    assert rc == 1, msg
-    assert "no-silent-rollback" in msg and "49" in msg and "57" in msg, msg
+    mod = _helper()
+    err = StringIO()
+    buf = StringIO()
+    with redirect_stdout(buf), redirect_stderr(err):
+        rc = mod.decide(str(out), _WT, _FROZEN, str(cfg), "300")
+    assert rc == 0, buf.getvalue()
+    assert "DISCLOSED ROLLBACK" in err.getvalue(), err.getvalue()
+    assert "50..57" in err.getvalue(), err.getvalue()
 
 
 def test_final_model_is_a_witness_in_the_decider(tmp_path: Path) -> None:
@@ -709,19 +734,31 @@ def test_final_model_is_a_witness_in_the_decider(tmp_path: Path) -> None:
 
 
 def test_decider_and_train_share_the_checkpoint_witness_set() -> None:
-    """H2: the two F1 enforcers must use the SAME checkpoint witness set.
+    """D1: the two rollback enforcers must use the SAME checkpoint witness set.
 
     Round-4 MAJOR: the decider treated ``final_model.pth`` as a witness while
-    train.py excluded it — the 'same rule' claim was false.  Pin the constants
-    equal so they cannot silently drift apart again.
+    train.py excluded it — the 'same rule' claim was false.  Both now import the
+    SAME shared ``nsmor.pipeline.resume_rollback`` constants, so pin them equal AND pin
+    the shared-source identity so they cannot silently drift apart again.
     """
     mod = _helper()
     from scripts import train as T
+    from nsmor.pipeline import resume_rollback as RR
 
     assert tuple(mod._CHECKPOINT_WITNESS_FAMILIES) == tuple(
         T._CHECKPOINT_WITNESS_FAMILIES
     )
-    assert set(mod._RESUME_EXCLUDED) == set(T._NON_RESUME_WITNESS_FAMILIES)
+    assert tuple(mod._CHECKPOINT_WITNESS_FAMILIES) == tuple(
+        RR._CHECKPOINT_WITNESS_FAMILIES
+    )
+    # ``best_model.pth`` IS an executed-epoch witness (its stored epoch was
+    # executed) but is NEVER a resume source: the decider's source-exclusion set
+    # and train.py's witness family are therefore DIFFERENT concepts now.
+    assert mod._RESUME_EXCLUDED == frozenset({"best_model.pth"})
+    assert "best_model.pth" in tuple(mod._CHECKPOINT_WITNESS_FAMILIES)
+    # The witness logic is the SAME function object on both enforcers.
+    assert mod._last_executed_epoch is RR.last_executed_epoch
+    assert T._last_executed_epoch is RR.last_executed_epoch
 
 
 def test_decider_and_train_share_the_epoch_progress_regex() -> None:

@@ -8,11 +8,12 @@ evidence: this test drives the REAL preflight helpers (never a
 re-implementation) against the actual checkpoint.
 
 The FIRST INTENDED USE is ``R0-control-seed44`` (started on ``8ed5edb``, died
-right after writing ``epoch_150.pth`` — a clean boundary, so F1 ACCEPTS it); its
-``epoch_150.pth`` (stored 149) is the accepted source exercised here.
-``R0-control-seed43`` is NOT resumed (F1 no-silent-rollback refuses its
-``epoch_50.pth``: the run reached epoch 57 but the newest periodic is stored 49);
-a test below pins that refusal against the real dir.
+right after writing ``epoch_150.pth`` — a clean boundary, so the disclosed-
+rollback rule ACCEPTS it); its ``epoch_150.pth`` (stored 149) is the accepted
+source exercised here.  ``R0-control-seed43`` reached epoch 57 with the newest
+periodic at stored 49 — a DISCLOSED rollback (re-train 50..57), no longer a
+refusal; that disclosure is covered by SYNTHETIC tests (no test depends on the
+mutable live dirs).
 
 The ``active_lineage`` it builds is NON-CIRCULAR: the nested split / fingerprint
 / provenance are loaded independently from the nested-prior artifact via
@@ -25,15 +26,12 @@ The test SKIPS when the READ-ONLY corpus / run dirs are absent (a machine
 without the phase-2 artifacts), so it never fails a checkout that lacks them.
 It never writes to the run dir.
 
-STATE-INDEPENDENCE: the seed-44 dir is MUTATED by the resume this amendment
-authorizes (it gains ``segment_0001.json`` and ``train.segment1.log``).  Every
-assertion on that dir is therefore written to hold in BOTH the pre-resume and
-the post-resume state — the real-dir test SIMULATES the resume's own writes on a
-copy (``test_real_seed44_dir_stays_a_clean_boundary_across_first_resume``), and
-the end-to-end test's source-selection assertion accepts ``epoch_150.pth`` OR the
-next periodic ``epoch_160.pth`` the resumed segment writes.  A hard pin on the
-live dir's exact current state (round-5 BLOCKER: an ``== 149`` / ``epoch_150.pth``
-pin that the first resume invalidates) is deliberately NOT used.
+STATE-INDEPENDENCE (round-10 amendment): the tests here read ONLY the immutable
+source checkpoint (``epoch_150.pth``) and the read-only corpus; NO assertion
+depends on the mutable live seed-44 dir's evolving state (the resume this
+amendment authorizes MUTATES it).  The previous live-dir state-pinning tests were
+REMOVED — their synthetic replacements live in ``test_epoch_recovery.py`` — and
+the live seed-44 dry-run evidence is recorded in the amendment log instead.
 """
 
 from __future__ import annotations
@@ -44,15 +42,13 @@ from typing import Any
 
 import pytest
 
-# The seed-44 (accepted) and seed-43 (F1-refused) runs and the corpus are
-# READ-ONLY inputs; these tests only read.
+# The seed-44 run dir (immutable source checkpoint) and the corpus are READ-ONLY
+# inputs; these tests only read.
 _ROOT = Path(
     "/mnt/d/Projects/NSMoR-phase2-8ed5edb/.scratch/realdata-phase2-20261010"
 )
 _RUN_DIR = _ROOT / "R0-control-seed44"
 _CKPT = _RUN_DIR / "epoch_150.pth"
-_SEED43_DIR = _ROOT / "R0-control-seed43"
-_SEED43_CKPT = _SEED43_DIR / "epoch_50.pth"
 _CORPUS = Path(
     "/mnt/d/Projects/NSMoR/.scratch/clock-corpus-r4/exploratory-chain-tiZddw2c"
 )
@@ -130,8 +126,9 @@ def test_train_resume_preflight_accepts_pre_amendment_checkpoint() -> None:
 
     # 1. Clock (dt_ms).
     validate_checkpoint_clock(peek, config.model.dt_ms, require_dt_ms=True)
-    # 2. Newest complete-epoch source (the source is its own dir's newest).
-    T._require_resume_source_is_newest_complete_epoch(_CKPT, peek, _RUN_DIR)
+    # 2. Newest complete-epoch source + disclosed-rollback resolution (the source
+    #    is its own dir's newest, so no rollback is disclosed).
+    T._resolve_resume_source_and_rollback(_CKPT, peek, _RUN_DIR)
     # 3. Complete current schema.
     T._require_complete_current_schema(peek, _CKPT)
     # 4. Architecture / script-owned controls match the active arm.
@@ -219,92 +216,55 @@ def test_preflight_scope_is_disclosed_not_overstated() -> None:
     assert peek["dataset_source_sha256"] == compute_source_fingerprint(_DATASET)
 
 
-def test_real_seed44_dir_stays_a_clean_boundary_across_first_resume(
-    tmp_path: Path,
-) -> None:
-    """The REAL seed-44 dir is a CLEAN BOUNDARY and STAYS one across the resume.
+def test_seed44_shape_clean_boundary_then_disclosed_rollback(tmp_path: Path) -> None:
+    """The seed-44 SHAPE (synthetic): clean boundary, then a disclosed rollback.
 
-    State-independent (round-5 BLOCKER): the previous version pinned
-    ``_last_executed_epoch(_RUN_DIR) == 149`` on the LIVE seed-44 dir, which the
-    resume this amendment authorizes MUTATES — it gains ``segment_0001.json``
-    {``starting_epoch``: 150} AND the resumed segment's own ``train.segment1.log``
-    (``Epoch 151/300`` once its first epoch completes), so the witness reads 150
-    and the ``== 149`` pin FAILS.  The test was invalidated by the very action it
-    gated.
-
-    Here the resume's exact writes are SIMULATED on a READ-ONLY COPY of the real
-    dir (the live dir is only read):
-      * first resume IN PROGRESS (segment start 150 written, first epoch not yet
-        complete) — the start-1 rule keeps the boundary at 149, so the real
-        ``epoch_150.pth`` (stored 149) is ACCEPTED (the round-5 hazard: the raw
-        start over-claimed to 150 and falsely refused);
-      * first resume's first epoch COMPLETE (log ``Epoch 151/300``) — the run has
-        genuinely executed through 150, so the old ``epoch_150.pth`` is now
-        correctly REFUSED and the resumed segment's newer periodic is the source.
+    NO live dir is touched (round-10 amendment: the live-dir state-pinning tests
+    were removed).  This drives the REAL helpers on a SYNTHETIC dir with the
+    seed-44 shape (newest periodic ``epoch_150.pth`` stored 149, log
+    ``Epoch 150/300``):
+      * pre-resume — clean boundary (last executed 149 == source 149): NO rollback;
+      * first resume IN PROGRESS — its segment record (start 150) still witnesses
+        only 149, so it stays a clean boundary (the round-5 hazard: a RAW start
+        read over-claimed to 150 and falsely disclosed a rollback);
+      * first resume's FIRST epoch COMPLETE (log ``Epoch 151/300``) — the run has
+        genuinely executed through 150, so the old ``epoch_150.pth`` is now a
+        DISCLOSED rollback (re-train 150..150), not a refusal.
     """
     import json
-    import shutil
 
     from scripts import train as T
 
-    # The live dir's CURRENT state is never a rollback (state-independent: 149
-    # pre-resume, 150 once the resumed segment's first epoch completes).  Read-only.
-    assert T._last_executed_epoch(_RUN_DIR) >= 149
-
     work = tmp_path / "seed44"
-    shutil.copytree(_RUN_DIR, work)
+    work.mkdir()
     src = work / "epoch_150.pth"
-    src_epoch = T._checkpoint_stored_epoch(src)
-    assert src_epoch == 149, src_epoch  # the clean-boundary source
-    peek = {"epoch": src_epoch}
+    _save_ckpt(src, 149)
+    peek = {"epoch": 149}
 
     # Pre-resume: last executed == newest checkpoint == 149 -> clean boundary.
+    (work / "train.stdout.log").write_text("[t] INFO - Epoch 150/300  train_loss=1.0\n")
     assert T._last_executed_epoch(work) == 149
-    T._require_resume_source_is_newest_complete_epoch(src, peek, work)
+    assert T._resolve_resume_source_and_rollback(src, peek, work) == (None, [])
 
     # The first resume IN PROGRESS writes its segment record (start = 149 + 1);
-    # its first epoch has not completed, so no post-150 log line exists yet.
-    (work / "segment_0001.json").write_text(
-        json.dumps({"starting_epoch": 150})
-    )
+    # its first epoch has not completed, so the boundary stays 149.
+    (work / "segment_0001.json").write_text(json.dumps({"starting_epoch": 150}))
     assert T._last_executed_epoch(work) == 149, (
         "the resumed segment's start over-claimed the last executed epoch "
-        "(round-5 hazard): the clean-boundary recovery would be falsely refused"
+        "(round-5 hazard): the clean-boundary recovery would be falsely disclosed"
     )
-    T._require_resume_source_is_newest_complete_epoch(src, peek, work)
+    assert T._resolve_resume_source_and_rollback(src, peek, work) == (None, [])
 
     # The resumed segment's FIRST epoch completes: the run has now executed
-    # through 150, so the old epoch_150.pth (149) is correctly refused.
+    # through 150, so the old epoch_150.pth (149) is a DISCLOSED rollback.
     (work / "train.segment1.log").write_text(
         "[t] INFO - Epoch 151/300  train_loss=1.0\n"
     )
     assert T._last_executed_epoch(work) == 150
-    with pytest.raises(ValueError, match="no-silent-rollback"):
-        T._require_resume_source_is_newest_complete_epoch(src, peek, work)
+    assert T._resolve_resume_source_and_rollback(src, peek, work) == ((150, 150), [])
 
 
-def test_real_seed43_dir_is_refused_by_f1_no_silent_rollback() -> None:
-    """F1: the seed-43 dir is REFUSED — its reached epoch exceeds the source.
+def _save_ckpt(path: Path, epoch: int) -> None:
+    import torch
 
-    The seed-43 run reached ``Epoch 58/300`` (0-based 57) but its newest
-    last-epoch checkpoint is ``epoch_50.pth``, so resuming would silently
-    re-train epochs 50..57.  Driving the REAL helper against the real dir
-    (read-only) pins the refusal, and the message names both epochs.  The
-    source's ``peek`` is the REAL ``epoch_50.pth``'s stored epoch (read from the
-    file), not a hand-written value, so the test drives the real dir end-to-end
-    (round-4 minor).
-    """
-    from nsmor.pipeline.nested_prior import load_artifact_bytes
-
-    from scripts import train as T
-
-    if not _SEED43_CKPT.exists():  # pragma: no cover - absent on some machines
-        pytest.skip("seed-43 dir absent")
-    peek = load_artifact_bytes(_SEED43_CKPT.read_bytes(), map_location="cpu")
-    stored = peek.get("epoch")
-    assert isinstance(stored, int) and not isinstance(stored, bool), peek.get("epoch")
-    with pytest.raises(ValueError, match="no-silent-rollback") as exc:
-        T._require_resume_source_is_newest_complete_epoch(
-            _SEED43_CKPT, peek, _SEED43_DIR,
-        )
-    assert str(stored) in str(exc.value) and "57" in str(exc.value), str(exc.value)
+    torch.save({"recovery_state_version": 2, "epoch": epoch}, path)

@@ -628,11 +628,43 @@ timing, or to survive a WSL failure / memory reclaim — and resumed from its
    (`recovery_state_version=2`) recoverable payload whose lineage, clock,
    optimizer/scheduler/RNG state and phase match the active run; a preflight
    failure refuses the resume (fail closed). The source is the run's LAST
-   complete-epoch checkpoint: `scripts/train.py` itself refuses `best_model.pth`
-   (the best SELECTED epoch, which may be far older) and, for an in-place
-   recovery, any source older than a newer last-epoch family file in the same
-   run dir (`_require_resume_source_is_newest_complete_epoch`) — so a bare
+   EXISTING complete-epoch checkpoint: `scripts/train.py` itself refuses
+   `best_model.pth` (the best SELECTED epoch, which may be far older) and, for an
+   in-place recovery, any source older than a newer last-epoch family file in the
+   same run dir (`_resolve_resume_source_and_rollback`) — so a bare
    `train.py --resume` enforces this, not only the launcher.
+
+   **DISCLOSED ROLLBACK (amendment 2026-10-11).** When the newest EXISTING
+   complete-epoch checkpoint is OLDER than the last epoch the run actually
+   EXECUTED — witnessed by the run's own records (the last `Epoch N/<budget>`
+   progress line in its logs, N 1-based; every `segment_*.json`'s
+   `starting_epoch` read as `start - 1`, since the writer stores the NEXT epoch
+   to execute; and every checkpoint's own stored epoch, `best_model.pth`
+   included) — the resume is **ALLOWED** (this is normal recovery: with
+   `checkpoint_interval: 10` a crash between periodics always loses up to 9
+   completed epochs, so refusing it would make resume unusable) but is NEVER
+   silent:
+   * the re-trained range `[source + 1, last_executed]` is **DISCLOSED** —
+     printed loudly, and recorded in the segment record's `disclosed_rollback`,
+     the `provenance.json` `resume_log` entry, a `status.log` line, and the
+     result dict (`train.log`'s `disclosed_rollback`), on **BOTH** the launcher
+     and a bare `train.py --resume` path;
+   * every abandoned-branch artifact the resume would overwrite (a run-dir
+     `*.pth` whose own stored epoch is GREATER than the source's) is **MOVED**
+     (rename, never delete, never overwrite) into `run_dir/abandoned_branch_<k>/`
+     with a `manifest.json` (file, sha256, stored epoch, reason), BEFORE the
+     best-model reconciliation reads it; a move that would overwrite an existing
+     archive path is refused. The run's logs and `segment_*.json` records are
+     never moved. The preflight (source selection + witness) is a pure LIST: the
+     MOVE happens only AFTER every fail-closed resume check has passed, so a
+     resume refused at preflight never mutates the run dir. (A fail-closed error
+     in the LATER restoration/reconciliation — e.g. a corrupt payload — would
+     leave the archive in place; the artifacts are preserved with their manifest,
+     never lost, so this is a recoverable, documented state, not a data loss.)
+
+   The shared witness/rollback logic lives in `nsmor/pipeline/resume_rollback.py` and is
+   imported by BOTH `scripts/train.py` and `scripts/resume_decision.py`, so the
+   two enforcers cannot drift.
 4. **All original logs and recovery records retained.** The interrupted
    segment's `train.stdout.log`, checkpoints and `segment_*.json` records are
    never overwritten or deleted: a fresh segment owns `train.stdout.log`, and
@@ -642,14 +674,18 @@ timing, or to survive a WSL failure / memory reclaim — and resumed from its
    resume time, the checkpoint's epoch and the resume source; `provenance.json`
    is rewritten in place (atomically, temp + fsync + rename) with its
    `resume_log` extended, so its prior fields and prior entries are preserved —
-   it is never truncated to a partial or empty file. The `status.log` /
-   `resume_log` records are written by the resume LAUNCHER
-   (`run_frozen_resume.sh` + `resume_decision.py`); a bare `train.py --resume`
-   bypasses the launcher, satisfies the equivalence guarantee, but writes
-   neither, so condition 5's per-run interruption reporting is guaranteed only
-   on the launcher path.
+   it is never truncated to a partial or empty file. The launcher
+   (`run_frozen_resume.sh` + `resume_decision.py`) writes the richer `resume_log`
+   / `status.log` entry; a bare `train.py --resume` writes its own `resume_log`
+   entry and `status.log` line in the run dir (so a disclosed rollback is
+   recorded even without the launcher), but does NOT write the launcher's
+   `head`/`origin_commit` fields, so condition 5's full per-run interruption
+   reporting remains guaranteed only on the launcher path.
 5. **Results report interruptions.** For every run, the results report the
-   number of interruptions, the interruption epochs and the resume sources.
+   number of interruptions, the interruption epochs, the resume sources, the
+   re-trained epoch range of any disclosed rollback, and the archived
+   abandoned-branch artifacts; a successor-commit resume also names BOTH
+   commits.
 
 **Successor-commit resume (amendment 2026-10-11; revised 2026-10-11 round-6).**
 A run STARTED on commit C may be resumed on a DIFFERENT commit C' (a successor
@@ -1363,6 +1399,72 @@ claim remains the accepted, disclosed, fail-closed residual risk (inert for the
 phase-2 corpus). The seed-44 decider + launcher DRY_RUN still accept the newest
 complete-epoch checkpoint and write nothing; the seed-43 refusal is unchanged.
 Focused + full suite (CPU) pass. The preliminary conclusions remain untouched.
+
+**Amendment log — 2026-10-11 (round-11: disclosed rollback replaces the F1
+refusal).** Reason: MAIN-SESSION DECISION — the user's original rule is "resume
+from the LAST COMPLETE-EPOCH CHECKPOINT"; the F1 refusal (rounds 8–10) turned a
+rollback to the newest EXISTING checkpoint into a hard failure, but with
+`checkpoint_interval: 10` a crash between periodics always loses up to 9 completed
+epochs, so refusing the rollback made resume unusable. What must never happen is a
+SILENT rollback or an OVERWRITE of the abandoned (un-checkpointed) branch's
+artifacts — not the rollback itself.
+
+(D1, disclosed rollback) `nsmor/pipeline/resume_rollback.py` is a NEW shared module:
+`last_executed_epoch` (the highest 0-based epoch the run's OWN records witness as
+executed — the last `Epoch N/<budget>` log line read as `N - 1`, each
+`segment_*.json`'s `starting_epoch` read as `start - 1`, and every checkpoint's
+own stored epoch, `best_model.pth` INCLUDED) and `rollback_retrained_range`. BOTH
+`scripts/train.py` and `scripts/resume_decision.py` import it, so the two
+enforcers cannot drift (pinned by
+`test_decider_and_train_share_the_checkpoint_witness_set`). When the source's
+stored epoch is OLDER than `last_executed_epoch`, the resume is ALLOWED and the
+re-trained range `[source + 1, last_executed]` is DISCLOSED — printed loudly,
+recorded in the segment record's `disclosed_rollback`, the `provenance.json`
+`resume_log` entry, a `status.log` line, and the result dict — on BOTH the
+launcher and a bare `train.py --resume` path (so a bare `--resume` can never roll
+back silently). `best_model.pth` is now a WITNESS (its stored epoch WAS executed)
+but is still NEVER a resume SOURCE.
+
+(D2, no overwrite) Before an in-place rollback resume writes anything, every
+run-dir `*.pth` whose own stored epoch is GREATER than the source's is MOVED
+(rename, never delete, never overwrite) into `run_dir/abandoned_branch_<k>/` with
+a `manifest.json` (file, sha256, stored epoch, reason), BEFORE the best-model
+reconciliation reads it; a move that would overwrite an existing archive path is
+refused (`abandoned_branch_0` present ⇒ the next free index is used). Logs and
+`segment_*.json` records are never moved. The MOVE happens only AFTER every
+fail-closed resume check has passed (the preflight is a pure LIST), so a REFUSED
+resume never mutates the run dir. Because the abandoned `best_model.pth` is
+archived, the best-model reconciliation would otherwise fail closed on the
+absent companion; the disclosed-rollback path instead seeds `best_val_loss` from
+the resume source's own recorded value (the retained epochs' legitimate best) and
+LOUDLY warns — never a silent degrade.
+
+(D3, tests) SYNTHETIC fixtures only — NO test depends on the mutable live seed-44
+dir. New/rewritten: clean boundary (no rollback recorded); rollback with a newer
+`best_model.pth` (archived + recorded, resume proceeds); archive collision
+refused/next-indexed; bare `train.py --resume` rollback records the range and does
+not overwrite (`test_bare_resume_disclosed_rollback_records_and_archives`,
+end-to-end); post-resume intermediate state (segment log past the newest periodic)
+handled as a RECORDED rollback, not a refusal. The live-dir state-pinning tests
+(`test_real_seed44_dir_stays_a_clean_boundary_across_first_resume`,
+`test_real_seed43_dir_is_refused_by_f1_no_silent_rollback`) are REMOVED; their
+synthetic replacements live in `tests/test_epoch_recovery.py`. The live seed-44
+dry-run evidence is recorded HERE instead of in a test: on this machine the
+UNSTUBBED decider (with `ORIGIN_COMMIT=8ed5edb`) selects the newest complete-epoch
+checkpoint `epoch_150.pth` (stored 149, next epoch 150) and discloses NO rollback
+(its log's last line is `Epoch 150/300`), writing NOTHING to the read-only run
+dir; the seed-43 dir (newest periodic stored 49, log `Epoch 58/300`) is a
+DISCLOSED rollback re-training 50..57.
+
+(D4, protocol) §11.1 conditions 3–5 are rewritten as above; reporting now
+requires the interruption count, interruption epochs, resume source, re-trained
+epoch range, archived artifacts, and (for a successor-commit resume) both
+commits. The preliminary conclusions are untouched; seed 43 remains a fresh
+rerun by user decision (original dir retained).
+
+(D5, verification) The seed-44 decider + launcher `DRY_RUN` re-run (clean
+boundary at `epoch_150.pth`, no rollback, writes nothing); focused + full suite
+(CPU) pass. Committed on this branch.
 
 *This amendment's text is bound to the reviewed worktree commit by the
 `sha256` of `docs/realdata-phase2-protocol-20261010.md` recorded in each run's

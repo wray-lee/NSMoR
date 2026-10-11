@@ -2031,7 +2031,7 @@ def test_real_cadence10_workers_allowed_and_compatible(tmp_path: Path) -> None:
     # Resume a cadence-10 parent at cadence 10 with workers>0: still allowed.
     # (cadence 10 writes no epoch_1.pth, so resume from the segment's last
     # complete-epoch checkpoint, final_model.pth — best_model.pth is NOT a
-    # resume source and is refused by _require_resume_source_is_newest_complete_epoch.)
+    # resume source and is refused by _resolve_resume_source_and_rollback.)
     periodic = src_dir / "final_model.pth"
     assert periodic.exists(), "the source segment must write final_model.pth"
     resumed = _real_config(tmp_path, epochs=2, name="c10_resume")
@@ -3895,26 +3895,31 @@ def test_resume_from_stale_periodic_is_refused_by_engine(tmp_path: Path) -> None
 
 
 # ═════════════════════════════════════════════════════════════
-# F1 no-silent-rollback (§11.1, 2026-10-11): the run's OWN records witness the
-# last executed epoch, so a source older than that is refused even when NO
-# newer last-epoch checkpoint file exists (the seed-43 interruption shape:
-# reached epoch 58 but the newest periodic is epoch_50.pth).
+# DISCLOSED ROLLBACK (§11.1, amendment 2026-10-11): the run's OWN records witness
+# the last executed epoch, so a source older than that is DISCLOSED (re-trained
+# range recorded + abandoned-branch artifacts moved aside), never refused and
+# never silent (the seed-43 interruption shape: reached epoch 58 but the newest
+# periodic is epoch_50.pth).
 # ═════════════════════════════════════════════════════════════
 
 
-def _ckpt(path: Path, epoch: int) -> None:
+def _ckpt(path: Path, epoch: int, *, best_val_loss: float | None = None) -> None:
     import torch
 
-    torch.save({"recovery_state_version": 2, "epoch": epoch}, path)
+    payload = {"recovery_state_version": 2, "epoch": epoch}
+    if best_val_loss is not None:
+        payload["best_val_loss"] = best_val_loss
+    torch.save(payload, path)
 
 
-def test_no_silent_rollback_refuses_source_older_than_log(tmp_path: Path) -> None:
-    """A source older than the log's last executed epoch is refused (names both).
+def test_disclosed_rollback_discloses_source_older_than_log(tmp_path: Path) -> None:
+    """D1: a source older than the log's last executed epoch is DISCLOSED.
 
     Only ``epoch_50.pth`` (stored 49) exists, but the run's ``train.stdout.log``
-    shows it executed through ``Epoch 57/300``.  No newer last-epoch FILE exists,
-    so the pre-amendment rule would accept the source and silently re-train
-    epochs 50..57; F1 refuses and names both epochs.
+    shows it executed through ``Epoch 58/300`` (0-based 57).  No newer last-epoch
+    FILE exists, so the pre-amendment rule would silently re-train epochs 50..57;
+    the disclosed rule ACCEPTS the source but returns the re-trained range
+    ``(50, 57)`` and archives the abandoned ``best_model.pth``.
     """
     from scripts import train as trainer
 
@@ -3922,6 +3927,8 @@ def test_no_silent_rollback_refuses_source_older_than_log(tmp_path: Path) -> Non
     run_dir.mkdir()
     src = run_dir / "epoch_50.pth"
     _ckpt(src, 49)
+    # The abandoned branch's best (stored 57) — archived, never overwritten.
+    _ckpt(run_dir / "best_model.pth", 57)
     # "Epoch N/300" is 1-based: the last line "Epoch 58/300" means the run
     # EXECUTED the 0-based epoch 57 (matching seed-43's real log).
     (run_dir / "train.stdout.log").write_text(
@@ -3929,14 +3936,18 @@ def test_no_silent_rollback_refuses_source_older_than_log(tmp_path: Path) -> Non
         "[t] INFO - Epoch 58/300  train_loss=1.0\n"
     )
     peek = {"epoch": 49}
-    with pytest.raises(ValueError, match="no-silent-rollback") as exc:
-        trainer._require_resume_source_is_newest_complete_epoch(src, peek, run_dir)
-    msg = str(exc.value)
-    assert "49" in msg and "57" in msg, msg
+    rollback, archived = trainer._resolve_resume_source_and_rollback(
+        src, peek, run_dir,
+    )
+    assert rollback == (50, 57), rollback
+    # The preflight is PURE: it LISTS the abandoned best but does not move it.
+    assert archived == ["best_model.pth"], archived
+    assert (run_dir / "best_model.pth").exists()
+    assert not (run_dir / "abandoned_branch_0").exists()
 
 
-def test_no_silent_rollback_accepts_clean_boundary(tmp_path: Path) -> None:
-    """The source equal to the last executed epoch is a clean boundary — accepted."""
+def test_disclosed_rollback_accepts_clean_boundary(tmp_path: Path) -> None:
+    """D1: the source equal to the last executed epoch is a clean boundary."""
     from scripts import train as trainer
 
     run_dir = tmp_path / "arm"
@@ -3945,35 +3956,120 @@ def test_no_silent_rollback_accepts_clean_boundary(tmp_path: Path) -> None:
     _ckpt(src, 149)
     (run_dir / "train.stdout.log").write_text("[t] INFO - Epoch 150/300  train_loss=1.0\n")
     peek = {"epoch": 149}
-    # Must NOT raise: stored 149 == last executed 149 (a clean boundary).
-    trainer._require_resume_source_is_newest_complete_epoch(src, peek, run_dir)
+    # No rollback: stored 149 == last executed 149 (a clean boundary).
+    assert trainer._resolve_resume_source_and_rollback(src, peek, run_dir) == (None, [])
 
 
-def test_no_silent_rollback_ignores_best_model_epoch(tmp_path: Path) -> None:
-    """``best_model.pth`` is NOT a witness (its stored epoch can be far older)."""
+def test_archive_moves_abandoned_branch_artifacts(tmp_path: Path) -> None:
+    """D2: a rollback MOVES (never deletes/overwrites) abandoned-branch ``*.pth``.
+
+    ``best_model.pth`` (stored 57) belongs to the abandoned branch (the resume
+    rolls back to stored 49); it is renamed into ``abandoned_branch_0/`` with a
+    manifest, and the source itself is untouched.
+    """
+    from scripts import train as trainer
+
+    run_dir = tmp_path / "arm"
+    run_dir.mkdir()
+    src = run_dir / "epoch_50.pth"
+    _ckpt(src, 49)
+    _ckpt(run_dir / "best_model.pth", 57)
+    src_bytes = src.read_bytes()
+    best_bytes = (run_dir / "best_model.pth").read_bytes()
+
+    moved = trainer.archive_abandoned_branch(
+        run_dir, source_epoch=49, last_executed=57, source_name="epoch_50.pth",
+    )
+    assert [e["file"] for e in moved] == ["best_model.pth"], moved
+    assert moved[0]["stored_epoch"] == 57
+    # MOVED, not deleted: the bytes survive in the archive with a manifest.
+    assert not (run_dir / "best_model.pth").exists()
+    archive = run_dir / "abandoned_branch_0"
+    assert (archive / "best_model.pth").read_bytes() == best_bytes
+    manifest = json.loads((archive / "manifest.json").read_text())
+    assert manifest["retrained_range"] == [50, 57]
+    assert manifest["files"][0]["file"] == "best_model.pth"
+    # The source is never moved.
+    assert src.read_bytes() == src_bytes
+
+
+def test_archive_collision_is_refused(tmp_path: Path) -> None:
+    """D2: a move that would overwrite an existing archive path is REFUSED.
+
+    The archive dir is ``abandoned_branch_<count-of-existing-archive-dirs>``.  A
+    NON-CONTIGUOUS stale archive set (only ``abandoned_branch_1`` exists, so the
+    computed index is 1) would make the move overwrite it, so the archive step
+    REFUSES (raises) rather than clobbering it.  The stale dir is untouched and
+    the abandoned ``best_model.pth`` is NOT moved.
+    """
+    from scripts import train as trainer
+
+    run_dir = tmp_path / "arm"
+    run_dir.mkdir()
+    _ckpt(run_dir / "epoch_50.pth", 49)
+    _ckpt(run_dir / "best_model.pth", 57)
+    stale = run_dir / "abandoned_branch_1"  # non-contiguous: index would be 1
+    stale.mkdir()
+    (stale / "best_model.pth").write_bytes(b"STALE")
+
+    with pytest.raises(FileExistsError, match="abandoned-branch archive"):
+        trainer.archive_abandoned_branch(
+            run_dir, source_epoch=49, last_executed=57, source_name="epoch_50.pth",
+        )
+    # The stale archive is untouched; the abandoned best is NOT moved.
+    assert (stale / "best_model.pth").read_bytes() == b"STALE"
+    assert (run_dir / "best_model.pth").exists()
+
+
+def test_archive_advances_past_a_contiguous_prior_archive(tmp_path: Path) -> None:
+    """D2: a CONTIGUOUS prior archive is advanced past (next index), not clobbered."""
+    from scripts import train as trainer
+
+    run_dir = tmp_path / "arm"
+    run_dir.mkdir()
+    _ckpt(run_dir / "epoch_50.pth", 49)
+    _ckpt(run_dir / "best_model.pth", 57)
+    prior = run_dir / "abandoned_branch_0"  # contiguous: next index is 1
+    prior.mkdir()
+    (prior / "epoch_2.pth").write_bytes(b"PRIOR")
+
+    moved = trainer.archive_abandoned_branch(
+        run_dir, source_epoch=49, last_executed=57, source_name="epoch_50.pth",
+    )
+    assert [e["file"] for e in moved] == ["best_model.pth"], moved
+    # The prior archive is untouched; the move landed in the NEXT free dir.
+    assert (prior / "epoch_2.pth").read_bytes() == b"PRIOR"
+    assert (run_dir / "abandoned_branch_1" / "best_model.pth").exists()
+
+
+def test_no_disclosure_ignores_best_model_epoch(tmp_path: Path) -> None:
+    """``best_model.pth`` is a WITNESS but a far-OLDER one is not a rollback.
+
+    ``best_model.pth`` stores the best SELECTED epoch (here OLDER than the
+    source, 3 < 9): it is an executed-epoch witness but it never forces a
+    disclosure when it is older than the source.
+    """
     from scripts import train as trainer
 
     run_dir = tmp_path / "arm"
     run_dir.mkdir()
     src = run_dir / "epoch_10.pth"
     _ckpt(src, 9)
-    # best_model.pth stores the best SELECTED epoch (here OLDER than the source).
     _ckpt(run_dir / "best_model.pth", 3)
     peek = {"epoch": 9}
-    # Must NOT raise: best_model.pth must not be read as a newer executed epoch.
-    trainer._require_resume_source_is_newest_complete_epoch(src, peek, run_dir)
+    assert trainer._resolve_resume_source_and_rollback(src, peek, run_dir) == (None, [])
 
 
 def test_h1_resumed_segment_start_does_not_overclaim(tmp_path: Path) -> None:
-    """H1 BLOCKER: a segment's ``starting_epoch`` witnesses ``start - 1``, not start.
+    """H1: a segment's ``starting_epoch`` witnesses ``start - 1``, not start.
 
     A run killed before completing its resumed segment's FIRST epoch leaves
     ``epoch_150.pth`` (stored 149), the log's last line ``Epoch 150/300``, and
     ``segment_0001.json``{``starting_epoch``: 150}.  The record is written BEFORE
     the loop and stores the NEXT epoch to execute, so it proves execution only
-    through 149 — equal to the source's stored epoch: a CLEAN BOUNDARY that MUST
-    be ACCEPTED.  Reading ``starting_epoch`` RAW over-claimed by one and refused
-    this recovery with no override (F1 round-4 BLOCKER), bricking seed-44.
+    through 149 — equal to the source's stored epoch: a CLEAN BOUNDARY with NO
+    disclosure.  Reading ``starting_epoch`` RAW over-claimed by one and would
+    falsely disclose a rollback of 150..150.
     """
     import json
 
@@ -3988,17 +4084,17 @@ def test_h1_resumed_segment_start_does_not_overclaim(tmp_path: Path) -> None:
     )
     (run_dir / "segment_0001.json").write_text(json.dumps({"starting_epoch": 150}))
     peek = {"epoch": 149}
-    # Must NOT raise: last executed epoch is 149 (segment start 150 -> 149).
-    trainer._require_resume_source_is_newest_complete_epoch(src, peek, run_dir)
+    # No disclosure: last executed epoch is 149 (segment start 150 -> 149).
+    assert trainer._resolve_resume_source_and_rollback(src, peek, run_dir) == (None, [])
 
 
-def test_h1_segment_start_still_refuses_real_rollback(tmp_path: Path) -> None:
-    """H1: the start-1 correction must NOT weaken a TRUE rollback refusal.
+def test_h1_segment_start_still_discloses_real_rollback(tmp_path: Path) -> None:
+    """H1: the start-1 correction must NOT hide a TRUE rollback.
 
     A segment that started at 58 (so executed through 57) with the newest
     checkpoint ``epoch_50.pth`` (stored 49) is a rollback of epochs 50..57: the
-    start-1 correction leaves 49 < 57, so it is still REFUSED with both epochs
-    named.  The fix narrows false refusals; it does not weaken true ones.
+    start-1 correction leaves 49 < 57, so it is still a REAL rollback — DISCLOSED
+    as (50, 57).  The fix narrows false disclosures; it does not hide true ones.
     """
     import json
 
@@ -4010,17 +4106,17 @@ def test_h1_segment_start_still_refuses_real_rollback(tmp_path: Path) -> None:
     _ckpt(src, 49)
     (run_dir / "segment_0001.json").write_text(json.dumps({"starting_epoch": 58}))
     peek = {"epoch": 49}
-    with pytest.raises(ValueError, match="no-silent-rollback") as exc:
-        trainer._require_resume_source_is_newest_complete_epoch(src, peek, run_dir)
-    msg = str(exc.value)
-    assert "49" in msg and "57" in msg, msg
+    rollback, _archived = trainer._resolve_resume_source_and_rollback(
+        src, peek, run_dir,
+    )
+    assert rollback == (50, 57), rollback
 
 
 def test_h2_final_model_is_a_witness(tmp_path: Path) -> None:
     """H2: ``final_model.pth`` IS an executed-epoch witness (it stores the last epoch).
 
     A completed/paused run writes ``final_model.pth`` with that run's last
-    executed epoch, so a source older than it is refused.  Pinned at the helper
+    executed epoch, so a source older than it is disclosed.  Pinned at the helper
     level (the full preflight would pick the newer ``final_model.pth`` itself as
     the source and mask the witness role).
     """
@@ -4034,15 +4130,17 @@ def test_h2_final_model_is_a_witness(tmp_path: Path) -> None:
 
 
 def test_h2_train_and_decider_share_checkpoint_witness_set() -> None:
-    """H2: train.py and the decider must use the SAME checkpoint witness set.
+    """H2/D1: train.py and the decider must use the SAME checkpoint witness set.
 
     Round-4 MAJOR: the decider treated ``final_model.pth`` as a witness while
-    train.py excluded it — the 'same rule' claim was false.  Pin the constants
+    train.py excluded it — the 'same rule' claim was false.  Both now import the
+    SAME shared ``nsmor.pipeline.resume_rollback`` constants and function, so pin them
     equal (the decider is loaded by path, as its own test module does).
     """
     import importlib.util
     import sys
 
+    from nsmor.pipeline import resume_rollback as RR
     from scripts import train as trainer
 
     helper = (
@@ -4055,10 +4153,15 @@ def test_h2_train_and_decider_share_checkpoint_witness_set() -> None:
     assert tuple(mod._CHECKPOINT_WITNESS_FAMILIES) == tuple(
         trainer._CHECKPOINT_WITNESS_FAMILIES
     )
-    assert set(mod._RESUME_EXCLUDED) == set(trainer._NON_RESUME_WITNESS_FAMILIES)
+    assert tuple(trainer._CHECKPOINT_WITNESS_FAMILIES) == tuple(
+        RR._CHECKPOINT_WITNESS_FAMILIES
+    )
     # The log-parse pattern must ALSO be shared, not two inline literals that
     # can drift (round-5 R2 minor).
     assert mod._EPOCH_PROGRESS_RE.pattern == trainer._EPOCH_PROGRESS_RE.pattern
+    # The witness logic is the SAME function object on both enforcers.
+    assert trainer._last_executed_epoch is RR.last_executed_epoch
+    assert mod._last_executed_epoch is RR.last_executed_epoch
 
 
 def test_h1_resumed_segment_log_advances_the_boundary(tmp_path: Path) -> None:
@@ -4066,12 +4169,10 @@ def test_h1_resumed_segment_log_advances_the_boundary(tmp_path: Path) -> None:
 
     The launcher writes the resumed segment's log (``train.segment1.log``), so
     once that segment's first epoch completes the run has genuinely executed
-    through 150 — the old ``epoch_150.pth`` (stored 149) is then a rollback and
-    is REFUSED.  This is the state a live-dir exact-equality test cannot pin
-    (round-5 BLOCKER: the first resume invalidates a hard ``== 149`` /
-    ``epoch_150.pth`` pin on the mutable dir).  Part (2) then adds the resumed
+    through 150 — the old ``epoch_150.pth`` (stored 149) is then a rollback that
+    is DISCLOSED (re-training 150..150).  Part (2) then adds the resumed
     segment's newer periodic (``epoch_160.pth``, stored 159), which becomes the
-    correct clean-boundary source.
+    correct clean-boundary source with no disclosure.
     """
     from scripts import train as trainer
 
@@ -4080,20 +4181,97 @@ def test_h1_resumed_segment_log_advances_the_boundary(tmp_path: Path) -> None:
     _ckpt(run_dir / "epoch_150.pth", 149)
 
     # (1) The resumed segment's first epoch completes: only the LOG (not any new
-    # checkpoint) advances the witness to 150, so the old source is refused.
+    # checkpoint) advances the witness to 150, so the old source is a disclosed
+    # rollback of epoch 150.
     (run_dir / "train.segment1.log").write_text(
         "[t] INFO - Epoch 151/300  train_loss=1.0\n"
     )
     assert trainer._last_executed_epoch(run_dir) == 150
-    with pytest.raises(ValueError, match="no-silent-rollback"):
-        trainer._require_resume_source_is_newest_complete_epoch(
-            run_dir / "epoch_150.pth", {"epoch": 149}, run_dir,
-        )
+    rollback, _ = trainer._resolve_resume_source_and_rollback(
+        run_dir / "epoch_150.pth", {"epoch": 149}, run_dir,
+    )
+    assert rollback == (150, 150), rollback
 
     # (2) The resumed segment writes its next periodic: it is now the newest
     # complete-epoch checkpoint (159) and the correct clean-boundary source.
     _ckpt(run_dir / "epoch_160.pth", 159)
     assert trainer._last_executed_epoch(run_dir) == 159
-    trainer._require_resume_source_is_newest_complete_epoch(
+    assert trainer._resolve_resume_source_and_rollback(
         run_dir / "epoch_160.pth", {"epoch": 159}, run_dir,
+    ) == (None, [])
+
+
+def test_bare_resume_disclosed_rollback_records_and_archives(
+    tmp_path: Path,
+) -> None:
+    """D2/D3: a bare ``train.py --resume`` rollback records the range + archives.
+
+    END-TO-END through the REAL ``train()`` (no launcher): a run directory whose
+    newest last-epoch checkpoint (``epoch_0.pth``, stored 0) is OLDER than the
+    epoch its own log witnesses (``Epoch 2/…`` -> executed 1), with an
+    abandoned-branch ``best_model.pth`` (stored 1) that the resume would
+    overwrite.  A bare ``--resume`` must:
+      * MOVE the abandoned ``best_model.pth`` into ``abandoned_branch_0/`` (never
+        overwrite) BEFORE the best-reconciliation reads it;
+      * RECORD the re-trained range in the run's ``provenance.json`` resume_log
+        and a ``status.log`` line (never silent);
+      * complete without fail-closing on the (archived) companion best.
+    """
+    from scripts import train as trainer
+
+    ds = _make_synthetic_dataset(tmp_path)
+    source = _real_config(tmp_path, epochs=2, name="rb_src")
+    source.training.checkpoint_interval = 1
+    with mock.patch.object(trainer, "validate", return_value=0.5):
+        trainer.train(source, dataset_path=str(ds))
+    src_dir = Path(source.checkpoint.output_dir)
+    # interval-1 writes epoch_1.pth (stored 0), epoch_2.pth (stored 1), plus
+    # best_model.pth / final_model.pth (both stored 1).
+    assert (src_dir / "epoch_1.pth").exists()
+    assert (src_dir / "best_model.pth").exists()
+
+    # The abandoned branch: the run reached epoch 1 (log ``Epoch 2/…``) but died
+    # BEFORE writing its newer last-epoch file, so the newest EXISTING last-epoch
+    # checkpoint is ``epoch_1.pth`` (stored 0) — a rollback of epoch 1.  The
+    # abandoned branch's ``best_model.pth`` stores epoch 1 (the artifact the
+    # resumed run would overwrite); remove the other newer files to model the
+    # un-checkpointed kill, and restamp the best's stored epoch to 1.
+    (src_dir / "epoch_2.pth").unlink()
+    (src_dir / "final_model.pth").unlink()
+    best = load_artifact_bytes((src_dir / "best_model.pth").read_bytes(), map_location="cpu")
+    best["epoch"] = 1
+    torch.save(best, src_dir / "best_model.pth")
+    (src_dir / "train.stdout.log").write_text(
+        "[t] INFO - Epoch 1/2  train_loss=1.0\n"
+        "[t] INFO - Epoch 2/2  train_loss=1.0\n"
     )
+    best_before = (src_dir / "best_model.pth").read_bytes()
+    assert trainer._last_executed_epoch(src_dir) == 1
+
+    resumed = _real_config(tmp_path, epochs=2, name="rb_src")
+    resumed.checkpoint.resume_from = str(src_dir / "epoch_1.pth")
+    with mock.patch.object(trainer, "validate", return_value=0.5):
+        result = trainer.train(
+            resumed, dataset_path=str(ds),
+            trusted_historical_checkpoint_sha256=_existing_shas(
+                src_dir / "epoch_1.pth"),
+        )
+
+    # The rollback is DISCLOSED in the results and in provenance + status.log.
+    assert result["disclosed_rollback"] == [1, 1], result["disclosed_rollback"]
+    prov = json.loads((src_dir / "provenance.json").read_text())
+    rb_entries = [
+        e for e in prov.get("resume_log", []) if e.get("disclosed_rollback")
+    ]
+    assert rb_entries and rb_entries[-1]["disclosed_rollback"] == [1, 1], rb_entries
+    status = (src_dir / "status.log").read_text()
+    assert "DISCLOSED-ROLLBACK" in status and "1..1" in status, status
+    # The abandoned best was MOVED (bytes preserved), never deleted/overwritten;
+    # the source epoch_1.pth (stored 0) is NOT moved.
+    manifest = json.loads(
+        (src_dir / "abandoned_branch_0" / "manifest.json").read_text()
+    )
+    assert manifest["retrained_range"] == [1, 1]
+    assert [f["file"] for f in manifest["files"]] == ["best_model.pth"], manifest
+    assert (src_dir / "abandoned_branch_0" / "best_model.pth").read_bytes() == best_before
+    assert (src_dir / "epoch_1.pth").exists()

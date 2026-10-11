@@ -1032,8 +1032,8 @@ def test_resume_refused_when_dataset_consumes_worker_rng(tmp_path: Path) -> None
             trainer, "_require_reliable_recovery_loaders", lambda *a, **k: None,
         ),
         mock.patch.object(
-            trainer, "_require_resume_source_is_newest_complete_epoch",
-            lambda *a, **k: None,
+            trainer, "_resolve_resume_source_and_rollback",
+            lambda *a, **k: (None, []),
         ),
     ):
         # A resume source is needed only to enter the resume preflight; the

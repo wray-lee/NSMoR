@@ -9,12 +9,19 @@
 # list entirely inside the worktree); otherwise it still REFUSES.  The resume
 # source is the newest LAST-epoch checkpoint (final_model.pth / epoch_*.pth);
 # best_model.pth is NEVER used (the best epoch can be far older than the last
-# executed epoch) and a dir holding only best_model.pth is refused.  F1
-# no-silent-rollback (§11.1, 2026-10-11): the decider ALSO refuses a source
-# whose stored epoch is OLDER than the last epoch the run actually executed
-# (read from the run's own progress logs / segment records / last-epoch
-# checkpoints), so a run killed before writing a newer last-epoch file is never
-# silently re-trained.  No override flag.
+# executed epoch) and a dir holding only best_model.pth is refused.  DISCLOSED
+# ROLLBACK (§11.1, amendment 2026-10-11): when the source's stored epoch is
+# OLDER than the last epoch the run actually executed (read from the run's own
+# progress logs / segment records / checkpoints), the resume is ALLOWED — with
+# checkpoint_interval 10 a crash between periodics always loses up to 9 epochs,
+# so refusing would make resume unusable — but the re-trained range
+# [source+1, last_executed] is recorded (resume_log + status.log) and printed,
+# and train.py MOVES the abandoned-branch artifacts to abandoned_branch_<k>/
+# (never overwrites).  The MOVE lives in train.py's resume path ONLY (chosen over
+# a launcher-side move): train.py is the single writer of the run dir, so putting
+# the move there covers a bare `train.py --resume` too, and the launcher's
+# `record` subcommand merely RECORDS the disclosed range in the resume_log.  No
+# silent rollback; no override flag.
 #
 # On CPU with a fixed seed the resumed arm is BITWISE-equivalent to the
 # uninterrupted run: train.py re-establishes the persistent loader iterator
