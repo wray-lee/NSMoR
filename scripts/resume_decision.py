@@ -18,11 +18,11 @@ Two subcommands, both CPU-only and side-effect-free except where noted:
       F1 no-silent-rollback (§11.1, 2026-10-11): the selected source must not
       be OLDER than the last epoch the run actually EXECUTED, as witnessed by
       the run's own records (the last ``Epoch N/…`` line in its progress logs,
-      the ``starting_epoch`` of its segment records, its last-epoch
-      checkpoints).  A run killed before writing a newer last-epoch file would
-      otherwise silently re-train the completed epochs in between; the refusal
-      names both epochs.  No override flag.  ``scripts/train.py`` enforces the
-      same rule in its own resume preflight.
+      each segment record's ``starting_epoch`` read as ``start - 1``, its
+      last-epoch checkpoints).  A run killed before writing a newer last-epoch
+      file would otherwise silently re-train the completed epochs in between;
+      the refusal names both epochs.  No override flag.  ``scripts/train.py``
+      enforces the SAME rule — same witness set — in its own resume preflight.
 
       SUCCESSOR-COMMIT RESUME (protocol amendment §11.1, 2026-10-11): a run
       started on commit C may be resumed on a DIFFERENT commit C' only when the
@@ -130,11 +130,21 @@ def _tie_break(name: str) -> tuple:
 # (``final_model.pth`` / ``epoch_*.pth``) are.
 _RESUME_EXCLUDED = frozenset({"best_model.pth"})
 
-# The LAST-EPOCH checkpoint families (mirrors ``scripts/train.py``): the segment
-# ``final_model.pth`` and the periodic ``epoch_<n>.pth``.  Used both to order
-# resume candidates and to witness the run's last executed epoch (F1).
-_LAST_EPOCH_FAMILIES = ("final_model.pth",)
+# The LAST-EPOCH checkpoint families: the segment ``final_model.pth`` and the
+# periodic ``epoch_<n>.pth``.  Used to witness the run's last executed epoch
+# (F1).  (Resume CANDIDATES are ordered by stored epoch across every non-best
+# ``*.pth``; this set only bounds the F1 witness.)
 _EPOCH_PERIODIC_RE = re.compile(r"epoch_(\d+)\.pth$")
+
+# The checkpoint files that witness an EXECUTED epoch (F1).  IDENTICAL to
+# ``scripts/train.py::_CHECKPOINT_WITNESS_FAMILIES`` — the two enforcers are the
+# SAME rule, so their witness sets must not drift (a divergence is a latent hole
+# even when a sibling check masks it today).  ``final_model.pth`` IS written at
+# the end of a completed/paused run with that run's last executed epoch, so it IS
+# a valid executed-epoch witness; ``best_model.pth`` stores the best SELECTED
+# epoch (possibly far older) and is NEVER a witness.  Keep the two literals in
+# lockstep; the F1 regression suite pins both enforcers.
+_CHECKPOINT_WITNESS_FAMILIES = ("final_model.pth",)
 
 
 def _resume_candidates(out: Path) -> list[tuple[Path, dict | None, str]]:
@@ -192,8 +202,10 @@ def _last_executed_epoch(out: Path) -> int | None:
 
     * the progress logs — every ``train.*.log`` in the run dir, taking the last
       ``Epoch N/<budget>`` line (N is 1-based);
-    * the 0-based ``starting_epoch`` of every ``segment_XXXX.json`` (a resumed
-      segment's own start is an executed epoch);
+    * every ``segment_XXXX.json``'s ``starting_epoch``, read as ``start - 1``:
+      the writer stores ``stored_epoch + 1`` (the NEXT epoch to execute, before
+      the loop), so a segment at ``starting_epoch`` S witnesses only epoch S-1 —
+      the epoch before its first (F1 round-4 BLOCKER);
     * the last-epoch family checkpoints (``final_model.pth`` / ``epoch_*.pth``).
 
     ``best_model.pth`` is EXCLUDED (it is the best SELECTED epoch, which may be
@@ -216,12 +228,19 @@ def _last_executed_epoch(out: Path) -> int | None:
             continue
         start = data.get("starting_epoch")
         if isinstance(start, int) and not isinstance(start, bool):
-            witnesses.append(start)
+            # ``_write_segment_record`` stores ``starting_epoch = stored_epoch + 1``
+            # — the NEXT epoch to execute, written BEFORE the loop — so it
+            # witnesses execution of ``start - 1``, NOT ``start``.  Reading it
+            # RAW over-claims by one and would refuse the clean-boundary recovery
+            # of an epoch that was only STARTED (never completed), bricking the
+            # seed-44 resume (F1 round-4 BLOCKER).
+            witnesses.append(start - 1)
     for cand in sorted(out.glob("*.pth")):
         if cand.name in _RESUME_EXCLUDED:
             continue
-        if cand.name not in _LAST_EPOCH_FAMILIES and not _EPOCH_PERIODIC_RE.match(
-            cand.name
+        if (
+            cand.name not in _CHECKPOINT_WITNESS_FAMILIES
+            and not _EPOCH_PERIODIC_RE.match(cand.name)
         ):
             continue
         try:

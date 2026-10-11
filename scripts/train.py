@@ -1047,14 +1047,37 @@ def _checkpoint_lineage_identity(payload: bytes, path: Path) -> Dict[str, Any]:
 # completed epochs.
 _LAST_EPOCH_FAMILIES = ("final_model.pth",)
 _EPOCH_PERIODIC_RE = re.compile(r"epoch_(\d+)\.pth$")
+# The checkpoint files that witness an EXECUTED epoch (F1).  IDENTICAL to
+# ``scripts/resume_decision.py::_CHECKPOINT_WITNESS_FAMILIES`` — the two
+# enforcers are the SAME rule, so their witness sets must not drift.  Written at
+# the end of a completed/paused run with that run's last executed epoch, so
+# ``final_model.pth`` IS a valid witness (it is never a resume SOURCE — see
+# ``_require_resume_source_is_newest_complete_epoch`` — but it is a witness);
+# ``best_model.pth`` stores the best SELECTED epoch (possibly far older) and is
+# NEVER a witness.
+_CHECKPOINT_WITNESS_FAMILIES = ("final_model.pth",)
+# Files that are NEVER read as evidence of an executed epoch.  ``best_model.pth``
+# is the best SELECTED epoch, which may be far OLDER than the last executed one.
+# (``final_model.pth`` IS a witness — see above — and is only excluded as a
+# resume SOURCE, by ``_require_resume_source_is_newest_complete_epoch``.)
+_NON_RESUME_WITNESS_FAMILIES = frozenset({"best_model.pth"})
 # The last "Epoch N/<budget>" progress line train.py's logger emits, once per
 # executed epoch.  Read only as a SECOND witness to how far a run actually got
 # (the newest complete-epoch checkpoint is the primary record); a fresh run's
 # log and a resume's segment log both carry these lines.
+#
+# ASSUMPTION (fail-closed): this matches ANY ``Epoch N/…`` banner, including the
+# PRE-epoch ``Epoch N/budget  lambda_routing_aux=…`` line (emitted BEFORE the
+# epoch's updates run, only when ``lambda_routing_aux > 0``; inert for the
+# phase-2 arms, all of which set it to 0.0).  A crash between that banner and
+# the epoch's completion line would make the log witness assert an epoch that
+# never executed — the same over-claim class as the segment BLOCKER.  Taking the
+# MAX keeps the rule fail-CLOSED (never laxer); the correctness of the witness
+# depends on no operator- or logger-emitted ``Epoch N/…`` line naming a
+# non-executed epoch.  The regex is deliberately NOT narrowed to the completion
+# line's ``train_loss=`` suffix, which would fail OPEN (miss a witness) if that
+# suffix ever changed.
 _EPOCH_PROGRESS_RE = re.compile(r"\bEpoch\s+(\d+)\s*/")
-# The one-part checkpoints carry no resumable state; they must never be read as
-# evidence of an executed epoch.
-_NON_RESUME_FAMILIES = frozenset({"best_model.pth", "final_model.pth"})
 
 
 def _checkpoint_stored_epoch(path: Path) -> Optional[int]:
@@ -1071,7 +1094,7 @@ def _checkpoint_stored_epoch(path: Path) -> Optional[int]:
     return epoch if isinstance(epoch, int) and not isinstance(epoch, bool) else None
 
 
-def _last_executed_epoch(output_dir: Path, *, resume_path: Path) -> Optional[int]:
+def _last_executed_epoch(output_dir: Path) -> Optional[int]:
     """The highest 0-based epoch the run is evidenced to have EXECUTED.
 
     Three records witness how far a run actually got, and the rule below takes
@@ -1079,8 +1102,12 @@ def _last_executed_epoch(output_dir: Path, *, resume_path: Path) -> Optional[int
 
     * the run's progress logs — every ``train.stdout.log`` / ``train.segment*.log``
       in the output dir, reading the last ``Epoch N/<budget>`` line (N is 1-based);
-    * the 0-based ``starting_epoch`` of every ``segment_XXXX.json`` (a resumed
-      segment's own start is itself an executed epoch);
+    * every ``segment_XXXX.json``'s ``starting_epoch``, read as ``start - 1``: the
+      writer stores ``stored_epoch + 1`` (the NEXT epoch to execute, before the
+      loop), so a segment at ``starting_epoch`` S witnesses only epoch S-1 — the
+      epoch before its first (F1 round-4 BLOCKER: reading it RAW over-claims by
+      one and would refuse a clean-boundary recovery of an epoch that was only
+      STARTED, never completed);
     * the last-epoch family checkpoints (``final_model.pth`` / ``epoch_*.pth``).
 
     ``best_model.pth`` is EXCLUDED here (as everywhere): it stores the best
@@ -1104,12 +1131,15 @@ def _last_executed_epoch(output_dir: Path, *, resume_path: Path) -> Optional[int
             continue
         start = data.get("starting_epoch")
         if isinstance(start, int) and not isinstance(start, bool):
-            witnesses.append(start)
+            # ``_write_segment_record`` stores ``stored_epoch + 1`` — the NEXT
+            # epoch to execute, written BEFORE the loop — so it witnesses epoch
+            # ``start - 1``, not ``start`` (F1 round-4 BLOCKER).
+            witnesses.append(start - 1)
     for cand in sorted(output_dir.glob("*.pth")):
-        if cand.name in _NON_RESUME_FAMILIES:
+        if cand.name in _NON_RESUME_WITNESS_FAMILIES:
             continue
         if (
-            cand.name not in _LAST_EPOCH_FAMILIES
+            cand.name not in _CHECKPOINT_WITNESS_FAMILIES
             and not _EPOCH_PERIODIC_RE.match(cand.name)
         ):
             continue
@@ -1140,16 +1170,18 @@ def _require_resume_source_is_newest_complete_epoch(
       launcher's mode and exactly what §11.1 governs): the source is stale —
       and refused — when EITHER a last-epoch family file (``final_model.pth`` /
       ``epoch_*.pth``) stores a NEWER epoch, OR the run's own records witness a
-      NEWER executed epoch (its progress logs, its segment ``starting_epoch``
-      entries, its last-epoch checkpoints).  The log/segment witness is the F1
-      no-silent-rollback rule (§11.1, 2026-10-11): a run killed before writing a
-      newer last-epoch file (reached epoch 58 but the newest periodic is
-      ``epoch_50.pth``) previously slipped through and silently re-trained the
-      completed epochs; the records close that hole.  There is NO override flag.
+      NEWER executed epoch (its progress logs, each segment record's
+      ``starting_epoch`` read as ``start - 1``, its last-epoch checkpoints).
+      The log/segment witness is the F1 no-silent-rollback rule (§11.1,
+      2026-10-11): a run killed before writing a newer last-epoch file (reached
+      epoch 58 but the newest periodic is ``epoch_50.pth``) previously slipped
+      through and silently re-trained the completed epochs; the records close
+      that hole.  There is NO override flag.
 
-    Both rules are scoped to IN-PLACE recovery because §11.1 is a statement
-    about a run resuming from ITS OWN last checkpoint; a resume into a DIFFERENT
-    output dir from an explicitly chosen source is a deliberate
+    Both rules are scoped to IN-PLACE recovery (the source lives in the run's
+    OWN output dir, ``resume_path.parent == output_dir``) because §11.1 is a
+    statement about a run resuming from ITS OWN last checkpoint; a resume into a
+    DIFFERENT output dir from an explicitly chosen source is a deliberate
     fork/continuation (exercised by the phase-boundary resume tests) and is not
     the silent-re-train risk this rule targets.  That exemption is intentional,
     not a hole: forking an older source into a NEW dir is a deliberate
@@ -1215,7 +1247,7 @@ def _require_resume_source_is_newest_complete_epoch(
     # when a NEWER last-epoch FILE existed; a run killed before writing one
     # (e.g. reached epoch 58 but the newest periodic is epoch_50.pth) slipped
     # through.  The log/segment records close that hole.  No override flag.
-    last_executed = _last_executed_epoch(resume_path.parent, resume_path=resume_path)
+    last_executed = _last_executed_epoch(resume_path.parent)
     if last_executed is not None and src_epoch < last_executed:
         raise ValueError(
             f"Refusing to resume from {resume_path} (stored epoch {src_epoch}): "

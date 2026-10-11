@@ -216,27 +216,41 @@ def test_real_seed44_dir_is_a_clean_boundary() -> None:
     last line is ``Epoch 150/300`` (0-based 149) and the newest periodic is
     ``epoch_150.pth`` (stored 149), so the boundary is clean and the source is
     accepted (no rollback).
+
+    STABLE ACROSS THE FIRST RESUME: seed-44's ``segment_0000.json`` records
+    ``starting_epoch`` 0 (-> -1).  The first resume this commit authorizes writes
+    ``segment_0001.json``{``starting_epoch``: 150}, which under the H1 start-1
+    rule witnesses only epoch 149 — so this assertion (149) is NOT invalidated
+    by the very action it gates (round-4 MAJOR: a raw start witness returned 150
+    and broke the pin).
     """
     from scripts import train as T
 
-    assert T._last_executed_epoch(_RUN_DIR, resume_path=_CKPT) == 149
+    assert T._last_executed_epoch(_RUN_DIR) == 149
 
 
 def test_real_seed43_dir_is_refused_by_f1_no_silent_rollback() -> None:
     """F1: the seed-43 dir is REFUSED — its reached epoch exceeds the source.
 
     The seed-43 run reached ``Epoch 58/300`` (0-based 57) but its newest
-    last-epoch checkpoint is ``epoch_50.pth`` (stored 49), so resuming would
-    silently re-train epochs 50..57.  Driving the REAL helper against the real
-    dir (read-only) pins the refusal, and the message names both epochs.
+    last-epoch checkpoint is ``epoch_50.pth``, so resuming would silently
+    re-train epochs 50..57.  Driving the REAL helper against the real dir
+    (read-only) pins the refusal, and the message names both epochs.  The
+    source's ``peek`` is the REAL ``epoch_50.pth``'s stored epoch (read from the
+    file), not a hand-written value, so the test drives the real dir end-to-end
+    (round-4 minor).
     """
+    from nsmor.pipeline.nested_prior import load_artifact_bytes
+
     from scripts import train as T
 
     if not _SEED43_CKPT.exists():  # pragma: no cover - absent on some machines
         pytest.skip("seed-43 dir absent")
-    peek = {"epoch": 49}
+    peek = load_artifact_bytes(_SEED43_CKPT.read_bytes(), map_location="cpu")
+    stored = peek.get("epoch")
+    assert isinstance(stored, int) and not isinstance(stored, bool), peek.get("epoch")
     with pytest.raises(ValueError, match="no-silent-rollback") as exc:
         T._require_resume_source_is_newest_complete_epoch(
             _SEED43_CKPT, peek, _SEED43_DIR,
         )
-    assert "49" in str(exc.value) and "57" in str(exc.value), str(exc.value)
+    assert str(stored) in str(exc.value) and "57" in str(exc.value), str(exc.value)

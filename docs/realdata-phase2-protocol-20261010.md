@@ -818,23 +818,67 @@ resume actually runs at.
 **F1 no-silent-rollback (§11.1, 2026-10-11).** A resume is REFUSED when the
 selected source's stored epoch is OLDER than the last epoch the run actually
 EXECUTED, determined from the run's OWN records: the last `Epoch N/<budget>`
-line in its progress logs (`train.stdout.log` / `train.segment*.log`), the
-0-based `starting_epoch` of its `segment_XXXX.json` records, and its last-epoch
-checkpoints (`final_model.pth` / `epoch_*.pth`; `best_model.pth` is never a
-witness — it stores the best SELECTED epoch, which may be far older). The rule
-takes the MAX witness so it can only be STRICTER. This closes a hole the
-newest-complete-epoch rule alone left open: a run killed BEFORE writing a newer
-last-epoch file (reached epoch 58 but the newest periodic is `epoch_50.pth`)
-previously slipped through and silently re-trained the completed epochs in
-between. The refusal message names BOTH epochs (the source's stored epoch and
-the last executed epoch). There is **no override flag**. Both the launcher
-decider (`scripts/resume_decision.py::decide`) and `scripts/train.py`'s own
-resume preflight (`_require_resume_source_is_newest_complete_epoch`) enforce it,
-so a bare `train.py --resume` is covered too. Tests:
+line in its progress logs (`train.stdout.log` / `train.segment*.log`), every
+`segment_XXXX.json`'s `starting_epoch` read as **`start - 1`**, and its
+last-epoch checkpoints (`final_model.pth` / `epoch_*.pth`; `best_model.pth` is
+never a witness — it stores the best SELECTED epoch, which may be far older).
+The rule takes the MAX witness so it can only be STRICTER.
+
+Two semantics are load-bearing and were corrected in round 4:
+
+* **The segment witness is `start - 1`, not `start`.** `_write_segment_record`
+  stores `starting_epoch = stored_epoch + 1` — the NEXT epoch to execute,
+  written BEFORE the epoch loop — so a segment at `starting_epoch` S witnesses
+  execution only through S-1, not S. Reading it RAW over-claimed by one and
+  produced a FALSE refusal of a legitimate clean-boundary recovery (a resume
+  killed before completing its first epoch leaves `epoch_150.pth`(149) + log
+  `Epoch 150/300` + `segment_0001.json`{`starting_epoch`: 150}; RAW read that as
+  executed-through-150 and refused 149 < 150 with no override, bricking the
+  seed-44 resume). Re-doing an epoch that was only STARTED (never completed,
+  never checkpointed) is normal recovery, not a rollback of completed work.
+* **`final_model.pth` IS a witness** (it is written at the end of a
+  completed/paused run with that run's last executed epoch); `best_model.pth` is
+  NEVER a witness. The two enforcers must use the SAME witness set — they are
+  the same rule, not two similar ones.
+
+The MAX-witness rule can only be STRICTER **given a correct witness set**; an
+over-claimed witness (the raw segment start, or the pre-epoch
+`Epoch N/budget  lambda_routing_aux=…` banner — see below) produces FALSE
+refusals, not merely stricter ones. The log parse `\bEpoch\s+(\d+)\s*/`
+deliberately matches ANY such banner: it also matches the pre-epoch
+`lambda_routing_aux` line, which is emitted BEFORE the epoch's updates and is
+gated off for the phase-2 arms (all set `lambda_routing_aux: 0.0`). Taking the
+MAX keeps the parse fail-CLOSED (never laxer), and the regex is NOT narrowed to
+the completion line's `train_loss=` suffix (that would fail OPEN if the suffix
+changed); the witness's correctness rests on no operator- or logger-emitted
+`Epoch N/…` line ever naming a non-executed epoch.
+
+This closes a hole the newest-complete-epoch rule alone left open: a run killed
+BEFORE writing a newer last-epoch file (reached epoch 58 but the newest periodic
+is `epoch_50.pth`) previously slipped through and silently re-trained the
+completed epochs in between. The refusal message names BOTH epochs (the source's
+stored epoch and the last executed epoch). There is **no override flag**.
+
+Both the launcher decider (`scripts/resume_decision.py::decide`) and
+`scripts/train.py`'s own resume preflight
+(`_require_resume_source_is_newest_complete_epoch`) enforce the SAME rule with
+the SAME witness set. train.py's preflight is scoped to **IN-PLACE** recovery
+(`resume_path.parent == output_dir`): a bare `train.py --resume <path>` whose
+source lives in the run's OWN dir is covered too, but a bare
+`train.py --resume <path> --output_dir <other>` (a fork into a DIFFERENT dir
+from an explicitly chosen source) is a deliberate continuation, **not** covered
+by train.py's F1 — only the launcher/decider path covers a cross-dir resume. The
+claim that the bare cross-dir path is covered is NOT made. Tests:
 `tests/test_run_frozen_resume.py::{test_refuses_silent_rollback_when_log_reached_newer_epoch,
-test_accepts_clean_boundary_when_log_matches_newest,test_dry_run_refusal_writes_nothing,test_segment_starting_epoch_is_a_witness}`
-and `tests/test_epoch_recovery.py::{test_no_silent_rollback_refuses_source_older_than_log,
-test_no_silent_rollback_accepts_clean_boundary,test_no_silent_rollback_ignores_best_model_epoch}`.
+test_accepts_clean_boundary_when_log_matches_newest,test_dry_run_refusal_writes_nothing,
+test_segment_starting_epoch_is_a_witness,test_h1_clean_boundary_with_resumed_segment_is_accepted,
+test_h1_segment_offbyone_still_refuses_real_rollback,test_final_model_is_a_witness_in_the_decider,
+test_decider_and_train_share_the_checkpoint_witness_set,
+test_real_seed44_dir_decider_accepts_clean_boundary_dry_run}` and
+`tests/test_epoch_recovery.py::{test_no_silent_rollback_refuses_source_older_than_log,
+test_no_silent_rollback_accepts_clean_boundary,test_no_silent_rollback_ignores_best_model_epoch,
+test_h1_resumed_segment_start_does_not_overclaim,test_h1_segment_start_still_refuses_real_rollback,
+test_h2_final_model_is_a_witness,test_h2_train_and_decider_share_checkpoint_witness_set}`.
 
 **First intended use of the successor-commit resume: `R0-control-seed44`.** It
 was started on C=`8ed5edb` and died right AFTER writing `epoch_150.pth` (its
@@ -1236,6 +1280,44 @@ checkpoint read-only). The original seed-43 dir is now REFUSED by F1 (dry run).
 Everything else from `b46ccd1` (expect-device gate, OUT_ROOT, ancestry check via
 git.exe, record of both commits) is kept. Tests: focused + full suite (CPU)
 pass. The preliminary conclusions remain untouched.
+
+**Amendment log — 2026-10-11 (round-9: F1 witness corrections).** Reason: the
+round-8 F1 amendment (`404d406`) was REJECTED on both reviews. (H1, BLOCKER) The
+segment record's `starting_epoch` is `stored_epoch + 1` — the NEXT epoch to
+execute, written before the loop — so reading it RAW as an executed epoch
+over-claimed by exactly one and produced a FALSE refusal of a legitimate
+clean-boundary recovery (a resume killed before completing its first epoch
+leaves `epoch_150.pth`(149) + `Epoch 150/300` + `segment_0001.json`
+{`starting_epoch`: 150}, which the raw read refused 149 < 150, bricking the
+seed-44 resume). FIX: BOTH enforcers now read the segment witness as `start - 1`
+(`scripts/train.py::_last_executed_epoch`, `scripts/resume_decision.py::
+_last_executed_epoch`), with the reviewers' repro committed as a regression
+(`test_h1_clean_boundary_with_resumed_segment_is_accepted`,
+`test_h1_resumed_segment_start_does_not_overclaim`) and the true-rollback cases
+still refused (`test_h1_segment_offbyone_still_refuses_real_rollback`,
+`test_h1_segment_start_still_refuses_real_rollback`). (H2, MAJOR) The two
+enforcers used DIFFERENT witness sets (`final_model.pth` in the decider,
+excluded in train.py). DECISION: `final_model.pth` IS a valid executed-epoch
+witness (written at the end of a completed/paused run with that run's last
+executed epoch); `best_model.pth` is NEVER a witness. FIX: a single shared
+witness set — `_CHECKPOINT_WITNESS_FAMILIES = ('final_model.pth',)` and
+`_NON_RESUME_WITNESS_FAMILIES = frozenset({'best_model.pth'})` in BOTH files,
+with the false 'mirrors train.py' comment removed and a drift-pin test
+(`test_decider_and_train_share_the_checkpoint_witness_set`). (H3, MAJOR) §11.1
+F1 now states train.py's preflight applies to IN-PLACE resume
+(`resume_path.parent == output_dir`); a fork into another dir is a deliberate
+continuation covered only by the launcher/decider path, and the bare cross-dir
+path is explicitly NOT claimed covered. (H4, minors) The dead `resume_path`
+keyword parameter is removed from `_last_executed_epoch`; a committed regression
+drives the UNSTUBBED decider end-to-end against the REAL seed-44 dir (dry run,
+read-only, writes nothing); the real seed-43 test now reads `epoch_50.pth`'s
+REAL stored epoch instead of a hand-written peek; and the `Epoch N/` log-parse
+assumption (it also matches the pre-epoch `lambda_routing_aux` banner; MAX keeps
+it fail-closed; the regex is not narrowed to the `train_loss=` suffix because
+that would fail open) is documented in both code and §11.1. The seed-44 decider
++ launcher DRY_RUN still accept `epoch_150.pth` and write nothing; the seed-43
+refusal is unchanged. Focused + full suite (CPU) pass. The preliminary
+conclusions remain untouched.
 
 *This amendment's text is bound to the reviewed worktree commit by the
 `sha256` of `docs/realdata-phase2-protocol-20261010.md` recorded in each run's

@@ -3962,3 +3962,97 @@ def test_no_silent_rollback_ignores_best_model_epoch(tmp_path: Path) -> None:
     peek = {"epoch": 9}
     # Must NOT raise: best_model.pth must not be read as a newer executed epoch.
     trainer._require_resume_source_is_newest_complete_epoch(src, peek, run_dir)
+
+
+def test_h1_resumed_segment_start_does_not_overclaim(tmp_path: Path) -> None:
+    """H1 BLOCKER: a segment's ``starting_epoch`` witnesses ``start - 1``, not start.
+
+    A run killed before completing its resumed segment's FIRST epoch leaves
+    ``epoch_150.pth`` (stored 149), the log's last line ``Epoch 150/300``, and
+    ``segment_0001.json``{``starting_epoch``: 150}.  The record is written BEFORE
+    the loop and stores the NEXT epoch to execute, so it proves execution only
+    through 149 — equal to the source's stored epoch: a CLEAN BOUNDARY that MUST
+    be ACCEPTED.  Reading ``starting_epoch`` RAW over-claimed by one and refused
+    this recovery with no override (F1 round-4 BLOCKER), bricking seed-44.
+    """
+    import json
+
+    from scripts import train as trainer
+
+    run_dir = tmp_path / "arm"
+    run_dir.mkdir()
+    src = run_dir / "epoch_150.pth"
+    _ckpt(src, 149)
+    (run_dir / "train.stdout.log").write_text(
+        "[t] INFO - Epoch 150/300  train_loss=1.0\n"
+    )
+    (run_dir / "segment_0001.json").write_text(json.dumps({"starting_epoch": 150}))
+    peek = {"epoch": 149}
+    # Must NOT raise: last executed epoch is 149 (segment start 150 -> 149).
+    trainer._require_resume_source_is_newest_complete_epoch(src, peek, run_dir)
+
+
+def test_h1_segment_start_still_refuses_real_rollback(tmp_path: Path) -> None:
+    """H1: the start-1 correction must NOT weaken a TRUE rollback refusal.
+
+    A segment that started at 58 (so executed through 57) with the newest
+    checkpoint ``epoch_50.pth`` (stored 49) is a rollback of epochs 50..57: the
+    start-1 correction leaves 49 < 57, so it is still REFUSED with both epochs
+    named.  The fix narrows false refusals; it does not weaken true ones.
+    """
+    import json
+
+    from scripts import train as trainer
+
+    run_dir = tmp_path / "arm"
+    run_dir.mkdir()
+    src = run_dir / "epoch_50.pth"
+    _ckpt(src, 49)
+    (run_dir / "segment_0001.json").write_text(json.dumps({"starting_epoch": 58}))
+    peek = {"epoch": 49}
+    with pytest.raises(ValueError, match="no-silent-rollback") as exc:
+        trainer._require_resume_source_is_newest_complete_epoch(src, peek, run_dir)
+    msg = str(exc.value)
+    assert "49" in msg and "57" in msg, msg
+
+
+def test_h2_final_model_is_a_witness(tmp_path: Path) -> None:
+    """H2: ``final_model.pth`` IS an executed-epoch witness (it stores the last epoch).
+
+    A completed/paused run writes ``final_model.pth`` with that run's last
+    executed epoch, so a source older than it is refused.  Pinned at the helper
+    level (the full preflight would pick the newer ``final_model.pth`` itself as
+    the source and mask the witness role).
+    """
+    from scripts import train as trainer
+
+    run_dir = tmp_path / "arm"
+    run_dir.mkdir()
+    _ckpt(run_dir / "epoch_50.pth", 49)
+    _ckpt(run_dir / "final_model.pth", 57)
+    assert trainer._last_executed_epoch(run_dir) == 57
+
+
+def test_h2_train_and_decider_share_checkpoint_witness_set() -> None:
+    """H2: train.py and the decider must use the SAME checkpoint witness set.
+
+    Round-4 MAJOR: the decider treated ``final_model.pth`` as a witness while
+    train.py excluded it — the 'same rule' claim was false.  Pin the constants
+    equal (the decider is loaded by path, as its own test module does).
+    """
+    import importlib.util
+    import sys
+
+    from scripts import train as trainer
+
+    helper = (
+        Path(__file__).resolve().parents[1] / "scripts" / "resume_decision.py"
+    )
+    spec = importlib.util.spec_from_file_location("resume_decision", helper)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["resume_decision"] = mod
+    spec.loader.exec_module(mod)
+    assert tuple(mod._CHECKPOINT_WITNESS_FAMILIES) == tuple(
+        trainer._CHECKPOINT_WITNESS_FAMILIES
+    )
+    assert set(mod._RESUME_EXCLUDED) == set(trainer._NON_RESUME_WITNESS_FAMILIES)

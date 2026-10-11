@@ -557,6 +557,13 @@ def _write_log(out: Path, last_epoch_1based: int, budget: int = 300) -> None:
     )
 
 
+def _write_segment(out: Path, starting_epoch: int, index: int = 1) -> None:
+    """A minimal segment record: ``starting_epoch`` = the NEXT epoch to run."""
+    (out / f"segment_{index:04d}.json").write_text(
+        json.dumps({"starting_epoch": starting_epoch})
+    )
+
+
 def test_refuses_silent_rollback_when_log_reached_newer_epoch(
     tmp_path: Path,
 ) -> None:
@@ -623,20 +630,98 @@ def test_dry_run_refusal_writes_nothing(tmp_path: Path) -> None:
 
 
 def test_segment_starting_epoch_is_a_witness(tmp_path: Path) -> None:
-    """F1: a segment record's ``starting_epoch`` also witnesses execution.
+    """F1: a segment record witnesses the epoch BEFORE its ``starting_epoch``.
 
-    Even with NO progress log, a resumed segment whose ``starting_epoch`` is
-    newer than the selected source is a rollback and is refused.
+    ``_write_segment_record`` stores ``starting_epoch = stored_epoch + 1`` (the
+    NEXT epoch to execute, written before the loop), so a segment whose
+    ``starting_epoch`` is S proves the run executed through S-1.  Here S=58, so
+    the run executed through 57 while the newest checkpoint is ``epoch_50.pth``
+    (stored 49): a rollback, refused with BOTH epochs (49 and 57) named.
     """
     cfg = tmp_path / "arm.yaml"
     cfg.write_text("training:\n  num_epochs: 300\n")
     out = tmp_path / "arm"
     _write_prov(out, cfg, _FROZEN, f"{_WT}/nsmor/__init__.py")
     _write_ckpt(out / "epoch_50.pth", 49)
-    (out / "segment_0001.json").write_text(json.dumps({"starting_epoch": 57}))
+    _write_segment(out, 58)
     rc, msg = _decide(out, cfg, n=300)
     assert rc == 1, msg
-    assert "no-silent-rollback" in msg and "57" in msg, msg
+    assert "no-silent-rollback" in msg and "49" in msg and "57" in msg, msg
+
+
+def test_h1_clean_boundary_with_resumed_segment_is_accepted(tmp_path: Path) -> None:
+    """H1 BLOCKER repro: a segment record must NOT over-claim by one.
+
+    A run killed before completing its resumed segment's FIRST epoch leaves
+    ``epoch_150.pth`` (stored 149), the log's last line ``Epoch 150/300``, and
+    ``segment_0001.json``{``starting_epoch``: 150}.  The segment witnesses only
+    epoch 149 (its start is the NEXT epoch to run), so the last executed epoch is
+    149 — equal to the source's stored epoch: a CLEAN BOUNDARY that MUST be
+    ACCEPTED.  The pre-fix code read ``starting_epoch`` RAW (150) and refused
+    with no override, bricking the seed-44 resume (F1 round-4 BLOCKER).
+    """
+    cfg = tmp_path / "arm.yaml"
+    cfg.write_text("training:\n  num_epochs: 300\n")
+    out = tmp_path / "arm"
+    _write_prov(out, cfg, _FROZEN, f"{_WT}/nsmor/__init__.py")
+    _write_ckpt(out / "epoch_150.pth", 149)
+    _write_ckpt(out / "best_model.pth", 142)
+    _write_log(out, last_epoch_1based=150)
+    _write_segment(out, 150)
+    rc, msg = _decide(out, cfg, n=300)
+    assert rc == 0, msg
+    assert msg.endswith("epoch_150.pth"), msg
+
+
+def test_h1_segment_offbyone_still_refuses_real_rollback(tmp_path: Path) -> None:
+    """H1: the start-1 correction must NOT turn a real rollback into an accept.
+
+    A segment that started at 58 (so executed through 57) with the newest
+    checkpoint ``epoch_50.pth`` (stored 49) is a rollback of epochs 50..57: the
+    start-1 correction leaves 49 < 57, so it is still REFUSED (the fix narrows
+    the false refusals, it does not weaken the true ones).
+    """
+    cfg = tmp_path / "arm.yaml"
+    cfg.write_text("training:\n  num_epochs: 300\n")
+    out = tmp_path / "arm"
+    _write_prov(out, cfg, _FROZEN, f"{_WT}/nsmor/__init__.py")
+    _write_ckpt(out / "epoch_50.pth", 49)
+    _write_segment(out, 58)
+    rc, msg = _decide(out, cfg, n=300)
+    assert rc == 1, msg
+    assert "no-silent-rollback" in msg and "49" in msg and "57" in msg, msg
+
+
+def test_final_model_is_a_witness_in_the_decider(tmp_path: Path) -> None:
+    """H2: the decider's witness set includes ``final_model.pth`` (same as train.py).
+
+    A completed/paused run writes ``final_model.pth`` with that run's last
+    executed epoch, so it IS a valid executed-epoch witness.  Driven through the
+    helper directly (the full ``decide`` path would select the newer
+    ``final_model.pth`` itself as the source, masking the witness role).
+    """
+    mod = _helper()
+    out = tmp_path / "arm"
+    out.mkdir()
+    _write_ckpt(out / "epoch_50.pth", 49)
+    _write_ckpt(out / "final_model.pth", 57)  # last executed epoch of a segment
+    assert mod._last_executed_epoch(out) == 57
+
+
+def test_decider_and_train_share_the_checkpoint_witness_set() -> None:
+    """H2: the two F1 enforcers must use the SAME checkpoint witness set.
+
+    Round-4 MAJOR: the decider treated ``final_model.pth`` as a witness while
+    train.py excluded it — the 'same rule' claim was false.  Pin the constants
+    equal so they cannot silently drift apart again.
+    """
+    mod = _helper()
+    from scripts import train as T
+
+    assert tuple(mod._CHECKPOINT_WITNESS_FAMILIES) == tuple(
+        T._CHECKPOINT_WITNESS_FAMILIES
+    )
+    assert set(mod._RESUME_EXCLUDED) == set(T._NON_RESUME_WITNESS_FAMILIES)
 
 
 def test_git_ancestor_real_repository() -> None:
@@ -658,3 +743,64 @@ def test_git_ancestor_real_repository() -> None:
         pytest.skip(f"git.exe/wslpath unavailable from this environment: {exc}")
     with pytest.raises(RuntimeError):
         mod._git_ancestor(repo, "deadbeef" * 5, "HEAD")
+
+
+# ── Real seed-44 end-to-end decider regression (round-4 H4 minor) ──────────
+# The accepted-path real evidence was previously the developer's manual dry run
+# plus synthetic-dir tests; this drives the UNSTUBBED decider against the REAL
+# seed-44 run dir, READ-ONLY (dry run writes nothing).  Skips when the
+# read-only corpus / run dir is absent (a machine without the phase-2 artifacts).
+_REAL_ROOT = Path(
+    "/mnt/d/Projects/NSMoR-phase2-8ed5edb/.scratch/realdata-phase2-20261010"
+)
+_REAL_SEED44 = _REAL_ROOT / "R0-control-seed44"
+_REAL_CORPUS = Path(
+    "/mnt/d/Projects/NSMoR/.scratch/clock-corpus-r4/exploratory-chain-tiZddw2c"
+)
+_REAL_ORIGIN = "8ed5edb994ef105db0551aedc50f6003b97fe87f"
+
+
+@pytest.mark.skipif(
+    not (_REAL_SEED44 / "epoch_150.pth").exists()
+    or not (_REAL_CORPUS / "etl-causal-final-zp12m0fa/nsmor_dataset.pt").exists(),
+    reason="real seed-44 run dir / corpus absent (READ-ONLY inputs not on this machine)",
+)
+def test_real_seed44_dir_decider_accepts_clean_boundary_dry_run() -> None:
+    """F3/round-4: the UNSTUBBED decider ACCEPTS the real seed-44 dir, writing nothing.
+
+    Drives the REAL ``decide`` (real ``_git_ancestor`` via git.exe, real config
+    sha, real checkpoint decode, real F1 witness) with the arm's frozen commit
+    (this worktree HEAD) and ``ORIGIN_COMMIT=8ed5edb``; asserts it selects
+    ``epoch_150.pth`` and, being a dry run, leaves the run dir byte-identical.
+    The run dir is READ-ONLY: nothing here writes to it.
+    """
+    import subprocess
+
+    mod = _helper()
+    cfg = Path(__file__).resolve().parents[1] / (
+        "config/realdata-phase2-20261010/R0-control-seed44.yaml"
+    )
+    wt = str(Path(__file__).resolve().parents[1])
+    # The worktree's ``.git`` file points at a Windows gitdir the WSL git cannot
+    # read; resolve HEAD via git.exe on the wslpath -w form, exactly as the
+    # module's own ``_git_ancestor`` does.
+    frozen = subprocess.run(
+        ["git.exe", "-C", mod._to_windows_path(wt), "rev-parse", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+    before = {p.name: (p.stat().st_size, p.stat().st_mtime_ns)
+              for p in _REAL_SEED44.iterdir()}
+    err = StringIO()
+    buf = StringIO()
+    with redirect_stdout(buf), redirect_stderr(err):
+        rc = mod.decide(
+            str(_REAL_SEED44), wt, frozen, str(cfg), "300", _REAL_ORIGIN,
+            dry_run=True,
+        )
+    assert rc == 0, f"stdout={buf.getvalue()!r} stderr={err.getvalue()!r}"
+    assert buf.getvalue().strip().endswith("epoch_150.pth"), buf.getvalue()
+    after = {p.name: (p.stat().st_size, p.stat().st_mtime_ns)
+             for p in _REAL_SEED44.iterdir()}
+    assert after == before, "the dry-run decider must not write to the run dir"
+
