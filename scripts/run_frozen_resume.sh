@@ -206,6 +206,9 @@ PY
     # reuse the same source checkpoint and range are BOTH recorded.  The id is
     # recorded with the launcher's entry and passed to train.py verbatim.
     RESUME_ID=$(python -c "import uuid;print(uuid.uuid4())")
+    if [ -z "$RESUME_ID" ]; then
+      echo "$(date -Is) $ARM REFUSED: could not mint a resume id (an empty id would double-count the resume)" >> "$LOG"; exit 1
+    fi
     if [ -n "$ORIGIN_COMMIT" ]; then
       python "$HELPER" record "$OUT" "$RESUME_CKPT" "$FROZEN" "$ORIGIN_COMMIT" --resume-id "$RESUME_ID" >> "$LOG"
     else

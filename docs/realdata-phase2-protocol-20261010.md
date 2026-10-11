@@ -954,10 +954,12 @@ Both the launcher decider (`scripts/resume_decision.py::decide`) and
 (`_resolve_resume_source_and_rollback`) enforce the SAME rule with the SAME
 witness set, imported from the shared `nsmor/pipeline/resume_rollback.py`. The
 launcher's `record` subcommand records the disclosed range into the `resume_log`;
-`train.py` records its own entry ONLY when the launcher's entry for THIS
-checkpoint + range is absent (`launcher_already_recorded`), so one launcher resume
-appends exactly ONE `disclosed_rollback` entry (a doubled count would make the
-mandated interruption count ambiguous). train.py's preflight is scoped to
+`train.py` records its own entry ONLY when the launcher's entry for THIS resume
+IDENTITY (`resume_id`, passed as `--resume-id`) is absent
+(`launcher_already_recorded`), so one launcher resume appends exactly ONE
+`disclosed_rollback` entry while a bare `train.py --resume` (no id) always records
+(condition 4; a doubled count would make the mandated interruption count
+ambiguous). train.py's preflight is scoped to
 **IN-PLACE** recovery (`resume_path.parent == output_dir`): a bare
 `train.py --resume <path>` whose source lives in the run's OWN dir is covered
 too, but a bare `train.py --resume <path> --output_dir <other>` (a fork into a
@@ -1607,7 +1609,8 @@ MOVE ordering; and the condition-(iii) enumeration names the CURRENT helper
 `_resolve_resume_source_and_rollback`, explicitly noting the committed diff
 artifact is bound to C'=`ef3c3aa` where the old name existed. A final grep
 confirms NO live normative sentence contradicts F1/D2 or names a non-existent
-symbol. The dated amendment-log entries (rounds 4–12; the occurrences at lines
+symbol (round 14 extends the sweep to the K2/K3 de-dup and status.log rules and
+fixes the one remaining checkpoint + range sentence in the §11.1 body). The dated amendment-log entries (rounds 4–12; the occurrences at lines
 ~1182, 1215, 1261, 1381, 1456, 1582) are HISTORICAL records of the state at
 those commits; they are retained verbatim as history, and the reader is told
 ONCE here that **rounds 8–10's F1 REFUSAL and the helper name
