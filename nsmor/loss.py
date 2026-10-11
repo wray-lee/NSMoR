@@ -60,6 +60,7 @@ class FrontendLoss(nn.Module):
         y_pred: torch.Tensor,
         y_true: torch.Tensor,
         lengths: torch.Tensor,
+        out_valid: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Compute masked MSE loss.
@@ -68,6 +69,9 @@ class FrontendLoss(nn.Module):
             y_pred: ``(B, T)``
             y_true: ``(B, T)``
             lengths: ``(B,)`` — true sequence lengths.
+            out_valid: Optional ``(B, T)`` bool emission mask (time-consuming
+                mode).  ``None`` (default) keeps the historical length-only
+                mask bitwise unchanged.
 
         Returns:
             Scalar loss tensor.
@@ -78,6 +82,11 @@ class FrontendLoss(nn.Module):
 
         arange_t = torch.arange(T, device=y_pred.device)
         mask = (arange_t.unsqueeze(0) < lengths.unsqueeze(1)).float()
+        if out_valid is not None:
+            assert out_valid.shape == (B, T), (
+                f"out_valid shape {tuple(out_valid.shape)} != (B={B}, T={T})"
+            )
+            mask = mask * out_valid.to(mask.dtype)
 
         squared_errors = (y_pred - y_true) ** 2
         masked_errors = squared_errors * mask
@@ -157,6 +166,7 @@ class BioDecisionLoss(nn.Module):
         routing_aux_margin: float = 0.024,
         lambda_compute: float = 0.0,
         refinement_ponder_cost: Optional[torch.Tensor] = None,
+        out_valid: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Compute bio-decision loss (MSE + physics penalties).
@@ -189,6 +199,13 @@ class BioDecisionLoss(nn.Module):
             refinement_ponder_cost: Scalar ponder cost from the refinement
                 module (``N.detach() + R`` averaged over valid tokens).
                 Required (and finite) whenever ``lambda_compute > 0``.
+            out_valid: Optional ``(B, T)`` bool mask of frames that received a
+                real emission.  ``None`` (default) preserves the historical
+                length-only mask bitwise.  When supplied (the time-consuming
+                mode's alignment mask) the masked MSE scores ONLY those frames,
+                so the zero-filled, never-emitted frames — whose target is a
+                real (nonzero) value — cannot inject a constant-bias/truncation
+                contaminant into the reported skill (findings R1-B2 / R2-B2).
 
         Returns:
             Scalar loss tensor.
@@ -206,6 +223,13 @@ class BioDecisionLoss(nn.Module):
 
         arange_t = torch.arange(T, device=y_pred.device)
         mask = (arange_t.unsqueeze(0) < lengths.unsqueeze(1)).float()
+        if out_valid is not None:
+            assert out_valid.shape == (B, T), (
+                f"out_valid shape {tuple(out_valid.shape)} != (B={B}, T={T})"
+            )
+            # Length mask AND the emission mask: a frame that was never emitted
+            # (zero-filled after the causal shift) is excluded from scoring.
+            mask = mask * out_valid.to(mask.dtype)
 
         # ── Masked MSE ──
         squared_errors = (y_pred - y_true) ** 2
@@ -262,6 +286,23 @@ class BioDecisionLoss(nn.Module):
             dy3 = dy2[:, 1:] - dy2[:, :-1]
             arange_t3 = torch.arange(T - 3, device=y_pred.device)
             length_mask = (arange_t3.unsqueeze(0) + 3 < lengths.unsqueeze(1)).float()
+            if out_valid is not None:
+                # Frame-based third difference: ``dy3[:, i]`` spans source
+                # frames ``i..i+3``, so the mask has width ``T - 3`` while
+                # ``out_valid`` has width ``T``.  A window is scored ONLY if
+                # every one of its four contributing frames received a real
+                # emission, so a never-emitted (zero-filled) frame cannot
+                # change the smoothness contribution at all (findings R1-B1 /
+                # R2-m1).  ``None`` (default) keeps the historical length-only
+                # mask bitwise unchanged.
+                ov = out_valid.to(length_mask.dtype)
+                assert ov.shape == (B, T), (
+                    f"out_valid shape {tuple(out_valid.shape)} != (B={B}, T={T})"
+                )
+                fully_emitted = (
+                    ov[:, :-3] * ov[:, 1:-2] * ov[:, 2:-1] * ov[:, 3:]
+                )
+                length_mask = length_mask * fully_emitted
             jerk_sq = (dy3 ** 2) * length_mask
             jerk_count = length_mask.sum().clamp(min=1.0)
             total_loss = total_loss + lambda_jerk_eff * (jerk_sq.sum() / jerk_count)
@@ -441,6 +482,7 @@ class BioJointLoss(nn.Module):
         routing_aux_margin: float = 0.024,
         lambda_compute: float = 0.0,
         refinement_ponder_cost: Optional[torch.Tensor] = None,
+        out_valid: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Compute the bio-constrained joint loss.
@@ -469,6 +511,9 @@ class BioJointLoss(nn.Module):
                 0.0 keeps the loss bitwise unchanged).
             refinement_ponder_cost: Scalar ACT ponder cost; required and
                 finite whenever ``lambda_compute > 0``.
+            out_valid: Optional ``(B, T)`` bool emission mask (time-consuming
+                mode).  ``None`` (default) keeps the historical length-only
+                mask bitwise unchanged.
 
         Returns:
             Scalar loss tensor.
@@ -490,6 +535,7 @@ class BioJointLoss(nn.Module):
             routing_aux_margin=routing_aux_margin,
             lambda_compute=lambda_compute,
             refinement_ponder_cost=refinement_ponder_cost,
+            out_valid=out_valid,
         )
 
 

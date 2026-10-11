@@ -28,6 +28,16 @@ import yaml
 # Nested config dataclasses
 # ═══════════════════════════════════════════════════════════════
 
+# Declared lower bound on ``time_consuming_eps`` (ADR 0009).  The
+# ``depth_delay`` crossing compares the accumulator against ``1 - eps``; for a
+# tiny ``eps`` that threshold rounds to exactly 1.0 in BOTH float32 and (below
+# ~1e-16) float64, so the crossing would be unreachable and the depth would
+# collapse to ``max_steps`` despite passing an ``eps in (0, 1)`` check
+# (finding R1-m2).  ``1e-6`` is far below any pre-registered value (default
+# 0.01) yet large enough that ``1 - eps`` is exactly representable.  This is
+# the single source of truth, imported by ``nsmor.model_nsmor_core``.
+MIN_TIME_CONSUMING_EPS = 1e-6
+
 @dataclass
 class ModelConfig:
     """Model architecture hyperparameters."""
@@ -126,6 +136,21 @@ class ModelConfig:
     refinement_eps: float = 0.01
     refinement_update_scale: float = 1.0
 
+    # ── Time-consuming recursion (phase-3 mechanism line, ADR 0009) ──
+    # An opt-in mode where processing depth CONSUMES model-grid time: a frame
+    # whose adaptive depth is ``d`` is emitted ``d - 1`` frames later (a
+    # strictly causal shift).  ``"off"`` (default) constructs no module, so
+    # historical numerics and state_dict keys are byte-unchanged.
+    # ``"depth_delay"`` uses an adaptive halt depth; ``"accumulate"`` uses a
+    # learned accumulator to a threshold.  Not implemented in the JAX/Flax
+    # backends (they refuse it).  NOT measured neural latency, work, or ATP.
+    time_consuming_mode: str = "off"
+    time_consuming_max_steps: int = 4
+    time_consuming_eps: float = 0.01
+    time_consuming_update_scale: float = 1.0
+    time_consuming_delay_scale: float = 1.0
+    time_consuming_threshold: float = 1.0
+
     def __post_init__(self) -> None:
         if self.activation not in ("relu", "swiglu"):
             raise ValueError(
@@ -171,6 +196,61 @@ class ModelConfig:
             raise ValueError(
                 "refinement_update_scale must be finite > 0, got "
                 f"{self.refinement_update_scale!r}"
+            )
+        # Time-consuming recursion options (ADR 0009) — validated here so an
+        # "off" model still refuses a malformed setting at the trust boundary.
+        if self.time_consuming_mode not in ("off", "depth_delay", "accumulate"):
+            raise ValueError(
+                "time_consuming_mode must be 'off'/'depth_delay'/'accumulate', "
+                f"got {self.time_consuming_mode!r}"
+            )
+        if (
+            isinstance(self.time_consuming_max_steps, bool)
+            or not isinstance(self.time_consuming_max_steps, int)
+            or self.time_consuming_max_steps < 1
+        ):
+            raise ValueError(
+                "time_consuming_max_steps must be an int >= 1, got "
+                f"{self.time_consuming_max_steps!r}"
+            )
+        if (
+            isinstance(self.time_consuming_eps, bool)
+            or not isinstance(self.time_consuming_eps, (int, float))
+            or not math.isfinite(self.time_consuming_eps)
+            or not MIN_TIME_CONSUMING_EPS <= float(self.time_consuming_eps) < 1.0
+        ):
+            raise ValueError(
+                "time_consuming_eps must be in "
+                f"[{MIN_TIME_CONSUMING_EPS}, 1), got "
+                f"{self.time_consuming_eps!r}"
+            )
+        for _name, _val in (
+            ("time_consuming_update_scale", self.time_consuming_update_scale),
+            ("time_consuming_delay_scale", self.time_consuming_delay_scale),
+        ):
+            if (
+                isinstance(_val, bool)
+                or not isinstance(_val, (int, float))
+                or not math.isfinite(_val)
+                or _val <= 0.0
+            ):
+                raise ValueError(
+                    f"{_name} must be finite > 0, got {_val!r}"
+                )
+        # The accumulate threshold is bounded to (0, 1] so the pre-crossing
+        # accumulator is < threshold <= 1 in every branch and the remainder
+        # weight ``R = 1 - sum_{j<N} g_j`` stays in (0, 1] — i.e. the ACT
+        # mixture stays inside the convex hull of the iterates (findings
+        # R1-m3 / R2-B4: threshold > 1 admits R < 0, an extrapolation).
+        if (
+            isinstance(self.time_consuming_threshold, bool)
+            or not isinstance(self.time_consuming_threshold, (int, float))
+            or not math.isfinite(self.time_consuming_threshold)
+            or not 0.0 < float(self.time_consuming_threshold) <= 1.0
+        ):
+            raise ValueError(
+                "time_consuming_threshold must be in (0, 1], got "
+                f"{self.time_consuming_threshold!r}"
             )
 
 

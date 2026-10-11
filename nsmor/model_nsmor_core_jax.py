@@ -37,7 +37,7 @@ except ImportError:
 from nsmor.model_nsmor_core import (
     NSMoRCore, certify_executed_topology, _validate_np_leaf,
     _require_real_floating_observation, assert_mechanism_tree_consistent,
-    refinement_module_present,
+    refinement_module_present, time_consuming_module_present,
 )
 
 
@@ -694,6 +694,22 @@ class NSMoRCoreJAX:
                 f"(refinement_mode={_ref_mode!r}, module present); the fused "
                 f"kernel would silently drop it. Use the complete Torch "
                 f"backend or construct with refinement_mode='off'."
+            )
+
+        # Fail closed on time-consuming recursion (ADR 0009): the fused kernel
+        # does not implement the delayed/accumulated output map, so an enabled
+        # module would be silently dropped and the kernel would return
+        # undelayed predictions.  Inspect the EXECUTED child, not the string.
+        if time_consuming_module_present(self.torch_model):
+            _tc_mode = getattr(
+                getattr(self.torch_model, "backend", None),
+                "time_consuming_mode", "off",
+            )
+            raise ValueError(
+                f"NSMoRCoreJAX does not implement time-consuming recursion "
+                f"(time_consuming_mode={_tc_mode!r}, module present); the fused "
+                f"kernel would silently drop it. Use the complete Torch "
+                f"backend or construct with time_consuming_mode='off'."
             )
 
         # Submodule aliases matching PyTorch API
