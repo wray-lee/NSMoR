@@ -2446,6 +2446,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Override periodic checkpoint interval (epochs).",
     )
     parser.add_argument(
+        "--expect-device",
+        type=str,
+        default=None,
+        choices=["cpu", "cuda"],
+        help="On a resume, refuse unless the resolved device matches this "
+             "value.  Enforces the §11.1 device clause: a CPU arm must not "
+             "silently resume on GPU (trajectory-unverified).  Unset = no "
+             "constraint (a bare --resume is unchanged).",
+    )
+    parser.add_argument(
         "--sweep_escape_band",
         type=str,
         default=None,
@@ -4945,6 +4955,7 @@ def train(
     require_nested_validation: bool = False,
     trusted_historical_checkpoint_sha256=None,
     trusted_historical_artifact_sha256=None,
+    expect_device: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Full training pipeline.
@@ -5034,6 +5045,24 @@ def train(
 
     # ── Device ────────────────────────────────────────────────
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # §11.1 device clause, MACHINE-ENFORCED: a resume must not silently run on
+    # a different device class than the caller intends.  The bitwise guarantee
+    # is CPU-only; a GPU resume is state-exact but trajectory-unverified, so a
+    # CPU arm resumed on a CUDA host would silently produce exactly the
+    # forbidden 'phase-2 result'.  ``--expect-device`` fails closed before any
+    # epoch when the resolved device disagrees.  A FRESH run is unconstrained
+    # (the opt-in is a resume-time gate) and an unset flag leaves a bare
+    # ``--resume`` unchanged.
+    if (expect_device is not None
+            and config.checkpoint.resume_from is not None
+            and device.type != expect_device):
+        raise ValueError(
+            f"Refusing to resume on device {device.type!r}: the caller "
+            f"required {expect_device!r} (--expect-device).  The bitwise "
+            "resume guarantee is CPU-only; a GPU resume is state-exact and "
+            "trajectory-unverified and must not produce a phase-2 result "
+            "(§11.1 device clause, fail closed)."
+        )
     logger.info("Device: %s", device)
     logger.info("lambda_reg: %.4f", lambda_reg)
     logger.info("lambda_routing_aux=%.4f", config.loss.lambda_routing_aux)
@@ -6588,6 +6617,11 @@ def train(
         # an early stop or the epoch budget).  Additive: an uninterrupted run
         # reports False, so existing consumers are unaffected.
         "paused": _paused_on_sentinel,
+        # The device this segment actually ran on ('cpu'/'cuda'), recorded so
+        # §11.1's device clause is machine-checkable after the fact: a
+        # CUDA-started arm must be reported GPU / trajectory-unverified, and
+        # the bitwise guarantee is scoped to 'cpu'.
+        "device": device.type,
     }
 
 
@@ -6627,6 +6661,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         require_nested_validation=not args.diagnostic_only,
         trusted_historical_checkpoint_sha256=args.trusted_historical_checkpoint_sha256,
         trusted_historical_artifact_sha256=args.trusted_historical_artifact_sha256,
+        expect_device=args.expect_device,
     )
     train_log_path = output_dir / "train.log"
     with open(train_log_path, "w") as f:

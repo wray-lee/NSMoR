@@ -548,3 +548,24 @@ def test_dry_run_marks_same_commit_path_too(tmp_path: Path) -> None:
     assert buf.getvalue().strip().endswith("epoch_4.pth")
     assert "[dry-run]" in err.getvalue(), err.getvalue()
     assert "chosen source" in err.getvalue(), err.getvalue()
+
+
+def test_git_ancestor_real_repository() -> None:
+    """R1-minor: the ancestry gate is exercised against a REAL repository.
+
+    The other ancestry cases monkeypatch ``_git_ancestor`` (they pin the
+    DECISION logic).  This test drives the UNSTUBBED ``_git_ancestor`` against
+    the real worktree repository: the ancestor direction (``HEAD~1`` is an
+    ancestor of ``HEAD``) is true, the reverse is false, and an invalid SHA
+    raises (fail closed) rather than returning a guess.  Skips cleanly where
+    ``git.exe`` / ``wslpath`` are unavailable or the repo has no parent commit.
+    """
+    repo = str(Path(__file__).resolve().parents[1])
+    mod = _helper()
+    try:
+        assert mod._git_ancestor(repo, "HEAD~1", "HEAD") is True
+        assert mod._git_ancestor(repo, "HEAD", "HEAD~1") is False
+    except RuntimeError as exc:  # pragma: no cover - env without git.exe/wslpath
+        pytest.skip(f"git.exe/wslpath unavailable from this environment: {exc}")
+    with pytest.raises(RuntimeError):
+        mod._git_ancestor(repo, "deadbeef" * 5, "HEAD")

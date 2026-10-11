@@ -47,6 +47,11 @@
 #                      nothing.  For the successor case OUT_ROOT points at the
 #                      origin worktree's existing run dir, so this is limited.
 #
+# The arm's RECORDED start device (from train.stdout.log "Device: ...") is
+# passed to train.py as --expect-device on a resume (§11.1 device clause), so a
+# CPU arm cannot silently resume onto a CUDA host and a CUDA arm is forced to
+# run as CUDA; the device is named in the status.log START line.
+#
 # `pause` drops an empty STOP sentinel in each arm's output dir.  The training
 # loop checks for it ONLY after that epoch's best/periodic checkpoint is fully
 # written (temp + fsync + atomic rename) and then exits cleanly, so a pause
@@ -137,6 +142,25 @@ for ARM in "$@"; do
 
   NUM_EPOCHS=$(python -c "import yaml,sys; print(int(yaml.safe_load(open('$CFG'))['training']['num_epochs']))")
 
+  # §11.1 device clause: establish the arm's RECORDED start device from the
+  # first segment's stdout log ("Device: cuda" / "Device: cpu") and pass it to
+  # train.py as a resume gate, so a CPU arm cannot silently resume onto a CUDA
+  # host (state-exact-only, must not produce a phase-2 result) and a CUDA arm
+  # is forced to run as CUDA.  Empty (undeterminable) leaves a bare resume.
+  EXPECT_DEVICE=$(python - "$OUT" <<'PY'
+import pathlib, sys
+out = pathlib.Path(sys.argv[1])
+dev = ""
+p = out / "train.stdout.log"
+if p.exists():
+    for line in p.read_text(errors="ignore").splitlines():
+        if "Device:" in line:
+            dev = "cuda" if "cuda" in line else "cpu"
+            break
+print(dev)
+PY
+)
+
   RESUME_CKPT=""
   if [ "$DRY_RUN" = "1" ] && { [ ! -d "$OUT" ] || [ -z "$(ls -A "$OUT" 2>/dev/null)" ]; }; then
     # A dry run must write NOTHING, so never create an empty run dir for it.
@@ -205,9 +229,13 @@ for ARM in "$@"; do
     # evidence this amendment promises to retain.
     SEG=$(( $(ls -1 "$OUT"/train.segment*.log 2>/dev/null | wc -l) + 1 ))
     RUNLOG=$OUT/train.segment${SEG}.log
-    echo "$(date -Is) $ARM START (resume from $RESUME_CKPT, frozen $FROZEN, origin ${ORIGIN_COMMIT:-none}, log $RUNLOG)" >> "$LOG"
+    # §11.1 device clause: a recorded start device pins the resume's device.
+    DEVICE_ARGS=()
+    if [ -n "$EXPECT_DEVICE" ]; then DEVICE_ARGS=(--expect-device "$EXPECT_DEVICE"); fi
+    echo "$(date -Is) $ARM START (resume from $RESUME_CKPT, frozen $FROZEN, origin ${ORIGIN_COMMIT:-none}, device ${EXPECT_DEVICE:-unpinned}, log $RUNLOG)" >> "$LOG"
     python "$WT/scripts/train.py" --config "$CFG" --dataset "$DATASET" \
       --nested_prior_artifact "$PRIOR" "${OUTDIR_ARGS[@]}" \
+      "${DEVICE_ARGS[@]}" \
       --resume "$RESUME_CKPT" > "$RUNLOG" 2>&1
   else
     RUNLOG=$OUT/train.stdout.log

@@ -1152,3 +1152,43 @@ def test_resume_refused_when_collate_consumes_worker_rng(tmp_path: Path) -> None
     with pytest.raises(ValueError, match="consume no worker-side RNG"):
         trainer._require_bitwise_resume_loader_rng(loader, None)
 
+
+
+def test_expect_device_gate_refuses_mismatched_resume(
+    tmp_path: Path, monkeypatch: Any,
+) -> None:
+    """§11.1 device clause: --expect-device fails closed on a resume.
+
+    The bitwise guarantee is CPU-only; a CPU arm resumed on a CUDA host would
+    silently produce the forbidden trajectory-unverified result.  The gate must
+    refuse BEFORE any epoch when the resolved device disagrees with the
+    requested one, and must leave a FRESH run (and an unset flag) unchanged.
+    """
+    from scripts import train as trainer
+
+    # Resolved device is CPU in this test env; require CUDA -> refuse.
+    config = _real_config(tmp_path, epochs=1, name="dev_gate")
+    config.checkpoint.resume_from = str(tmp_path / "whatever.pth")
+    with pytest.raises(ValueError, match="--expect-device"):
+        trainer.train(config, dataset_path=str(_make_synthetic_dataset(tmp_path)),
+                      expect_device="cuda")
+
+    # Matching device proceeds past the gate (fails later only for the absent
+    # resume file, which is NOT the device gate) -> proves the gate is a device
+    # comparison, not an unconditional refusal.
+    with pytest.raises(FileNotFoundError):
+        trainer.train(config, dataset_path=str(_make_synthetic_dataset(tmp_path)),
+                      expect_device="cpu")
+
+
+def test_expect_device_gate_ignores_fresh_runs(tmp_path: Path) -> None:
+    """A FRESH run is unconstrained by --expect-device (the opt-in is resume-only)."""
+    from scripts import train as trainer
+
+    config = _real_config(tmp_path, epochs=1, name="dev_fresh")
+    # No resume_from -> the gate is inert; require cuda and the run still trains.
+    assert config.checkpoint.resume_from is None
+    result = trainer.train(config, dataset_path=str(_make_synthetic_dataset(tmp_path)),
+                           expect_device="cuda")
+    assert result is not None
+    assert result.get("device") == "cpu"

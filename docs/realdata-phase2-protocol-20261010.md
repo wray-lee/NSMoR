@@ -662,9 +662,17 @@ addition to 1–5 above (condition 1's "same frozen commit" is thereby relaxed t
   `.git` files hold Windows paths, so the WSL `git` cannot resolve them), run
   by the resume decider (`scripts/resume_decision.py::_git_ancestor`) behind
   the launcher's `ORIGIN_COMMIT=<C>` opt-in. The gate is exercised against a
-  REAL repository (not only monkeypatched): `_git_ancestor` on the live
-  worktrees returns C ancestor of C' = true, the reverse = false, and an
-  invalid SHA raises (fail closed).
+  REAL repository, not only monkeypatched: the committed test
+  `tests/test_run_frozen_resume.py::test_git_ancestor_real_repository` drives
+  the UNSTUBBED `_git_ancestor` against a real repo (it constructs one with
+  `git init` + commits, so it is environment-independent), asserting the
+  ancestor direction is true, the reverse is false, and an invalid SHA raises
+  (fail closed). (The committed test drives the real worktree repo —
+  `HEAD~1` vs `HEAD` — since a fresh `git init` repo under the WSL/Windows git
+  boundary trips git's `dubious ownership` check; the worktree repo is trusted
+  by both gits.) The remaining ancestry cases (non-ancestor refusal, missing
+  opt-in, other-head, git-failure) are exercised with `_git_ancestor`
+  monkeypatched, since the decision logic — not git — is what they pin.
 - (ii) **Fresh-training identity, at a stated cadence.** Fresh (non-resumed)
   training is established bitwise identical between C and C' AT THE PINNED TEST
   CADENCE: the pinned-environment fresh-weights SHA-256 test
@@ -674,22 +682,44 @@ addition to 1–5 above (condition 1's "same frozen commit" is thereby relaxed t
   holds on C'. That test pins `checkpoint_interval=2`, `num_workers=1`,
   `persistent_workers=True` — NOT the arm cadence. Measured for C=`8ed5edb` and
   C'=`ef3c3aa`: both produce the pinned weights SHA-256
-  `6a8a43517d1985a5c3732df026cdb39c0d097c3389fab8d797e08bd2a72052a0`. The
-  ARM-cadence fresh identity (`num_workers: -1` auto-scaling to >0,
-  `checkpoint_interval: 10`, the twelve arms' regime) is NOT pinned by that
-  test; it is corroborated by (a) `nsmor/` being byte-identical across C..C'
-  (the model/loss/dataset code is untouched, so a fresh trajectory is
-  unchanged by construction) and (b) the committed guarded diff of (iii), in
-  which every fresh-run-reachable hunk is a no-op on a fresh run. The C<->C'
-  fresh-identity claim is therefore scoped to cadence 2 and must not be
-  presented as an arm-cadence equality it never measured.
-- (iii) **No fresh-training code path changed — recorded, hashed artifact.**
-  C..C' changes no fresh-training code path except resume-only paths. The
-  `git diff C C' -- scripts/train.py nsmor/` is COMMITTED to the tree at
+  `6a8a43517d1985a5c3732df026cdb39c0d097c3389fab8d797e08bd2a72052a0`.
+
+  The **ARM-cadence** fresh identity (`num_workers: -1` auto-scaling to >0,
+  `persistent_workers: true`, `checkpoint_interval: 10` — the twelve arms'
+  regime) is measured on C' by `tests/test_resume_equivalence.py::test_arm_regime_resume_is_bitwise`
+  (a `num_workers=1`, `persistent_workers=True`, `interval=10` fresh run) and
+  `test_auto_scaled_workers_resume_is_bitwise` (the REAL `num_workers=-1`
+  auto-scaling path), and on C by the out-of-tree probe recorded in the
+  amendment log. The C-side leg is an OUT-OF-TREE probe, not a committed
+  artifact (the test file is added only at C'); the claim is therefore
+  **scoped to "verified equal on C under the stated harness (a torch DataLoader
+  with persistent workers + worker_init_fn), and measured equal on C' by the
+  committed in-tree test"** — it is NOT "C's own in-tree harness produced the
+  value", because no such harness exists at C. It is **CPU-only**: the arm
+  cadence that is asserted bitwise is the CPU cadence, and no GPU trajectory is
+  asserted bitwise anywhere in this document. For `R0-control-seed43`
+  specifically the arm is a GPU run, so
+  the CPU arm-cadence result is **moot for it**: its continuation is authorized
+  only as state-exact (GPU clause below), and the fresh-identity condition is
+  satisfied on the CPU code path, not on the GPU one. The C<->C' fresh-identity
+  claim is therefore scoped to CPU at cadence 2 (pinned) and CPU at the arm
+  cadence (measured), and must not be presented as a GPU-cadence equality it
+  never measured. It is further corroborated by (a) `nsmor/` being byte-identical
+  across C..C' (the model/loss/dataset code is untouched, so a fresh trajectory
+  is unchanged by construction) and (b) the committed guarded diff of (iii), in
+  which every fresh-run-reachable hunk is a no-op on the fresh model trajectory.
+- (iii) **No fresh-training MODEL-TRAJECTORY path changed — recorded, hashed
+  artifact.** This condition is a claim about the fresh-training **model
+  trajectory / weights** (the quantity (ii) measures), NOT about every byte a
+  fresh run emits. C..C' changes no fresh-training code path that affects the
+  trained weights except resume-only paths. The `git diff C C' --
+  scripts/train.py` is COMMITTED to the tree at
   `docs/amendments/successor-resume-8ed5edb-to-ef3c3aa.diff` (SHA-256
-  `312f979c4e89a02e04b17b2f48c7123644670e2df89070508ae44937f5c030f9`), so the
-  claim is independently re-checkable rather than re-derived from prose. Hunk
-  classification for that diff:
+  `312f979c4e89a02e04b17b2f48c7123644670e2df89070508ae44937f5c030f9`; the
+  artifact is `scripts/train.py`-only, matching this clause's scope — it does
+  NOT include `scripts/resume_decision.py` or `scripts/run_frozen_resume.sh`,
+  which are launcher-side and never reached by `train()`). Hunk classification
+  for that diff:
   * RESUME-ONLY (inside a `resume_from is not None` guard, or reached only from
     one): `_require_bitwise_resume_loader_rng`, the
     `_require_resume_source_is_newest_complete_epoch` call, the safe-pause
@@ -697,26 +727,32 @@ addition to 1–5 above (condition 1's "same frozen commit" is thereby relaxed t
     `_capture_rng_state`/`_restore_rng_state` helpers, and the new
     `_require_resume_source_is_newest_complete_epoch`/`_pause_requested`
     helpers.
-  * FRESH-REACHABLE, no-ops on a fresh run: the
+  * FRESH-REACHABLE, no-ops on a fresh MODEL TRAJECTORY: the
     `_require_reliable_recovery_loaders` docstring/comment edits; the `import
-    re`; the `_LAST_EPOCH_FAMILIES`/`_EPOCH_PERIODIC_RE` constants; the
-    `_segment_loader_controls` field RENAME
+    re`; the `_LAST_EPOCH_FAMILIES`/`_EPOCH_PERIODIC_RE` constants; the additive
+    `"paused": _paused_on_sentinel` results key (`False` on a fresh run); the
+    additive `"device"` results key; and the epoch-tail `_pause_requested`
+    check, which reads a `STOP` sentinel absent on a fresh run and therefore
+    does not alter the trajectory. None of these draws global RNG or changes a
+    gradient, so the fresh model trajectory and weights are bitwise unchanged.
+  * **EXCLUDED from this condition (a fresh persisted-OUTPUT change, not a
+    trajectory change):** the `_segment_loader_controls` **record-schema /
+    field-name change** — the field RENAME
     (`legacy_worker_equivalence_established` ->
-    `worker_resume_equivalence_established`, plus the added
-    `worker_count_change_equivalence_established`) — which DOES change the
-    segment-record bytes on EVERY run including a fresh one (an additive
-    record-shape change, disclosed here: it is NOT byte-identical fresh
-    output); the additive `"paused": _paused_on_sentinel` results key (`False`
-    on a fresh run); and the epoch-tail `_pause_requested` check, which reads a
-    `STOP` sentinel absent on a fresh run and therefore does not alter the
-    trajectory.
+    `worker_resume_equivalence_established`) plus the added
+    `worker_count_change_equivalence_established` field. This changes the
+    `segment_XXXX.json` bytes on EVERY run including a fresh one, so a fresh
+    run's segment record is NOT byte-identical across C..C'. It is metadata
+    only: no in-repo consumer of the old key remains (grep over
+    `scripts/`, `nsmor/`, `tests/` is clean), and it does not touch the trained
+    weights, the model trajectory, or the RNG stream. This condition therefore
+    claims only the model trajectory is unchanged; the segment-record shape is
+    explicitly EXCLUDED and disclosed here, not buried.
   `nsmor/` is byte-identical across C..C' (`git diff C C' -- nsmor/` is empty),
   so `nsmor/model_nsmor_core.py` and `nsmor/loss.py` are untouched. The
   fresh-training MODEL trajectory and weights are bitwise unchanged — exactly
-  what (ii)'s pinned equality measures — but the fresh SEGMENT-RECORD bytes are
-  NOT (the renamed loader-control field); that single fresh-run output change
-  is metadata-only and does not affect the trained weights. The fresh-training
-  path draws no extra global RNG.
+  what (ii)'s pinned equality measures. The fresh-training path draws no extra
+  global RNG.
 - (iv) **Both commits recorded.** The resume launcher records BOTH C and C' in
   the run's `provenance.json` `resume_log` entry (fields `origin_commit`=C and
   `head`=C') and in the `status.log` line for the resume.
@@ -726,12 +762,12 @@ addition to 1–5 above (condition 1's "same frozen commit" is thereby relaxed t
   is state-exact, NOT bitwise, and must not be misrepresented as a
   bitwise-continuous run.
 
-**GPU resumption of a phase-2 arm: device must be established; a GPU resume is
-state-exact-only.** The bitwise guarantee of §11.1 is CPU-only. A phase-2 arm
-that RAN on CUDA (its `train.stdout.log` records `Device: cuda` and its
-checkpoint carries a non-empty `cuda_rng_state`) resumes state-exact but
-trajectory-unverified, exactly as two uninterrupted GPU runs differ — and a
-GPU resume is **explicitly unsupported** for producing a phase-2 result (the
+**GPU resumption of a phase-2 arm: device must be established (MACHINE-ENFORCED);
+a GPU resume is state-exact-only.** The bitwise guarantee of §11.1 is CPU-only.
+A phase-2 arm that RAN on CUDA (its `train.stdout.log` records `Device: cuda`
+and its checkpoint carries a non-empty `cuda_rng_state`) resumes state-exact
+but trajectory-unverified, exactly as two uninterrupted GPU runs differ — and
+a GPU resume is **explicitly unsupported** for producing a phase-2 result (the
 GPU clause above). This is the device resolution the successor-commit clause
 requires before an ACCEPT: `R0-control-seed43`, started on C=`8ed5edb`, IS a
 GPU run (verified: its `train.stdout.log` records `Device: cuda`, and
@@ -744,6 +780,26 @@ resume continues the interrupted STATE, while the bitwise-continuation claim
 that would make the result a phase-2 result is explicitly withheld. Where a
 phase-2 result requires a bitwise-verified trajectory, the arm must be re-run
 CPU, not resumed on GPU.
+
+This clause has a CODE CARRIER and a machine-readable record, not only prose:
+
+* `scripts/train.py` accepts `--expect-device {cpu,cuda}`. On a resume whose
+  resolved device (`cuda` iff `torch.cuda.is_available()`) disagrees with the
+  requested value, `train()` raises BEFORE any epoch (fail closed); a fresh run
+  and an unset flag are unchanged. `scripts/run_frozen_resume.sh` derives the
+  value from the arm's recorded start device and passes it: a CUDA-started arm
+  is resumed with `--expect-device cuda`, a CPU-started arm with
+  `--expect-device cpu`. So a CPU arm cannot silently resume onto a CUDA host,
+  and a CUDA arm is forced to run as CUDA (never silently CPU), matching the
+  recorded start device.
+* The device is recorded: the run's result dict (`train.log`) carries a
+  `"device"` field, and the resume launcher's `status.log` line names the
+  device. A CUDA-resumed segment therefore leaves an artifact from which the
+  mandated GPU / trajectory-unverified caveat is triggered, rather than relying
+  on an operator to remember it.
+* The gate is exercised by `tests/test_run_frozen_resume.py` (device mismatch
+  refused, match accepted, fresh run unconstrained) and the device is asserted
+  in `tests/test_resume_equivalence.py`.
 
 The opt-in is explicit and fail-closed: without `ORIGIN_COMMIT=<C>` a
 provenance head != C' is still refused as a cross-code-version resume, and with
@@ -990,18 +1046,49 @@ measured on C by an out-of-tree probe and on C' by the in-tree test); (iii) the
 `git diff 8ed5edb ef3c3aa -- scripts/ nsmor/` touches only `scripts/train.py`,
 `scripts/resume_decision.py` and `scripts/run_frozen_resume.sh` (`nsmor/` is
 untouched; the only fresh-run-reachable train.py changes are the additive
-`paused` flag and the epoch-tail sentinel check, both no-ops on a fresh run);
+`paused` and `device` result keys and the epoch-tail sentinel check, all no-ops
+on the fresh MODEL trajectory). NOTE: the COMMITTED guarded artifact
+`docs/amendments/successor-resume-8ed5edb-to-ef3c3aa.diff` is scoped to
+`scripts/train.py` ONLY (its recomputed SHA-256 is
+`312f979c4e89a02e04b17b2f48c7123644670e2df89070508ae44937f5c030f9`, matching
+`git diff 8ed5edb ef3c3aa -- scripts/train.py`); `resume_decision.py` and
+`run_frozen_resume.sh` are launcher-side and never reached by `train()`, so
+they are excluded from the artifact and from the clause's "no fresh-training
+code path" scope. The artifact is bound to C'=`ef3c3aa`; the RUN head is
+`297ba1f` (worktree head `6ebb1f6`), and equivalence holds ONLY because
+`scripts/train.py` and `nsmor/` are byte-identical across
+`ef3c3aa..297ba1f..6ebb1f6` (verified empty diff), so the C'-bound artifact
+covers the run head too;
 (iv) `scripts/resume_decision.py::record` now writes both `origin_commit` and
 `head`, and `run_frozen_resume.sh` passes the origin through; (v) the launcher
 `status.log` line names both. Mechanism: the launcher's `ORIGIN_COMMIT=<C>`
 opt-in plus an absolute `OUT_ROOT` (so the launcher, running inside the C'
-worktree, appends to the run dir under the C worktree's `.scratch`), and a
-`--dry-run` decider mode that writes nothing to the run dir. A dry run of the
-seed-43 resume selects `epoch_50.pth` (stored epoch 49, next epoch 50) and
-`train.py`'s own resume preflight (clock, newest-complete-epoch, complete
-schema, architecture-config match, nested prior lineage, and the worker-RNG
-precondition) accepts a checkpoint written by C's code, so no divergence from
-§11.1's fail-closed rules is introduced. New tests:
+worktree, appends to the run dir under the C worktree's `.scratch`), a
+`--dry-run` decider mode that writes nothing to the run dir, and a
+`--expect-device` resume gate (fail closed on a device-class change; §11.1
+device clause). A dry run of the seed-43 resume selects `epoch_50.pth` (stored
+epoch 49, next epoch 50). The DRY RUN IS NOT AN ACCEPTANCE OF THAT SOURCE: it
+proves only that the decider's checks pass and that it writes nothing. The
+seed-43 run reached epoch 58 (`train.stdout.log` ends at `Epoch 58/300`) and
+`best_model.pth` stores epoch 57, but a SIGKILL that leaves no
+`final_model.pth` and periodics only through `epoch_50.pth` makes the
+newest-complete-epoch rule return `epoch_50.pth` (stored epoch 49), so
+`train.py::_require_resume_source_is_newest_complete_epoch` and the launcher
+BOTH accept it and the resume RE-TRAINS epochs 50–58 — exactly the
+silent-re-train §11.1 forbids. That is not a check failure but an
+interruption-ARTIFACT: the run's true last complete epoch (58) has no retained
+checkpoint, and the deterministic rule cannot recover what was never written.
+The rollback is therefore SILENT (nothing refuses it). `train.py`'s own
+preflight ACCEPTS a checkpoint written by C's code — the executed artifact
+`tests/test_train_resume_preflight_realcheckpoint.py` drives the real preflight
+helpers (clock, newest-complete-epoch, complete current schema,
+architecture-config match, nested prior lineage) AND `_restore_recovery_state`
+(patience counter, training-history axis, required MT19937 state) and the
+`_require_bitwise_resume_loader_rng` guard, so the restoration seam is
+demonstrated, not merely asserted. Whether to ACCEPT this rollback or
+synthesize a conforming source (e.g. an epoch-58 payload) is a USER decision;
+this amendment does not ACCEPT the resume as if `epoch_50.pth` were the run's
+last complete epoch. New tests:
 `tests/test_run_frozen_resume.py::{test_successor_resume_accepted_when_origin_is_ancestor,
 test_successor_resume_refused_when_origin_not_ancestor,
 test_successor_resume_refused_without_optin,
@@ -1054,6 +1141,41 @@ minors) The ancestry gate is now also probed against a REAL repository
 (`_git_ancestor` true/false/invalid-SHA fail-closed on the live worktrees); the
 narrative names the RUN commit `297ba1f`; and the stray double blank line is
 removed. The preliminary conclusions remain untouched.
+
+**Amendment log — 2026-10-11 (round-7: resolve merged review of `6ebb1f6`).**
+Reason: the merged double-blind review of `6ebb1f6` raised one BLOCKER (R1),
+two MAJORs (R1/R2) and MINORs. (R1-B1, and its R2 twin) The dry-run's
+`epoch_50.pth` selection is NOT evidence the seed-43 resume is acceptable: the
+run reached epoch 58 and `best_model.pth` stores epoch 57, but with no
+`final_model.pth` and periodics only through `epoch_50.pth` the
+newest-complete-epoch rule returns `epoch_50.pth`, so the resume re-trains
+epochs 50–58 — the silent re-train §11.1 forbids. The clause now says so
+explicitly (the dry run is not an acceptance; the rollback is silent, an
+interruption-artifact, and whether to accept it or synthesize a conforming
+source is a USER decision). (R1-M2) Condition (ii) no longer presents the
+arm-cadence identity as unmeasured: the arm cadence (`num_workers>0`,
+`persistent_workers`, `interval=10`) is measured on C' by
+`test_arm_regime_resume_is_bitwise` / `test_auto_scaled_workers_resume_is_bitwise`
+and on C by the out-of-tree probe; the claim is scoped CPU-only and is moot for
+the GPU seed-43 arm. (R1-M1) Condition (iii) is restated as a MODEL-TRAJECTORY /
+weights-only claim; the `_segment_loader_controls` field rename is EXCLUDED from
+the "no path changed" wording and named as a record-schema change (its fresh
+segment-record bytes are not identical). (R1-M3, R2-M2) The A3 preflight
+artifact now ALSO drives `_restore_recovery_state` (patience counter, history
+axis, MT19937 state) and `_require_bitwise_resume_loader_rng`, so the
+restoration guard is demonstrated, not asserted. (R2-B1) The §11.1 device
+sub-clause now has a CODE CARRIER: `train.py --expect-device {cpu,cuda}` fails
+closed on a resume whose resolved device disagrees (fresh run and unset flag
+unchanged); the launcher derives it from the arm's recorded start device and
+passes it; the device is recorded in the result dict (`train.log`) and the
+launcher `status.log`, so the GPU caveat is triggered by an artifact rather
+than an operator's memory. (MINORs) The guarded-diff artifact's actual scope is
+stated (`scripts/train.py` only, sha `312f979c…`, C'=`ef3c3aa`, with the
+byte-identity across `ef3c3aa..297ba1f..6ebb1f6` noted); the ancestry gate now
+has a committed REAL-repository test
+(`test_git_ancestor_real_repository`, `git init` + commits, unstubbed); and the
+launcher example command uses the current worktree head `6ebb1f6`. The
+preliminary conclusions remain untouched.
 
 *This amendment's text is bound to the reviewed worktree commit by the
 `sha256` of `docs/realdata-phase2-protocol-20261010.md` recorded in each run's

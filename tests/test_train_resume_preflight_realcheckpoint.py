@@ -124,6 +124,60 @@ def test_train_resume_preflight_accepts_pre_amendment_checkpoint() -> None:
     )
 
 
+def test_train_restore_recovery_state_accepts_pre_amendment_checkpoint() -> None:
+    """R1-M3/R2-M2: the restoration seam accepts the 8ed5edb-written checkpoint.
+
+    ``_restore_recovery_state`` is the recovery seam train.py runs on every
+    resume (patience counter, training-history axis, required MT19937 state).
+    Driving the REAL helper — not a re-implementation — demonstrates the guard
+    that the earlier preflight-only artifact omitted.  ``resume_epoch`` is the
+    checkpoint's own stored epoch + 1 (49 -> 50), matching train.py.
+    """
+    _yaml, _cfg, load_artifact_bytes = _load()
+
+    from scripts import train as T
+
+    peek = load_artifact_bytes(_CKPT.read_bytes(), map_location="cpu")
+    resume_epoch = int(peek["epoch"]) + 1
+    ewi, history, np_state, history_start = T._restore_recovery_state(
+        peek, _CKPT, resume_epoch=resume_epoch,
+    )
+    # A current-schema (v2) payload restores positionally: the counter is a
+    # non-negative int, the two loss series share one axis of ``resume_epoch``
+    # entries (0..49), the axis starts at 0, and the MT19937 state is present.
+    assert isinstance(ewi, int) and ewi >= 0
+    assert set(history) == {"train_loss", "val_loss"}
+    assert len(history["train_loss"]) == len(history["val_loss"]) == resume_epoch
+    assert history_start == 0
+    assert np_state is not None
+
+
+def test_resume_loader_rng_guard_accepts_real_corpus_loaders() -> None:
+    """R1-M3/R2-M2: ``_require_bitwise_resume_loader_rng`` accepts the arm loaders.
+
+    The guard train.py runs on every resume (before the resume block) must PASS
+    for the phase-2 corpus, whose ``NSMoRDataset.__getitem__`` and collate
+    consume no worker-side RNG.  Built through the real ``build_dataloaders``
+    with the arm's own config, so the assertion is on the path the resume takes.
+    """
+    yaml, ExperimentConfig, _load_bytes = _load()
+
+    from scripts import train as T
+
+    config = ExperimentConfig.from_yaml(str(_CFG))
+    p2 = (yaml.safe_load(_CFG.read_text()) or {}).get("phase2") or {}
+    T._SELECTION_METRIC = str(p2.get("selection_metric", "total"))
+    T._ZERO_INPUT_CHANNELS = tuple(
+        sorted(int(c) for c in (p2.get("zero_input_channels") or []))
+    )
+    train_loader, val_loader = T.build_dataloaders(
+        config, dataset_path=str(_DATASET),
+        nested_prior_artifact=str(_ARTIFACT),
+    )
+    # Must NOT raise: the phase-2 corpus satisfies the worker-RNG precondition.
+    T._require_bitwise_resume_loader_rng(train_loader, val_loader)
+
+
 def test_preflight_scope_is_disclosed_not_overstated() -> None:
     """The acceptance rests on the nested path; the strongest guard IS reached.
 
