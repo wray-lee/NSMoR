@@ -200,10 +200,26 @@ titles carry the required caveats: "model-internal exploratory", "recording
 prefixes are not animals", "not Kaplan–Meier", "annotated states unavailable".
 
 Fix-forward presentation issues; none affects validity:
-1. In the prestimulus panel, a true zero rate draws no bar and looks like a
-   missing bar. Add value labels.
-2. In the timing panel, the legend can overlap a curve that saturates at 1.0
-   (R2-s44). Move the legend outside the axes.
+1. In the prestimulus panel, a true zero rate drew no bar and looked like a
+   missing bar.
+2. In the timing panel, the legend could overlap a curve that saturates at 1.0
+   (R2-s44).
+
+**Fixed (2026-10-15):** commit 8026bf4 on `feat/secondary-figure-fix-20261015`
+(dual ACCEPT, focused non-training tests 51/51) labels every rate bar and moves
+the legend below the axes.
+- **Re-render:** all 12 runs were re-rendered with that code (batch 1, CPU, one
+  thread) into `.scratch/realdata-phase2-20261010/secondary-20261015-v3-figfix/`
+  (MANIFEST sha `bcfcbf70…`).
+- **Equivalence with v2:** `compare-vs-v2.json` shows every `trial_level.csv` is
+  byte-identical to v2 and every summary.json matches v2 apart from provenance.
+  The scientific outputs are unchanged.
+- **Real-data check of the batching code:** 8026bf4 builds on the batching
+  refactor 84baab7, so this also shows the refactored default (batch 1) path
+  reproduces the 02b29e6 outputs exactly on real data. Batch > 1 remains
+  unchecked on real data.
+- **Visual check:** the R2-s44 figure was re-checked by eye. Zero rates now read
+  "0", and the legend sits below the timing axes.
 
 ## 7. Limitations and next steps
 
@@ -211,12 +227,14 @@ Fix-forward presentation issues; none affects validity:
   in the user's 2026-10-13 plan go into a new versioned dataset; their timing is
   undecided.
 - R0 arm conformance: R0-s44 is a GPU successor-commit resume and R0-s43 is a GPU
-  rather than CPU rerun (§1). How to treat them needs a user decision. Options:
-  - keep them with the stated caveats; or
-  - re-run R0 s43/s44 from scratch as §11.1 prescribes, which is training and
-    falls under the single start authorization.
+  rather than CPU rerun (§1).
+  - **User decision (2026-10-15):** keep both checkpoints in the reported family,
+    with the §1 caveats; no R0 retraining.
+  - Every R0-involving slot and contrast is reported as GPU /
+    trajectory-unverified. The R0 contribution is a disclosed deviation from
+    §11.1, not a §11.1-conformant phase-2 result.
+  - The gate verdict is unaffected (§3).
 - Pending:
-  - the two figure fix-forwards;
   - a CPU equivalence check before any production use of `batch_size > 1`
     (`feat/secondary-batching-20261014`, 84baab7).
 - No training was run for this report. The next training round, including the
