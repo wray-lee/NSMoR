@@ -22,7 +22,7 @@ frozen protocol changes; the phase-3 protocol keeps its arm ids (`C1`–`C6`).
 
 | Name | Code | Phase-3 arms | What it is |
 | :-- | :-- | :-- | :-- |
-| **NS-CAMoR** (short: CAMoR) | umbrella | — | One shared bounded residual block reused across internal depth, with a per-frame ACT-style halt head. Strictly causal; one external timestep advances the LIF/GRU state exactly once. |
+| **NS-CAMoR** (short: CAMoR) | umbrella | — | One shared bounded residual block reused across internal depth, with a per-frame ACT-style halt head (present but not executed in the fixed-K control). Strictly causal; one external timestep advances the LIF/GRU state exactly once. |
 | **CAMoR-R** (refinement) | `refinement_mode: "adaptive"` (ADR 0008) | `C6` | Depth refines the post-fusion representation only; it never consumes model time. |
 | CAMoR-R fixed-K control | `refinement_mode: "fixed"` | `C3`/`C4`/`C5` (K2/K3/K4) | Same module and parameters with no early exit: the capacity-matched control. |
 | **CAMoR-L** (latency-coupled) | `time_consuming_mode: "depth_delay" \| "accumulate"` (ADR 0009) | `C1`/`C2` | The output for frame `t` is emitted `delay_scale·(depth−1)` frames later, so depth is a model-grid latency comparable with the animal's response latency. |
@@ -50,7 +50,8 @@ phase-2 R0–R3 checkpoints) contains no CAMoR at all.
 ## Related work
 
 - Graves 2016, Adaptive Computation Time (arXiv 1603.08983): the halting rule.
-- Dehghani et al. 2019, Universal Transformers: a shared block with ACT depth.
+- Dehghani et al. 2019, Universal Transformers (ICLR 2019; arXiv 1807.03819):
+  a shared block with ACT depth.
 - Veerabadran et al. 2023, adaptive recurrent vision (NeurIPS; arXiv
   2311.06964): an ACT-halting ConvRNN whose iteration count scales with
   difficulty. This is the closest precedent for "processing time grows with
@@ -59,18 +60,32 @@ phase-2 R0–R3 checkpoints) contains no CAMoR at all.
   and the name.
 
 A name check on 2026-10-14 found no existing use of "NS-CAMoR". It found
-unrelated uses of the short letters "CAMoR" in other fields: "CAMOR", congestion-aware multipath routing (SDN, 2017); "CaMor", camera
-morphing (graphics, 2017); and the DFKI "CaMoRe" causal-models group. There is also "CAMoRo", an Interreg collaborative-robots project. None of
-these is an adaptive-recursion method, which is why the full name NS-CAMoR is
-used on first mention. The check was not exhaustive; repeat it
+unrelated uses of the short letters "CAMoR" in other fields:
+
+- "CAMOR": Congestion Aware Multipath Optimal Routing, an SDN routing method
+  (Shah et al., PlatCon 2017; IEEE Xplore document 7883694).
+- "CaMor": Raghuraman, Barrash and Rossignac, "CaMor: Screw Interpolation
+  between Perspective Projections of Partial Views of Rectangular Images",
+  Eurographics WICED 2017, DOI 10.2312/wiced.20171066.
+- "CaMoRe": the DFKI research group Causal Models and Representations.
+- "CAMoRo": an Interreg project on collaborative autonomous mobile robots.
+
+None of these is an adaptive-recursion method, which is why the full name
+NS-CAMoR is used on first mention. The check was not exhaustive; repeat it
 before publication.
 
 ## Limits on claims
 
-- The name describes the model, not a biological claim. As the phase-3
-  protocol states, the strongest licensable claim is "an adaptive processing
-  duration exists; CAMoR is one discrete approximation", never "the cricket
-  has CAMoR/MoR".
+- The name describes the model, not a biological claim.
+- The phase-3 protocol (§12) states its claim ceiling in terms of MoR: "an
+  adaptive processing duration exists; MoR is one discrete approximation", and
+  never "the cricket has MoR". Under this ADR's renaming, the paraphrase is that
+  an adaptive processing duration exists and CAMoR is one discrete
+  approximation of it.
+- That paraphrase is the **upper bound** of what may be concluded, and only if
+  the pre-registered phase-3 tests support it. It is not a result. Without that
+  support, nothing about adaptive processing duration is claimed, and "the
+  cricket has CAMoR/MoR" is never claimed.
 - CAMoR-L's delay is a model-grid timing device, not measured neural latency,
   work/MAC or ATP (ADR 0009).
 - The `[g_lif, g_gru]` `MoRRouter` gate is pathway readout mixing and is not part
