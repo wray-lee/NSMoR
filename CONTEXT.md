@@ -30,6 +30,12 @@ The "MoR" in NSMoR, after Bae et al., arXiv 2507.10524: a shared recursive block
 The opt-in ``refinement_mode`` (ADR 0008) and ``time_consuming_mode`` (ADR 0009) are ACT-style related computational implementations, not a full reproduction of Bae et al.'s expert-choice / token-choice routing. Runs with both modes ``off``, including all phase-2 R0–R3 checkpoints, cannot test adaptive recursion. Visual modulation is compatible with adaptive recursion, and a missing fast-LIF / slow-GRU separation does not reject MoR.
 _Avoid_: calling the MoR Router "MoR"
 
+**NS-CAMoR** (short form **CAMoR**):
+Causal Adaptive Mixture-of-Recursions: the documentation name for this repository's opt-in MoR-inspired recursion family. "NS" stands for Neuroscience, as in NSMoR. Use NS-CAMoR on first mention and CAMoR in running text. Models with both recursion modes ``off`` are the NSMoR baseline, not NS-CAMoR. It uses a shared bounded residual block with a per-frame ACT-style halt head. It is strictly causal, and LIF/GRU state advances once per external timestep.
+
+There are two variants. **CAMoR-R** is ``refinement_mode`` (representational refinement; ``"fixed"`` gives the fixed-K control). **CAMoR-L** is the latency-coupled ``time_consuming_mode`` (depth becomes model-grid output delay). Code identifiers are unchanged; see ADR 0010.
+_Avoid_: calling CAMoR "MoR" without qualification, or claiming it reproduces Bae et al.
+
 **FrontendEncoder**:
 Stage 1 of the Hybrid Funnel architecture, encapsulating optional dendritic compartmentalization (IIR filtering on visual channels) and the SensoryEncoder, mapping raw 4-D sensory features to hidden representations.
 _Avoid_: encoder, frontend, stage 1

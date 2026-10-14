@@ -18,7 +18,7 @@
 
 ## Project Architecture
 
-NSMoR (Biological Mixture-of-Recursions) models **cricket multi-sensory integration** using a dual-pathway recurrent neural network:
+NSMoR (Neuroscience Mixture-of-Recursions) models **cricket multi-sensory integration** using a dual-pathway recurrent neural network:
 
 - **LIF Pathway:** Leaky Integrate-and-Fire event-driven spiking pathway. Whether it is faster than the GRU pathway, or splits onset/sustained work with it, must be shown empirically; do not assume it.
 - **GRU Pathway:** Gated Recurrent Unit for smooth, continuous temporal integration.
@@ -28,6 +28,7 @@ NSMoR (Biological Mixture-of-Recursions) models **cricket multi-sensory integrat
 
 - The ``[g_lif, g_gru]`` gate is pathway readout mixing, not MoR depth routing. Report it as readout dependence, never as evidence about recursion depth. The historical class and interface names (``MoR Router``, ``NSMoRCore``) are kept.
 - Adaptive / time-consuming recursion exists only as opt-in modes: ``refinement_mode`` (ADR 0008) and ``time_consuming_mode`` (ADR 0009). These are ACT-style related computational implementations, not a full reproduction of Bae et al.'s expert-choice / token-choice routing algorithms.
+- In docs, papers and figures this opt-in family is named **NS-CAMoR** (NS = Neuroscience, as in NSMoR), short form **CAMoR** (Causal Adaptive Mixture-of-Recursions, "MoR-inspired"). The variants are CAMoR-R (``refinement_mode``) and CAMoR-L (latency-coupled, ``time_consuming_mode``). Models with both modes ``off`` are the NSMoR baseline, not NS-CAMoR. Code identifiers are unchanged (ADR 0010).
 - Runs with both modes ``off``, including all phase-2 R0–R3 checkpoints, cannot test adaptive recursion.
 - Visual modulation is compatible with adaptive recursion. A missing fast-LIF / slow-GRU separation does not reject MoR.
 - See ``MULTISENSORY_MOR_INTERPRETATION_20261014.md``.
