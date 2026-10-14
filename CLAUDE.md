@@ -20,13 +20,15 @@
 
 NSMoR (Biological Mixture-of-Recursions) models **cricket multi-sensory integration** using a dual-pathway recurrent neural network:
 
-- **LIF Pathway:** Leaky Integrate-and-Fire spiking neuron for fast, event-driven sensory transients.
+- **LIF Pathway:** Leaky Integrate-and-Fire event-driven spiking pathway. Whether it is faster than the GRU pathway, or splits onset/sustained work with it, must be shown empirically; do not assume it.
 - **GRU Pathway:** Gated Recurrent Unit for smooth, continuous temporal integration.
 - **MoR Router:** The code component of this name is a learned pathway-readout gate that blends LIF and GRU outputs per timestep. It produces per-step softmax weights ``[g_lif, g_gru]`` over the two pathway outputs; it is not a causal-inference estimator.
 
 **What "MoR" means:** MoR is Mixture-of-Recursions (Bae et al., arXiv 2507.10524): a shared recursive block plus input-dependent recursion-depth routing. ACT is related but a different algorithm.
-- The ``[g_lif, g_gru]`` gate is pathway readout mixing, not MoR depth routing. Report it as readout dependence, never as evidence about recursion depth.
-- Adaptive / time-consuming recursion exists only as opt-in modes: ``refinement_mode`` (ADR 0008) and ``time_consuming_mode`` (ADR 0009). Runs with both ``off``, including all phase-2 R0–R3 checkpoints, cannot test adaptive recursion.
+
+- The ``[g_lif, g_gru]`` gate is pathway readout mixing, not MoR depth routing. Report it as readout dependence, never as evidence about recursion depth. The historical class and interface names (``MoR Router``, ``NSMoRCore``) are kept.
+- Adaptive / time-consuming recursion exists only as opt-in modes: ``refinement_mode`` (ADR 0008) and ``time_consuming_mode`` (ADR 0009). These are ACT-style related computational implementations, not a full reproduction of Bae et al.'s expert-choice / token-choice routing algorithms.
+- Runs with both modes ``off``, including all phase-2 R0–R3 checkpoints, cannot test adaptive recursion.
 - Visual modulation is compatible with adaptive recursion. A missing fast-LIF / slow-GRU separation does not reject MoR.
 - See ``MULTISENSORY_MOR_INTERPRETATION_20261014.md``.
 

@@ -11,7 +11,7 @@ The top-level neural network module composing a FrontendEncoder and a BioDecisio
 _Avoid_: model, network, MoR
 
 **LIF Pathway**:
-Leaky Integrate-and-Fire spiking neuron pathway for fast, event-driven sensory transient processing. Implements synaptic delay, refractory periods, spike-frequency adaptation, short-term plasticity, and lateral inhibition.
+Leaky Integrate-and-Fire event-driven spiking pathway. Whether it is faster than the GRU Pathway, or splits onset/sustained work with it, must be shown empirically; it is not assumed. Implements synaptic delay, refractory periods, spike-frequency adaptation, short-term plasticity, and lateral inhibition.
 _Avoid_: Path A, spiking path
 
 **GRU Pathway**:
@@ -20,7 +20,15 @@ _Avoid_: Path B, continuous path
 
 **MoR Router**:
 Per-timestep routing network that produces coupled softmax weights (the two columns sum to 1) blending LIF Pathway and GRU Pathway outputs, conditioned on sensory encoding and MCMC Prior. The gate vector is ``[g_lif, g_gru]`` (column 0 = LIF weight, column 1 = GRU weight); it is a learned representational-routing gate, not a causal-inference estimator.
+
+This is pathway readout mixing, not Mixture-of-Recursions depth routing (see **Mixture-of-Recursions**); the historical name is kept. Report gate effects as readout dependence, never as recursion-depth evidence.
 _Avoid_: gate, mixer, blender, causal inference gate
+
+**Mixture-of-Recursions**:
+The "MoR" in NSMoR, after Bae et al., arXiv 2507.10524: a shared recursive block with input-dependent recursion-depth routing. ACT is a related but different algorithm.
+
+The opt-in ``refinement_mode`` (ADR 0008) and ``time_consuming_mode`` (ADR 0009) are ACT-style related computational implementations, not a full reproduction of Bae et al.'s expert-choice / token-choice routing. Runs with both modes ``off``, including all phase-2 R0–R3 checkpoints, cannot test adaptive recursion. Visual modulation is compatible with adaptive recursion, and a missing fast-LIF / slow-GRU separation does not reject MoR.
+_Avoid_: calling the MoR Router "MoR"
 
 **FrontendEncoder**:
 Stage 1 of the Hybrid Funnel architecture, encapsulating optional dendritic compartmentalization (IIR filtering on visual channels) and the SensoryEncoder, mapping raw 4-D sensory features to hidden representations.
