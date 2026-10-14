@@ -62,8 +62,9 @@ phase-2 R0–R3 checkpoints) contains no CAMoR at all.
 A name check on 2026-10-14 found no existing use of "NS-CAMoR". It found
 unrelated uses of the short letters "CAMoR" in other fields:
 
-- "CAMOR": Congestion Aware Multipath Optimal Routing, an SDN routing method
-  (Shah et al., PlatCon 2017; IEEE Xplore document 7883694).
+- "CAMOR": Shah et al., "CAMOR: Congestion Aware Multipath Optimal Routing
+  Solution by Using Software-Defined Networking", PlatCon 2017 (IEEE Xplore
+  document 7883694).
 - "CaMor": Raghuraman, Barrash and Rossignac, "CaMor: Screw Interpolation
   between Perspective Projections of Partial Views of Rectangular Images",
   Eurographics WICED 2017, DOI 10.2312/wiced.20171066.
@@ -78,8 +79,8 @@ before publication.
 
 - The name describes the model, not a biological claim.
 - The phase-3 protocol (§12) states its claim ceiling in terms of MoR: "an
-  adaptive processing duration exists; MoR is one discrete approximation", and
-  never "the cricket has MoR". Under this ADR's renaming, the paraphrase is that
+  adaptive processing duration exists and MoR is one discrete approximation of
+  it", and it lists "The cricket has MoR." among the claims it never makes. Under this ADR's renaming, the paraphrase is that
   an adaptive processing duration exists and CAMoR is one discrete
   approximation of it.
 - That paraphrase is the **upper bound** of what may be concluded, and only if

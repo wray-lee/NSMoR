@@ -155,7 +155,7 @@ _Avoid_: safe save, checkpoint wrapper
 ### Analysis
 
 **Gating Fingerprint**:
-A 16-dimensional vector summarizing a trial's MoR routing strategy without time windows, used for unsupervised clustering of routing dynamics.
+A 16-dimensional vector summarizing a trial's MoR Router (pathway-readout gate) strategy without time windows, used for unsupervised clustering of routing dynamics.
 _Avoid_: fingerprint, routing feature
 
 **FixedPointAdapter**:
