@@ -35,6 +35,17 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 
+# Repo-root import seam (same pattern as scripts/prepare_data.py): the
+# installed nsmor package in site-packages may be a stale copy, so the
+# shared stimulus vocabulary must resolve to THIS tree.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from nsmor.pipeline.conditions import (  # noqa: E402
+    INIT_DEG_DEFAULT,
+    WIND_PRESENCE_THRESHOLD,
+    looming_ttc_ms,
+)
+
 warnings.filterwarnings('ignore', category=pd.errors.PerformanceWarning)
 
 KIN_TARGET: List[str] = [
@@ -57,6 +68,139 @@ EVT_TARGET: List[str] = [
     "event_type",
     "event_value",
 ]
+
+KNOWN_TRIAL_TYPES: frozenset = frozenset({
+    "baseline_visual",
+    "baseline_wind",
+    "looming_wind",
+})
+"""Declared ``trial_start`` type vocabulary.
+
+A DECLARED type outside this set fails the adaptation closed: the old
+behaviour silently zeroed the looming channel for any unrecognized type,
+after which the condition classifier read a multisensory trial as
+``wind_only`` and it disappeared into the baseline (no warning, no
+error).  Trials with no ``trial_start`` row at all keep the historical
+kinematics-derived fallback (they carry no type declaration to
+validate); only a declared-and-unrecognized type aborts.
+"""
+
+_LEGACY_INJECTED_EVENT_VALUE: str = '{"source": "kinematics_injected"}'
+"""Byte-exact legacy ``event_value`` of an injected ``stimulus_onset``.
+
+Kept literally so the wind-onset injection path stays byte-identical for
+the existing wind-first corpora.
+"""
+
+_COLLISION_INJECTED_EVENT_VALUE: str = (
+    '{"source": "kinematics_injected", "reference_event": "visual_collision"}'
+)
+"""``event_value`` of a collision-clocked injected ``stimulus_onset``.
+
+Used when the first stimulus event is the visual collision: every
+visual-only trial (ADR 0011 re-clock) and wind-lagging multisensory
+trials.  The extra ``reference_event`` key records WHY the clock moved;
+the wind-first path keeps the legacy string unchanged.
+"""
+
+MAX_ISOLATED_WIND_ARTIFACTS: int = 4
+"""Declared bound on tolerated single-sample wind artifacts per session.
+
+The phase-2 raw corpus carries 9 non-{0,1} ``stim_state`` samples across
+8 of 128 files (at most 2 per file), all isolated one-off telemetry
+corruption with distinct values (e.g. -1, 88, 587, 9702); the historical
+``.eq(1)`` mapping silently read them as no-wind.  A coherent non-binary
+CODING (intensity 0.5/0.8, an alternate sentinel) produces repeated or
+adjacent values and always fails closed regardless of this bound.
+"""
+
+
+def _binary_wind_state(values: pd.Series, session_id: str, column: str) -> pd.Series:
+    """Coerce a raw wind channel to 0/1, failing closed on a coding scheme.
+
+    The previous ``.eq(1)`` mapping silently zeroed every non-1 value: a
+    session coding wind intensity as 0.5/0.8 (or any sentinel) produced a
+    wind-free channel, the condition classifier flipped the trial to
+    ``visual_only`` and the multisensory trial disappeared into the
+    visual baseline.  The wind contract is exactly ``{0, 1}``.
+
+    Declared tolerance: ISOLATED single-sample telemetry artifacts, the
+    documented artifact class of this rig.  A non-{0,1} sample is
+    tolerated only when ALL of
+
+    * no two offending samples are adjacent (temporal isolation),
+    * no offending finite value repeats within the session,
+    * at most one non-finite (NaN) sample,
+    * at most :data:`MAX_ISOLATED_WIND_ARTIFACTS` offending samples.
+
+    Anything else — a repeated sentinel, an intensity coding, a run of
+    non-binary samples — fails closed.  Tolerated artifacts are REPORTED
+    with a warning and mapped to 0 (the historical reading), never
+    silently.
+
+    Args:
+        values: Raw wind/``stim_state`` column.
+        session_id: Session identifier for the error message.
+        column: Source column name for the error message.
+
+    Returns:
+        Integer 0/1 series (wind presence uses the shared
+        ``WIND_PRESENCE_THRESHOLD``).
+
+    Raises:
+        ValueError: If the non-binary samples do not fit the isolated
+            single-sample artifact pattern.
+    """
+    numeric = pd.to_numeric(values, errors="coerce")
+    arr = numeric.to_numpy(dtype=float)
+    bad = ~np.isin(arr, (0.0, 1.0))
+    if bad.any():
+        idx = np.where(bad)[0]
+        offenders = arr[idx]
+        finite_vals = offenders[np.isfinite(offenders)]
+        unique, counts = np.unique(finite_vals, return_counts=True)
+        repeated = unique[counts > 1]
+        nan_count = int(np.sum(~np.isfinite(offenders)))
+        reasons: List[str] = []
+        if idx.size > MAX_ISOLATED_WIND_ARTIFACTS:
+            reasons.append(
+                f"{idx.size} offending samples exceed the declared "
+                f"single-sample artifact bound ({MAX_ISOLATED_WIND_ARTIFACTS})"
+            )
+        if idx.size > 1 and bool(np.any(np.diff(idx) <= 1)):
+            reasons.append(
+                "adjacent non-binary samples (a coherent coding, not a "
+                "single-sample artifact)"
+            )
+        if repeated.size:
+            reasons.append(f"repeated non-binary value(s) {repeated.tolist()}")
+        if nan_count > 1:
+            reasons.append(f"{nan_count} non-finite (NaN) samples")
+        if reasons:
+            raise ValueError(
+                f"[{session_id}] wind column {column!r} violates the "
+                f"wind-state contract {{0, 1}}: "
+                + "; ".join(reasons)
+                + f". Offending value(s) {sorted(set(offenders.tolist()))!r} "
+                f"at row(s) {idx.tolist()[:20]}. Fail closed: silently "
+                f"coercing a non-binary state would flip the trial's "
+                f"condition stamp."
+            )
+        warnings.warn(
+            f"[{session_id}] wind column {column!r} carries "
+            f"{idx.size} isolated non-binary sample(s) "
+            f"{sorted(set(offenders.tolist()))!r} at row(s) {idx.tolist()}; "
+            f"treated as the documented single-sample telemetry artifact "
+            f"and read as 0 (the historical .eq(1) mapping did the same, "
+            f"silently).",
+            stacklevel=2,
+        )
+    out = (arr > WIND_PRESENCE_THRESHOLD).astype(int)
+    # Tolerated artifacts read as 0 (the historical reading).  Letting a
+    # glitch value above the threshold through as "wind present" would
+    # fabricate a wind onset and flip the trial's condition stamp.
+    out[bad] = 0
+    return pd.Series(out, index=values.index, dtype=int)
 
 _PROTECTED_RAW_PATHS: List[Path] = [
     Path("/mnt/d/Data/train/all"),
@@ -357,14 +501,13 @@ def reconstruct_visual_angle(
     if lv_ratio_ms is None or lv_ratio_ms <= 0:
         return visual_angle
 
-    # Compute TTC from experiment parameters (matching paradigm.py)
+    # Compute TTC from experiment parameters (matching paradigm.py).
+    # Single source of truth for the collision clock: looming_ttc_ms is
+    # the same helper the stimulus_onset injection uses, so the
+    # reconstructed channel and the injected event time cannot drift.
     lv_s = lv_ratio_ms / 1000.0
-    init_rad = math.radians(init_deg / 2)
-    tan_val = math.tan(init_rad)
-    if tan_val <= 0:
-        return visual_angle
-    t_col_s = lv_s / tan_val  # TTC in seconds from looming onset
-    ttc_ms = t_col_s * 1000.0  # Convert to ms
+    ttc_ms = looming_ttc_ms(lv_ratio_ms, init_deg)  # Convert to ms
+    t_col_s = ttc_ms / 1000.0  # TTC in seconds from looming onset
 
     # Compute visual angle for all time points where t < TTC
     # time_ms is relative to looming onset (0 = start of looming)
@@ -1476,22 +1619,16 @@ def adapt_session_pair(
         df_k["visual_angle"] = 0.0
         df_k["l_v_ratio"] = 0.0
         if "stim_state" in df_k.columns:
-            df_k["wind_state"] = (
-                pd.to_numeric(df_k["stim_state"], errors="coerce")
-                .fillna(0)
-                .eq(1)
-                .astype(int)
+            df_k["wind_state"] = _binary_wind_state(
+                df_k["stim_state"], session_id, "stim_state",
             )
         else:
             df_k["wind_state"] = 0
     else:
         df_k["session_id"] = session_id
         if "wind_state" in df_k.columns:
-            df_k["wind_state"] = (
-                pd.to_numeric(df_k["wind_state"], errors="coerce")
-                .fillna(0)
-                .eq(1)
-                .astype(int)
+            df_k["wind_state"] = _binary_wind_state(
+                df_k["wind_state"], session_id, "wind_state",
             )
 
     # Per-trial kinematics absolute-time origin (chronological first sample).
@@ -1522,13 +1659,40 @@ def adapt_session_pair(
         trial_type = info.get('type', 'unknown')
         lv_ratio_ms = info.get('lv_ratio_ms')
 
+        # ``parse_trial_events`` writes the literal placeholder 'unknown'
+        # when a trial_start row exists but declares no ``type``; that is
+        # "no declaration", not a declared type.  A genuinely DECLARED
+        # type outside the vocabulary fails closed: the old behaviour
+        # zeroed the looming channel for any unrecognized type, after
+        # which the condition classifier read a multisensory trial as
+        # wind_only and it vanished into the baseline with no warning
+        # (data-contract guard, F5).
+        declared_type = info.get('type')
+        if (
+            declared_type is not None
+            and declared_type != 'unknown'
+            and declared_type not in KNOWN_TRIAL_TYPES
+        ):
+            raise ValueError(
+                f"[{session_id}/trial {tid}] unrecognized trial_start type "
+                f"{trial_type!r}; known types are "
+                f"{sorted(KNOWN_TRIAL_TYPES)} (fail closed: an "
+                f"unrecognized type must not silently zero the looming "
+                f"channel)."
+            )
+
         has_visual = trial_type in ('baseline_visual', 'looming_wind')
         has_wind = trial_type in ('baseline_wind', 'looming_wind')
-        known_type = trial_type in ('baseline_visual', 'baseline_wind', 'looming_wind')
+        known_type = trial_type in KNOWN_TRIAL_TYPES
 
         trial_mask = tid_series == tid
         time_vals = df_k.loc[trial_mask, "time_ms"].values
 
+        # Collision clock of this trial (kin-relative ms), defined only
+        # when the visual channel is actually published below.  Used for
+        # the first-stimulus-event reference (F2) and the visual-only
+        # re-clock (F4, ADR 0011).
+        collision_time: Optional[float] = None
         if has_visual and lv_ratio_ms and lv_ratio_ms > 0:
             onset_kin = info.get('looming_onset_ms')
             if onset_kin is None:
@@ -1549,7 +1713,7 @@ def adapt_session_pair(
             else:
                 t_rel = time_vals - float(onset_kin)
                 visual_angle = reconstruct_visual_angle(
-                    t_rel, lv_ratio_ms, init_deg=2.0,
+                    t_rel, lv_ratio_ms, init_deg=INIT_DEG_DEFAULT,
                 )
                 # Data-quality guard: reject any non-expanding (flat) curve
                 # regardless of its baseline value.  A flat curve — whether
@@ -1572,6 +1736,20 @@ def adapt_session_pair(
                 else:
                     df_k.loc[trial_mask, "visual_angle"] = visual_angle
                     df_k.loc[trial_mask, "l_v_ratio"] = lv_ratio_ms
+                    collision_time = float(onset_kin) + looming_ttc_ms(
+                        float(lv_ratio_ms), INIT_DEG_DEFAULT,
+                    )
+                    if time_vals.size and collision_time > float(time_vals[-1]):
+                        # The label clock sits beyond the recording: the
+                        # labeler can only see pre-collision activity and
+                        # will fail closed (NO_RESPONSE / PRE_ACTIVE).
+                        warnings.warn(
+                            f"[{session_id}/trial {tid}] computed collision "
+                            f"{collision_time:.1f} ms lies beyond the "
+                            f"recorded window end {float(time_vals[-1]):.1f} "
+                            f"ms; the label clock is outside the data.",
+                            stacklevel=2,
+                        )
         else:
             df_k.loc[trial_mask, "visual_angle"] = 0.0
             df_k.loc[trial_mask, "l_v_ratio"] = 0.0
@@ -1592,29 +1770,60 @@ def adapt_session_pair(
                     kind='mergesort',
                 )
                 stim_time = wind_times.iloc[0]
-                stim_starts.append({
-                    "session_id": session_id,
-                    "trial_id": tid,
-                    "time_ms": stim_time,
-                    "event_type": "stimulus_onset",
-                    "event_value": '{"source": "kinematics_injected"}',
-                })
+                # F2: the label clock is the FIRST stimulus event of the
+                # trial, min(wind onset, collision).  For the wind-first
+                # corpora (wind strictly before the collision) this is the
+                # wind onset, bit-for-bit the historical injection; it
+                # changes only for wind-lagging paradigms.
+                if collision_time is not None and collision_time < float(stim_time):
+                    stim_starts.append({
+                        "session_id": session_id,
+                        "trial_id": tid,
+                        "time_ms": collision_time,
+                        "event_type": "stimulus_onset",
+                        "event_value": _COLLISION_INJECTED_EVENT_VALUE,
+                    })
+                else:
+                    stim_starts.append({
+                        "session_id": session_id,
+                        "trial_id": tid,
+                        "time_ms": stim_time,
+                        "event_type": "stimulus_onset",
+                        "event_value": _LEGACY_INJECTED_EVENT_VALUE,
+                    })
         elif has_visual:
-            parsed_onset = info.get('looming_onset_ms')
-            if parsed_onset is not None:
-                # Keep valid negative kin-relative onsets negative (v4 B F3).
-                # A normal delayed looming (onset > 0) is NOT an anomaly and
-                # must not warn (v4 A5).
-                onset_val = float(parsed_onset)
+            if collision_time is not None:
+                # F4 (ADR 0011): the visual-only label clock is the
+                # COLLISION.  Under the old looming-onset clock no
+                # collision-locked escape could ever be labelled (the
+                # 200 ms response window closes seconds before the
+                # collision).
                 stim_starts.append({
                     "session_id": session_id,
                     "trial_id": tid,
-                    "time_ms": onset_val,
+                    "time_ms": collision_time,
                     "event_type": "stimulus_onset",
-                    "event_value": '{"source": "kinematics_injected"}',
+                    "event_value": _COLLISION_INJECTED_EVENT_VALUE,
                 })
-            # Missing Looming: do NOT fabricate stimulus_onset at 0.0
-            # (v4 review A4 / B F2).
+            else:
+                parsed_onset = info.get('looming_onset_ms')
+                if parsed_onset is not None:
+                    # Legacy fallback when the collision is uncomputable
+                    # (geometry missing / channel unpublished): keep the
+                    # historical looming-onset injection unchanged.
+                    # Keep valid negative kin-relative onsets negative
+                    # (v4 B F3).  A normal delayed looming (onset > 0) is
+                    # NOT an anomaly and must not warn (v4 A5).
+                    onset_val = float(parsed_onset)
+                    stim_starts.append({
+                        "session_id": session_id,
+                        "trial_id": tid,
+                        "time_ms": onset_val,
+                        "event_type": "stimulus_onset",
+                        "event_value": _LEGACY_INJECTED_EVENT_VALUE,
+                    })
+                # Missing Looming: do NOT fabricate stimulus_onset at 0.0
+                # (v4 review A4 / B F2).
 
     # ── 4. Process Events ──
     df_e = pd.read_csv(e_path)

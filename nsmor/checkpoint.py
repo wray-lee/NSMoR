@@ -9,14 +9,20 @@ experiment configuration dictionary.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
 
 import torch
 import torch.nn as nn
 
-from nsmor.config import PIPELINE_SEMANTICS_VERSION
+from nsmor.config import (
+    PIPELINE_SEMANTICS_VERSION,
+    pipeline_version_status,
+)
 from nsmor.pipeline.nested_prior import load_artifact_bytes
+
+logger = logging.getLogger(__name__)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -26,25 +32,48 @@ from nsmor.pipeline.nested_prior import load_artifact_bytes
 def _require_pipeline_version(
     found: Optional[str],
     artifact_description: str,
-) -> None:
+) -> str:
     """
-    Reject artifacts produced under a different (or unknown) pipeline
-    semantics version.
+    Gate an artifact on its pipeline semantics version stamp.
 
     A pre-2.0 checkpoint interprets LIF time constants in FRAME units;
     loading it under the ms-semantics code silently runs a different
     biophysical system.  A pre-2.0 dataset carries same-sample-leaked
     MCMC priors and np.max-based labels.  Both failure modes are silent
-    at load time, so the only safe behaviour is to refuse the artifact.
+    at load time, so those artifacts are refused.
+
+    Retained versions (:data:`nsmor.config.RETAINED_PIPELINE_SEMANTICS_VERSIONS`,
+    e.g. ``2.2`` for the frozen phase-2 corpus) load READ-ONLY with an
+    explicit warning that stamps them as legacy — the user-authorized
+    retention policy from ADR 0011: existing artifacts at the old
+    version must keep loading, clearly marked, instead of breaking.
 
     Args:
         found: The version string stored in the artifact (may be None).
         artifact_description: Human-readable identifier for error text.
 
+    Returns:
+        The :func:`nsmor.config.pipeline_version_status` verdict:
+        ``"current"`` or ``"retained"``.
+
     Raises:
-        RuntimeError: If the version is missing or mismatched.
+        RuntimeError: If the version is missing or not loadable.
     """
-    if found is None:
+    status = pipeline_version_status(found)
+    if status == "current":
+        return status
+    if status == "retained":
+        logger.warning(
+            "%s was produced under pipeline semantics v%s, which is a "
+            "RETAINED (legacy) version under the running code v%s. "
+            "Loading READ-ONLY for continuity; do not interpret its "
+            "labels or features as v%s semantics. See ADR 0011 for the "
+            "label-clock change between these versions.",
+            artifact_description, found, PIPELINE_SEMANTICS_VERSION,
+            PIPELINE_SEMANTICS_VERSION,
+        )
+        return status
+    if status == "missing":
         raise RuntimeError(
             f"{artifact_description} has no 'pipeline_semantics_version' "
             f"stamp: it was produced by pre-2.0 code whose scientific "
@@ -53,13 +82,12 @@ def _require_pipeline_version(
             f"Re-run data preparation / training with the current code "
             f"before using this artifact."
         )
-    if str(found) != PIPELINE_SEMANTICS_VERSION:
-        raise RuntimeError(
-            f"{artifact_description} was produced under pipeline "
-            f"semantics v{found}, but the running code implements "
-            f"v{PIPELINE_SEMANTICS_VERSION}. Refusing to mix semantics. "
-            f"Regenerate the artifact with the current pipeline."
-        )
+    raise RuntimeError(
+        f"{artifact_description} was produced under pipeline "
+        f"semantics v{found}, but the running code implements "
+        f"v{PIPELINE_SEMANTICS_VERSION}. Refusing to mix semantics. "
+        f"Regenerate the artifact with the current pipeline."
+    )
 
 
 # ═══════════════════════════════════════════════════════════════

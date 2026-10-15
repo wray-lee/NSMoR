@@ -37,6 +37,7 @@ from nsmor.config import (
     Label,
     MCMCTrainingConfig,
     PIPELINE_SEMANTICS_VERSION,
+    pipeline_version_status,
 )
 from nsmor.mcmc_module import MCMCPriorGenerator, train_mcmc_cross_fitted
 from nsmor.pipeline.grouping import (
@@ -96,7 +97,16 @@ def validate_nested_dataset(
             "Dataset lacks 'pipeline_semantics_version'. "
             "Legacy unversioned artifacts cannot be used for nested CV."
         )
-    if str(psv) != str(PIPELINE_SEMANTICS_VERSION):
+    version_status = pipeline_version_status(psv)
+    if version_status == "retained":
+        # ADR 0011: retained (legacy) versions keep loading, marked.
+        logger.warning(
+            "Dataset pipeline_semantics_version %r is a RETAINED (legacy) "
+            "version under the running code %r; loading READ-ONLY for "
+            "continuity (see ADR 0011).",
+            psv, PIPELINE_SEMANTICS_VERSION,
+        )
+    elif version_status != "current":
         raise ValueError(
             f"Dataset pipeline_semantics_version {psv!r} != "
             f"expected {PIPELINE_SEMANTICS_VERSION!r}."

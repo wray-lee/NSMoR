@@ -9,14 +9,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import ClassVar, Tuple
+from typing import Any, ClassVar, Tuple
 
 
 # ──────────────────────────────────────────────────────────────
 # Pipeline provenance (Round-2 CRITICAL-A / m-2)
 # ──────────────────────────────────────────────────────────────
 
-PIPELINE_SEMANTICS_VERSION: str = "2.2"
+PIPELINE_SEMANTICS_VERSION: str = "2.3"
 """
 Version tag for the CURRENT scientific semantics of the pipeline.
 
@@ -48,8 +48,69 @@ over a different population.
 
 Every checkpoint written by :func:`nsmor.checkpoint.save_checkpoint`
 carries this key; loaders MUST reject artifacts whose version differs
-(or is absent) instead of silently reinterpreting them.
+(or is absent) instead of silently reinterpreting them — except for the
+explicitly RETAINED versions (below), which load clearly marked as
+legacy, never silently as current.
+
+Bumped to ``2.3`` (phase-3 prerequisites, ADR 0011) because the LABEL
+CLOCK of visual-only trials changed.  The injected ``stimulus_onset``
+of a visual-only trial is now the looming COLLISION
+(``looming_onset + lv_ratio_ms / tan(radians(init_deg/2))``), not the
+looming onset: under the 2.2 clock no collision-locked visual escape
+could ever be labelled (the response window
+``[looming_onset, looming_onset + 200 ms)`` closes seconds before the
+collision; on the phase-2 corpus 1 stored ESCAPE vs 8 collision-anchored
+responders).  The same change makes the multisensory reference event the
+FIRST stimulus event of the trial (``min(wind onset, collision)``), a
+no-op for the existing wind-first corpus but the correct clock for
+wind-lagging paradigms (wind at / after the collision).  New additive
+per-trial keys (``stimulus_soa_ms``, ``stimulus_variant``,
+``stimulus_reference_event``) record the signed wind->collision SOA and
+the reference event.  Every label of a visual-only trial can change
+under this re-clock, so v2.2 and v2.3 label arrays are NOT
+interchangeable for visual-only trials.
+
+``2.2`` is RETAINED (see :data:`RETAINED_PIPELINE_SEMANTICS_VERSIONS`):
+the frozen phase-2 corpus, its checkpoints and its analyses must keep
+loading.  Retained artifacts load READ-ONLY with an explicit warning
+that stamps them as legacy; every other version is still refused.
 """
+
+RETAINED_PIPELINE_SEMANTICS_VERSIONS: Tuple[str, ...] = ("2.2",)
+"""Version stamps that still load, clearly marked as legacy.
+
+A retained version is accepted by the provenance guards with a warning
+that names the version and what changed since; it is never silently
+treated as current.  Artifacts stamped with any other version (or no
+version at all) remain rejected, because pre-2.0 artifacts carry
+leaked priors / frame-unit time constants that are silently
+misinterpreted at load time.
+"""
+
+
+def pipeline_version_status(found: Any) -> str:
+    """Classify an artifact's ``pipeline_semantics_version`` stamp.
+
+    Single source of truth for every provenance gate (checkpoints,
+    datasets, nested-prior artifacts, evaluation scripts).
+
+    Args:
+        found: The stamp stored in the artifact (may be None or any type).
+
+    Returns:
+        ``"current"`` when the stamp equals
+        :data:`PIPELINE_SEMANTICS_VERSION`; ``"retained"`` when it is one
+        of :data:`RETAINED_PIPELINE_SEMANTICS_VERSIONS` (loadable, marked
+        legacy); ``"missing"`` when absent; ``"rejected"`` otherwise.
+    """
+    if found is None:
+        return "missing"
+    text = str(found)
+    if text == PIPELINE_SEMANTICS_VERSION:
+        return "current"
+    if text in RETAINED_PIPELINE_SEMANTICS_VERSIONS:
+        return "retained"
+    return "rejected"
 
 
 # ──────────────────────────────────────────────────────────────

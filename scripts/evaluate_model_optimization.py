@@ -38,8 +38,7 @@ if str(SCRIPTS_DIR) not in sys.path:
 import numpy as np
 import torch
 
-from nsmor.config import PIPELINE_SEMANTICS_VERSION
-
+from nsmor.config import PIPELINE_SEMANTICS_VERSION, pipeline_version_status
 from nsmor.analysis.model_comparison import (
     CANDIDATE_IDS,
     COMPARATOR_IDS,
@@ -62,6 +61,8 @@ if "scripts.train" in sys.modules:
     build_dataloaders = sys.modules["scripts.train"].build_dataloaders
 else:
     from train import build_dataloaders
+
+logger = logging.getLogger(__name__)
 
 # Immutable protocol pins (docs/model-optimization-protocol-20261004.md)
 EXPECTED_DATASET_SHA256 = (
@@ -345,7 +346,16 @@ def validate_checkpoint_dict_config(
     psv = ckpt.get("pipeline_semantics_version")
     if psv is None:
         raise ValueError(f"{label} missing required 'pipeline_semantics_version'")
-    if str(psv) != PIPELINE_SEMANTICS_VERSION:
+    version_status = pipeline_version_status(psv)
+    if version_status == "retained":
+        # ADR 0011: retained (legacy) versions keep loading, marked.
+        logger.warning(
+            "%s pipeline_semantics_version %r is a RETAINED (legacy) "
+            "version under the running code %r; loading READ-ONLY for "
+            "continuity (see ADR 0011).",
+            label, psv, PIPELINE_SEMANTICS_VERSION,
+        )
+    elif version_status != "current":
         raise ValueError(
             f"{label} pipeline_semantics_version mismatch: "
             f"expected '{PIPELINE_SEMANTICS_VERSION}', got '{psv}'"

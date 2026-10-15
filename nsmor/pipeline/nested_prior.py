@@ -23,7 +23,12 @@ from typing import Any, Dict, Optional, Sequence, Tuple, Union
 import numpy as np
 import torch
 
-from nsmor.config import PIPELINE_SEMANTICS_VERSION, FeatureConfig, TimeWindowConfig
+from nsmor.config import (
+    PIPELINE_SEMANTICS_VERSION,
+    FeatureConfig,
+    TimeWindowConfig,
+    pipeline_version_status,
+)
 from nsmor.mcmc_module import MCMCPriorGenerator
 from nsmor.pipeline.clock_storage import restore_clock_provenance
 from nsmor.pipeline.grouping import (
@@ -392,7 +397,17 @@ def load_nested_prior_split(
         )
 
     psv = artifact["pipeline_semantics_version"]
-    if str(psv) != str(PIPELINE_SEMANTICS_VERSION):
+    version_status = pipeline_version_status(psv)
+    if version_status == "retained":
+        # ADR 0011 retention policy: the frozen phase-2 artifact keeps
+        # loading, clearly marked as legacy (never silently current).
+        logger.warning(
+            "Nested prior artifact stamped pipeline_semantics_version %r "
+            "is a RETAINED (legacy) version under the running code %r; "
+            "loading READ-ONLY for continuity (see ADR 0011).",
+            psv, PIPELINE_SEMANTICS_VERSION,
+        )
+    elif version_status != "current":
         raise ValueError(
             f"Artifact pipeline_semantics_version {psv!r} != expected "
             f"{PIPELINE_SEMANTICS_VERSION!r}"

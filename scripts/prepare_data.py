@@ -1454,12 +1454,25 @@ def prepare_dataset(
     logger.info("[Step 5] Extracting continuous sequences with visual physics reconstruction...")
 
     sequences = []
-    from nsmor.pipeline.conditions import derive_anchor_frames
+    from nsmor.pipeline.conditions import (
+        derive_anchor_frames,
+        stimulus_reference_event,
+        stimulus_soa_ms,
+        stimulus_variant_key,
+    )
     anchor_frames_before_cast: List[int] = []
     valid_snaps = []  # 仅收集快照输入，不在循环内推理
     seq_session_ids: List[str] = []  # Round-3 CRITICAL-3b: session id per kept trial
     seq_trial_ids: List[int] = []  # Stable trial id per kept trial
     seq_target_ttc_ms: List[Optional[float]] = []  # Keyed declared target TTC (ms)
+    # Additive per-trial paradigm keys (ADR 0011, F1/F2): the signed
+    # wind->collision SOA read off the saved physical channels, the
+    # (target_ttc_ms, SOA bucket) variant key, and the reference event
+    # the label clock is anchored to.  Old loaders ignore them; a missing
+    # key means "unknown", never a silent default.
+    seq_soa_ms: List[float] = []
+    seq_variants: List[str] = []
+    seq_reference_events: List[str] = []
     # Stimulus modality per kept trial.  The MoR Router's routing
     # hypothesis is per modality, so the condition has to travel with the
     # sequence rather than be re-derived from the 8-D features later (the
@@ -1610,7 +1623,21 @@ def prepare_dataset(
             seq_session_ids.append(str(info["session_id"]))
             seq_trial_ids.append(int(info["trial_id"]))
             seq_target_ttc_ms.append(target_ttc_ms_val)
-            seq_conditions.append(classify_stimulus_condition(trial_data))
+            condition_str = classify_stimulus_condition(trial_data)
+            seq_conditions.append(condition_str)
+            # Additive paradigm keys, derived from the SAVED physical
+            # channels (the same channels the behavior analysis reads, so
+            # stored and recomputed SOAs agree by construction).
+            trial_soa_ms = stimulus_soa_ms(
+                X_saved, X_saved.shape[0], float(dt_ms),
+            )
+            seq_soa_ms.append(trial_soa_ms)
+            seq_variants.append(
+                stimulus_variant_key(condition_str, target_ttc_ms_val, trial_soa_ms)
+            )
+            seq_reference_events.append(
+                stimulus_reference_event(condition_str, trial_soa_ms)
+            )
             seq_clock_provenance.append(trial_data.get("clock_provenance"))
             del model_trial
 
@@ -1678,6 +1705,35 @@ def prepare_dataset(
     assert is_pure_wind.shape == (len(X_seqs),), (
         f"is_pure_wind shape {is_pure_wind.shape} != ({len(X_seqs)},)"
     )
+    stimulus_soa_ms_arr = np.array(seq_soa_ms, dtype=np.float64)
+    stimulus_variant_arr = np.array(seq_variants, dtype=object)
+    stimulus_reference_event_arr = np.array(seq_reference_events, dtype=object)
+    n_seq = len(X_seqs)
+    assert stimulus_soa_ms_arr.shape == (n_seq,), (
+        f"stimulus_soa_ms shape {stimulus_soa_ms_arr.shape} != ({n_seq},)"
+    )
+    assert stimulus_variant_arr.shape == (n_seq,), (
+        f"stimulus_variant shape {stimulus_variant_arr.shape} != ({n_seq},)"
+    )
+    assert stimulus_reference_event_arr.shape == (n_seq,), (
+        f"stimulus_reference_event shape {stimulus_reference_event_arr.shape} "
+        f"!= ({n_seq},)"
+    )
+    # Multisensory trials must carry a finite SOA: both channels are
+    # present by construction, so a non-finite SOA means the saved
+    # channels disagree with the condition stamp (fail closed).
+    multi_mask = stimulus_conditions == "multisensory"
+    if not np.all(np.isfinite(stimulus_soa_ms_arr[multi_mask])):
+        offenders = sorted({
+            str(sid) for sid, bad in zip(
+                snapshot_groups_aligned[multi_mask],
+                ~np.isfinite(stimulus_soa_ms_arr[multi_mask]),
+            ) if bad
+        })
+        raise ValueError(
+            f"multisensory trials with non-finite SOA in session(s) "
+            f"{offenders} (fail closed)"
+        )
     condition_counts = {
         str(name): int(count)
         for name, count in zip(
@@ -1798,6 +1854,19 @@ def prepare_dataset(
         # rather than assume False.
         "stimulus_conditions": stimulus_conditions,
         "is_pure_wind": is_pure_wind,
+        # Additive paradigm keys (ADR 0011).  ``stimulus_soa_ms`` is the
+        # signed per-trial SOA (collision_frame - wind_onset_frame) * dt;
+        # positive means the wind comes first.  ``stimulus_variant`` keys
+        # multisensory trials on (target_ttc_ms, SOA bucket) so paradigms
+        # sharing a TTC but differing in wind timing can never merge.
+        # ``stimulus_reference_event`` records the event the label clock
+        # is anchored to (min(wind onset, collision) for multisensory,
+        # collision for visual_only).  Additive keys — old loaders ignore
+        # them; consumers must treat a missing key as "unknown" rather
+        # than assume a value.
+        "stimulus_soa_ms": np.array(seq_soa_ms, dtype=np.float64),
+        "stimulus_variant": np.array(seq_variants, dtype=object),
+        "stimulus_reference_event": np.array(seq_reference_events, dtype=object),
         # Round-3 (Reviewer A MAJ-3B): label-composition sensitivity to
         # a ±25% scaling of the velocity thresholds.
         "labeling_eligibility": labeling_eligibility,

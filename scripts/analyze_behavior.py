@@ -46,10 +46,15 @@ against a reference cluster bootstrap.
 
 Primary trigger rule (D1, declared before looking at any outcome)
 ------------------------------------------------------------------
-Reference (trigger) event per condition: wind onset for wind-containing
-trials, visual collision for visual-only trials -- exactly
+Reference (trigger) event per trial: the FIRST STIMULUS EVENT,
+``min(wind onset, collision)`` for multisensory trials, wind onset for
+wind_only, visual collision for visual_only -- exactly
 :func:`nsmor.pipeline.conditions.derive_anchor_frames`, the same onset
-reference the labeling pipeline uses.
+reference the labeling pipeline uses (ADR 0011).  For every wind-first
+corpus this is the wind onset, bit-for-bit the historical rule; for
+wind-lagging paradigms (wind at or after the collision) it is the
+collision, and the Miller bound shifts the wind-only term by
+``max(0, -soa)`` accordingly.
 
 D1 fixes a round-2 blocker: the visual response window
 ``[collision - 2000 ms, collision + 1000 ms]`` reached ~1750 ms BEFORE the
@@ -105,8 +110,15 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from nsmor.pipeline.conditions import (  # noqa: E402
+    SOA_BUCKET_MS,
+    SOA_HOMOGENEITY_TOLERANCE_FRAMES,
+    WIND_PRESENCE_THRESHOLD,
     derive_anchor_frames,
     derive_stimulus_metadata,
+    first_stimulus_frame,
+    soa_bucket_ms,
+    stimulus_soa_ms,
+    stimulus_variant_key,
 )
 from nsmor.pipeline.grouping import animal_keys_of  # noqa: E402
 from nsmor.pipeline.labeling import _check_sustained_speed  # noqa: E402
@@ -114,13 +126,39 @@ from nsmor.pipeline.nested_prior import load_artifact_bytes  # noqa: E402
 
 logger = logging.getLogger("analyze_behavior")
 
+
+class UndeclaredTargetTTCError(ValueError):
+    """Named fail-fast: multisensory trials without a declared target TTC.
+
+    An undeclared ``target_ttc_ms`` is saved as NaN by the ETL; the old
+    code then died mid-summary with ``int(NaN)`` after events and
+    responses had already been computed.  The analysis now refuses at
+    entry, listing the affected sessions.
+    """
+
+
+class SOAHomogeneityError(ValueError):
+    """Named fail-closed: a variant's within-cell SOA spread is too wide.
+
+    A ``(target_ttc_ms, SOA bucket)`` variant whose trials do not share
+    one wind->collision delay cannot supply one Miller-bound shift.  The
+    declared tolerance is ``--soa_tolerance_frames`` (default 1 frame);
+    corpora with known wind-delivery jitter must declare a larger
+    tolerance explicitly instead of silently pooling paradigms.
+    """
+
+
 # ── Physical / analysis constants ────────────────────────────────────
 DT_MS_DEFAULT = 4.0
 ESCAPE_THRESHOLD_CMS = 10.0
 # D1: ONE response window, W = 2000 ms, applied identically to every
-# condition, measured STRICTLY AFTER the per-condition trigger.  For
-# visual_only the trigger is the looming collision, so [collision,
-# collision + 2000 ms] covers collision + 1000 ms by construction.
+# condition, measured STRICTLY AFTER the per-condition trigger.  The
+# trigger is the FIRST STIMULUS EVENT of the trial (ADR 0011):
+# min(wind onset, collision) for multisensory trials, wind onset for
+# wind_only, collision for visual_only.  For visual_only [collision,
+# collision + 2000 ms] covers collision + 1000 ms by construction; for
+# wind-lagging paradigms (collision first) the same window covers
+# collision + 2000 ms with the wind onset inside it.
 RESPONSE_WINDOW_MS = 2000.0
 # Legacy collision-anchored window (round 1/2): [collision - 2000 ms,
 # collision + 1000 ms].  Demoted to the labeled SENSITIVITY s3 only.
@@ -204,6 +242,32 @@ def load_corpus(dataset_path: Path) -> Dict[str, Any]:
             "stamped stimulus_conditions disagree with channels; fail closed"
         )
 
+    # Additive paradigm keys (ADR 0011).  A missing key means "unknown"
+    # (old artifact), never a silent default; the analysis then derives
+    # the SOA from the physical channels itself.
+    stored_soa = data.get("stimulus_soa_ms")
+    if stored_soa is not None:
+        stored_soa = np.asarray(stored_soa, dtype=float)
+        if stored_soa.shape != (n,):
+            raise ValueError(
+                f"stimulus_soa_ms shape {stored_soa.shape} != ({n},)"
+            )
+    stored_variant = data.get("stimulus_variant")
+    if stored_variant is not None:
+        stored_variant = np.asarray(stored_variant, dtype=object)
+        if stored_variant.shape != (n,):
+            raise ValueError(
+                f"stimulus_variant shape {stored_variant.shape} != ({n},)"
+            )
+    stored_reference = data.get("stimulus_reference_event")
+    if stored_reference is not None:
+        stored_reference = np.asarray(stored_reference, dtype=object)
+        if stored_reference.shape != (n,):
+            raise ValueError(
+                f"stimulus_reference_event shape {stored_reference.shape} "
+                f"!= ({n},)"
+            )
+
     dt_ms = float(data.get("model_dt_ms", DT_MS_DEFAULT))
     return {
         "x": x,
@@ -220,6 +284,9 @@ def load_corpus(dataset_path: Path) -> Dict[str, Any]:
         ),
         "feature_config": str(data.get("feature_config", "unknown")),
         "labeling_funnel": dict(data.get("labeling_funnel", {})),
+        "stimulus_soa_ms": stored_soa,
+        "stimulus_variant": stored_variant,
+        "stimulus_reference_event": stored_reference,
         "n_trials": n,
     }
 
@@ -284,8 +351,8 @@ def visual_onset(x: np.ndarray) -> int:
 
 
 def wind_onset(x: np.ndarray) -> int:
-    """First frame the wind channel is active (state > 0.5)."""
-    return first_above(x[:, 1], 0.5)
+    """First frame the wind channel is active (> the shared threshold)."""
+    return first_above(x[:, 1], WIND_PRESENCE_THRESHOLD)
 
 
 def escape_frame(
@@ -318,10 +385,14 @@ def detect_events(
 ) -> Dict[str, np.ndarray]:
     """Detect per-trial visual onset, wind onset and visual collision.
 
-    The trigger / reference event reuses
-    :func:`nsmor.pipeline.conditions.derive_anchor_frames`: first wind frame
-    for wind-containing trials, peak visual angle (collision) for
-    visual-only trials.
+    The trigger / reference event is the FIRST STIMULUS EVENT of the
+    trial, :func:`nsmor.pipeline.conditions.first_stimulus_frame`:
+    ``min(wind onset, collision)`` for multisensory trials, the first
+    wind frame for wind_only, the peak visual angle (collision) for
+    visual_only.  The cross-check against
+    :func:`nsmor.pipeline.conditions.derive_anchor_frames` (the shared
+    anchor contract) warns when the condition stamp and the physical
+    channels disagree.
     """
     n = corpus["n_trials"]
     x, conditions = corpus["x"], corpus["conditions"]
@@ -334,20 +405,294 @@ def detect_events(
             v_col[i] = int(np.argmax(x[i][:, 0]))
         if conditions[i] != "visual_only":
             w_on[i] = wind_onset(x[i])
-    anchor_list = derive_anchor_frames(list(x), corpus["lengths"].tolist())
-    ref = np.asarray(anchor_list, dtype=int)
+    ref = np.asarray(
+        [first_stimulus_frame(x[i], corpus["lengths"][i]) for i in range(n)],
+        dtype=int,
+    )
     assert ref.shape == (n,), f"reference shape {ref.shape}"
-    # Cross-check the derived trigger against the physical events.
+    # Cross-check the derived trigger against the shared anchor contract
+    # and the physical events.
+    anchor_list = derive_anchor_frames(list(x), corpus["lengths"].tolist())
     mismatch = 0
     for i in range(n):
-        expected = w_on[i] if conditions[i] != "visual_only" else v_col[i]
-        if expected >= 0 and ref[i] != expected:
+        expected = min(
+            [f for f in (w_on[i], v_col[i]) if f >= 0],
+            default=-1,
+        )
+        if expected >= 0 and (ref[i] != expected or ref[i] != anchor_list[i]):
             mismatch += 1
     if mismatch:
         logger.warning(
             "%d/%d trials: derived anchor != physical trigger", mismatch, n
         )
     return {"v_on": v_on, "w_on": w_on, "v_col": v_col, "ref": ref}
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Paradigm identity, SOA homogeneity, fail-fast guards (F1/F3, ADR 0011)
+# ══════════════════════════════════════════════════════════════════════
+def fail_fast_on_undeclared_ttc(
+    conditions: np.ndarray,
+    ttc: np.ndarray,
+    session_ids: np.ndarray,
+) -> None:
+    """Refuse the analysis at entry when a multisensory TTC is undeclared.
+
+    Args:
+        conditions: ``(N,)`` condition per trial.
+        ttc: ``(N,)`` declared ``target_ttc_ms`` (NaN when undeclared).
+        session_ids: ``(N,)`` session id per trial.
+
+    Raises:
+        UndeclaredTargetTTCError: Listing the affected sessions, their
+            offending trial counts, and the total.
+    """
+    assert conditions.shape == ttc.shape == session_ids.shape, (
+        f"shape mismatch {conditions.shape} {ttc.shape} {session_ids.shape}"
+    )
+    bad = (conditions == "multisensory") & ~np.isfinite(ttc)
+    if not bad.any():
+        return
+    counts: Dict[str, int] = {}
+    for sid in session_ids[bad]:
+        counts[str(sid)] = counts.get(str(sid), 0) + 1
+    listing = ", ".join(
+        f"{sid} (n={counts[sid]})" for sid in sorted(counts)
+    )
+    raise UndeclaredTargetTTCError(
+        f"{int(bad.sum())} multisensory trial(s) have no finite declared "
+        f"target_ttc_ms; a multisensory variant cannot be identified "
+        f"without it. Affected sessions: {listing}. Declare "
+        f"target_ttc_ms in trial_start details (or, for a deliberate "
+        f"variant-unknown bucket, that bucket is not implemented — this "
+        f"entry point fails fast by design)."
+    )
+
+
+def per_trial_soa_ms(
+    corpus: Dict[str, Any],
+    events: Dict[str, np.ndarray],
+    dt_ms: float,
+) -> np.ndarray:
+    """Signed per-trial SOA (ms) from the physical channels.
+
+    ``SOA = (collision_frame - wind_onset_frame) * dt_ms``; positive
+    means the wind comes first.  When the artifact carries the additive
+    ``stimulus_soa_ms`` key it is cross-checked against the channel
+    derivation (a mismatch beyond one frame warns; the channel value is
+    authoritative because the analysis's own event detection produced
+    it).
+    """
+    n = corpus["n_trials"]
+    w_on, v_col = events["w_on"], events["v_col"]
+    soa = np.full(n, np.nan, dtype=float)
+    for i in range(n):
+        if w_on[i] >= 0 and v_col[i] >= 0:
+            soa[i] = float((v_col[i] - w_on[i]) * dt_ms)
+    stored = corpus.get("stimulus_soa_ms")
+    if stored is not None:
+        both = np.isfinite(stored) & np.isfinite(soa)
+        drift = both & (np.abs(stored - soa) > dt_ms + 1e-9)
+        if drift.any():
+            logger.warning(
+                "%d/%d trials: stored stimulus_soa_ms disagrees with the "
+                "channel-derived SOA by more than one frame; using the "
+                "channel-derived value",
+                int(drift.sum()), n,
+            )
+    return soa
+
+
+def multisensory_variants(
+    cond: np.ndarray,
+    ttc: np.ndarray,
+    soa: np.ndarray,
+    dt_ms: float,
+) -> List[Dict[str, Any]]:
+    """Enumerate multisensory variants keyed on ``(ttc, SOA bucket)``.
+
+    Returns:
+        One dict per variant, sorted by ``(ttc, bucket)``: ``ttc``,
+        ``bucket_ms``, ``key`` (the canonical
+        ``"multisensory_ttc<v>_soa<b>"`` key, identical to the persisted
+        ``stimulus_variant`` of a trial in this cell), ``mask`` (bool
+        array over trials), ``soa_median_ms``, ``soa_spread_ms``.
+    """
+    m_multi = cond == "multisensory"
+    buckets = np.asarray([soa_bucket_ms(s) for s in soa], dtype=float)
+    if m_multi.any() and not np.all(np.isfinite(soa[m_multi])):
+        # A multisensory trial always carries both channels (the stamp is
+        # validated against them at load), so a non-finite SOA is corrupt
+        # evidence, not a category: fail closed instead of dropping it.
+        raise ValueError(
+            f"{int(np.sum(m_multi & ~np.isfinite(soa)))} multisensory "
+            f"trial(s) have a non-finite channel-derived SOA (fail closed)"
+        )
+    pairs = sorted({
+        (float(ttc[i]), float(buckets[i])) for i in np.where(m_multi)[0]
+    })
+    variants: List[Dict[str, Any]] = []
+    for ttc_v, bucket in pairs:
+        mask = m_multi & (ttc == ttc_v) & (buckets == bucket)
+        values = finite(soa[mask])
+        variants.append({
+            "ttc": ttc_v,
+            "bucket_ms": bucket,
+            # Canonical key, identical to the persisted stimulus_variant
+            # key of a trial in this cell (one name everywhere).
+            "key": stimulus_variant_key("multisensory", ttc_v, bucket),
+            "mask": mask,
+            "soa_median_ms": float(np.median(values)) if values.size else np.nan,
+            "soa_spread_ms": (
+                float(values.max() - values.min()) if values.size else np.nan
+            ),
+        })
+    return variants
+
+
+def variant_ids(
+    cond: np.ndarray, ttc: np.ndarray, soa: np.ndarray
+) -> np.ndarray:
+    """Per-trial canonical variant key (ADR 0011).
+
+    Multisensory trials are keyed on ``(target_ttc_ms, SOA bucket)``;
+    every other trial keeps its condition name.  Same vocabulary as the
+    persisted ``stimulus_variant`` dataset key.
+    """
+    ids = np.asarray(
+        [
+            stimulus_variant_key(cond[i], ttc[i], soa[i])
+            for i in range(cond.shape[0])
+        ],
+        dtype=object,
+    )
+    assert ids.shape == cond.shape, f"variant ids shape {ids.shape}"
+    return ids
+
+
+def audit_soa_homogeneity(
+    variants: List[Dict[str, Any]],
+    dt_ms: float,
+    tolerance_frames: float,
+) -> Dict[str, Any]:
+    """Fail closed when a variant's within-cell SOA spread is too wide.
+
+    Args:
+        variants: Output of :func:`multisensory_variants`.
+        dt_ms: Frame interval (ms).
+        tolerance_frames: Declared tolerance in frames.
+
+    Returns:
+        Audit report (declared tolerance, per-variant spread, verdict).
+
+    Raises:
+        SOAHomogeneityError: When any variant's spread exceeds
+            ``tolerance_frames * dt_ms`` or a variant has no finite SOA.
+    """
+    tolerance_ms = float(tolerance_frames) * float(dt_ms)
+    per_variant: Dict[str, Any] = {}
+    violations: List[str] = []
+    for v in variants:
+        spread = v["soa_spread_ms"]
+        n = int(v["mask"].sum())
+        passed = bool(np.isfinite(spread) and spread <= tolerance_ms + 1e-9)
+        per_variant[v["key"]] = {
+            "n": n,
+            "soa_median_ms": v["soa_median_ms"],
+            "soa_spread_ms": spread,
+            "soa_spread_frames": (
+                float(spread / dt_ms) if np.isfinite(spread) else None
+            ),
+            "passed": passed,
+        }
+        if not passed:
+            violations.append(
+                f"{v['key']} (n={n}, spread={spread} ms = "
+                f"{spread / dt_ms:.1f} frames)"
+                if np.isfinite(spread)
+                else f"{v['key']} (n={n}, no finite SOA)"
+            )
+    report = {
+        "declared_tolerance_frames": float(tolerance_frames),
+        "declared_tolerance_ms": tolerance_ms,
+        "dt_ms": float(dt_ms),
+        "soa_bucket_ms": float(SOA_BUCKET_MS),
+        "per_variant": per_variant,
+        "passed": not violations,
+        "definition": (
+            "within-variant SOA spread = max - min of the per-trial "
+            "signed SOA (collision_frame - wind_onset_frame) * dt_ms "
+            "inside one (target_ttc_ms, SOA bucket) variant; the spread "
+            "must not exceed the declared tolerance"
+        ),
+    }
+    if violations:
+        raise SOAHomogeneityError(
+            "SOA-homogeneity audit FAILED (fail closed): "
+            + "; ".join(violations)
+            + f". Tolerance = {tolerance_frames} frame(s) = "
+            f"{tolerance_ms} ms. If the corpus's wind-delivery jitter "
+            f"genuinely exceeds the default (e.g. the phase-2 corpus "
+            f"measures 6-7 frames), declare the corpus's tolerance "
+            f"explicitly with --soa_tolerance_frames; never pool "
+            f"paradigms with different wind timing silently."
+        )
+    return report
+
+
+def pre_reference_responders(
+    cond: np.ndarray,
+    w_on: np.ndarray,
+    responses: Dict[str, np.ndarray],
+    labels: np.ndarray,
+    variant_keys: np.ndarray,
+) -> Dict[str, Any]:
+    """Named class: responders whose initiation precedes the wind onset.
+
+    Under the first-stimulus reference clock a wind-lagging trial's
+    collision-triggered escape is a response that lies strictly BEFORE
+    the wind onset frame.  The old wind-onset clock could not see it as
+    such: it was either excluded by the stationarity gate or misdated to
+    ~0 ms after the wind onset, and the stored label carried PRE_ACTIVE.
+    This block reports that class explicitly so the replacement is
+    visible (it is empty, by construction, on wind-first corpora).
+    """
+    n = cond.shape[0]
+    counts: Dict[str, Dict[str, int]] = {}
+    for clock, resp in (
+        ("primary", responses["resp"]),
+        ("s1_labeling_gated", responses["resp_label"]),
+    ):
+        per_cond: Dict[str, int] = {}
+        for c in ("visual_only", "wind_only", "multisensory"):
+            sel = (cond == c) & (w_on >= 0)
+            per_cond[c] = int(np.sum(sel & (resp >= 0) & (resp < w_on)))
+        counts[clock] = per_cond
+    per_variant: Dict[str, int] = {}
+    for key in sorted(set(variant_keys[cond == "multisensory"].tolist())):
+        sel = (cond == "multisensory") & (variant_keys == key)
+        per_variant[str(key)] = int(
+            np.sum(sel & (responses["resp"] >= 0)
+                   & (responses["resp"] < w_on))
+        )
+    assert all(v.shape == (n,) for v in responses.values())
+    return {
+        "definition": (
+            "a detected response whose initiation frame lies STRICTLY "
+            "BEFORE the trial's wind onset frame; with the "
+            "first-stimulus reference clock these are the "
+            "collision-triggered responses of wind-lagging trials that "
+            "the wind-onset clock could not see as such (its artefacts "
+            "were stored PRE_ACTIVE labels and ~0 ms wind-onset "
+            "responses). Zero by construction on wind-first corpora."
+        ),
+        "counts_by_condition": counts,
+        "counts_by_variant_primary": per_variant,
+        "stored_pre_active_by_condition": {
+            c: int(np.sum((cond == c) & (labels == 2)))
+            for c in ("visual_only", "wind_only", "multisensory")
+        },
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -584,33 +929,66 @@ def miller_bound(
     soa_vals: Sequence[float],
     soa_weights: Sequence[float],
 ) -> np.ndarray:
-    """Miller (1982) race bound on the wind clock, SOA-corrected.
+    """Miller (1982) race bound on the reference clock, SOA-corrected.
 
-    ``bound(t) = F_A(t) + sum_k w_k F_V(t - soa_k)`` with ``F_A`` the
-    wind-only defective CDF (from wind onset), ``F_V`` the visual-only
-    defective CDF (from collision) and ``soa_k`` the wind->collision SOA
-    of variant ``k``.  A race model implies ``F_AV <= bound`` everywhere.
+    The reference clock is the trial's FIRST STIMULUS EVENT
+    (``min(wind onset, collision)``; ADR 0011), so the two
+    single-modality clocks sit at per-variant offsets
+    ``tau_wind_k = max(0, -soa_k)`` (wind onset after the reference for
+    wind-lagging variants) and ``tau_col_k = max(0, soa_k)`` (collision
+    after the reference for wind-first variants), where
+    ``soa_k = collision - wind onset`` (positive = wind first).  The
+    mixture bound is
+
+    ``bound(t) = sum_k w_k [F_A(t - tau_wind_k) + F_V(t - tau_col_k)]``
+
+    with ``F_A`` the wind-only defective CDF (from wind onset) and
+    ``F_V`` the visual-only defective CDF (from collision).  A race model
+    implies ``F_AV <= bound`` everywhere.
+
+    For a wind-first corpus (every ``soa_k >= 0``, so every
+    ``tau_wind_k = 0``) this reduces EXACTLY to the historical
+    ``F_A(t) + sum_k w_k F_V(t - soa_k)``, evaluated by the same
+    expression order (bit-identical); the A-term shift only appears for
+    wind-lagging variants.
 
     Args:
-        tgrid: ``(T,)`` wind-clock time grid in ms.
+        tgrid: ``(T,)`` reference-clock time grid in ms.
         lat_a: Sorted finite wind-only latencies (ms).
         n_a: Wind-only population size (denominator of ``F_A``).
         lat_v: Sorted finite visual-only latencies (ms, from collision).
         n_v: Visual-only population size (denominator of ``F_V``).
-        soa_vals: Per-variant wind->collision SOAs (ms).
+        soa_vals: Per-variant SIGNED wind->collision SOAs (ms); the
+            clock offsets are derived from the sign.
         soa_weights: Per-variant mixture weights (sum to 1).
 
     Returns:
         ``(T,)`` Miller bound on ``tgrid``.
     """
     assert tgrid.ndim == 1, f"tgrid shape {tgrid.shape}"
-    fa = ecdf(lat_a, tgrid, n_a)
-    bound = fa.copy()
     weights = np.asarray(soa_weights, dtype=float)
     if weights.sum() > 0:
         weights = weights / weights.sum()
-    for soa, w in zip(soa_vals, weights):
-        bound = bound + w * ecdf(lat_v, tgrid - soa, n_v)
+    soa_arr = np.asarray(soa_vals, dtype=float)
+    if bool(np.all(soa_arr >= 0.0)):
+        # Wind-first path: tau_wind = 0 and tau_col = soa, i.e. the
+        # historical expression, evaluated in the same order (bitwise
+        # identical for the existing corpus).
+        fa = ecdf(lat_a, tgrid, n_a)
+        bound = fa.copy()
+        for soa, w in zip(soa_arr, weights):
+            bound = bound + w * ecdf(lat_v, tgrid - soa, n_v)
+    else:
+        # First-stimulus clock with at least one wind-lagging variant:
+        # both terms shift by their own clock offset inside the mixture.
+        bound = np.zeros_like(tgrid, dtype=float)
+        for soa, w in zip(soa_arr, weights):
+            tau_wind = max(0.0, -float(soa))
+            tau_col = max(0.0, float(soa))
+            bound = bound + w * (
+                ecdf(lat_a, tgrid - tau_wind, n_a)
+                + ecdf(lat_v, tgrid - tau_col, n_v)
+            )
     # M1: a Miller bound is a probability -- clip at 1 (F_A + F_V can exceed
     # 1 for late t, which is meaningless as a CDF upper envelope).
     bound = np.clip(bound, 0.0, RACE_CDF_CLIP)
@@ -812,16 +1190,27 @@ def weighted_count(sel: np.ndarray, weights: np.ndarray) -> float:
 
 
 # ══════════════════════════════════════════════════════════════════════
-# Race model per TTC group (C2, B2/B3/B4/B5/M1)
+# Race model per variant group (C2, B2/B3/B4/B5/M1)
 # ══════════════════════════════════════════════════════════════════════
-def race_strata(cond: np.ndarray, ttc: np.ndarray) -> np.ndarray:
-    """Per-trial bootstrap stratum: condition, split by TTC for multisensory."""
+def race_strata(cond: np.ndarray, variant: np.ndarray) -> np.ndarray:
+    """Per-trial bootstrap stratum: condition, split by VARIANT.
+
+    A multisensory stratum is the canonical ``(target_ttc_ms, SOA bucket)``
+    variant key (F1), so two paradigms that share a TTC but differ in
+    wind timing are never pooled into one resampling stratum.  For a
+    corpus whose prefixes each carry exactly one variant, the partition —
+    and therefore the bootstrap draw sequence — is identical to the
+    historical TTC-keyed strata.
+    """
+    assert cond.shape == variant.shape, (
+        f"cond/variant shape {cond.shape} {variant.shape}"
+    )
     strata = np.empty(cond.shape[0], dtype=object)
     for i in range(cond.shape[0]):
-        if cond[i] == "multisensory":
-            strata[i] = f"multi_{int(ttc[i])}"
-        else:
-            strata[i] = str(cond[i])
+        strata[i] = (
+            f"multi_{variant[i]}" if cond[i] == "multisensory"
+            else str(cond[i])
+        )
     return strata
 
 
@@ -829,7 +1218,25 @@ def _variant_soa(
     m_multi: np.ndarray, ttc: np.ndarray, w_on: np.ndarray, v_col: np.ndarray,
     dt_ms: float, v: float,
 ) -> float:
-    """Median wind->collision SOA (ms) for one multisensory TTC variant."""
+    """Median signed wind->collision SOA (ms) for one multisensory TTC group.
+
+    Backward-compatible accessor kept at its historical signature and
+    semantics (the phase-3 model-comparison spec imports
+    ``ab._variant_soa`` as the frozen SOA definition and pins its values on
+    the existing corpus: 356/288/244/208 ms).  The value is the median of
+    ``(collision_frame - wind_onset_frame) * dt_ms`` over the multisensory
+    trials of TTC ``v`` -- the SAME channel-derived definition the analysis
+    uses (:func:`per_trial_soa_ms`); for the existing corpus it is
+    bit-identical to the historical expression.  ``0.0`` when the group is
+    empty (historical fallback).
+
+    On a corpus where ONE TTC carries several paradigms (F1) this pools
+    them; the ``(target_ttc_ms, SOA bucket)``-aware API for that case is
+    :func:`multisensory_variants` / :func:`per_trial_soa_ms`.
+    """
+    assert m_multi.shape == ttc.shape == w_on.shape == v_col.shape, (
+        f"shape mismatch {m_multi.shape} {ttc.shape} {w_on.shape} {v_col.shape}"
+    )
     sel = m_multi & (ttc == v)
     d = finite((v_col[sel] - w_on[sel]) * dt_ms)
     return float(np.median(d)) if d.size else 0.0
@@ -838,9 +1245,8 @@ def _variant_soa(
 def run_race_model(
     cond: np.ndarray,
     ttc: np.ndarray,
+    soa: np.ndarray,
     latency: np.ndarray,
-    w_on: np.ndarray,
-    v_col: np.ndarray,
     prefix_keys: np.ndarray,
     eligible: np.ndarray,
     dt_ms: float,
@@ -850,16 +1256,24 @@ def run_race_model(
     n_perm: int = 2000,
     perm_rng: Optional[np.random.Generator] = None,
 ) -> Dict[str, Any]:
-    """SOA-corrected Miller test per TTC variant and pooled (D1/D2/D5).
+    """SOA-corrected Miller test per variant and pooled (D1/D2/D5).
 
-    Each multisensory TTC variant (each prefix has exactly one TTC) is a
-    separate between-group comparison against the SAME eligible wind_only
-    and visual_only populations.  Only ELIGIBLE trials (stationary at the
-    D1 trigger) enter any CDF; ``n_eligible`` records the per-condition
+    Each multisensory variant — a ``(target_ttc_ms, SOA bucket)`` cell,
+    each prefix carrying exactly one variant — is a separate
+    between-group comparison against the SAME eligible wind_only and
+    visual_only populations.  Only ELIGIBLE trials (stationary at the D1
+    trigger) enter any CDF; ``n_eligible`` records the per-condition
     denominators and the excluded counts are reported.
 
+    The D1 trigger is the trial's FIRST stimulus event (ADR 0011):
+    ``min(wind onset, collision)``.  The Miller bound is evaluated on
+    that clock: the visual term shifts by ``max(0, soa_k)`` and the
+    wind-only term by ``max(0, -soa_k)``, so a wind-lagging variant's
+    collision-triggered responses are comparable with the wind-alone CDF
+    (see :func:`miller_bound`).
+
     Violation areas carry **true with-replacement** prefix-cluster bootstrap
-    CIs (B1).  PRIMARY race inference (D2) is, per TTC variant and pooled:
+    CIs (B1).  PRIMARY race inference (D2) is, per variant and pooled:
 
     * a prefix-cluster **bootstrap CI of the violation area** -- the same
       with-replacement cluster bootstrap that produced the point estimate;
@@ -877,19 +1291,19 @@ def run_race_model(
     No pseudo-p (``1 - frac > 0``) and no BH-FDR on such a pseudo-p are
     reported.  The one-sided prefix-permutation p-values are corrected for
     multiplicity with **Holm** (X2) over the declared race family (pooled +
-    the 4 TTC variants); raw and Holm-adjusted p are both reported.  Power
-    (D5) is reported for the FACILITATION contrast only;
-    no signed one-sample race power is emitted (a violation area is a
-    non-negative quantity whose sign is uninformative).  A simulation-based
-    power for the permutation test is estimated from the cluster bootstrap
-    when ``n_boot`` permits.
+    the variants actually used, named in ``holm_family``); raw and
+    Holm-adjusted p are both reported.  Power (D5) is reported for the
+    FACILITATION contrast only; no signed one-sample race power is emitted
+    (a violation area is a non-negative quantity whose sign is
+    uninformative).  A simulation-based power for the permutation test is
+    estimated from the cluster bootstrap when ``n_boot`` permits.
 
     Args:
         cond: ``(N,)`` condition per trial.
         ttc: ``(N,)`` target TTC per trial (ms).
+        soa: ``(N,)`` signed channel-derived SOA per trial (ms; positive =
+            wind first).
         latency: ``(N,)`` PRIMARY eligible latency, ms.
-        w_on: ``(N,)`` wind onset frame.
-        v_col: ``(N,)`` visual collision frame.
         prefix_keys: ``(N,)`` recording-prefix key.
         eligible: ``(N,)`` D1 eligibility mask.
         dt_ms: Frame interval (ms).
@@ -907,33 +1321,32 @@ def run_race_model(
     m_vis = cond == "visual_only"
     m_multi = cond == "multisensory"
     el = eligible
-    variants = np.unique(ttc[m_multi])
+    variants = multisensory_variants(cond, ttc, soa, dt_ms)
     tgrid = np.arange(0.0, RESPONSE_WINDOW_MS + dt_ms, dt_ms)
     if perm_rng is None:
         perm_rng = np.random.default_rng(1234)
 
-    soa_vals = [
-        _variant_soa(m_multi, ttc, w_on, v_col, dt_ms, float(v)) for v in variants
-    ]
-    counts = np.array([int((m_multi & (ttc == v) & el).sum()) for v in variants], float)
+    soa_vals = [v["soa_median_ms"] for v in variants]
+    counts = np.array([int((v["mask"] & el).sum()) for v in variants], float)
     weights = counts / counts.sum() if counts.sum() else counts
-    strata = race_strata(cond, ttc)
+    strata = race_strata(cond, variant_ids(cond, ttc, soa))
 
     def cdf_terms(
-        w: np.ndarray, v: Optional[float]
-    ) -> Tuple[np.ndarray, int, np.ndarray, int, np.ndarray, int, np.ndarray]:
-        """Return (lat_av, n_av, lat_a, n_a, lat_v, n_v, variant_weights)."""
+        w: np.ndarray, v: Optional[Dict[str, Any]]
+    ) -> Tuple[np.ndarray, int, np.ndarray, int, np.ndarray, int, np.ndarray,
+               np.ndarray]:
+        """Return (lat_av, n_av, lat_a, n_a, lat_v, n_v, soa, weights)."""
         if v is None:
             av_sel = m_multi & el
             wv = np.array(
-                [weighted_count(m_multi & (ttc == vv) & el, w) for vv in variants]
+                [weighted_count(vv["mask"] & el, w) for vv in variants]
             )
             wv = wv / wv.sum() if wv.sum() else weights
             sv = soa_vals
         else:
-            av_sel = m_multi & (ttc == v) & el
+            av_sel = v["mask"] & el
             wv = np.array([1.0])
-            sv = [_variant_soa(m_multi, ttc, w_on, v_col, dt_ms, float(v))]
+            sv = [v["soa_median_ms"]]
         lat_av = expand_weighted(latency[av_sel], w[av_sel])
         n_av = int(round(weighted_count(av_sel, w)))
         lat_a = expand_weighted(latency[m_wind & el], w[m_wind & el])
@@ -947,7 +1360,7 @@ def run_race_model(
             sv, wv,
         )
 
-    def area_for(w: np.ndarray, v: Optional[float]) -> Dict[str, Any]:
+    def area_for(w: np.ndarray, v: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         lat_av, n_av, lat_a, n_a, lat_v, n_v, sv, wv = cdf_terms(w, v)
         fav = ecdf(lat_av, tgrid, n_av)
         bound = miller_bound(tgrid, lat_a, n_a, lat_v, n_v, sv, wv)
@@ -963,19 +1376,24 @@ def run_race_model(
     out: Dict[str, Any] = {
         "design": (
             "A=wind_only (from wind onset), V=visual_only (from collision), "
-            "AV=multisensory (from wind onset); V trigger shifted by the "
-            "per-variant wind->collision SOA."
+            "AV=multisensory (from the first stimulus event "
+            "min(wind onset, collision)); the visual term is shifted by "
+            "max(0, soa) and the wind-only term by max(0, -soa) on that clock."
         ),
         "reference_per_condition": {
             "wind_only": "wind onset",
-            "multisensory": "wind onset",
+            "multisensory": (
+                "first stimulus event: min(wind onset, collision)"
+            ),
             "visual_only": "visual collision",
         },
         "inclusion_rule": (
             "D1 primary: eligible only if |Y| < 10 cm/s throughout "
             "[trigger-250 ms, trigger]; latency = first frame STRICTLY after "
             "the trigger with |Y| >= 10 cm/s in [trigger, trigger + 2000 ms], "
-            "trigger = wind onset (wind-containing) / collision (visual_only)"
+            "trigger = first stimulus event (min(wind onset, collision) for "
+            "multisensory; wind onset for wind_only; collision for "
+            "visual_only)"
         ),
         "nonresponder_handling": (
             "defective CDF: no |Y|>=10 cm/s in the post-trigger window "
@@ -989,6 +1407,7 @@ def run_race_model(
             }
             for c in ("visual_only", "wind_only", "multisensory")
         },
+        "variant_keys": [v["key"] for v in variants],
         "soa_wind_to_collision_ms": [float(x) for x in soa_vals],
         "variant_weights": [float(x) for x in weights],
         "cdf_at_2s": {
@@ -1042,21 +1461,21 @@ def run_race_model(
     out["pooled"]["n_prefixes"] = int(len({str(p) for p in prefix_keys[m_multi]}))
 
     for v in variants:
-        point = area_for(unit, float(v))
+        point = area_for(unit, v)
         boots = [
-            area_for(w, float(v))["violation"]["area"]
+            area_for(w, v)["violation"]["area"]
             for w in bootstrap_weights(prefix_keys, strata, n_boot, rng)
         ]
         arr = np.asarray(boots)
-        n_pref_v = int(len({str(p) for p in prefix_keys[m_multi & (ttc == v)]}))
-        out["per_variant"][f"ttc_{int(v)}"] = {
+        n_pref_v = int(len({str(p) for p in prefix_keys[v["mask"]]}))
+        out["per_variant"][v["key"]] = {
             "n_av": point["n_av"],
             "n_prefixes": n_pref_v,
             # D4: a variant with < 5 prefixes is flagged uninformative.
             "informative": bool(n_pref_v >= 5),
-            "soa_wind_to_collision_ms": _variant_soa(
-                m_multi, ttc, w_on, v_col, dt_ms, float(v)
-            ),
+            "ttc_ms": float(v["ttc"]),
+            "soa_bucket_ms": float(v["bucket_ms"]),
+            "soa_wind_to_collision_ms": v["soa_median_ms"],
             "violation_area": point["violation"]["area"],
             "violation_max": point["violation"]["max"],
             "violation_peak_time_ms": point["violation"]["peak_time_ms"],
@@ -1070,7 +1489,7 @@ def run_race_model(
 
     # ── D2: prefix-level permutation test of the violation area ─────────
     out["permutation_test"] = prefix_permutation_test(
-        cond, ttc, latency, w_on, v_col, prefix_keys, el, dt_ms,
+        cond, ttc, soa, latency, prefix_keys, el, dt_ms,
         n_perm, perm_rng,
     )
 
@@ -1088,7 +1507,7 @@ def run_race_model(
         len({str(p) for p in prefix_keys[m_multi]})
     )
     out["n_prefixes_per_variant"] = {
-        f"ttc_{int(v)}": int(len({str(p) for p in prefix_keys[m_multi & (ttc == v)]}))
+        v["key"]: int(len({str(p) for p in prefix_keys[v["mask"]]}))
         for v in variants
     }
 
@@ -1109,7 +1528,9 @@ def run_race_model(
         nv2 = int((m_vis & el).sum())
         fav2 = ecdf(np.sort(finite(lat2[m_multi & el])), tgrid,
                     int((m_multi & el).sum()))
-        bound2 = miller_bound(tgrid, lat_a2, na2, lat_v2, nv2, soa_vals, weights)
+        bound2 = miller_bound(
+            tgrid, lat_a2, na2, lat_v2, nv2, soa_vals, weights,
+        )
         out["sensitivity_labeling_responder"] = {
             "note": (
                 "s1: response criterion = labeling sustained > 5 cm/s for "
@@ -1178,9 +1599,8 @@ def _race_power(
 def prefix_permutation_test(
     cond: np.ndarray,
     ttc: np.ndarray,
+    soa: np.ndarray,
     latency: np.ndarray,
-    w_on: np.ndarray,
-    v_col: np.ndarray,
     prefix_keys: np.ndarray,
     eligible: np.ndarray,
     dt_ms: float,
@@ -1206,18 +1626,19 @@ def prefix_permutation_test(
     is essentially the AV-vs-A facilitation area -- this is the boundary
     case of the race null, stated explicitly in ``note``.
 
-    Reported per TTC variant AND pooled.  For a variant the AV group is that
-    variant's prefixes and the A group is all wind_only prefixes; the visual
-    term (if any) uses that variant's SOA.
+    Reported per variant AND pooled.  For a variant the AV group is that
+    variant's prefixes and the A group is all wind_only prefixes; the
+    single-modality terms use that variant's signed SOA on the
+    first-stimulus reference clock (``miller_bound``).
 
     Args:
-        cond, ttc, latency, w_on, v_col, prefix_keys, eligible, dt_ms:
+        cond, ttc, soa, latency, prefix_keys, eligible, dt_ms:
             As in :func:`run_race_model`.
         n_perm: Permutation replicates.
         perm_rng: Seeded generator.
 
     Returns:
-        Dict keyed by ``pooled`` and ``ttc_<v>``; each entry carries
+        Dict keyed by ``pooled`` and each variant key; each entry carries
         ``observed_area_ms``, ``null_mean``, ``null_p95``, ``p_one_sided``,
         ``n_perm``, ``n_prefixes`` and a shared ``note``.
     """
@@ -1226,7 +1647,7 @@ def prefix_permutation_test(
     m_vis = cond == "visual_only"
     el = eligible
     tgrid = np.arange(0.0, RESPONSE_WINDOW_MS + dt_ms, dt_ms)
-    variants = np.unique(ttc[m_multi])
+    variants = multisensory_variants(cond, ttc, soa, dt_ms)
 
     # Fixed visual term (D1: post-collision responders).  It is small and is
     # held constant across the AV-vs-A relabeling.
@@ -1253,7 +1674,9 @@ def prefix_permutation_test(
     )
 
     def permutation_for(
-        av_prefixes: np.ndarray, soa_vals: np.ndarray, wv: np.ndarray
+        av_prefixes: np.ndarray,
+        soa_vals: np.ndarray,
+        wv: np.ndarray,
     ) -> Dict[str, Any]:
         """One AV-vs-A prefix permutation for a given AV prefix set.
 
@@ -1300,12 +1723,11 @@ def prefix_permutation_test(
 
     out: Dict[str, Any] = {"note": note}
 
-    # Pooled AV: all multisensory prefixes; visual term is the SOA mixture.
-    pooled_soa = np.array(
-        [_variant_soa(m_multi, ttc, w_on, v_col, dt_ms, float(v)) for v in variants]
-    )
+    # Pooled AV: all multisensory prefixes; single-modality terms are the
+    # SOA mixture over the variants actually used.
+    pooled_soa = np.array([v["soa_median_ms"] for v in variants])
     pooled_w = np.array(
-        [int((m_multi & (ttc == v) & el).sum()) for v in variants], dtype=float
+        [int((v["mask"] & el).sum()) for v in variants], dtype=float
     )
     pooled_w = pooled_w / pooled_w.sum() if pooled_w.sum() else pooled_w
     multi_prefixes = np.array(
@@ -1313,32 +1735,39 @@ def prefix_permutation_test(
     )
     out["pooled"] = permutation_for(multi_prefixes, pooled_soa, pooled_w)
 
-    # Per-variant AV: that variant's prefixes; visual term = variant SOA.
+    # Per-variant AV: that variant's prefixes; terms use the variant SOA.
     for v in variants:
         av_pref = np.array(
-            sorted({str(p) for p in prefix_keys[m_multi & (ttc == v)]}), dtype=object
+            sorted({str(p) for p in prefix_keys[v["mask"]]}), dtype=object
         )
-        sv = np.array([_variant_soa(m_multi, ttc, w_on, v_col, dt_ms, float(v))])
+        sv = np.array([v["soa_median_ms"]])
         wv1 = np.array([1.0])
-        out[f"ttc_{int(v)}"] = permutation_for(av_pref, sv, wv1)
+        out[v["key"]] = permutation_for(av_pref, sv, wv1)
 
-    # ── X2: Holm correction over the DECLARED race family (pooled + the 4
-    # TTC variants).  The family is declared before the p-values are read.
-    family_keys = ["pooled"] + [f"ttc_{int(v)}" for v in variants]
+    # ── X2: Holm correction over the DECLARED race family (pooled + the
+    # variants actually used).  The family is declared before the p-values
+    # are read, and its composition is generated from that same list.
+    family_keys = ["pooled"] + [v["key"] for v in variants]
+    family_members = ", ".join(v["key"] for v in variants)
     raw = [out[k].get("p_one_sided") for k in family_keys]
     adj = holm_adjust(raw)
     for k, adj_p in zip(family_keys, adj):
         out[k]["p_one_sided_holm"] = float(adj_p)
     out["holm_family"] = {
         "correction": "Holm step-down (family-wise error rate)",
-        "family": "the race violation family: pooled + the 4 TTC variants",
+        "family": (
+            f"the race violation family: pooled + the {len(variants)} "
+            f"multisensory variants actually used ({family_members})"
+        ),
+        "family_keys": family_keys,
         "m": int(sum(1 for p in raw if p is not None)),
         "note": (
-            "Holm over the declared 5-test race family (pooled + 4 TTC "
-            "variants) on the prefix-permutation one-sided p-values; raw "
-            "`p_one_sided` and adjusted `p_one_sided_holm` are both reported. "
-            "A variant with no permutation null is excluded from m and its "
-            "Holm p is NaN."
+            f"Holm over the declared {len(family_keys)}-test race family "
+            f"(pooled + {len(variants)} multisensory variants: "
+            f"{family_members}) on the prefix-permutation one-sided "
+            f"p-values; raw `p_one_sided` and adjusted `p_one_sided_holm` "
+            f"are both reported. A variant with no permutation null is "
+            f"excluded from m and its Holm p is NaN."
         ),
     }
     return out
@@ -1498,9 +1927,10 @@ def fit_latency_distribution(x: np.ndarray) -> Dict[str, Any]:
 
 
 def run_accumulation(
-    cond: np.ndarray, ttc: np.ndarray, latency: np.ndarray
+    cond: np.ndarray, ttc: np.ndarray, soa: np.ndarray, latency: np.ndarray,
+    dt_ms: float,
 ) -> Dict[str, Any]:
-    """Ex-Gaussian fits per group and the mean-SD trend across TTC variants."""
+    """Ex-Gaussian fits per group and the mean-SD trend across variants."""
     from scipy import stats as sps
 
     m_multi = cond == "multisensory"
@@ -1511,15 +1941,17 @@ def run_accumulation(
             latency[cond == "visual_only"]
         ),
     }
+    variants = multisensory_variants(cond, ttc, soa, dt_ms)
     groups: List[Dict[str, Any]] = []
-    for v in np.unique(ttc[m_multi]):
-        sel = m_multi & (ttc == v)
-        x = finite(latency[sel])
-        acc[f"multisensory_ttc_{int(v)}"] = fit_latency_distribution(x)
+    for v in variants:
+        x = finite(latency[v["mask"]])
+        acc[f"multisensory_{v['key']}"] = fit_latency_distribution(x)
         if x.size >= 20:
             groups.append(
                 {
-                    "ttc_ms": int(v),
+                    "variant": v["key"],
+                    "ttc_ms": float(v["ttc"]),
+                    "soa_median_ms": v["soa_median_ms"],
                     "n": int(x.size),
                     "mean": float(x.mean()),
                     "sd": float(x.std(ddof=1)),
@@ -1540,7 +1972,8 @@ def run_accumulation(
         ),
         "interpretation": (
             "right skew + ex-Gaussian best-fit + mean-SD co-increase is the "
-            "accumulation-to-threshold signature; 'suggestive' at 4 points"
+            f"accumulation-to-threshold signature; 'suggestive' at "
+            f"{len(groups)} points"
         ),
     }
 
@@ -1549,26 +1982,50 @@ def run_accumulation(
 # Looming trigger rule (descriptive; negative item)
 # ══════════════════════════════════════════════════════════════════════
 def run_looming_trigger(
-    cond: np.ndarray, ttc: np.ndarray, latency: np.ndarray, w_on: np.ndarray,
-    v_col: np.ndarray, dt_ms: float,
+    cond: np.ndarray, ttc: np.ndarray, soa: np.ndarray, latency: np.ndarray,
+    w_on: np.ndarray, v_col: np.ndarray, dt_ms: float,
 ) -> Dict[str, Any]:
-    """Escape time relative to collision across the four TTC variants."""
+    """Escape time relative to collision across the multisensory variants.
+
+    ``latency`` is measured on the trial's FIRST-STIMULUS reference clock
+    (ADR 0011): ``min(wind onset, collision)``.  The conversion to the
+    collision clock subtracts the offset of the reference from the
+    collision, ``max(0, v_col - w_on) * dt_ms`` -- the historical
+    ``v_col - w_on`` shift for wind-first variants (whose reference is the
+    wind onset), and exactly ZERO for simultaneous and wind-lagging
+    variants (SOA <= 0), whose reference IS the collision, so their
+    ``latency`` is already collision-relative and must not be shifted
+    again.  Same expression as :func:`figure_trigger`.
+    """
     from scipy import stats as sps
 
-    m_multi = cond == "multisensory"
+    assert cond.shape == ttc.shape == soa.shape == latency.shape, (
+        f"shape mismatch {cond.shape} {ttc.shape} {soa.shape} {latency.shape}"
+    )
+    assert w_on.shape == v_col.shape == latency.shape, (
+        f"event shape mismatch {w_on.shape} {v_col.shape} {latency.shape}"
+    )
+    variants = multisensory_variants(cond, ttc, soa, dt_ms)
     per_variant: List[Dict[str, Any]] = []
-    for v in np.unique(ttc[m_multi]):
-        sel = m_multi & (ttc == v)
+    for v in variants:
+        sel = v["mask"]
         lat_from_col = np.array(
             [
-                (np.nan if not np.isfinite(latency[i]) else latency[i] - (v_col[i] - w_on[i]) * dt_ms)
+                (
+                    np.nan
+                    if not np.isfinite(latency[i])
+                    else latency[i]
+                    - max(0, v_col[i] - w_on[i]) * dt_ms
+                )
                 for i in np.where(sel)[0]
             ]
         )
         per_variant.append(
             {
-                "ttc_ms": int(v),
-                "l_over_v_proxy_ms": float(-v - 50.0),
+                "variant": v["key"],
+                "ttc_ms": float(v["ttc"]),
+                "soa_median_ms": v["soa_median_ms"],
+                "l_over_v_proxy_ms": float(-v["ttc"] - 50.0),
                 "n_responders": int(np.sum(np.isfinite(lat_from_col))),
                 "escape_minus_collision_ms": summary_stats(lat_from_col),
             }
@@ -1595,35 +2052,58 @@ def run_looming_trigger(
             "n_points": int(ok.sum()),
         }
     return {
-        "available_variants": [int(v) for v in np.unique(ttc[m_multi])],
+        "available_variants": [v["key"] for v in variants],
         "per_variant": per_variant,
         "linear_fit_median_escape_vs_lv": fit,
         "note": (
-            "escape is wind-locked in multisensory, so escape time relative to "
-            "collision is dominated by the wind, not the looming angle; a "
-            "fixed-angular-size threshold (LGMD/DCMD-like) is a kinematic "
-            "identity here and is NOT identifiable. Only ONE collision "
-            "geometry exists. The wind-locked timing is read from "
-            "per_variant[*].escape_minus_collision_ms (median), not hardcoded."
+            "escape is wind-locked in the wind-first multisensory variants, so "
+            "escape time relative to collision is dominated by the wind, not "
+            "the looming angle; a fixed-angular-size threshold "
+            "(LGMD/DCMD-like) is a kinematic identity here and is NOT "
+            "identifiable. Only ONE collision geometry exists. The "
+            "wind-locked timing is read from "
+            "per_variant[*].escape_minus_collision_ms (median), not hardcoded. "
+            "For wind-lagging variants (negative SOA) the reference clock is "
+            "the collision, so this reading is not the wind lock."
         ),
     }
 
 
-def run_reliability_status() -> Dict[str, str]:
-    """Report why cue-reliability weighting is untestable in this corpus."""
+def run_reliability_status(
+    variants: List[Dict[str, Any]],
+) -> Dict[str, str]:
+    """Report why cue-reliability weighting is untestable in this corpus.
+
+    The ``present``/``approximation`` prose is GENERATED from the
+    multisensory variants actually used (keys, TTCs, SOAs), never from a
+    hardcoded four-TTC list (F1).
+    """
+    n_variants = len(variants)
+    ttc_list = "/".join(str(int(v["ttc"])) for v in variants)
+    soa_list = "/".join(f"{v['soa_median_ms']:g}" for v in variants)
+    has_ttc0 = any(abs(v["ttc"]) < 1e-9 for v in variants)
+    has_wind_lagging = any(v["soa_median_ms"] < 0 for v in variants)
     return {
         "needed": (
             "TTC=0 trials or deliberate cue-conflict conditions to vary "
             "single-cue reliability and measure weighting"
         ),
         "present": (
-            "4 TTC variants (-373/-308/-261/-225 ms); no TTC=0; no "
-            "cue-conflict or reliability manipulation"
+            f"{n_variants} multisensory variant(s) keyed on "
+            f"(target_ttc_ms, SOA bucket): TTC {ttc_list} ms, wind->collision "
+            f"SOA {soa_list} ms"
+            + ("" if has_ttc0 else "; no TTC=0")
+            + "; no cue-conflict or reliability manipulation"
         ),
         "approximation": (
             "the variants change the wind-visual SOA but keep wind the sole "
             "trigger"
+            if not has_wind_lagging
+            else "the variants change the wind-visual SOA; wind-lagging "
+            "variants are triggered at the first stimulus event "
+            "(min(wind onset, collision))"
         ),
+        "variants": [v["key"] for v in variants],
         "verdict": "NOT TESTABLE in this corpus",
     }
 
@@ -1916,6 +2396,7 @@ def _facilitation_contrast(
 def run_facilitation(
     cond: np.ndarray,
     ttc: np.ndarray,
+    soa: np.ndarray,
     latency: np.ndarray,
     resp: np.ndarray,
     prefix_keys: np.ndarray,
@@ -1923,6 +2404,7 @@ def run_facilitation(
     covariates: Dict[str, Any],
     rng: np.random.Generator,
     n_boot: int,
+    dt_ms: float,
     latency_label: Optional[np.ndarray] = None,
     resp_label: Optional[np.ndarray] = None,
 ) -> Dict[str, Any]:
@@ -1936,9 +2418,10 @@ def run_facilitation(
     medians + permutation p); the trial-level Mann-Whitney / Fisher tests are
     descriptive only and flagged as not valid under nesting.
 
-    D4: the contrast is reported PER TTC VARIANT and POOLED, each with
-    ``n_trials`` and ``n_prefixes``.  The variant with fewer than 5 prefixes
-    (TTC -225, 3 prefixes) is flagged ``informative=False``.
+    D4: the contrast is reported PER VARIANT — a
+    ``(target_ttc_ms, SOA bucket)`` cell (F1) — and POOLED, each with
+    ``n_trials`` and ``n_prefixes``.  A variant with fewer than 5 prefixes
+    is flagged ``informative=False``.
 
     D5: power uses the SD of the per-prefix summary (not the LMM
     ``sigma_b`` alone) and is reported for the FACILITATION contrast only.
@@ -2067,18 +2550,24 @@ def run_facilitation(
         }
 
     # D4: per-variant contrasts (each multisensory variant vs wind_only).
+    # Variants are (target_ttc_ms, SOA bucket) cells (F1), so two paradigms
+    # that share a TTC but differ in wind timing are separate contrasts.
+    variants = multisensory_variants(cond, ttc, soa, dt_ms)
     per_variant: Dict[str, Any] = {}
-    for v in np.unique(ttc[cond == "multisensory"]):
-        m_v = m_multi & (ttc == v)
+    for v in variants:
+        m_v = m_multi & v["mask"]
         row = _facilitation_contrast(latency, resp, prefix_keys, m_wind, m_v, rng)
-        row["ttc_ms"] = int(v)
+        row["ttc_ms"] = float(v["ttc"])
+        row["soa_bucket_ms"] = float(v["bucket_ms"])
+        row["soa_median_ms"] = v["soa_median_ms"]
         row["informative"] = bool(row["n_prefixes"]["multisensory"] >= 5)
-        per_variant[f"ttc_{int(v)}"] = row
+        per_variant[v["key"]] = row
 
-    # X2: Holm over the DECLARED facilitation family (pooled + the 4 TTC
-    # variants) on the prefix-permutation two-sided p-values (the primary
-    # reference; the Welch t is secondary and is left uncorrected).
+    # X2: Holm over the DECLARED facilitation family (pooled + the variants
+    # actually used) on the prefix-permutation two-sided p-values (the
+    # primary reference; the Welch t is secondary and is left uncorrected).
     fam = ["pooled"] + list(per_variant.keys())
+    family_members = ", ".join(v["key"] for v in variants)
     raw_fam = [small.get("permutation_p_two_sided")] + [
         per_variant[k]["prefix_level_test"].get("permutation_p_two_sided")
         for k in per_variant
@@ -2090,13 +2579,18 @@ def run_facilitation(
             per_variant[k]["prefix_level_test"]["permutation_p_two_sided_holm"] = float(adj_p)
     holm_family = {
         "correction": "Holm step-down (family-wise error rate)",
-        "family": "the facilitation family: pooled + the 4 TTC variants",
+        "family": (
+            f"the facilitation family: pooled + the {len(variants)} "
+            f"multisensory variants actually used ({family_members})"
+        ),
+        "family_keys": fam,
         "m": int(sum(1 for p in raw_fam if p is not None and np.isfinite(p))),
         "note": (
-            "Holm over the declared 5-test facilitation family (pooled + 4 TTC "
-            "variants) on the prefix-permutation two-sided p-values; raw "
-            "`permutation_p_two_sided` and adjusted "
-            "`permutation_p_two_sided_holm` are both reported."
+            f"Holm over the declared {len(fam)}-test facilitation family "
+            f"(pooled + {len(variants)} multisensory variants: "
+            f"{family_members}) on the prefix-permutation two-sided "
+            f"p-values; raw `permutation_p_two_sided` and adjusted "
+            f"`permutation_p_two_sided_holm` are both reported."
         ),
     }
 
@@ -2209,6 +2703,7 @@ def figure_race(
     out_dir: Path,
     cond: np.ndarray,
     ttc: np.ndarray,
+    soa: np.ndarray,
     latency: np.ndarray,
     v_col: np.ndarray,
     w_on: np.ndarray,
@@ -2218,7 +2713,7 @@ def figure_race(
     eligible: np.ndarray,
     rng: np.random.Generator,
 ) -> Optional[str]:
-    """Panel (a): race CDFs per TTC group with violation + bootstrap band.
+    """Panel (a): race CDFs per variant with violation + bootstrap band.
 
     The Miller bound is clipped at 1 (M1).  The band is the prefix-cluster
     bootstrap envelope of the bound (10% of the requested replicates, for
@@ -2234,8 +2729,8 @@ def figure_race(
     m_wind = (cond == "wind_only") & eligible
     m_vis = (cond == "visual_only") & eligible
     m_multi = (cond == "multisensory") & eligible
-    variants = np.unique(ttc[cond == "multisensory"])
-    if variants.size == 0:
+    variants = multisensory_variants(cond, ttc, soa, dt_ms)
+    if not variants:
         return None
     tgrid = np.arange(0.0, RESPONSE_WINDOW_MS + dt_ms, dt_ms)
     lat_a = np.sort(finite(latency[m_wind]))
@@ -2243,20 +2738,20 @@ def figure_race(
     lat_v = np.sort(finite(latency[m_vis]))
     n_v = int(m_vis.sum())
 
-    strata = race_strata(cond, ttc)
+    strata = race_strata(cond, variant_ids(cond, ttc, soa))
     band_weights = list(bootstrap_weights(prefix_keys, strata, n_boot, rng))
 
     fig, axes = plt.subplots(
-        1, variants.size, figsize=(4 * variants.size, 3.4), sharey=True,
+        1, len(variants), figsize=(4 * len(variants), 3.4), sharey=True,
         squeeze=False,
     )
     for ax, v in zip(axes[0], variants):
-        sel = m_multi & (ttc == v)
+        sel = m_multi & v["mask"]
         lat_av = np.sort(finite(latency[sel]))
         n_av = int(sel.sum())
-        soa = _variant_soa(cond == "multisensory", ttc, w_on, v_col, dt_ms, float(v))
+        soa_v = v["soa_median_ms"]
         fav = ecdf(lat_av, tgrid, n_av)
-        bound = miller_bound(tgrid, lat_a, n_a, lat_v, n_v, [soa], [1.0])
+        bound = miller_bound(tgrid, lat_a, n_a, lat_v, n_v, [soa_v], [1.0])
         band = np.vstack(
             [
                 miller_bound(
@@ -2265,7 +2760,7 @@ def figure_race(
                     int(round(weighted_count(m_wind, w))),
                     np.sort(finite(expand_weighted(latency[m_vis], w[m_vis]))),
                     int(round(weighted_count(m_vis, w))),
-                    [soa],
+                    [soa_v],
                     [1.0],
                 )
                 for w in band_weights
@@ -2282,7 +2777,7 @@ def figure_race(
             tgrid, bound, np.maximum(fav, bound), color="C3", alpha=0.25,
             label="violation",
         )
-        _style(ax, f"TTC = {int(v)} ms (SOA {soa:.0f} ms)")
+        _style(ax, f"{v['key']} (SOA {soa_v:.0f} ms)")
     axes[0][0].set_ylabel("defective CDF")
     for ax in axes[0]:
         ax.set_xlabel("time from wind onset (ms)")
@@ -2349,10 +2844,12 @@ def figure_accumulation(
     out_dir: Path,
     cond: np.ndarray,
     ttc: np.ndarray,
+    soa: np.ndarray,
     latency: np.ndarray,
     eligible: np.ndarray,
+    dt_ms: float,
 ) -> Optional[str]:
-    """Panel (c): latency distributions + ex-Gaussian fits, mean-SD by TTC."""
+    """Panel (c): latency distributions + ex-Gaussian fits, mean-SD by variant."""
     import matplotlib
 
     matplotlib.use("Agg")
@@ -2360,13 +2857,13 @@ def figure_accumulation(
     from scipy import stats as sps
 
     m_multi = (cond == "multisensory") & eligible
-    variants = np.unique(ttc[cond == "multisensory"])
-    if variants.size < 2:
+    variants = multisensory_variants(cond, ttc, soa, dt_ms)
+    if len(variants) < 2:
         return None
     fig, axes = plt.subplots(1, 2, figsize=(9, 3.6))
     xs = np.linspace(0, 400, 200)
     for v in variants:
-        x = finite(latency[m_multi & (ttc == v)])
+        x = finite(latency[m_multi & v["mask"]])
         if x.size < 20:
             continue
         axes[0].hist(x, bins=np.arange(0, 400, 20), density=True, alpha=0.25)
@@ -2375,14 +2872,14 @@ def figure_accumulation(
             axes[0].plot(xs, sps.exponnorm.pdf(xs, k, lo, sc), lw=1.2)
         except Exception:  # pragma: no cover
             pass
-    axes[0].set_xlabel("latency from wind onset (ms)")
+    axes[0].set_xlabel("latency from trigger (ms)")
     axes[0].set_ylabel("density")
     _style(axes[0], "Latency + ex-Gaussian fits (eligible)")
     means, sds, xs_v = [], [], []
     for v in variants:
-        x = finite(latency[m_multi & (ttc == v)])
+        x = finite(latency[m_multi & v["mask"]])
         if x.size >= 20:
-            xs_v.append(int(v))
+            xs_v.append(v["ttc"])
             means.append(float(x.mean()))
             sds.append(float(x.std(ddof=1)))
     if means:
@@ -2390,9 +2887,9 @@ def figure_accumulation(
             xs_v, means, yerr=sds, fmt="o-",
             capsize=3, color="C3",
         )
-        axes[1].set_xlabel("TTC (ms)")
+        axes[1].set_xlabel("target TTC (ms)")
         axes[1].set_ylabel("mean +/- SD latency (ms)")
-        _style(axes[1], "Mean-SD across TTC (suggestive)")
+        _style(axes[1], "Mean-SD across variants (suggestive)")
     fig.tight_layout()
     path = out_dir / "accumulation_latency.png"
     fig.savefig(path, dpi=150)
@@ -2409,7 +2906,14 @@ def figure_trigger(
     dt_ms: float,
     eligible: np.ndarray,
 ) -> Optional[str]:
-    """Optional panel: escape locked to wind onset rather than collision."""
+    """Optional panel: escape timing from the trigger vs from the collision.
+
+    The trigger-clock latencies are the primary D1 latencies.  The
+    collision-clock latencies subtract the offset of the trigger from the
+    collision, ``max(0, v_col - w_on) * dt`` — zero for wind-lagging
+    variants (whose trigger IS the collision), the historical
+    ``v_col - w_on`` shift for wind-first variants.
+    """
     import matplotlib
 
     matplotlib.use("Agg")
@@ -2420,7 +2924,7 @@ def figure_trigger(
     lat_col = finite(
         np.array(
             [
-                latency[i] - (v_col[i] - w_on[i]) * dt_ms
+                latency[i] - max(0, v_col[i] - w_on[i]) * dt_ms
                 for i in np.where(m_multi)[0]
                 if np.isfinite(latency[i])
             ]
@@ -2431,13 +2935,13 @@ def figure_trigger(
     fig, ax = plt.subplots(figsize=(4.5, 3.4))
     bins = np.arange(-1000, 400, 25)
     ax.hist(lat_wind, bins=bins, alpha=0.6, color="C3",
-            label="from wind onset")
+            label="from trigger")
     ax.hist(lat_col, bins=bins, alpha=0.6, color="C0", label="from collision")
     ax.axvline(0, color="k", lw=0.8)
     ax.set_xlabel("escape time (ms)")
     ax.set_ylabel("count")
     ax.legend(fontsize=7)
-    _style(ax, "Multisensory escape is wind-locked")
+    _style(ax, "Multisensory escape timing by clock")
     fig.tight_layout()
     path = out_dir / "trigger_locking.png"
     fig.savefig(path, dpi=150)
@@ -2464,6 +2968,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="prefix-cluster bootstrap replicates")
     parser.add_argument("--n_perm", type=int, default=2000,
                         help="prefix-level permutation replicates for the race test")
+    parser.add_argument(
+        "--soa_tolerance_frames", type=float,
+        default=SOA_HOMOGENEITY_TOLERANCE_FRAMES,
+        help=(
+            "DECLARED tolerance (in frames) for the SOA-homogeneity audit: "
+            "the within-variant spread of the per-trial signed SOA must not "
+            "exceed it, else the analysis fails closed (default 1 frame). "
+            "Corpora with known wind-delivery jitter (the phase-2 corpus "
+            "measures 6-7 frames) must declare a larger tolerance."
+        ),
+    )
     return parser
 
 
@@ -2483,11 +2998,25 @@ def run(args: argparse.Namespace) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         )
     cond = corpus["conditions"]
     ttc = corpus["ttc"]
+    # F3: fail fast at entry — a multisensory trial without a finite
+    # declared target_ttc_ms cannot be assigned a variant; the old code
+    # died mid-summary with int(NaN) after the ETL had already saved NaN.
+    fail_fast_on_undeclared_ttc(cond, ttc, corpus["session_ids"])
     prefix_keys, prefix_source = resolve_prefix_keys(
         corpus["session_ids"], args.nested_prior_artifact
     )
     n_prefix = len(set(prefix_keys.tolist()))
     events = detect_events(corpus, dt_ms)
+    # F1: signed per-trial SOA from the channels (cross-checked against
+    # the stored additive key when the artifact carries one), the
+    # (ttc, SOA bucket) variant table, and the fail-closed homogeneity
+    # audit against the DECLARED tolerance.
+    soa = per_trial_soa_ms(corpus, events, dt_ms)
+    variants = multisensory_variants(cond, ttc, soa, dt_ms)
+    soa_audit = audit_soa_homogeneity(
+        variants, dt_ms, float(args.soa_tolerance_frames),
+    )
+    variant_key_per_trial = variant_ids(cond, ttc, soa)
     responses = detect_responses(corpus, events, dt_ms)
     latency = responses["latency_ms"]
     resp = responses["resp"]
@@ -2564,10 +3093,20 @@ def run(args: argparse.Namespace) -> Tuple[Dict[str, Any], Dict[str, Any]]:
                 "recording_prefix (stratified by group, with replacement; "
                 "prefix multiplicity weights)"
             ),
+            "soa_bucket_ms": float(SOA_BUCKET_MS),
+            "soa_tolerance_frames": float(args.soa_tolerance_frames),
+            "wind_presence_threshold": float(WIND_PRESENCE_THRESHOLD),
             "definitions": {
                 "reference_event": {
-                    "wind_only": "wind onset (first wind channel > 0.5)",
-                    "multisensory": "wind onset",
+                    "wind_only": (
+                        "wind onset (first wind channel above the shared "
+                        "threshold)"
+                    ),
+                    "multisensory": (
+                        "first stimulus event: min(wind onset, collision); "
+                        "equals the wind onset for wind-first variants and "
+                        "the collision for wind-lagging variants (ADR 0011)"
+                    ),
                     "visual_only": "visual collision (peak visual angle)",
                 },
                 "primary_inclusion_rule": (
@@ -2578,9 +3117,12 @@ def run(args: argparse.Namespace) -> Tuple[Dict[str, Any], Dict[str, Any]]:
                 "primary_response": (
                     "D1: first frame STRICTLY after the trigger (latency 0 "
                     "impossible) with |Y| >= 10 cm/s inside [trigger, "
-                    "trigger+2000 ms] for EVERY condition; trigger = wind onset "
-                    "(wind-containing) / collision (visual_only), so the visual "
-                    "window covers collision+1000 ms"
+                    "trigger+2000 ms] for EVERY condition; trigger = the "
+                    "trial's FIRST stimulus event (min(wind onset, collision) "
+                    "for multisensory, wind onset for wind_only, collision for "
+                    "visual_only), so the visual window covers "
+                    "collision+1000 ms and a wind-lagging trial's wind onset "
+                    "falls inside its own response window"
                 ),
                 "eligibility_sensitivity_5cms": (
                     "labeling-consistent variant: |Y| < 5 cm/s throughout "
@@ -2628,15 +3170,41 @@ def run(args: argparse.Namespace) -> Tuple[Dict[str, Any], Dict[str, Any]]:
             "latency_from_trigger_ms": summary_stats(latency[m]),
         }
     m_multi = cond == "multisensory"
-    for v in np.unique(ttc[m_multi]):
-        sel = m_multi & (ttc == v)
-        summary["multisensory_soa_by_variant"][f"ttc_{int(v)}"] = {
+    for v in variants:
+        sel = m_multi & v["mask"]
+        summary["multisensory_soa_by_variant"][v["key"]] = {
             "n": int(sel.sum()),
+            "ttc_ms": float(v["ttc"]),
+            "soa_bucket_ms": float(v["bucket_ms"]),
             "soa_wind_to_collision_ms": summary_stats(
                 (events["v_col"][sel] - events["w_on"][sel]) * dt_ms
             ),
-            "latency_from_wind_ms": summary_stats(latency[sel]),
+            "latency_from_trigger_ms": summary_stats(latency[sel]),
         }
+    # F1: the SOA-homogeneity audit result (fail-closed gate already
+    # passed by this point) and the per-trial reference event mix.
+    summary["soa_homogeneity_audit"] = soa_audit
+    summary["soa_homogeneity_audit"]["soa_source"] = (
+        "channel-derived (collision_frame - wind_onset_frame) * dt_ms"
+        + (
+            "; cross-checked against the stored stimulus_soa_ms key"
+            if corpus.get("stimulus_soa_ms") is not None else
+            "; artifact has no stored stimulus_soa_ms key (additive key "
+            "introduced with pipeline semantics 2.3)"
+        )
+    )
+    if corpus.get("stimulus_reference_event") is not None:
+        stored_ref = corpus["stimulus_reference_event"]
+        summary["stimulus_reference_event_stored"] = {
+            str(name): int(np.sum(stored_ref == name))
+            for name in sorted(set(stored_ref.tolist()))
+        }
+    # F2: named class replacing the PRE_ACTIVE / ~0 ms wind-response
+    # artefacts of the old wind-onset clock for wind-lagging paradigms.
+    summary["pre_reference_responders"] = pre_reference_responders(
+        cond, events["w_on"], responses, corpus["labels"],
+        variant_key_per_trial,
+    )
 
     # D1/D3: eligibility + per-condition excluded-count report.
     summary["eligibility"] = {
@@ -2747,7 +3315,7 @@ def run(args: argparse.Namespace) -> Tuple[Dict[str, Any], Dict[str, Any]]:
 
     # C2: race model (D1/D2/D5).  Its power_analysis is produced inside.
     summary["race_model"] = run_race_model(
-        cond, ttc, latency, events["w_on"], events["v_col"], prefix_keys,
+        cond, ttc, soa, latency, prefix_keys,
         eligible, dt_ms, args.n_boot, rng,
         latency_label=responses["latency_label_ms"],
         n_perm=args.n_perm,
@@ -2755,13 +3323,14 @@ def run(args: argparse.Namespace) -> Tuple[Dict[str, Any], Dict[str, Any]]:
 
     # Descriptive / negative items.
     summary["discrete_modes"] = run_discrete_modes(cond, latency, kin, rng)
-    summary["accumulation"] = run_accumulation(cond, ttc, latency)
+    summary["accumulation"] = run_accumulation(cond, ttc, soa, latency, dt_ms)
     summary["looming_trigger"] = run_looming_trigger(
-        cond, ttc, latency, events["w_on"], events["v_col"], dt_ms
+        cond, ttc, soa, latency, events["w_on"], events["v_col"], dt_ms
     )
-    summary["reliability_weighting_status"] = run_reliability_status()
+    summary["reliability_weighting_status"] = run_reliability_status(variants)
     summary["facilitation"] = run_facilitation(
-        cond, ttc, latency, resp, prefix_keys, eligible, covariates, rng, args.n_boot,
+        cond, ttc, soa, latency, resp, prefix_keys, eligible, covariates, rng,
+        args.n_boot, dt_ms,
         latency_label=responses["latency_label_ms"],
         resp_label=responses["resp_label"],
     )
@@ -2772,6 +3341,7 @@ def run(args: argparse.Namespace) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         "responses": responses,
         "prefix_keys": prefix_keys,
         "eligible": eligible,
+        "soa": soa,
         "dt_ms": dt_ms,
     }
     return summary, context
@@ -2784,6 +3354,7 @@ def write_figures(
     responses: Dict[str, np.ndarray],
     prefix_keys: np.ndarray,
     eligible: np.ndarray,
+    soa: np.ndarray,
     dt_ms: float,
     n_boot: int,
     seed: int,
@@ -2804,7 +3375,7 @@ def write_figures(
     jobs = [
         (
             figure_race,
-            (out_dir, cond, ttc, latency, events["v_col"], events["w_on"],
+            (out_dir, cond, ttc, soa, latency, events["v_col"], events["w_on"],
              dt_ms, band_n, prefix_keys, eligible, rng),
             {
                 "panel": "(a) race_model_cdfs.png",
@@ -2828,12 +3399,12 @@ def write_figures(
         ),
         (
             figure_accumulation,
-            (out_dir, cond, ttc, latency, eligible),
+            (out_dir, cond, ttc, soa, latency, eligible, dt_ms),
             {
                 "panel": "(c) accumulation_latency.png",
                 "uncertainty": (
                     "eligible trials only; ex-Gaussian fits are point MLEs; "
-                    "the 4-point mean-SD trend is suggestive, no band"
+                    "the per-variant mean-SD trend is suggestive, no band"
                 ),
             },
         ),
@@ -2875,6 +3446,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         context["responses"],
         context["prefix_keys"],
         context["eligible"],
+        context["soa"],
         context["dt_ms"],
         args.n_boot,
         args.seed,

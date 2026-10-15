@@ -11,6 +11,10 @@ Contract:
   * Canonical schema (``time_ms`` already ms): no double scaling.
   * Same constant offset on event+kin seconds => same trial-relative
     canonical event times and downstream anchor selection.
+  * ADR 0011: for visual trials the injected ``stimulus_onset`` is the
+    looming COLLISION (``looming onset + lv_ratio_ms / tan(radians(1))``
+    at the adapter's declared init_deg = 2.0), not the looming onset;
+    :func:`_collision_ms` is the shared expectation helper.
 """
 
 from __future__ import annotations
@@ -117,6 +121,16 @@ def _write_raw_pair(
     return kin_path, evt_path
 
 
+def _collision_ms(looming_rel_ms: float, lv_ratio_ms: float = 120.0) -> float:
+    """ADR 0011 collision clock: looming onset + lv / tan(init_deg/2).
+
+    The adapter's declared ``init_deg`` is 2.0; the injected visual-only
+    ``stimulus_onset`` and the visual-only snapshot anchor share this
+    geometry.
+    """
+    return looming_rel_ms + lv_ratio_ms / math.tan(math.radians(1.0))
+
+
 def _get_stimulus_onset(evt_df: pd.DataFrame, trial_id: int) -> float:
     """Return time_ms of the stimulus_onset event for a trial."""
     mask = (evt_df["trial_id"] == trial_id) & (evt_df["event_type"] == "stimulus_onset")
@@ -149,10 +163,12 @@ class TestRawEventTimeNormalization:
     """Raw timestamp seconds must become per-trial relative milliseconds."""
 
     def test_raw_looming_onset_20ms_not_012(self, tmp_path: Path):
-        """trial_start=.100s, Looming=.120s, first kin=.100s → event 20ms.
+        """trial_start=.100s, Looming=.120s, first kin=.100s → collision clock.
 
-        The bug injects 0.12 (raw seconds) instead of 20 (ms, per-trial).
-        Assert observed output rows, not helper arithmetic.
+        The bug injected 0.12 (raw seconds) instead of a per-trial
+        millisecond value; since ADR 0011 the injected ``stimulus_onset``
+        is the looming COLLISION on that same per-trial clock.  Assert
+        observed output rows, not helper arithmetic.
         """
         raw_dir = tmp_path / "raw"
         out_dir = tmp_path / "out"
@@ -168,13 +184,17 @@ class TestRawEventTimeNormalization:
 
         evt_out = pd.read_csv(out_dir / s1 / f"{s1}_events.csv")
         onset = _get_stimulus_onset(evt_out, trial_id=1)
-        assert onset == pytest.approx(20.0, abs=1e-6), (
-            f"Expected stimulus_onset at 20ms (per-trial relative), got {onset}"
-        )
-        # Must also agree with the authoritative Looming transition
+        # The authoritative Looming transition is 20 ms on the per-trial
+        # relative clock...
         looming_t = _get_phase_time(evt_out, trial_id=1, to_phase="Looming")
-        assert onset == pytest.approx(looming_t, abs=1e-6), (
-            f"stimulus_onset {onset} != Looming transition {looming_t}"
+        assert looming_t == pytest.approx(20.0, abs=1e-6), (
+            f"Expected the Looming transition at 20ms (per-trial relative), "
+            f"got {looming_t}"
+        )
+        # ...and the injected onset is the collision from that clock.
+        assert onset == pytest.approx(_collision_ms(looming_t), abs=1e-6), (
+            f"stimulus_onset {onset} != collision clock from Looming "
+            f"transition {looming_t}"
         )
 
     def test_raw_looming_onset_not_raw_seconds(self, tmp_path: Path):
@@ -224,7 +244,7 @@ class TestOffsetInvariance:
         assert results[0] == pytest.approx(results[1], abs=1e-6), (
             f"Offset changed trial-relative onset: {results}"
         )
-        assert results[0] == pytest.approx(20.0, abs=1e-6)
+        assert results[0] == pytest.approx(_collision_ms(20.0), abs=1e-6)
 
     def test_two_sessions_different_origins(self, tmp_path: Path):
         """Two sessions with distinct absolute clock origins → same relative times."""
@@ -248,8 +268,8 @@ class TestOffsetInvariance:
         onset_b = _get_stimulus_onset(
             pd.read_csv(out_dir / s2 / f"{s2}_events.csv"), trial_id=1,
         )
-        assert onset_a == pytest.approx(20.0, abs=1e-6)
-        assert onset_b == pytest.approx(20.0, abs=1e-6)
+        assert onset_a == pytest.approx(_collision_ms(20.0), abs=1e-6)
+        assert onset_b == pytest.approx(_collision_ms(20.0), abs=1e-6)
 
     def test_multi_trial_per_trial_relative(self, tmp_path: Path):
         """Multiple trials in one session: each gets its own per-trial origin."""
@@ -315,8 +335,8 @@ class TestOffsetInvariance:
         evt_out = pd.read_csv(out_dir / s1 / f"{s1}_events.csv")
         for tid in (1, 2):
             onset = _get_stimulus_onset(evt_out, trial_id=tid)
-            assert onset == pytest.approx(20.0, abs=1e-6), (
-                f"Trial {tid}: expected 20ms, got {onset}"
+            assert onset == pytest.approx(_collision_ms(20.0), abs=1e-6), (
+                f"Trial {tid}: expected the collision clock, got {onset}"
             )
 
 
@@ -377,13 +397,14 @@ class TestCanonicalSchemaNoDoubleConvert:
         info = parse_trial_events(evt_path)
         assert info[0]["looming_onset_ms"] == pytest.approx(137.5)
 
-        # Full adapt: injected stimulus_onset must match
+        # Full adapt: the injected onset is the collision computed from the
+        # canonical (already-ms) looming onset, without rescaling it.
         adapt_cercus_to_nsmor(raw_dir=str(tmp_path))
         evt_out = pd.read_csv(evt_path)
         onset = _get_stimulus_onset(evt_out, trial_id=0)
-        assert onset == pytest.approx(137.5, abs=1e-6), (
-            f"Canonical onset double-converted: {onset}"
-        )
+        assert onset == pytest.approx(
+            _collision_ms(137.5, lv_ratio_ms=40.0), abs=1e-6,
+        ), f"Canonical onset double-converted: {onset}"
 
     def test_canonical_ms_not_multiplied(self, tmp_path: Path):
         """Guard: canonical value 137.5 must not become 137500."""
@@ -430,8 +451,12 @@ class TestCanonicalSchemaNoDoubleConvert:
         adapt_cercus_to_nsmor(raw_dir=str(tmp_path))
         evt_out = pd.read_csv(session_dir / "session_canon2_events.csv")
         onset = _get_stimulus_onset(evt_out, trial_id=0)
-        assert onset == pytest.approx(50.0, abs=1e-6)
-        assert onset < 1000.0, f"Canonical ms double-scaled: {onset}"
+        assert onset == pytest.approx(
+            _collision_ms(50.0, lv_ratio_ms=40.0), abs=1e-6,
+        )
+        # A x1000 rescale of the 50 ms canonical value would land near
+        # 5e4; the collision clock stays in the low thousands.
+        assert onset < 10000.0, f"Canonical ms double-scaled: {onset}"
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -658,8 +683,11 @@ class TestV6PerTrialStimulusOnsetPreservation:
         assert len(t1_stim) == 1, (
             f"Trial 1 must have exactly 1 stimulus_onset, got {len(t1_stim)}"
         )
-        # Computed onset: Looming at 0.120s, kin first at 0.100s → 20ms.
-        assert float(t1_stim.iloc[0]["time_ms"]) == pytest.approx(20.0, abs=1e-6)
+        # Computed onset (ADR 0011): collision from the Looming transition
+        # at 0.120s on the kin clock (kin first at 0.100s → Looming 20 ms).
+        assert float(t1_stim.iloc[0]["time_ms"]) == pytest.approx(
+            _collision_ms(20.0), abs=1e-6,
+        )
 
         # Trial 2: source stimulus_onset PRESERVED (Fix 5 regression guard).
         t2_stim = stim[stim["trial_id"] == 2]
@@ -712,7 +740,7 @@ class TestDownstreamAnchorAlignment:
     """Canonical event time feeds extract_trial_data and anchor resolution."""
 
     def test_extract_trial_data_visual_event_time(self, tmp_path: Path):
-        """extract_trial_data exposes stimulus_onset at 20ms (visual trial)."""
+        """extract_trial_data exposes stimulus_onset on the collision clock."""
         from nsmor.pipeline.io import extract_trial_data
         from nsmor.pipeline.labeling import find_event_time
 
@@ -737,7 +765,7 @@ class TestDownstreamAnchorAlignment:
             trial["event_types"], trial["event_times"], "stimulus_onset",
         )
         assert onset is not None
-        assert onset == pytest.approx(20.0, abs=1e-6)
+        assert onset == pytest.approx(_collision_ms(20.0), abs=1e-6)
 
     def test_visual_anchor_rule_looming_collision(self, tmp_path: Path):
         """Visual-only trials anchor at looming_collision, not stimulus_onset."""
@@ -881,7 +909,7 @@ class TestKinClockAlignment:
     """
 
     def test_stimulus_onset_kin_clock_16ms(self, tmp_path: Path):
-        """stimulus_onset and Looming transition land at 16 ms (kin clock)."""
+        """stimulus_onset (collision clock) and Looming share the kin clock."""
         raw_dir = tmp_path / "raw"
         out_dir = tmp_path / "out"
         s1 = "session_kin_clock"
@@ -895,12 +923,12 @@ class TestKinClockAlignment:
 
         evt_out = pd.read_csv(out_dir / s1 / f"{s1}_events.csv")
         onset = _get_stimulus_onset(evt_out, trial_id=1)
-        assert onset == pytest.approx(16.0, abs=1e-6), (
-            f"Expected stimulus_onset at 16ms on kin clock, got {onset}"
-        )
         looming_t = _get_phase_time(evt_out, trial_id=1, to_phase="Looming")
         assert looming_t == pytest.approx(16.0, abs=1e-6), (
             f"Looming transition expected 16ms on kin clock, got {looming_t}"
+        )
+        assert onset == pytest.approx(_collision_ms(looming_t), abs=1e-6), (
+            f"Expected the collision clock on the kin clock, got {onset}"
         )
 
     def test_visual_pre_onset_baseline_and_true_onset(self, tmp_path: Path):
@@ -941,7 +969,7 @@ class TestKinClockAlignment:
         )
 
     def test_public_path_extract_trial_16ms(self, tmp_path: Path):
-        """Downstream extract_trial_data sees stimulus_onset at 16 ms."""
+        """Downstream extract_trial_data sees the collision clock."""
         from nsmor.pipeline.io import extract_trial_data
         from nsmor.pipeline.labeling import find_event_time
 
@@ -967,8 +995,9 @@ class TestKinClockAlignment:
             trial["event_types"], trial["event_times"], "stimulus_onset",
         )
         assert onset is not None
-        assert onset == pytest.approx(16.0, abs=1e-6), (
-            f"extract_trial_data onset expected 16ms, got {onset}"
+        assert onset == pytest.approx(_collision_ms(16.0), abs=1e-6), (
+            f"extract_trial_data onset expected the collision clock, "
+            f"got {onset}"
         )
 
 
@@ -1195,8 +1224,11 @@ class TestV4MissingLoomingAndOnsetSign:
         stim = evt_df[evt_df["event_type"] == "stimulus_onset"]
         assert len(stim) == 1
         onset = float(stim.iloc[0]["time_ms"])
-        assert onset == pytest.approx(-10.0, abs=1e-6), (
-            f"valid negative onset must stay negative, got {onset}"
+        # The kin-relative Looming onset (-10 ms) is preserved inside the
+        # collision clock: onset = -10 + ttc (ADR 0011).
+        assert onset == pytest.approx(_collision_ms(-10.0), abs=1e-6), (
+            f"valid negative Looming onset must stay negative inside the "
+            f"collision clock, got {onset}"
         )
         # And the warning channel must not claim a deviation anomaly.
         assert not any("deviates" in str(w.message) for w in caught)
@@ -1236,10 +1268,11 @@ class TestV4ChronologicalFirstLooming:
         stim = evt_df[evt_df["event_type"] == "stimulus_onset"]
         assert len(stim) == 1
         # kin_first=0.100, chronological-first Looming=0.116 -> 16.0 ms
-        assert float(stim.iloc[0]["time_ms"]) == pytest.approx(16.0, abs=1e-6), (
-            f"expected chronological-first Looming onset 16 ms, "
-            f"got {float(stim.iloc[0]['time_ms'])}"
-        )
+        # looming onset inside the collision clock (ADR 0011).
+        assert float(stim.iloc[0]["time_ms"]) == pytest.approx(
+            _collision_ms(16.0), abs=1e-6,
+        ), (f"expected the collision clock from the chronological-first "
+            f"Looming onset, got {float(stim.iloc[0]['time_ms'])}")
 
 
 class TestV4VisualAnglePhysics:
@@ -1372,7 +1405,9 @@ class TestV4AlternativeEventSchemas:
         assert float(ts0) == pytest.approx(0.0, abs=1e-6)
         stim = evt_out[evt_out["event_type"] == "stimulus_onset"]
         assert len(stim) == 1
-        assert float(stim.iloc[0]["time_ms"]) == pytest.approx(20.0, abs=1e-6)
+        assert float(stim.iloc[0]["time_ms"]) == pytest.approx(
+            _collision_ms(20.0), abs=1e-6,
+        )
 
     def test_event_name_plus_time_ms(self, tmp_path: Path):
         raw_dir = tmp_path / "raw"
@@ -1407,7 +1442,9 @@ class TestV4AlternativeEventSchemas:
         assert (evt_out["event_type"] == "trial_start").any()
         stim = evt_out[evt_out["event_type"] == "stimulus_onset"]
         assert len(stim) == 1
-        assert float(stim.iloc[0]["time_ms"]) == pytest.approx(20.0, abs=1e-6)
+        assert float(stim.iloc[0]["time_ms"]) == pytest.approx(
+            _collision_ms(20.0), abs=1e-6,
+        )
 
 
 class TestV4NoSpuriousWarnings:
@@ -1654,11 +1691,13 @@ class TestV5DuplicateLooming:
             f"expected a duplicate-Looming warning, got: {warn_msgs}"
         )
 
-        # Chronologically first Looming (0.120 s → 20 ms) must win.
+        # Chronologically first Looming (0.120 s → 20 ms) must win; the
+        # injected onset is its collision clock (ADR 0011).
         evt_out = pd.read_csv(out_dir / s1 / f"{s1}_events.csv")
         onset = _get_stimulus_onset(evt_out, trial_id=1)
-        assert onset == pytest.approx(20.0, abs=1e-6), (
-            f"chronologically-first Looming expected 20 ms, got {onset}"
+        assert onset == pytest.approx(_collision_ms(20.0), abs=1e-6), (
+            f"chronologically-first Looming expected 20 ms inside the "
+            f"collision clock, got {onset}"
         )
 
 
@@ -1752,7 +1791,9 @@ def test_legacy_visual_first_frame_artifact_does_not_shift_snapshot(tmp_path: Pa
     onset = find_event_time(clean["event_types"], clean["event_times"], "stimulus_onset")
     expected, rule = resolve_snapshot_anchor(clean, onset)
     assert rule == "looming_collision"
-    assert expected == pytest.approx(onset + 120.0 / math.tan(math.radians(1)), abs=0.01)
+    # ADR 0011: the injected stimulus_onset IS the collision clock, so the
+    # anchor coincides with it (within the frame grid).
+    assert expected == pytest.approx(onset, abs=0.01)
     baseline = extract_mcmc_snapshot(clean, stimulus_onset_ms=onset)
     changed = kin.copy()
     first = changed.index[(changed.visual_angle > 0) & (changed.visual_angle < 179)][0]
