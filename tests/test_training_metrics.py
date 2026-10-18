@@ -612,7 +612,6 @@ def test_post_training_sweep_accepts_metadata_and_legacy_batches(tmp_path, monke
         return train_loader, val_loader
 
     bands = [5.0, 10.0, 20.0, 50.0]
-    monkeypatch.setattr(mod, "_SWEEP_BANDS", bands)
     exports, headlines = [], []
     for width in (4, 3):
         with monkeypatch.context() as patch:
@@ -624,7 +623,10 @@ def test_post_training_sweep_accepts_metadata_and_legacy_batches(tmp_path, monke
             cfg.training.num_workers = 0
             cfg.training.normalize_targets = True
             cfg.training.target_clip_cm_s = 100.0
-            result = mod.train(cfg, phase1_epochs=0, dataset_path=str(ds_path))
+            result = mod.train(
+                cfg, phase1_epochs=0, dataset_path=str(ds_path),
+                sweep_bands=bands,
+            )
 
         assert len(result["history"]["train_loss"]) == len(result["history"]["val_loss"]) == 1
         assert result["eval_provenance"] == "best"

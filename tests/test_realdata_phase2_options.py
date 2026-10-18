@@ -124,7 +124,7 @@ def test_zero_input_channels_inplace_requires_sequences() -> None:
 
 
 def test_train_mse_selection_records_phase2_provenance(
-    tmp_path: Path, monkeypatch,
+    tmp_path: Path,
 ) -> None:
     """A 1-epoch MSE-selected run writes the additive phase-2 provenance and a
     finite selected metric into best_model.pth (config dict untouched)."""
@@ -134,9 +134,12 @@ def test_train_mse_selection_records_phase2_provenance(
 
     ds = _make_synthetic_dataset(tmp_path)
     cfg = _make_config(tmp_path, epochs=1)
-    monkeypatch.setattr(T, "_SELECTION_METRIC", "mse")
-    monkeypatch.setattr(T, "_ZERO_INPUT_CHANNELS", ())
-    T.train(cfg, lambda_reg=0.01, dataset_path=str(ds))
+    # The executed arm travels with the CALL (the config is unbound), not
+    # through process-global state that a later invocation could replace.
+    T.train(
+        cfg, lambda_reg=0.01, dataset_path=str(ds),
+        selection_metric="mse", zero_input_channels=(),
+    )
 
     best = Path(cfg.checkpoint.output_dir) / "best_model.pth"
     ckpt = load_artifact_bytes(best.read_bytes())
@@ -700,7 +703,7 @@ def test_phase2_slot_availability_follows_primitive_pvalue() -> None:
 
 
 def test_phase2_resume_guard_refuses_zero_input_channels_switch(
-    monkeypatch, tmp_path: Path,
+    tmp_path: Path,
 ) -> None:
     """A resume that switches the history ablation must be refused."""
     import scripts.train as T
@@ -711,13 +714,16 @@ def test_phase2_resume_guard_refuses_zero_input_channels_switch(
         "selection_metric": "mse",
         "zero_input_channels": [2, 3],
     }
-    monkeypatch.setattr(T, "_SELECTION_METRIC", "mse")
-    monkeypatch.setattr(T, "_ZERO_INPUT_CHANNELS", ())
     with pytest.raises(ValueError):
-        T._require_architecture_config_match(ckpt, cfg, tmp_path / "x.pth")
+        T._require_architecture_config_match(
+            ckpt, cfg, tmp_path / "x.pth",
+            selection_metric="mse", zero_input_channels=(),
+        )
     # Matching ablation is accepted.
-    monkeypatch.setattr(T, "_ZERO_INPUT_CHANNELS", (2, 3))
-    T._require_architecture_config_match(ckpt, cfg, tmp_path / "x.pth")
+    T._require_architecture_config_match(
+        ckpt, cfg, tmp_path / "x.pth",
+        selection_metric="mse", zero_input_channels=(2, 3),
+    )
 
 
 def test_phase2_zero_input_channels_inplace_honours_sensory_dim() -> None:

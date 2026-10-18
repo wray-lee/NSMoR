@@ -154,8 +154,6 @@ def _build_resolution_diff() -> Dict[str, Any]:
     sys.path.insert(0, str(REPO / "scripts"))
     from train import build_config  # type: ignore
 
-    import train  # type: ignore
-
     a1_cfg, _, _ = build_config(["--config", str(A1_YAML)])
     a1_flat = _flatten(a1_cfg.to_dict())
     arms_out: Dict[str, Any] = {}
@@ -178,13 +176,13 @@ def _build_resolution_diff() -> Dict[str, Any]:
                 key=lambda row: row[0],
             )
             missing = sorted([k for k in a1_flat if k not in flat])
-            # The script-owned phase-2 controls resolve to module state in
-            # ``scripts.train`` (never into ``to_dict()``); capture and
-            # cross-check them here so the diff proves the CLI/YAML path
-            # actually produced the declared arm.
+            # The script-owned phase-2 controls are bound to THIS config by
+            # ``build_config`` (never into ``to_dict()``); read the binding,
+            # not module state, so a later invocation cannot leak into the
+            # cross-check.  This proves the CLI/YAML path produced the arm.
             resolved = {
-                "selection_metric": train._SELECTION_METRIC,
-                "zero_input_channels": list(train._ZERO_INPUT_CHANNELS),
+                "selection_metric": cfg._selection_metric,
+                "zero_input_channels": list(cfg._zero_input_channels),
             }
             declared = {
                 "selection_metric": PHASE2[arm]["selection_metric"],

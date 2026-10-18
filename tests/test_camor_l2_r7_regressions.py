@@ -45,8 +45,18 @@ def _corpus(tmp_path: Path) -> tuple[Path, torch.Tensor]:
     return path, groups
 
 
-def _config(tmp_path: Path, groups: torch.Tensor, name: str) -> Any:
-    """Resolve independently declared supervision through the public CLI."""
+def _config(
+    tmp_path: Path,
+    groups: torch.Tensor,
+    name: str,
+    zero_input_channels: int | None = None,
+) -> Any:
+    """Resolve independently declared supervision through the public CLI.
+
+    ``zero_input_channels`` is declared in the same invocation that creates the
+    returned config, so the ablation is bound to the config itself rather than
+    to mutable module state that a later ``build_config`` call would replace.
+    """
     from scripts.train import build_config
 
     payload = _payload()
@@ -66,7 +76,7 @@ def _config(tmp_path: Path, groups: torch.Tensor, name: str) -> Any:
     })
     path = tmp_path / f"{name}.pt"
     torch.save(payload, path)
-    config, _, _ = build_config([
+    argv = [
         "--time_consuming_mode", "stochastic", "--lambda_latency", "1",
         "--latency_target_table", str(path), "--latency_target_group",
         "0" if name == "a" else "9", "--latency_reference_group",
@@ -74,7 +84,10 @@ def _config(tmp_path: Path, groups: torch.Tensor, name: str) -> Any:
         "none" if name == "a" else "pair_id",
         "--latency_min_prefixes_per_group", "1" if name == "a" else "2",
         "--latency_min_trials_per_group", "2" if name == "a" else "4",
-    ])
+    ]
+    if zero_input_channels is not None:
+        argv += ["--zero_input_channels", str(zero_input_channels)]
+    config, _, _ = build_config(argv)
     config.model.hidden_dim = 8
     config.model.dropout = 0.0
     config.model.time_consuming_max_steps = 3
@@ -246,8 +259,11 @@ def test_latency_conditions_survive_input_ablation(
     from nsmor.pipeline.latency_metadata import build_latency_sidecar
 
     corpus, groups = _corpus(tmp_path)
-    config = _config(tmp_path, groups, "a")
-    training.build_config(["--zero_input_channels", str(channel)])
+    # The ablation must travel with the config under test: a second
+    # build_config call would only mutate module globals and the run would
+    # silently train unablated (train.py prefers config-bound controls).
+    config = _config(tmp_path, groups, "a", zero_input_channels=channel)
+    assert getattr(config, "_zero_input_channels", None) == (channel,)
     with mock.patch("scripts.train.train_one_epoch", return_value=(1.0, {})) as epoch:
         training.train(config, dataset_path=str(corpus))
     loader = epoch.call_args.kwargs["loader"]

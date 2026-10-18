@@ -4476,12 +4476,12 @@ def test_launcher_path_records_rollback_once_end_to_end(tmp_path: Path) -> None:
 
     resumed = _real_config(tmp_path, epochs=2, name="lr1")
     resumed.checkpoint.resume_from = str(src)
-    with mock.patch.object(trainer, "_RESUME_ID", "launcher-resume-id-1"):
-        with mock.patch.object(trainer, "validate", return_value=0.5):
-            trainer.train(
-                resumed, dataset_path=str(ds),
-                trusted_historical_checkpoint_sha256=_existing_shas(src),
-            )
+    with mock.patch.object(trainer, "validate", return_value=0.5):
+        trainer.train(
+            resumed, dataset_path=str(ds),
+            resume_id="launcher-resume-id-1",
+            trusted_historical_checkpoint_sha256=_existing_shas(src),
+        )
     prov = json.loads((d / "provenance.json").read_text())
     rb = [e for e in prov["resume_log"] if e.get("disclosed_rollback")]
     assert len(rb) == 1, rb
@@ -4535,13 +4535,12 @@ def test_bare_resume_same_checkpoint_range_still_records(tmp_path: Path) -> None
 
     resumed = _real_config(tmp_path, epochs=2, name="k2")
     resumed.checkpoint.resume_from = str(src)
-    # A BARE resume: no --resume-id -> _RESUME_ID is None.
-    with mock.patch.object(trainer, "_RESUME_ID", None):
-        with mock.patch.object(trainer, "validate", return_value=0.5):
-            trainer.train(
-                resumed, dataset_path=str(ds),
-                trusted_historical_checkpoint_sha256=_existing_shas(src),
-            )
+    # A BARE resume: no --resume-id -> resume_id is None.
+    with mock.patch.object(trainer, "validate", return_value=0.5):
+        trainer.train(
+            resumed, dataset_path=str(ds), resume_id=None,
+            trusted_historical_checkpoint_sha256=_existing_shas(src),
+        )
     prov = json.loads((d / "provenance.json").read_text())
     rb = [e for e in prov["resume_log"] if e.get("disclosed_rollback")]
     # BOTH the launcher's and the bare resume's entry survive (2 distinct resumes).

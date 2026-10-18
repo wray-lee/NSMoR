@@ -212,9 +212,6 @@ def _run_segment(
     """
     from scripts import train as trainer
 
-    trainer._SELECTION_METRIC = selection_metric
-    trainer._ZERO_INPUT_CHANNELS = tuple(zic)
-
     sink: List[int] = []
     epochs_idx: List[List[int]] = []
     real = trainer.train_one_epoch
@@ -228,6 +225,8 @@ def _run_segment(
         try:
             result = trainer.train(
                 config, dataset_path=str(ds),
+                selection_metric=selection_metric,
+                zero_input_channels=tuple(zic),
                 trusted_historical_checkpoint_sha256=trusted,
             )
         except _TestInterruption:
@@ -430,11 +429,14 @@ def test_resume_refuses_switched_selection_metric(tmp_path: Path) -> None:
 
     resume = _real_config(tmp_path, epochs=2, name="sel_resume")
     resume.checkpoint.resume_from = str(periodic)
-    trainer._SELECTION_METRIC = "mse"
-    trainer._ZERO_INPUT_CHANNELS = ()
-    with mock.patch.object(trainer, "train_one_epoch", side_effect=AssertionError("epoch ran")):
+    with mock.patch.object(
+        trainer, "train_one_epoch", side_effect=AssertionError("epoch ran"),
+    ):
         with pytest.raises(ValueError, match="selection_metric"):
-            trainer.train(resume, dataset_path=str(ds))
+            trainer.train(
+                resume, dataset_path=str(ds), selection_metric="mse",
+                zero_input_channels=(),
+            )
 
 
 def test_safe_pause_stops_at_epoch_boundary_and_resumes(tmp_path: Path) -> None:
@@ -703,8 +705,6 @@ def _run_arm_segment(
     """
     from scripts import train as trainer
 
-    trainer._SELECTION_METRIC = selection_metric
-    trainer._ZERO_INPUT_CHANNELS = tuple(zic)
     real = trainer.train_one_epoch
     outdir = Path(config.checkpoint.output_dir)
     sink: List[List[int]] = []
@@ -730,6 +730,8 @@ def _run_arm_segment(
     ):
         result = trainer.train(
             config, dataset_path=str(ds),
+            selection_metric=selection_metric,
+            zero_input_channels=tuple(zic),
             trusted_historical_checkpoint_sha256=trusted,
         )
     return result, outdir, epochs_order

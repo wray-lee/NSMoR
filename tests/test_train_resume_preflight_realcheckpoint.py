@@ -93,8 +93,8 @@ def test_train_resume_preflight_accepts_pre_amendment_checkpoint() -> None:
     p2 = (yaml.safe_load(_CFG.read_text()) or {}).get("phase2") or {}
     # Stamp the arm's script-owned controls exactly as build_config does, so
     # _require_architecture_config_match compares against the right arm.
-    T._SELECTION_METRIC = str(p2.get("selection_metric", "total"))
-    T._ZERO_INPUT_CHANNELS = tuple(
+    config._selection_metric = str(p2.get("selection_metric", "total"))
+    config._zero_input_channels = tuple(
         sorted(int(c) for c in (p2.get("zero_input_channels") or []))
     )
 
@@ -183,8 +183,8 @@ def test_resume_loader_rng_guard_accepts_real_corpus_loaders() -> None:
 
     config = ExperimentConfig.from_yaml(str(_CFG))
     p2 = (yaml.safe_load(_CFG.read_text()) or {}).get("phase2") or {}
-    T._SELECTION_METRIC = str(p2.get("selection_metric", "total"))
-    T._ZERO_INPUT_CHANNELS = tuple(
+    config._selection_metric = str(p2.get("selection_metric", "total"))
+    config._zero_input_channels = tuple(
         sorted(int(c) for c in (p2.get("zero_input_channels") or []))
     )
     train_loader, val_loader = T.build_dataloaders(

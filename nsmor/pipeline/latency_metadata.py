@@ -310,7 +310,9 @@ def build_latency_sidecar(
         ``latency_prefix_id``, optional ``latency_pair_id``).
 
     Raises:
-        ValueError: If an index is out of range.
+        ValueError: If an index is out of range, if dataset metadata is missing
+            or length-mismatched, or if dataset conditions or anchor frames
+            disagree with the table.
     """
     indices = torch.as_tensor(list(source_indices), dtype=torch.long)
     n_rows = table.target_frames.shape[0]
@@ -351,7 +353,9 @@ def build_latency_sidecar(
                 physical, [len(values) for values in physical],
             )
         if len(conditions) != len(indices):
-            raise ValueError("Latency physical conditions length disagrees with dataset")
+            raise ValueError(
+                "Latency physical conditions length disagrees with dataset"
+            )
         assert np.asarray(conditions).shape == (len(indices),)
         names_by_group = {
             group: name for name, group in table.condition_mapping.items()

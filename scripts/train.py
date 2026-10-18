@@ -644,6 +644,9 @@ def _require_resume_equivalence_for_time_consuming(
 
 def _require_architecture_config_match(
     ckpt: Dict[str, Any], config: ExperimentConfig, ckpt_path: Path,
+    *,
+    selection_metric: Optional[str] = None,
+    zero_input_channels: Optional[Sequence[int]] = None,
 ) -> None:
     """Fail closed when a resume switches an architecture-defining setting.
 
@@ -652,6 +655,24 @@ def _require_architecture_config_match(
     config and refuses any mismatch, so a resume can never silently continue as
     a different architecture (finding R3 / A5, B14).  Legacy checkpoints
     without a stored config are left to the existing limited fallback.
+
+    The two script-owned controls must be the values the caller will ACTUALLY
+    execute (``train`` passes its resolved locals), not merely the config
+    defaults: an explicit call override that is absent from ``to_dict()``
+    would otherwise be invisible to this guard.
+
+    Args:
+        ckpt: Loaded checkpoint dict.
+        config: Active experiment config.
+        ckpt_path: Resume source, for diagnostics.
+        selection_metric: Executed checkpoint-selection metric.  ``None``
+            resolves from the config binding / module default.
+        zero_input_channels: Executed history-ablation columns.  ``None``
+            resolves from the config binding / module default.
+
+    Raises:
+        ValueError: On any recorded-vs-executed mismatch, or when an unbound
+            config would inherit stale non-default module state.
     """
     ckpt_cfg = ckpt.get("config")
     if not isinstance(ckpt_cfg, dict):
@@ -676,7 +697,12 @@ def _require_architecture_config_match(
     # It is recorded as an additive top-level checkpoint key; legacy
     # checkpoints without it default to "total".
     recorded_sel = ckpt.get("selection_metric", "total")
-    active_sel = _SELECTION_METRIC
+    if selection_metric is None:
+        selection_metric = _resolve_script_control(
+            _UNSET, config, "_selection_metric", _SELECTION_METRIC,
+            _DEFAULT_SELECTION_METRIC, "selection_metric",
+        )
+    active_sel = _parse_selection_metric(selection_metric)
     if recorded_sel != active_sel:
         mismatches.append(
             f"selection_metric: checkpoint={recorded_sel!r} vs "
@@ -689,7 +715,14 @@ def _require_architecture_config_match(
     # alongside the selection_metric guard.  Legacy checkpoints without the
     # key default to the unablated control ([]).
     recorded_zic = sorted(int(c) for c in ckpt.get("zero_input_channels", []))
-    active_zic = sorted(int(c) for c in _ZERO_INPUT_CHANNELS)
+    if zero_input_channels is None:
+        zero_input_channels = _resolve_script_control(
+            _UNSET, config, "_zero_input_channels", _ZERO_INPUT_CHANNELS,
+            _DEFAULT_ZERO_INPUT_CHANNELS, "zero_input_channels",
+        )
+    if zero_input_channels is None:
+        zero_input_channels = _DEFAULT_ZERO_INPUT_CHANNELS
+    active_zic = sorted(int(c) for c in zero_input_channels)
     if recorded_zic != active_zic:
         mismatches.append(
             f"zero_input_channels: checkpoint={recorded_zic} vs "
@@ -2496,17 +2529,41 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+class _UnsetType:
+    """Sentinel distinguishing an omitted argument from an explicit ``None``."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "<unset>"
+
+
+_UNSET = _UnsetType()
+
+# Documented module defaults.  A control that is NOT bound to the active
+# config may fall back to module state ONLY while the module value still
+# equals its default; a non-default value means an earlier build_config()
+# invocation left state behind, and silently inheriting it would run a
+# different arm than the caller requested (fail closed in
+# ``_resolve_script_control``).
+_DEFAULT_SWEEP_BANDS: Optional[List[float]] = None
+_DEFAULT_ZERO_INPUT_CHANNELS: Tuple[int, ...] = ()
+_DEFAULT_SELECTION_METRIC: str = "total"
+_DEFAULT_RESUME_ID: Optional[str] = None
+
 # Opt-in escape-band sensitivity sweep list, set by build_config() from
 # --sweep_escape_band and consumed by train().  ``None`` disables (default).
-_SWEEP_BANDS: Optional[List[float]] = None
+_SWEEP_BANDS: Optional[List[float]] = _DEFAULT_SWEEP_BANDS
 
 # ── Phase-2 controls, resolved by build_config() ──────────────
 # Kept as script-owned module state (NOT added to the protected
 # ``nsmor/config_parser.py`` schema, so for THESE keys ``ExperimentConfig.
 # to_dict()`` is unchanged).  Both default to the current behaviour: ``()`` =
 # no column zeroed, ``"total"`` = full-objective selection.  build_config()
-# sets them from the CLI/YAML; tests may set them directly or pass the explicit
-# arguments to build_dataloaders()/validate().
+# sets them from the CLI/YAML AND binds the same values onto the returned
+# config (``config._*``), which is what train()/build_dataloaders() prefer;
+# the module state is a legacy fallback for directly constructed configs.
 #
 # NOTE (ADR 0009, finding R2-M2): the ``time_consuming_*`` leaves are NOT
 # script-owned — they live in the protected ``ModelConfig`` schema, so
@@ -2514,8 +2571,8 @@ _SWEEP_BANDS: Optional[List[float]] = None
 # every run, off included.  The numerical outputs, ``state_dict`` keys and
 # construction RNG are byte-unchanged (defaults reproduce the historical
 # behavior); only the config-hash lineage string moves.
-_ZERO_INPUT_CHANNELS: Tuple[int, ...] = ()
-_SELECTION_METRIC: str = "total"
+_ZERO_INPUT_CHANNELS: Tuple[int, ...] = _DEFAULT_ZERO_INPUT_CHANNELS
+_SELECTION_METRIC: str = _DEFAULT_SELECTION_METRIC
 
 # The launcher's per-invocation resume IDENTITY (``--resume-id``), set by
 # build_config().  train.py uses it ONLY to skip its OWN duplicate
@@ -2523,11 +2580,61 @@ _SELECTION_METRIC: str = "total"
 # (a bare ``train.py --resume``) always records.  Script-owned module state,
 # mirroring ``_ZERO_INPUT_CHANNELS``/``_SELECTION_METRIC`` — never part of the
 # protected config schema, so every config/checkpoint stays byte-unchanged.
-_RESUME_ID: Optional[str] = None
+_RESUME_ID: Optional[str] = _DEFAULT_RESUME_ID
+
+
+def _resolve_script_control(
+    explicit: Any,
+    config: ExperimentConfig,
+    attr: str,
+    module_value: Any,
+    default: Any,
+    name: str,
+) -> Any:
+    """Resolve an explicit > config-bound > module-default script control.
+
+    A config produced by :func:`build_config` always carries ``attr`` (an
+    explicit ``None`` included), so its value is authoritative and never
+    falls through to process-global state.  A directly constructed config
+    without the attribute may fall back to the module value ONLY while that
+    value equals its documented default; otherwise an earlier
+    ``build_config`` call would leak into this run, so fail closed.
+
+    Args:
+        explicit: Caller-supplied value, or ``_UNSET`` when omitted.
+        config: Active experiment configuration.
+        attr: Private config attribute bound by :func:`build_config`.
+        module_value: Current module-level fallback.
+        default: Documented default for the control.
+        name: Public control name used in the error message.
+
+    Returns:
+        The resolved value.
+
+    Raises:
+        ValueError: If the config is unbound and the module value is
+            non-default (stale cross-invocation state).
+    """
+    if explicit is not _UNSET:
+        return explicit
+    if hasattr(config, attr):
+        return getattr(config, attr)
+    if module_value != default:
+        raise ValueError(
+            f"{name} is not bound to this config and the trainer module "
+            f"global is non-default ({module_value!r}); refusing to inherit "
+            "another invocation's state. Use build_config(), bind the "
+            f"attribute {attr!r}, or pass {name}= explicitly."
+        )
+    return default
 
 
 def _parse_selection_metric(value: Optional[str]) -> str:
-    """Validate a ``--selection_metric`` value; ``None`` keeps ``'total'``."""
+    """Validate a ``--selection_metric`` value; ``None`` keeps ``'total'``.
+
+    Raises:
+        ValueError: If ``value`` is neither ``None``, ``"total"`` nor ``"mse"``.
+    """
     if value is None:
         return "total"
     if value not in ("total", "mse"):
@@ -3260,6 +3367,13 @@ def build_config(argv: Optional[Sequence[str]] = None) -> Tuple[ExperimentConfig
     _ZERO_INPUT_CHANNELS = zero_input_channels
     _SELECTION_METRIC = selection_metric
     _RESUME_ID = resume_id
+    config._zero_input_channels = zero_input_channels
+    config._selection_metric = selection_metric
+    config._resume_id = resume_id
+    # Copy at the boundary: config and module state must never alias one
+    # mutable list (an in-place append/sort on either side would re-introduce
+    # cross-invocation leakage).
+    config._sweep_bands = list(sweep_bands) if sweep_bands is not None else None
     config._time_consuming_grad_checkpointing = time_consuming_grad_checkpointing
     config._time_consuming_memory_budget_mb = time_consuming_memory_budget_mb
     # Script-owned invocation metadata: deliberately excluded by to_dict().
@@ -3277,7 +3391,7 @@ def build_config(argv: Optional[Sequence[str]] = None) -> Tuple[ExperimentConfig
         "latency_min_prefixes_per_group": latency_min_prefixes_per_group,
         "latency_min_trials_per_group": latency_min_trials_per_group,
     }
-    _SWEEP_BANDS = sweep_bands
+    _SWEEP_BANDS = list(sweep_bands) if sweep_bands is not None else None
 
     return config, lambda_reg, args.phase1_epochs
 
@@ -3650,15 +3764,23 @@ def build_dataloaders(
             "aligns with the artifact. Refusing to run (fail closed)."
         )
 
+    # Resolve the history-ablation control ONCE: explicit argument > config
+    # binding > module default (and fail closed on stale non-default module
+    # state for an unbound config).
+    if zero_input_channels is None:
+        zero_input_channels = _resolve_script_control(
+            _UNSET, config, "_zero_input_channels", _ZERO_INPUT_CHANNELS,
+            _DEFAULT_ZERO_INPUT_CHANNELS, "zero_input_channels",
+        )
+    if zero_input_channels is None:
+        zero_input_channels = _DEFAULT_ZERO_INPUT_CHANNELS
+    zero_input_channels = tuple(int(c) for c in zero_input_channels)
+
     # The history-ablation control zeroes columns on the eager NSMoRDataset.
     # Lazy rows are rebuilt on demand through a different path that does not
     # apply the ablation, so a lazy run with the option set would silently be
     # the UNABLATED control.  Refuse rather than mislabel the arm (fail closed).
-    _zero_requested = (
-        zero_input_channels if zero_input_channels is not None
-        else _ZERO_INPUT_CHANNELS
-    )
-    if use_lazy_loading and _zero_requested:
+    if use_lazy_loading and zero_input_channels:
         raise ValueError(
             "data.zero_input_channels (history ablation) is unsupported in "
             "lazy loading mode; use ETL mode or clear the option. Refusing to "
@@ -3987,15 +4109,9 @@ def build_dataloaders(
 
     max_seq_len = getattr(config.training, "max_seq_len", None)
 
-    # History-ablation control: resolve the declared zeroed feature columns
-    # once.  ``zero_input_channels`` (the explicit parameter) takes precedence
-    # over the module-level ``_ZERO_INPUT_CHANNELS`` (set by build_config from
-    # the CLI); both default to empty, so a caller that passes neither gets the
+    # History-ablation control was resolved once at the top of this function;
+    # all defaults are empty, so a caller that passes neither gets the
     # historical datasets bitwise unchanged.
-    if zero_input_channels is None:
-        zero_input_channels = tuple(_ZERO_INPUT_CHANNELS)
-    else:
-        zero_input_channels = tuple(zero_input_channels)
     if zero_input_channels:
         logger.info(
             "History ablation active: zeroing input channels %s",
@@ -6265,6 +6381,10 @@ def train(
     expect_device: Optional[str] = None,
     eval_mc_samples: Optional[int] = None,
     eval_seed_base: Optional[int] = None,
+    selection_metric: Optional[str] = None,
+    zero_input_channels: Optional[Sequence[int]] = None,
+    resume_id: Optional[str] | _UnsetType = _UNSET,
+    sweep_bands: Optional[Sequence[float]] | _UnsetType = _UNSET,
 ) -> Dict[str, Any]:
     """
     Full training pipeline.
@@ -6315,15 +6435,59 @@ def train(
             config's CLI declaration, or S=5 for stochastic and S=1 elsewhere.
         eval_seed_base: First fixed validation seed and the seed for final
             single-draw metrics. Defaults to this config's declaration or zero.
+        selection_metric: Per-call checkpoint-selection override (``"total"``
+            or ``"mse"``). ``None`` (default) uses the value bound to
+            ``config`` by :func:`build_config`, or the documented default for
+            an unbound config. An override is NOT persisted in
+            ``config.to_dict()``, so a resume must pass it again (fail closed
+            otherwise).
+        zero_input_channels: Per-call history-ablation override (feature
+            columns zeroed). ``None`` (default) uses the config-bound value;
+            pass ``()`` to explicitly disable. A resume must repeat it.
+        resume_id: Launcher resume identity. ``_UNSET`` (default) uses the
+            config-bound value; an explicit ``None`` is a legitimate bare
+            resume and never falls through to stale module state.
+        sweep_bands: Opt-in post-training escape-band sweep. ``_UNSET``
+            (default) uses the config-bound value; an explicit ``None``
+            disables the sweep.
 
     Returns:
         Dictionary with ``"best_val_loss`` and ``"final_train_loss"``.
 
     Raises:
-        ValueError: If no training data is provided (loader is None).
+        ValueError: If no training data is provided (loader is None), if
+            ``selection_metric`` is invalid, or if an unbound config would
+            inherit non-default module state for a script-owned control.
         FileExistsError: If a fresh run would reuse an existing best checkpoint.
     """
     config.validate()
+    selection_metric = _parse_selection_metric(
+        _resolve_script_control(
+            _UNSET if selection_metric is None else selection_metric,
+            config, "_selection_metric", _SELECTION_METRIC,
+            _DEFAULT_SELECTION_METRIC, "selection_metric",
+        )
+    )
+    _resolved_zic = _resolve_script_control(
+        _UNSET if zero_input_channels is None else tuple(zero_input_channels),
+        config, "_zero_input_channels", _ZERO_INPUT_CHANNELS,
+        _DEFAULT_ZERO_INPUT_CHANNELS, "zero_input_channels",
+    )
+    zero_input_channels = (
+        _DEFAULT_ZERO_INPUT_CHANNELS if _resolved_zic is None
+        else tuple(int(c) for c in _resolved_zic)
+    )
+    resume_id = _resolve_script_control(
+        resume_id, config, "_resume_id", _RESUME_ID,
+        _DEFAULT_RESUME_ID, "resume_id",
+    )
+    sweep_bands = _resolve_script_control(
+        sweep_bands, config, "_sweep_bands", _SWEEP_BANDS,
+        _DEFAULT_SWEEP_BANDS, "sweep_bands",
+    )
+    if sweep_bands is not None:
+        sweep_bands = [float(b) for b in sweep_bands]
+
     eval_mc_samples, eval_seed_base = _resolve_run_eval_settings(
         config, eval_mc_samples=eval_mc_samples, eval_seed_base=eval_seed_base,
     )
@@ -6484,6 +6648,7 @@ def train(
         use_lazy_loading=use_lazy_loading,
         nested_prior_artifact=nested_prior_artifact,
         trusted_historical_artifact_sha256=trusted_historical_artifact_sha256,
+        zero_input_channels=zero_input_channels,
     )
 
     if train_loader is None:
@@ -6634,8 +6799,8 @@ def train(
     # ``_require_architecture_config_match``); ``zero_input_channels`` names
     # the history ablation a checkpoint was trained under.
     phase2_provenance: Dict[str, Any] = {
-        "selection_metric": _SELECTION_METRIC,
-        "zero_input_channels": list(_ZERO_INPUT_CHANNELS),
+        "selection_metric": selection_metric,
+        "zero_input_channels": list(zero_input_channels),
         # Time-consuming recursion (ADR 0009): the EXECUTED mode is stamped as
         # an additive top-level checkpoint key so a resume that switches it is
         # detectable even against a checkpoint whose stored config lacks the
@@ -6879,7 +7044,11 @@ def train(
         _require_complete_current_schema(ckpt_peek, ckpt_path)
         # R3: refuse a resume that switches an architecture-defining setting
         # (refinement / activation / lambda_compute) relative to the checkpoint.
-        _require_architecture_config_match(ckpt_peek, config, ckpt_path)
+        _require_architecture_config_match(
+            ckpt_peek, config, ckpt_path,
+            selection_metric=selection_metric,
+            zero_input_channels=zero_input_channels,
+        )
         # ADR 0012: the validation MC sample count / seed base and the
         # supervised latency target are script-owned, so they live in the
         # checkpoint top level rather than the config.  A resume must reuse
@@ -7579,7 +7748,7 @@ def train(
     # truncating, the prior entries) and to a status.log line in the run dir.
     if _disclosed_rollback is not None:
         _record_disclosed_rollback(
-            output_dir, ckpt_path, start_epoch, _disclosed_rollback, _RESUME_ID,
+            output_dir, ckpt_path, start_epoch, _disclosed_rollback, resume_id,
         )
 
     # ── Consume a stale safe-pause sentinel on resume ─────────
@@ -7834,7 +8003,7 @@ def train(
                 wind_only_mask_full=val_is_pure_wind,
                 routing_aux_margin=config.loss.routing_aux_margin,
                 lambda_compute=config.loss.lambda_compute,
-                selection_metric=_SELECTION_METRIC,
+                selection_metric=selection_metric,
                 eval_mc_samples=eval_mc_samples,
                 eval_seed_base=eval_seed_base,
                 lambda_latency=config.loss.lambda_latency,
@@ -8049,7 +8218,7 @@ def train(
     logger.info("=" * 60)
     logger.info(
         "Training complete.  Best val %s: %.6f",
-        _SELECTION_METRIC, best_val_loss,
+        selection_metric, best_val_loss,
     )
     logger.info("=" * 60)
 
@@ -8123,7 +8292,7 @@ def train(
         logger.info("Metrics saved: %s", metrics_path)
 
         # ── Band x min_run sensitivity sweep (opt-in) ──────────
-        if _SWEEP_BANDS:
+        if sweep_bands:
             all_true: List[np.ndarray] = []
             all_pred: List[np.ndarray] = []
             all_valid_sweep: List[np.ndarray] = []
@@ -8160,7 +8329,7 @@ def train(
                             else np.ones(n, dtype=bool)
                         )
             rows = sweep_escape_sensitivity(
-                all_true, all_pred, _SWEEP_BANDS,
+                all_true, all_pred, sweep_bands,
                 all_valid=all_valid_sweep if any_valid_sweep else None,
             )
             sweep_path = output_dir / "escape_sensitivity.csv"
