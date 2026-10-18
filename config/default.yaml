@@ -61,6 +61,10 @@ model:
   time_consuming_delay_scale: 1.0    # frames of delay per recursion step
                                      # (phase-3 arms set 10.0 -> 120 ms at K=4)
   time_consuming_threshold: 1.0      # accumulate-mode threshold, in (0, 1]
+  # ADR 0012: private RNG seed for the stochastic / hard_depth modes.  A
+  # plain attribute (NOT a buffer), so the default off-mode state_dict and
+  # construction RNG are unchanged.
+  time_consuming_seed: 0
 
   # Physical model-grid interval (ms). All lif_tau_* below are declared
   # in PHYSICAL ms and converted internally via alpha = exp(-dt/tau).
@@ -176,6 +180,8 @@ loss:
   lambda_routing_aux: 0.0    # auxiliary routing separation (Ticket #15; 0 disables; warmup-scaled)
   routing_aux_margin: 0.024  # hinge on trial-mean g_lif (1.0× pooled std; backup corpus)
   lambda_compute: 0.0        # adaptive-refinement compute cost (0 disables; requires refinement_mode != off)
+  lambda_latency: 0.0        # ADR 0012 stimulus-anchored latency contrast (0 disables;
+                             # >0 requires time_consuming_mode stochastic/hard_depth + target table)
   jerk_threshold: 0.1       # sudden-change jerk mask threshold
   warmup_epochs: 20          # CF9: extended warmup for new biophysical mechanisms
 

@@ -26,6 +26,12 @@ frozen protocol changes; the phase-3 protocol keeps its arm ids (`C1`–`C6`).
 | **CAMoR-R** (refinement) | `refinement_mode: "adaptive"` (ADR 0008) | `C6` | Depth refines the post-fusion representation only; it never consumes model time. |
 | CAMoR-R fixed-K control | `refinement_mode: "fixed"` | `C3`/`C4`/`C5` (K2/K3/K4) | Same module and parameters with no early exit: the capacity-matched control. |
 | **CAMoR-L** (latency-coupled) | `time_consuming_mode: "depth_delay" \| "accumulate"` (ADR 0009) | `C1`/`C2` | The output for frame `t` is emitted `delay_scale·(depth−1)` frames later, so depth is a model-grid latency comparable with the animal's response latency. |
+| **CAMoR-L-S** (stochastic depth) | `time_consuming_mode: "stochastic"` (ADR 0012) | new L2 arms | Same shared block and hard `u_N` readout, but depth is sampled from the first-success halt pmf (inverse-CDF, float64) and trained with a hard-forward / expectation-gradient STE. Its PRIMARY A/B is CAMoR-L-H, which fixes the value readout. |
+| **CAMoR-L-H** (hard-depth control) | `time_consuming_mode: "hard_depth"` (ADR 0012) | new L2 control | Deterministic matched control: the same halt pmf `p_k`, hard `u_N` readout and expectation-gradient STE (including halt-head learning), with `N = clamp(floor(E[N]+0.5), 1, K)`. Isolates stochastic depth from the value/gradient estimator. |
+
+The `stochastic` vs `depth_delay` contrast is secondary and confounded: ADR
+0009's deterministic modes use the ACT full-prefix mixture, not the hard `u_N`
+readout, so a difference cannot be attributed to stochastic depth alone.
 
 `refinement_mode: "off"` together with `time_consuming_mode: "off"` (all
 phase-2 R0–R3 checkpoints) contains no CAMoR at all.

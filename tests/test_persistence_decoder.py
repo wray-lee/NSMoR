@@ -529,6 +529,35 @@ def _stub_core_io(model: NSMoRCore, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(model.backend, "forward", _backend)
 
 
+@pytest.mark.parametrize("return_internals", [False, True])
+@pytest.mark.parametrize("carry", [False, True])
+def test_default_forward_preserves_legacy_backend_signature(
+    return_internals: bool,
+    carry: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Default calls must not require optional keywords on legacy backends."""
+    model = NSMoRCore(hidden_dim=8, dt_ms=4.0, persistence_skip=0.5)
+    _stub_core_io(model, monkeypatch)
+    x = torch.zeros(1, 3, 8)
+    states = {} if carry else None
+
+    result = model(
+        x, torch.tensor([3]),
+        return_internals=return_internals, states=states,
+    )
+
+    if carry or return_internals:
+        assert isinstance(result, tuple)
+        assert len(result) == (3 if carry else 2)
+        y = result[0]
+    else:
+        assert isinstance(result, torch.Tensor)
+        y = result
+    assert y.shape == (1, 3)
+    assert torch.equal(y, torch.zeros_like(y))
+
+
 @pytest.mark.parametrize("dtype", [torch.int8, torch.uint8, torch.int16])
 @pytest.mark.parametrize("carry", [False, True])
 def test_narrow_integer_lengths_do_not_overflow_range_check(

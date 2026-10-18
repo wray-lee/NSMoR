@@ -38,6 +38,38 @@ import yaml
 # the single source of truth, imported by ``nsmor.model_nsmor_core``.
 MIN_TIME_CONSUMING_EPS = 1e-6
 
+
+def validate_time_consuming_seed(seed: Any, *, context: str) -> int:
+    """Validate a private time-consuming RNG seed.
+
+    The seed is a non-boolean integer in ``[0, 2**63)`` — the range accepted
+    by ``torch.Generator.manual_seed``.  It is validated at every trust
+    boundary (config, constructor, ``set_train_seed`` / ``set_eval_seed``)
+    even when the mode is ``"off"``, so a malformed seed cannot lurk in a
+    config until the mechanism is enabled later.
+
+    Args:
+        seed: Candidate seed.
+        context: Caller label used in the error message.
+
+    Returns:
+        The validated seed as a Python ``int``.
+
+    Raises:
+        ValueError: If *seed* is a bool, non-int, negative, or ``>= 2**63``.
+    """
+    if (
+        isinstance(seed, bool)
+        or not isinstance(seed, int)
+        or not (0 <= seed < 2**63)
+    ):
+        raise ValueError(
+            f"{context}: time_consuming_seed must be an int in [0, 2**63), "
+            f"got {seed!r}"
+        )
+    return int(seed)
+
+
 @dataclass
 class ModelConfig:
     """Model architecture hyperparameters."""
@@ -142,14 +174,28 @@ class ModelConfig:
     # strictly causal shift).  ``"off"`` (default) constructs no module, so
     # historical numerics and state_dict keys are byte-unchanged.
     # ``"depth_delay"`` uses an adaptive halt depth; ``"accumulate"`` uses a
-    # learned accumulator to a threshold.  Not implemented in the JAX/Flax
-    # backends (they refuse it).  NOT measured neural latency, work, or ATP.
+    # learned accumulator to a threshold.  ``"stochastic"`` (CAMoR-L-S, ADR
+    # 0012) samples the integer depth from the halt-derived pmf
+    # ``P(N=k)`` and emits the sampled ``u_N``; ``"hard_depth"`` (CAMoR-L-H)
+    # is the deterministic matched control using
+    # ``N = clamp(floor(E[N] + 0.5), 1, K)``.  Not implemented in the
+    # JAX/Flax backends (they refuse it).  NOT measured neural latency,
+    # work, or ATP.
     time_consuming_mode: str = "off"
     time_consuming_max_steps: int = 4
     time_consuming_eps: float = 0.01
     time_consuming_update_scale: float = 1.0
     time_consuming_delay_scale: float = 1.0
     time_consuming_threshold: float = 1.0
+    time_consuming_seed: int = 0
+    """Private training-stream seed for ``time_consuming_mode="stochastic"``.
+
+    Validated for every mode (including ``"off"``) but only used by the
+    stochastic sampler.  It seeds a module-private ``torch.Generator``; the
+    global RNG stream is never consumed.  The generator state is NOT stored
+    in a checkpoint (see ADR 0012): a resume cannot reproduce the sampled
+    stream, which is why an enabled mode remains non-resumable.
+    """
 
     def __post_init__(self) -> None:
         if self.activation not in ("relu", "swiglu"):
@@ -199,11 +245,17 @@ class ModelConfig:
             )
         # Time-consuming recursion options (ADR 0009) — validated here so an
         # "off" model still refuses a malformed setting at the trust boundary.
-        if self.time_consuming_mode not in ("off", "depth_delay", "accumulate"):
+        if self.time_consuming_mode not in (
+            "off", "depth_delay", "accumulate", "stochastic", "hard_depth",
+        ):
             raise ValueError(
-                "time_consuming_mode must be 'off'/'depth_delay'/'accumulate', "
-                f"got {self.time_consuming_mode!r}"
+                "time_consuming_mode must be 'off'/'depth_delay'/'accumulate'/"
+                "'stochastic'/'hard_depth', got "
+                f"{self.time_consuming_mode!r}"
             )
+        validate_time_consuming_seed(
+            self.time_consuming_seed, context="ModelConfig",
+        )
         if (
             isinstance(self.time_consuming_max_steps, bool)
             or not isinstance(self.time_consuming_max_steps, int)
@@ -499,6 +551,24 @@ class LossConfig:
     bio-regularizer to ramp)."""
     jerk_threshold: float = 0.1
     """Threshold for sudden-change jerk mask (unused when mask=None)."""
+    lambda_latency: float = 0.0
+    """Stimulus-anchored latency-contrast weight (ADR 0012).
+
+    ``0.0`` (default) leaves the loss bitwise unchanged: the latency term is
+    never touched and ``last_latency_stats`` reports ``"disabled"``.  A
+    positive value requires ``model.time_consuming_mode`` in
+    ``{"stochastic", "hard_depth"}`` (validated in
+    :meth:`ExperimentConfig.validate`) and batch-level latency metadata.
+    NOT warmup-scaled (it is a supervised objective, not a bio-regularizer).
+
+    Biological caveat (must be repeated in every report): the observed
+    latency decomposes as ``L_obs = L_fixed(g) + L_proc(g) + eps``.  The
+    loss aligns only the *condition-relative* difference, so it identifies
+    ``Delta L_obs = Delta L_fixed + Delta L_proc``, never ``Delta L_proc``
+    alone.  The fixed component is assumed condition-independent; that is a
+    declared assumption, not a result.  Processing time is supervised, not
+    emergent.
+    """
     warmup_epochs: int = 0
     """Cosine warmup epoch count for ``lambda_energy``, ``lambda_sparse``,
     and ``lambda_jerk``.  These three bio-loss terms are ramped from 0
@@ -506,6 +576,25 @@ class LossConfig:
 
     ``lambda_reg`` is explicitly EXCLUDED from warmup scaling so the MoR
     router receives anti-collapse pressure from epoch 0."""
+
+    def __post_init__(self) -> None:
+        """Validate ``lambda_latency`` at the dataclass trust boundary.
+
+        Mirrors the unconditional ``lambda_compute`` validation: a boolean,
+        non-numeric, non-finite or negative weight is refused even when the
+        term is disabled.  This runs for direct construction and for
+        :meth:`ExperimentConfig.from_dict` (which rebuilds the dataclass).
+        """
+        if (
+            isinstance(self.lambda_latency, bool)
+            or not isinstance(self.lambda_latency, (int, float))
+            or not math.isfinite(self.lambda_latency)
+            or self.lambda_latency < 0.0
+        ):
+            raise ValueError(
+                "lambda_latency must be a finite scalar >= 0, got "
+                f"{self.lambda_latency!r}"
+            )
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -609,6 +698,7 @@ class ExperimentConfig:
     def validate(self) -> None:
         """Reject unsupported residual-decoder configurations before side effects."""
         self.model.__post_init__()
+        self.loss.__post_init__()
         if self.model.persistence_skip != 0.0:
             if (
                 self.training.normalize_targets is not False
@@ -644,6 +734,29 @@ class ExperimentConfig:
                 "refinement_mode='adaptive' requires lambda_compute > 0 (the ACT "
                 "depth is trained only through the compute-cost surrogate); got "
                 f"lambda_compute={self.loss.lambda_compute!r}."
+            )
+        # Latency supervision (ADR 0012) needs a differentiable E[delay],
+        # which only the stochastic / hard_depth modes expose.  The
+        # deterministic ADR 0009 delays are detached, so a positive weight
+        # there would silently have no gradient path; refuse before training.
+        if (
+            self.loss.lambda_latency > 0.0
+            and self.model.time_consuming_mode
+            not in ("stochastic", "hard_depth")
+        ):
+            raise ValueError(
+                "lambda_latency > 0 requires model.time_consuming_mode in "
+                "{'stochastic', 'hard_depth'} (the differentiable expected "
+                "delay); got "
+                f"{self.model.time_consuming_mode!r}."
+            )
+        if (
+            self.loss.lambda_latency > 0.0
+            and self.model.time_consuming_max_steps < 2
+        ):
+            raise ValueError(
+                "lambda_latency > 0 requires time_consuming_max_steps >= 2; "
+                "K=1 has constant zero expected delay and no latency gradient."
             )
 
     # ── Serialisation ────────────────────────────────────────

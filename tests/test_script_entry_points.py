@@ -41,6 +41,8 @@ _ENTRY_POINTS = [
     "evaluate_nested_prior.py",
     "make_subset_dataset.py",
     "train.py",
+    "analyze_latency.py",
+    "benchmark_time_consuming.py",
 ]
 
 

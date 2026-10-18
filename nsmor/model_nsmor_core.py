@@ -29,14 +29,17 @@ All tensors are annotated with their shape in comments.
 from __future__ import annotations
 
 import math
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple, overload
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
-from nsmor.config_parser import MIN_TIME_CONSUMING_EPS
+from nsmor.config_parser import (
+    MIN_TIME_CONSUMING_EPS,
+    validate_time_consuming_seed,
+)
 
 
 # Valid activation names for the encoder / decoder projections.
@@ -301,18 +304,25 @@ def _validate_refinement_options(
     return mode, int(max_steps), float(eps), float(update_scale)
 
 
-# Valid time-consuming recursion modes (phase-3 mechanism line, ADR 0009).
-# ``off`` (default) constructs no module and leaves historical numerics,
-# parameters and RNG byte-unchanged.  ``depth_delay`` ties the output time of
-# each frame to its adaptive processing depth; ``accumulate`` ties it to the
-# first step at which a learned scalar accumulator reaches a threshold.
-_VALID_TIME_CONSUMING_MODES = ("off", "depth_delay", "accumulate")
+# Valid time-consuming recursion modes (phase-3 mechanism line, ADR 0009;
+# stochastic/hard_depth added by ADR 0012).  ``off`` (default) constructs no
+# module and leaves historical numerics, parameters and RNG byte-unchanged.
+# ``depth_delay`` ties the output time of each frame to its adaptive
+# processing depth; ``accumulate`` ties it to the first step at which a
+# learned scalar accumulator reaches a threshold; ``stochastic`` (CAMoR-L-S)
+# samples the integer depth from the halt-derived pmf; ``hard_depth``
+# (CAMoR-L-H) is the deterministic matched control.
+_VALID_TIME_CONSUMING_MODES = (
+    "off", "depth_delay", "accumulate", "stochastic", "hard_depth",
+)
+
+_STOCHASTIC_TIME_CONSUMING_MODES = ("stochastic", "hard_depth")
 
 
 def _validate_time_consuming_options(
     *, mode: Any, max_steps: Any, eps: Any, update_scale: Any,
-    delay_scale: Any, threshold: Any, context: str,
-) -> Tuple[str, int, float, float, float, float]:
+    delay_scale: Any, threshold: Any, seed: Any, context: str,
+) -> Tuple[str, int, float, float, float, float, int]:
     """Validate ORIGINAL time-consuming-recursion options independently.
 
     Mirrors :func:`_validate_refinement_options`: the option contract holds at
@@ -331,16 +341,22 @@ def _validate_time_consuming_options(
     convex hull of the iterates (findings R1-m3 / R2-B4).  A ``threshold > 1``
     would permit ``R < 0`` (an extrapolation, not a mixture).
 
+    ``seed`` is validated for every mode (including ``"off"``); it is only
+    used by the stochastic sampler.  ``eps`` and ``threshold`` are likewise
+    validated but do not participate in ``"stochastic"`` / ``"hard_depth"``
+    (a declared shared-option contract, not a silent no-op).
+
     Returns the validated ``(mode, int(max_steps), float(eps),
-    float(update_scale), float(delay_scale), float(threshold))``.
+    float(update_scale), float(delay_scale), float(threshold), int(seed))``.
 
     Raises:
         ValueError: On any malformed option.
     """
     if mode not in _VALID_TIME_CONSUMING_MODES:
         raise ValueError(
-            f"{context}: time_consuming_mode must be 'off'/'depth_delay'/"
-            f"'accumulate', got {mode!r}"
+            f"{context}: time_consuming_mode must be "
+            "'off'/'depth_delay'/'accumulate'/'stochastic'/'hard_depth', "
+            f"got {mode!r}"
         )
     if isinstance(max_steps, bool) or not isinstance(max_steps, int) or max_steps < 1:
         raise ValueError(
@@ -387,9 +403,10 @@ def _validate_time_consuming_options(
             f"{context}: time_consuming_threshold must be in (0, 1], got "
             f"{threshold!r}"
         )
+    seed = validate_time_consuming_seed(seed, context=context)
     return (
         mode, int(max_steps), float(eps), float(update_scale),
-        float(delay_scale), float(threshold),
+        float(delay_scale), float(threshold), seed,
     )
 
 
@@ -2678,8 +2695,85 @@ def _emit_delayed(
     return out, out_valid, max_delay, n_collisions, n_truncated, realized_delay
 
 
+def _inverse_cdf_from_uniform(
+    u: torch.Tensor, g: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Inverse-CDF sampler for the halt-derived depth distribution.
+
+    For each row, the halt probabilities ``g_1..g_K`` define the survival
+    values ``S_k = prod_{j<=k}(1 - g_j)`` and the first-success pmf
+
+    ``p_k = S_{k-1} g_k`` for ``k < K`` and ``p_K = S_{K-1}`` (the remaining
+    mass at the truncation point).  For ``U ~ Uniform[0, 1)``::
+
+        N = min{k in 1..K : S_k < U},  else N = K.
+
+    Then ``P(N=k) = S_{k-1} - S_k = p_k`` for ``k < K`` and
+    ``P(N=K) = S_{K-1} = p_K``.  The pmf equals the distribution induced by
+    the *computed float64* survival values, up to float64 rounding (~1e-16
+    per step); it is not an exact real-arithmetic identity.  ``U`` must be
+    float64: a float32 grid cannot resolve tiny atoms whose interval is
+    narrower than the float32 spacing (~6e-8 near 1.0).
+
+    Args:
+        u: ``(N,)`` float64 uniforms in ``[0, 1)``.
+        g: ``(N, K)`` float64 halt probabilities in ``[0, 1]``.
+
+    Returns:
+        ``(depth, p)``: ``depth`` ``(N,)`` int64 in ``[1, K]``; ``p``
+        ``(N, K)`` float64 with rows summing to 1 (float64 rounding).
+
+    Raises:
+        ValueError: If dtypes, shapes or devices are inconsistent, or a
+            probability is nonfinite or outside ``[0, 1]``.
+    """
+    if u.dtype != torch.float64 or g.dtype != torch.float64:
+        raise ValueError(
+            "_inverse_cdf_from_uniform requires float64 u and g, got "
+            f"{u.dtype} and {g.dtype}"
+        )
+    if u.dim() != 1 or g.dim() != 2:
+        raise ValueError(
+            f"expected u (N,) and g (N, K), got {tuple(u.shape)} and "
+            f"{tuple(g.shape)}"
+        )
+    n, k_total = g.shape
+    if u.shape != (n,) or k_total < 1:
+        raise ValueError(
+            f"inconsistent shapes: u {tuple(u.shape)}, g {tuple(g.shape)}"
+        )
+    if u.device != g.device:
+        raise ValueError("u and g must be on the same device")
+    if not bool(torch.isfinite(g).all()):
+        raise ValueError("halt probabilities must be finite")
+    if bool(((g < 0.0) | (g > 1.0)).any()):
+        raise ValueError("halt probabilities must lie in [0, 1]")
+
+    device = g.device
+    p = torch.zeros(n, k_total, dtype=torch.float64, device=device)
+    depth = torch.full((n,), k_total, dtype=torch.long, device=device)
+    halted = torch.zeros(n, dtype=torch.bool, device=device)
+    survival = torch.ones(n, dtype=torch.float64, device=device)
+    for k in range(k_total):
+        if k < k_total - 1:
+            # p_k = S_{k-1} * g_k; then advance S to S_k and test the
+            # first crossing S_k < U.
+            p[:, k] = survival * g[:, k]
+            survival = survival * (1.0 - g[:, k])
+            just = (~halted) & (survival < u)
+        else:
+            # p_K = S_{K-1}; every remaining row truncates at K.
+            p[:, k_total - 1] = survival
+            just = ~halted
+        depth = torch.where(
+            just, torch.full_like(depth, k + 1), depth,
+        )
+        halted = halted | just
+    return depth, p
+
+
 class TimeConsumingRecursion(nn.Module):
-    """Time-consuming adaptive recursion (opt-in, ADR 0009).
+    """Time-consuming adaptive recursion (opt-in, ADR 0009 / ADR 0012).
 
     Unlike :class:`AdaptiveLatentRefinement`, which refines the post-fusion
     latent at a fixed external timestep and never advances biological time,
@@ -2692,7 +2786,7 @@ class TimeConsumingRecursion(nn.Module):
     of each trial are truncated, shrinking the effective output length by up
     to ``max_steps - 1`` frames.
 
-    Two modes share the SAME parameter tree (capacity-matched controls):
+    Modes share the SAME parameter tree (capacity-matched controls):
 
     * ``"depth_delay"`` — each valid frame runs the shared bounded block
       exactly ``max_steps`` times; the shared halt head's first crossing
@@ -2704,12 +2798,24 @@ class TimeConsumingRecursion(nn.Module):
       emitted at the first step ``d`` at which the accumulator reaches
       ``threshold`` (else ``max_steps``).  This is the "accumulate to a
       threshold before emitting" reading.
+    * ``"stochastic"`` (CAMoR-L-S, ADR 0012) — the same block/halt stack
+      defines the first-success pmf ``p_k = S_{k-1} g_k`` (``p_K = S_{K-1}``);
+      an integer depth ``N ~ p`` is drawn by inverse CDF from a float64
+      uniform, and the emitted value is the hard ``u_N``.  The backward pass
+      uses the expected value ``E[u] = sum_k p_k u_k`` (hard-forward /
+      expectation-gradient STE), so the halt head and block receive the
+      expected-value gradient.  The scored target frame depends on the
+      detached ``N``; that bias is documented, not hidden.
+    * ``"hard_depth"`` (CAMoR-L-H) — the deterministic matched control:
+      same pmf, same hard ``u_N`` readout, same parameters, but
+      ``N = clamp(floor(E[N] + 0.5), 1, K)``.  It fixes the value readout for
+      the stochastic-vs-hard-depth A/B. It uses the SAME expectation-gradient
+      STE as stochastic so the task loss also trains its halt head.
 
-    Identifiability (ADR 0009): the two modes are behaviorally nearly
-    indistinguishable, so the strongest licensable claim is that an adaptive
-    processing duration exists and MoR is one discrete approximation — never
-    that the cricket has MoR.  The module is a representational timing device,
-    NOT measured neural latency, work, or ATP.
+    ``time_consuming_eps`` / ``time_consuming_threshold`` do not participate
+    in the stochastic/hard_depth modes (they remain validated shared
+    options).  The module is a representational timing device, NOT measured
+    neural latency, work, or ATP.
 
     Padding / empty rows never recurse (depth 0, no delay, not emitted).
     """
@@ -2724,6 +2830,8 @@ class TimeConsumingRecursion(nn.Module):
         update_scale: float = 1.0,
         delay_scale: float = 1.0,
         threshold: float = 1.0,
+        seed: int = 0,
+        grad_checkpointing: bool = False,
     ) -> None:
         super().__init__()
         # Validate the ORIGINAL time-consuming options first (so a malformed
@@ -2735,18 +2843,29 @@ class TimeConsumingRecursion(nn.Module):
         # module has no dropout layer, so accepting one would be a silently
         # unused knob and would make the "identical topology / capacity-matched"
         # claim (vs AdaptiveLatentRefinement) imprecise.
-        (mode, max_steps, eps, update_scale, delay_scale, threshold) = (
-            _validate_time_consuming_options(
-                mode=mode, max_steps=max_steps, eps=eps,
-                update_scale=update_scale, delay_scale=delay_scale,
-                threshold=threshold, context="TimeConsumingRecursion",
-            )
+        (mode, max_steps, eps, update_scale, delay_scale, threshold,
+         seed) = _validate_time_consuming_options(
+            mode=mode, max_steps=max_steps, eps=eps,
+            update_scale=update_scale, delay_scale=delay_scale,
+            threshold=threshold, seed=seed,
+            context="TimeConsumingRecursion",
         )
         if mode == "off":
             raise ValueError(
                 "TimeConsumingRecursion is the ENABLED time-consuming module and "
                 "does not accept mode='off'; 'off' means the module is absent "
-                "(BioDecisionCore builds it only for 'depth_delay'/'accumulate')."
+                "(BioDecisionCore builds it only for an enabled mode)."
+            )
+        if not isinstance(grad_checkpointing, bool):
+            raise ValueError(
+                "grad_checkpointing must be a bool, got "
+                f"{grad_checkpointing!r}"
+            )
+        if grad_checkpointing and mode not in _STOCHASTIC_TIME_CONSUMING_MODES:
+            raise ValueError(
+                "grad_checkpointing is only implemented for 'stochastic' / "
+                f"'hard_depth'; got mode={mode!r}.  The ADR 0009 deterministic "
+                "modes keep their existing numeric path."
             )
         self.mode = mode
         self.max_steps = int(max_steps)
@@ -2755,13 +2874,23 @@ class TimeConsumingRecursion(nn.Module):
         self.delay_scale = float(delay_scale)
         self.threshold = float(threshold)
         self.hidden_dim = int(hidden_dim)
+        # Private RNG state: plain attributes, never buffers / parameters, so
+        # they do not appear in ``state_dict`` and do not change construction
+        # RNG.  ``eval_seed`` is stateless per call when overridden.
+        self.seed = int(seed)
+        self.eval_seed = int(seed)
+        self.grad_checkpointing = bool(grad_checkpointing)
+        self._train_generator: Optional[torch.Generator] = None
+        self._train_generator_device: Optional[torch.device] = None
+        self.last_nonfinite_expected: int = 0
 
         # Shared bounded residual block (identical topology to
         # AdaptiveLatentRefinement, so the two are capacity-matched).
         self.norm = nn.LayerNorm(hidden_dim)
         self.fc1 = nn.Linear(hidden_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        # Shared halt head (depth_delay) / accumulator gate (accumulate).
+        # Shared halt head (depth_delay) / accumulator gate (accumulate) /
+        # halt probability (stochastic, hard_depth).
         self.halt = nn.Linear(hidden_dim, 1)
 
     def _block(self, u: torch.Tensor) -> torch.Tensor:
@@ -2773,36 +2902,337 @@ class TimeConsumingRecursion(nn.Module):
         delta = self.update_scale * torch.tanh(h)
         return u + delta
 
+    def _step_block(self, u: torch.Tensor) -> torch.Tensor:
+        """Run one bounded block step, optionally under gradient checkpointing.
+
+        Checkpointing is opt-in and only valid for the stochastic/hard_depth
+        modes (enforced in ``__init__``).  It recomputes the block in backward
+        to reduce saved block activations; K input/output states remain live,
+        so memory still grows with K. The forward output is unchanged.
+        """
+        if self.grad_checkpointing and torch.is_grad_enabled():
+            from torch.utils.checkpoint import checkpoint
+
+            return checkpoint(self._block, u, use_reentrant=False)
+        return self._block(u)
+
+    def _draw_uniform(
+        self,
+        batch_size: int,
+        timesteps: int,
+        device: torch.device,
+        eval_seed: Optional[int],
+    ) -> torch.Tensor:
+        """Draw the ``(B, T)`` float64 uniform grid for inverse-CDF sampling.
+
+        Training uses a private per-device ``torch.Generator`` seeded with
+        ``self.seed``; the stream advances across forwards and never consumes
+        the global RNG.  Evaluation creates a throw-away local generator from
+        ``eval_seed`` (or ``self.eval_seed``), so the same input and seed are
+        bitwise reproducible while remaining a SINGLE hard draw (not a
+        noise-free expectation).
+        """
+        if self.training:
+            if (
+                self._train_generator is None
+                or self._train_generator_device != device
+            ):
+                generator = torch.Generator(device=device)
+                generator.manual_seed(self.seed)
+                self._train_generator = generator
+                self._train_generator_device = device
+            generator = self._train_generator
+        else:
+            seed = (
+                self.eval_seed if eval_seed is None
+                else validate_time_consuming_seed(eval_seed, context="eval_seed")
+            )
+            generator = torch.Generator(device=device)
+            generator.manual_seed(int(seed))
+        return torch.rand(
+            (batch_size, timesteps), dtype=torch.float64,
+            generator=generator, device=device,
+        )
+
+    def set_train_seed(self, seed: int) -> None:
+        """Validate and reseed the private training stream.
+
+        Does not touch parameters, ``state_dict`` or the global RNG.  The next
+        training forward lazily rebuilds the generator on its device.
+        """
+        self.seed = validate_time_consuming_seed(
+            seed, context="TimeConsumingRecursion.set_train_seed",
+        )
+        self._train_generator = None
+        self._train_generator_device = None
+
+    def set_eval_seed(self, seed: int) -> None:
+        """Validate and set the default eval seed (no parameter change)."""
+        self.eval_seed = validate_time_consuming_seed(
+            seed, context="TimeConsumingRecursion.set_eval_seed",
+        )
+
+    @overload
     def forward(
+        self,
+        h_fused: torch.Tensor,
+        valid: torch.Tensor,
+        *,
+        return_distribution_internals: Literal[False] = False,
+        eval_seed: Optional[int] = None,
+    ) -> Tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int,
+        torch.Tensor, int, int, torch.Tensor,
+    ]: ...
+
+    @overload
+    def forward(
+        self,
+        h_fused: torch.Tensor,
+        valid: torch.Tensor,
+        *,
+        return_distribution_internals: Literal[True],
+        eval_seed: Optional[int] = None,
+    ) -> Tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int,
+        torch.Tensor, int, int, torch.Tensor, torch.Tensor, torch.Tensor,
+    ]: ...
+
+    def forward(
+        self,
+        h_fused: torch.Tensor,
+        valid: torch.Tensor,
+        *,
+        return_distribution_internals: bool = False,
+        eval_seed: Optional[int] = None,
+    ) -> Tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int,
+        torch.Tensor, int, int, torch.Tensor,
+    ] | Tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int,
+        torch.Tensor, int, int, torch.Tensor, torch.Tensor, torch.Tensor,
+    ]:
+        """Consume time on ``h_fused`` (B, T, H).
+
+        Returns ``(out, depth, updates, delays, max_delay, out_valid,
+        n_collisions, n_truncated, realized_delay)``; with
+        ``return_distribution_internals=True`` (only valid for
+        ``"stochastic"`` / ``"hard_depth"``) two more tensors are appended:
+        ``halt_probs`` ``(B, T, K)`` and ``expected_delay`` ``(B, T)``.
+
+        ``eval_seed`` is only valid in evaluation mode for ``"stochastic"``;
+        it is stateless (does not modify ``self.eval_seed``).  Passing it in
+        training mode or for any other mode fails closed.
+        """
+        B, T, H = h_fused.shape
+        assert h_fused.shape == (B, T, H)
+        assert valid.shape == (B, T)
+        if eval_seed is not None:
+            if self.mode != "stochastic":
+                raise ValueError(
+                    "eval_seed is only valid for time_consuming_mode="
+                    f"'stochastic'; got mode={self.mode!r}"
+                )
+            if self.training:
+                raise ValueError(
+                    "eval_seed is only valid in evaluation mode; the training "
+                    "stream advances between forwards and must not be reseeded "
+                    "per call."
+                )
+            validate_time_consuming_seed(eval_seed, context="eval_seed")
+        if (
+            return_distribution_internals
+            and self.mode not in _STOCHASTIC_TIME_CONSUMING_MODES
+        ):
+            raise ValueError(
+                "return_distribution_internals is only implemented for "
+                "'stochastic' / 'hard_depth'; got mode="
+                f"{self.mode!r}"
+            )
+        if self.mode in _STOCHASTIC_TIME_CONSUMING_MODES:
+            return self._forward_stochastic(
+                h_fused, valid, eval_seed=eval_seed,
+                return_distribution_internals=return_distribution_internals,
+            )
+        return self._forward_deterministic(h_fused, valid)
+
+    def _forward_stochastic(
+        self,
+        h_fused: torch.Tensor,
+        valid: torch.Tensor,
+        *,
+        eval_seed: Optional[int],
+        return_distribution_internals: bool,
+    ) -> Tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int,
+        torch.Tensor, int, int, torch.Tensor,
+    ] | Tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int,
+        torch.Tensor, int, int, torch.Tensor, torch.Tensor, torch.Tensor,
+    ]:
+        """Stochastic / hard-depth forward (vectorised over valid frames)."""
+        B, T, H = h_fused.shape
+        assert h_fused.shape == (B, T, H)
+        assert valid.shape == (B, T)
+        K = self.max_steps
+        device = h_fused.device
+        dt = h_fused.dtype
+        self.last_nonfinite_expected = 0
+
+        # Draw the full (B, T) grid even when every row is padding: padding
+        # samples are discarded but the training stream still advances.
+        uniform = (
+            self._draw_uniform(B, T, device, eval_seed)
+            if self.mode == "stochastic" else None
+        )
+        n_valid = int(valid.sum().item())
+        depth = torch.zeros(B, T, dtype=torch.long, device=device)
+        halt_probs = torch.zeros(B, T, K, dtype=dt, device=device)
+        expected_delay = torch.zeros(B, T, dtype=dt, device=device)
+        refined = torch.zeros(B, T, H, dtype=dt, device=device)
+
+        if n_valid > 0:
+            flat_valid = valid.reshape(-1)
+            u = h_fused.reshape(B * T, H)[flat_valid]        # (N, H)
+            iterates: List[torch.Tensor] = []
+            for _ in range(K):
+                u = self._step_block(u)
+                iterates.append(u)
+            # (N, K, H): the hard-depth control MUST retain all iterates (its
+            # N is only known after the full pmf); the stochastic readout uses
+            # the same stack for E[u], so both modes share one code path.
+            u_stack = torch.stack(iterates, dim=1)
+            g = torch.sigmoid(self.halt(u_stack)).squeeze(-1)  # (N, K)
+            g64 = g.double()
+            steps = torch.arange(
+                1, K + 1, dtype=torch.float64, device=device,
+            )
+            if self.mode == "stochastic":
+                u_flat = uniform.reshape(-1)[flat_valid]      # (N,)
+                depth_s, p64 = _inverse_cdf_from_uniform(u_flat, g64)
+            else:
+                # p does not depend on U; the uniform argument is unused.
+                _, p64 = _inverse_cdf_from_uniform(
+                    torch.zeros(n_valid, dtype=torch.float64, device=device),
+                    g64,
+                )
+                e_n_all = (p64 * steps).sum(dim=1)
+                if not bool(torch.isfinite(e_n_all).all()):
+                    raise ValueError(
+                        "hard_depth: nonfinite expected depth E[N]; a "
+                        "deterministic control cannot be defined.  Refusing "
+                        "rather than emitting an arbitrary depth."
+                    )
+                depth_s = torch.floor(e_n_all + 0.5).clamp(1, K).to(torch.long)
+
+            gather_idx = (depth_s - 1).view(n_valid, 1, 1).expand(n_valid, 1, H)
+            v_hard = u_stack.gather(1, gather_idx).squeeze(1)  # (N, H)
+            acc_dtype = (
+                torch.float32 if dt in (torch.float16, torch.bfloat16) else dt
+            )
+            e_u = torch.einsum(
+                "nk,nkh->nh", p64.to(acc_dtype), u_stack.to(acc_dtype),
+            ).to(dt)
+            row_finite = (
+                torch.isfinite(e_u).all(dim=-1)
+                & torch.isfinite(u_stack).all(dim=(1, 2))
+            )
+            self.last_nonfinite_expected = int((~row_finite).sum().item())
+            if self.last_nonfinite_expected:
+                # Masking AFTER a nonfinite operation still backpropagates
+                # 0 * Inf/NaN. Abandon that entire graph and recompute ONLY
+                # finite rows from the original input. Blocks are row-local.
+                # Bad rows keep detached diagnostics/hard values and an empty
+                # sum connects finite zero gradients to inputs/parameters.
+                zero = h_fused.reshape(-1)[:0].sum()
+                for parameter in self.parameters():
+                    zero = zero + parameter.reshape(-1)[:0].sum()
+                e_u_safe = torch.zeros_like(e_u) + zero
+                p_safe = p64.detach().clone() + zero.double()
+                good = row_finite.nonzero(as_tuple=True)[0]
+                if good.numel():
+                    safe_u = h_fused.reshape(B * T, H)[flat_valid][good]
+                    safe_iterates: List[torch.Tensor] = []
+                    for _ in range(K):
+                        safe_u = self._step_block(safe_u)
+                        safe_iterates.append(safe_u)
+                    safe_stack = torch.stack(safe_iterates, dim=1)
+                    safe_g = torch.sigmoid(self.halt(safe_stack)).squeeze(-1)
+                    _, safe_p = _inverse_cdf_from_uniform(
+                        torch.zeros(good.numel(), dtype=torch.float64,
+                                    device=device), safe_g.double(),
+                    )
+                    safe_e = torch.einsum(
+                        "nk,nkh->nh", safe_p.to(acc_dtype),
+                        safe_stack.to(acc_dtype),
+                    ).to(dt)
+                    assert safe_e.shape == (good.numel(), H)
+                    e_u_safe = e_u_safe.index_copy(0, good, safe_e)
+                    p_safe = p_safe.index_copy(0, good, safe_p)
+                p64 = p_safe
+            else:
+                e_u_safe = e_u
+            assert e_u_safe.shape == (n_valid, H)
+            # BOTH new modes use the same surrogate, including a trainable
+            # halt head. Only their hard depth selection differs. Parentheses
+            # preserve bitwise hard forward values (E - E.detach() == 0).
+            v_out = v_hard.detach() + (e_u_safe - e_u_safe.detach())
+
+            hp_flat = torch.zeros(
+                B * T, K, dtype=torch.float64, device=device,
+            )
+            hp_flat[flat_valid] = p64
+            halt_probs = hp_flat.reshape(B, T, K).to(dt)
+
+            e_n = (p64 * steps).sum(dim=1)                    # (N,) float64
+            ed_flat = torch.zeros(B * T, dtype=torch.float64, device=device)
+            ed_flat[flat_valid] = (
+                (e_n - 1.0).clamp(min=0.0) * float(self.delay_scale)
+            )
+            expected_delay = ed_flat.reshape(B, T).to(dt)
+
+            depth_flat = torch.zeros(B * T, dtype=torch.long, device=device)
+            depth_flat[flat_valid] = depth_s
+            depth = depth_flat.reshape(B, T)
+
+            refined_flat = torch.zeros(B * T, H, dtype=dt, device=device)
+            refined_flat[flat_valid] = v_out
+            refined = refined_flat.reshape(B, T, H)
+
+        source_delay = (depth.to(dt) - 1.0).clamp(min=0.0) * self.delay_scale
+        assert source_delay.shape == (B, T)
+        lengths = valid.sum(dim=1)                            # (B,)
+        (out, out_valid, max_delay, n_collisions,
+         n_truncated, realized_delay) = _emit_delayed(
+            refined, source_delay, valid, lengths,
+        )
+        updates = torch.tensor(
+            n_valid * K, dtype=torch.long, device=device,
+        )
+        assert out.shape == (B, T, H)
+        assert depth.shape == (B, T)
+        assert halt_probs.shape == (B, T, K)
+        assert expected_delay.shape == (B, T)
+        assert realized_delay.shape == (B, T)
+        base = (
+            out, depth, updates, source_delay, max_delay, out_valid,
+            n_collisions, n_truncated, realized_delay,
+        )
+        if return_distribution_internals:
+            return base + (halt_probs, expected_delay)
+        return base
+
+    def _forward_deterministic(
         self, h_fused: torch.Tensor, valid: torch.Tensor,
     ) -> Tuple[
         torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int,
         torch.Tensor, int, int, torch.Tensor,
     ]:
-        """Consume time on ``h_fused`` (B, T, H).
+        """ADR 0009 deterministic forward (``depth_delay`` / ``accumulate``).
 
-        Returns ``(out, depth, updates, delays, max_delay, out_valid,
-        n_collisions, n_truncated, realized_delay)`` where
-
-        * ``out`` ``(B, T, H)`` — delayed/truncated output (frames with no
-          source write are exact zeros);
-        * ``depth`` ``(B, T)`` int — per-frame recursion depth (0 for padding);
-        * ``updates`` int scalar — ACTUAL executed block AND halt rows
-          (``n_valid * K``).  Both the shared block and the halt head run on
-          every one of the ``K`` steps for every valid row (there is no early
-          exit), so ``block_rows == halt_rows == updates`` and the protocol
-          §5 budget identity holds;
-        * ``delays`` ``(B, T)`` — per-frame emission delay in frames
-          (``delay_scale * (depth - 1)``, 0 for padding), indexed by SOURCE;
-        * ``max_delay`` int — the largest delay in the batch;
-        * ``out_valid`` ``(B, T)`` bool — frames that received a source write;
-        * ``n_collisions`` int — in-trial sources that lost arbitration;
-        * ``n_truncated`` int — sources whose target fell outside the trial;
-        * ``realized_delay`` ``(B, T)`` — the POST-ARBITRATION delay of the
-          surviving source, indexed by TARGET frame (0 where no write
-          happened).  This is the R6 latency statistic's quantity (finding
-          R1-M1): a collided target reports the delay actually emitted, not
-          the losing source's delay.
+        Byte-for-byte the pre-ADR-0012 implementation: the branch above never
+        reaches this method for the stochastic modes, and the default keyword
+        arguments do not alter the returned 9-tuple.
         """
         B, T, H = h_fused.shape
         assert h_fused.shape == (B, T, H)
@@ -2810,6 +3240,7 @@ class TimeConsumingRecursion(nn.Module):
         K = self.max_steps
         device = h_fused.device
         dt = h_fused.dtype
+        self.last_nonfinite_expected = 0
 
         depth = torch.zeros(B, T, dtype=torch.long, device=device)
         # ACT full-prefix mixture (differentiable in the shared block and halt
@@ -2966,6 +3397,8 @@ class BioDecisionCore(nn.Module):
         time_consuming_update_scale: float = 1.0,
         time_consuming_delay_scale: float = 1.0,
         time_consuming_threshold: float = 1.0,
+        time_consuming_seed: int = 0,
+        time_consuming_grad_checkpointing: bool = False,
     ) -> None:
         """
         Args:
@@ -3004,16 +3437,24 @@ class BioDecisionCore(nn.Module):
                 (``|delta| <= update_scale``).
             time_consuming_mode: ``"off"`` (default; module absent, historical
                 numerics unchanged), ``"depth_delay"`` (adaptive depth delays
-                each frame's emission), or ``"accumulate"`` (a learned
-                accumulator to a threshold sets the delay).  ADR 0009.
+                each frame's emission), ``"accumulate"`` (a learned
+                accumulator to a threshold sets the delay), ``"stochastic"``
+                (CAMoR-L-S: sampled integer depth, ADR 0012), or
+                ``"hard_depth"`` (CAMoR-L-H: deterministic matched control).
             time_consuming_max_steps: Maximum recursion depth / delay steps K.
             time_consuming_eps: ``depth_delay`` halting threshold; a frame is
                 emitted when its cumulative halt probability reaches
-                ``1 - eps``.
+                ``1 - eps``.  Validated but unused by stochastic/hard_depth.
             time_consuming_update_scale: Bound on the per-step residual update.
             time_consuming_delay_scale: Frames of delay per recursion step
                 (``delay = delay_scale * (depth - 1)``).
             time_consuming_threshold: ``accumulate`` accumulator threshold.
+                Validated but unused by stochastic/hard_depth.
+            time_consuming_seed: Private training-stream seed for
+                ``"stochastic"``; validated for every mode.
+            time_consuming_grad_checkpointing: Opt-in gradient checkpointing
+                for the stochastic/hard_depth block steps (default ``False``);
+                refused for the ADR 0009 deterministic modes.
         """
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -3078,12 +3519,16 @@ class BioDecisionCore(nn.Module):
         # trust boundary (findings R1-M2 / R2-m1).
         (time_consuming_mode, time_consuming_max_steps, time_consuming_eps,
          time_consuming_update_scale, time_consuming_delay_scale,
-         time_consuming_threshold) = _validate_time_consuming_options(
-            mode=time_consuming_mode, max_steps=time_consuming_max_steps,
-            eps=time_consuming_eps, update_scale=time_consuming_update_scale,
-            delay_scale=time_consuming_delay_scale,
-            threshold=time_consuming_threshold,
-            context="BioDecisionCore",
+         time_consuming_threshold, time_consuming_seed) = (
+            _validate_time_consuming_options(
+                mode=time_consuming_mode, max_steps=time_consuming_max_steps,
+                eps=time_consuming_eps,
+                update_scale=time_consuming_update_scale,
+                delay_scale=time_consuming_delay_scale,
+                threshold=time_consuming_threshold,
+                seed=time_consuming_seed,
+                context="BioDecisionCore",
+            )
         )
         self.time_consuming_mode = time_consuming_mode
         if time_consuming_mode == "off":
@@ -3097,6 +3542,8 @@ class BioDecisionCore(nn.Module):
                 update_scale=time_consuming_update_scale,
                 delay_scale=time_consuming_delay_scale,
                 threshold=time_consuming_threshold,
+                seed=time_consuming_seed,
+                grad_checkpointing=time_consuming_grad_checkpointing,
             )
 
         # ── Neuromodulatory gain for GRU pathway (Gap C) ──
@@ -3117,6 +3564,7 @@ class BioDecisionCore(nn.Module):
         return_internals: bool = False,
         override_gates: Optional[Dict[str, float]] = None,
         states: Optional[Dict[str, torch.Tensor]] = None,
+        eval_seed: Optional[int] = None,
     ) -> torch.Tensor | Tuple[torch.Tensor, Dict[str, torch.Tensor]] | Tuple[torch.Tensor, Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
         """
         Forward pass through the bio-decision core.
@@ -3128,12 +3576,30 @@ class BioDecisionCore(nn.Module):
             return_internals: If ``True``, return internals dict.
             override_gates: Optional dict for in-silico lesioning.
             states: Optional dict of recurrent states for autoregressive mode.
+            eval_seed: Optional stateless evaluation seed for the
+                ``"stochastic"`` time-consuming mode.  Only valid in
+                evaluation mode; other modes fail closed.
 
         Returns:
             Same as :meth:`NSMoRCore.forward`.
         """
         B, T, H = e_sensory.shape
         device = e_sensory.device
+        if eval_seed is not None:
+            if (
+                self.time_consuming is None
+                or self.time_consuming.mode != "stochastic"
+            ):
+                raise ValueError(
+                    "eval_seed is only valid when the executed time-consuming "
+                    "module is in 'stochastic' mode; got "
+                    f"{getattr(self.time_consuming, 'mode', None)!r}"
+                )
+            if self.training:
+                raise ValueError(
+                    "eval_seed is only valid in evaluation mode; the training "
+                    "stream must advance between forwards."
+                )
 
         assert e_sensory.shape == (B, T, self.hidden_dim), (
             f"e_sensory shape {tuple(e_sensory.shape)} != "
@@ -3444,13 +3910,32 @@ class BioDecisionCore(nn.Module):
             time_consuming_truncated = torch.zeros(
                 (), dtype=torch.long, device=device,
             )
+            time_consuming_halt_probs: Optional[torch.Tensor] = None
+            time_consuming_expected_delay: Optional[torch.Tensor] = None
+            time_consuming_nonfinite_expected = 0
             if self.time_consuming is not None:
+                # ADR 0012: the stochastic/hard_depth modes additionally return
+                # the per-frame pmf and the differentiable expected delay.  The
+                # default (False) keeps the exact 9-tuple contract of ADR 0009.
+                _want_distribution = (
+                    self.time_consuming.mode
+                    in _STOCHASTIC_TIME_CONSUMING_MODES
+                )
+                _tc_out = self.time_consuming(
+                    h_refined, valid,
+                    return_distribution_internals=_want_distribution,
+                    eval_seed=eval_seed,
+                )
                 (h_emitted, time_consuming_depth, time_consuming_updates,
                  time_consuming_delays, time_consuming_max_delay,
                  time_consuming_out_valid, _n_coll, _n_trunc,
-                 time_consuming_realized_delay) = (
-                    self.time_consuming(h_refined, valid)
-                )
+                 time_consuming_realized_delay) = _tc_out[:9]
+                if _want_distribution:
+                    time_consuming_halt_probs = _tc_out[9]
+                    time_consuming_expected_delay = _tc_out[10]
+                    time_consuming_nonfinite_expected = int(
+                        self.time_consuming.last_nonfinite_expected
+                    )
                 # ``h_emitted`` is the delayed emission; the direction head
                 # decodes it.  The delayed map is not injective, so sources can
                 # lose per-target arbitration (collisions) and sources can be
@@ -3575,6 +4060,31 @@ class BioDecisionCore(nn.Module):
             internals["time_consuming_hidden"] = h_emitted
             internals["time_consuming_collisions"] = time_consuming_collisions
             internals["time_consuming_truncated"] = time_consuming_truncated
+            # ADR 0012: present ONLY for stochastic/hard_depth, so the ADR
+            # 0009 modes keep their exact internals key set.
+            if time_consuming_halt_probs is not None:
+                assert time_consuming_expected_delay is not None
+                K_tc = self.time_consuming.max_steps
+                assert time_consuming_halt_probs.shape == (B, T, K_tc), (
+                    f"time_consuming_halt_probs shape "
+                    f"{tuple(time_consuming_halt_probs.shape)} != "
+                    f"(B={B}, T={T}, K={K_tc})"
+                )
+                assert time_consuming_expected_delay.shape == (B, T), (
+                    f"time_consuming_expected_delay shape "
+                    f"{tuple(time_consuming_expected_delay.shape)} != "
+                    f"(B={B}, T={T})"
+                )
+                internals["time_consuming_halt_probs"] = (
+                    time_consuming_halt_probs
+                )
+                internals["time_consuming_expected_delay"] = (
+                    time_consuming_expected_delay
+                )
+                internals["time_consuming_nonfinite_expected"] = torch.tensor(
+                    int(time_consuming_nonfinite_expected),
+                    dtype=torch.long, device=device,
+                )
 
         if states is not None:
             states_out: Dict[str, torch.Tensor] = {
@@ -3854,6 +4364,8 @@ class NSMoRCore(nn.Module):
         time_consuming_update_scale: float = 1.0,
         time_consuming_delay_scale: float = 1.0,
         time_consuming_threshold: float = 1.0,
+        time_consuming_seed: int = 0,
+        time_consuming_grad_checkpointing: bool = False,
     ) -> None:
         super().__init__()
         if (
@@ -3920,6 +4432,10 @@ class NSMoRCore(nn.Module):
             time_consuming_update_scale=time_consuming_update_scale,
             time_consuming_delay_scale=time_consuming_delay_scale,
             time_consuming_threshold=time_consuming_threshold,
+            time_consuming_seed=time_consuming_seed,
+            time_consuming_grad_checkpointing=(
+                time_consuming_grad_checkpointing
+            ),
         )
 
         # ── Backward-compatible attribute aliases ──
@@ -3939,6 +4455,7 @@ class NSMoRCore(nn.Module):
         return_internals: bool = False,
         override_gates: Optional[Dict[str, float]] = None,
         states: Optional[Dict[str, torch.Tensor]] = None,
+        eval_seed: Optional[int] = None,
     ) -> torch.Tensor | Tuple[torch.Tensor, Dict[str, torch.Tensor]] | Tuple[torch.Tensor, Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
         """
         Forward pass (Hybrid Funnel).
@@ -3949,6 +4466,9 @@ class NSMoRCore(nn.Module):
             return_internals: If ``True``, return internals dict.
             override_gates: Optional dict for in-silico lesioning.
             states: Optional dict of recurrent states for autoregressive mode.
+            eval_seed: Optional stateless evaluation seed for the
+                ``"stochastic"`` time-consuming mode (default ``None``;
+                existing callers are unchanged).
 
         Returns:
             Same as original ``NSMoRCore.forward``.
@@ -4063,12 +4583,15 @@ class NSMoRCore(nn.Module):
             assert y.shape == (B, T), f"y shape {tuple(y.shape)} != (B={B}, T={T})"
             return y
 
+        # Preserve the legacy backend signature unless a seed is requested.
+        seed_kwargs = {"eval_seed": eval_seed} if eval_seed is not None else {}
         if states is not None:
             y_pred, internals, states_out = self.backend(
                 e_sensory, mcmc_prior, lengths,
                 return_internals=True,
                 override_gates=override_gates,
                 states=states,
+                **seed_kwargs,
             )
             y_pred = _apply_skip(y_pred)
             # Include frontend dendritic state in states_out so
@@ -4084,6 +4607,7 @@ class NSMoRCore(nn.Module):
                 e_sensory, mcmc_prior, lengths,
                 return_internals=True,
                 override_gates=override_gates,
+                **seed_kwargs,
             )
             y_pred = _apply_skip(y_pred)
             return y_pred, internals
@@ -4091,6 +4615,7 @@ class NSMoRCore(nn.Module):
         y_pred = self.backend(
             e_sensory, mcmc_prior, lengths,
             override_gates=override_gates,
+            **seed_kwargs,
         )
         return _apply_skip(y_pred)
 

@@ -16,10 +16,12 @@ Covered:
   the historical length-only mask.
 * depth -> delay mapping ``delay = delay_scale * (depth - 1)``; forced-halt
   depth and the ACT full-prefix value mixture.
-* default preservation vs a genuine ``git show HEAD`` module: off-mode
-  construction consumes exactly the HEAD baseline RNG, has the HEAD
-  state_dict keys (both directions), and a HEAD state_dict loads ``strict=True``
-  into the current off model and produces bitwise-identical outputs.
+* default preservation vs the fixed pre-change ref module (``PRE_CHANGE_REF``):
+  off-mode construction consumes exactly the ref baseline RNG, has the ref
+  state_dict keys (both directions), and a ref state_dict loads ``strict=True``
+  into the current off model and produces bitwise-identical outputs.  The ref
+  is a fixed SHA (not ``HEAD``) so the test stays meaningful after the ADR 0012
+  commit moves HEAD.
 * one external timestep = one LIF/GRU advance (time-consuming adds no recurrent
   carry: ``states_out`` is unchanged between off and enabled).
 * the integer depth is detached; task gradient reaches the shared halt head.
@@ -73,11 +75,34 @@ _TC_KEYS = (
 )
 
 
-def _load_head_module(relpath: str, name: str):
-    """Load the ``git show HEAD:<relpath>`` source as an importable module."""
+# ADR 0012 fixed pre-change reference (the commit this change branched from).
+PRE_CHANGE_REF = "5eadb2268bcb6d67038dda3e981870895758ac46"
+
+
+def _load_module_at_ref(ref: str, relpath: str, name: str):
+    """Load ``git show <ref>:<relpath>`` as an importable module.
+
+    Self-comparison guard: if the ref resolves to the current HEAD AND the
+    working-tree file is byte-identical to the ref source, the comparison is
+    vacuous, so fail closed.  During pre-commit development HEAD *is* the
+    pre-change ref while the working tree differs; the guard therefore keys
+    on file content, not only the SHA.
+    """
     source = subprocess.check_output(
-        ["git", "show", f"HEAD:{relpath}"], cwd=str(_REPO_ROOT), text=True,
+        ["git", "show", f"{ref}:{relpath}"], cwd=str(_REPO_ROOT), text=True,
     )
+    current = (_REPO_ROOT / relpath).read_text()
+    ref_sha = subprocess.check_output(
+        ["git", "rev-parse", ref], cwd=str(_REPO_ROOT), text=True,
+    ).strip()
+    head_sha = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=str(_REPO_ROOT), text=True,
+    ).strip()
+    if ref_sha == head_sha and source == current:
+        raise RuntimeError(
+            f"self-comparison refused: {ref} == HEAD and {relpath} is "
+            "byte-identical to the working tree"
+        )
     tmp = Path(tempfile.mkdtemp()) / Path(relpath).name
     tmp.write_text(source)
     spec = importlib.util.spec_from_file_location(name, tmp)
@@ -476,8 +501,9 @@ class TestDepthDelayAndValue:
 
 class TestDefaultPreservationVsHead:
     def test_off_construction_consumes_no_extra_rng(self) -> None:
-        head_core = _load_head_module(
-            "nsmor/model_nsmor_core.py", "head_core_tc_rng",
+        head_core = _load_module_at_ref(
+            PRE_CHANGE_REF, "nsmor/model_nsmor_core.py",
+            "ref_core_tc_rng",
         )
         kwargs = dict(sensory_dim=4, mcmc_dim=4, hidden_dim=8, dropout=0.0)
         torch.manual_seed(1234)
@@ -496,13 +522,14 @@ class TestDefaultPreservationVsHead:
         assert not torch.equal(torch.get_rng_state(), rng_head)
 
     def test_off_state_dict_matches_head_and_loads(self) -> None:
-        head_core = _load_head_module(
-            "nsmor/model_nsmor_core.py", "head_core_tc_sd",
+        head_core = _load_module_at_ref(
+            PRE_CHANGE_REF, "nsmor/model_nsmor_core.py",
+            "ref_core_tc_sd",
         )
         kwargs = dict(sensory_dim=4, mcmc_dim=4, hidden_dim=8, dropout=0.0)
         torch.manual_seed(7)
         new = NSMoRCore(time_consuming_mode="off", **kwargs).eval()
-        # The HEAD reference is built from the ACTUAL ``git show HEAD`` module,
+        # The reference is built from the ACTUAL fixed pre-change ref module,
         # NOT the current repo module (finding R1-B2: building both sides from
         # the current module made the test tautological).
         torch.manual_seed(7)

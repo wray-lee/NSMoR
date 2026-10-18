@@ -19,7 +19,7 @@ Shape legend
 from __future__ import annotations
 
 import math
-from typing import Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -97,6 +97,397 @@ class FrontendLoss(nn.Module):
         return masked_errors.sum()
 
 
+def stimulus_anchored_expected_delay(
+    expected_delay: torch.Tensor,
+    anchor_frames: torch.Tensor,
+) -> torch.Tensor:
+    """Read the model's expected processing delay at each stimulus anchor.
+
+    The primary latency readout (ADR 0012) is the SINGLE anchor frame
+    ``d_i = E[delay][i, a_i]``, not a whole-trial average and not the
+    post-arbitration ``realized_delay``.  ``expected_delay`` is source-indexed
+    and deterministic (it does not depend on the sampled depth or on
+    arbitration); ``anchor_frames`` are in the SAVED (post-crop) coordinate
+    system produced by
+    :func:`~nsmor.pipeline.conditions.resolve_anchor_crop`.
+
+    Args:
+        expected_delay: ``(B, T)`` floating per-source expected delay.
+        anchor_frames: ``(B,)`` int64 anchor frame indices in saved
+            coordinates.
+
+    Returns:
+        ``(B,)`` floating anchor-frame expected delays.
+
+    Raises:
+        ValueError: On a shape/dtype violation or an out-of-range anchor
+            (``a_i < 0`` or ``a_i >= T``).
+    """
+    if expected_delay.dim() != 2:
+        raise ValueError(
+            "expected_delay must be (B, T), got "
+            f"{tuple(expected_delay.shape)}"
+        )
+    if not expected_delay.is_floating_point():
+        raise ValueError(
+            f"expected_delay must be floating, got {expected_delay.dtype}"
+        )
+    B, T = expected_delay.shape
+    assert expected_delay.shape == (B, T)
+    if anchor_frames.shape != (B,):
+        raise ValueError(
+            f"anchor_frames shape {tuple(anchor_frames.shape)} != (B={B},)"
+        )
+    if anchor_frames.dtype != torch.long:
+        raise ValueError(
+            f"anchor_frames must be int64, got {anchor_frames.dtype}"
+        )
+    if anchor_frames.device != expected_delay.device:
+        raise ValueError("anchor_frames and expected_delay must share a device")
+    if bool(((anchor_frames < 0) | (anchor_frames >= T)).any()):
+        raise ValueError(
+            f"anchor_frames must lie in [0, {T}); got "
+            f"{anchor_frames.tolist()}"
+        )
+    out = expected_delay.gather(1, anchor_frames.unsqueeze(1)).squeeze(1)
+    assert out.shape == (B,)
+    return out
+
+
+def _differentiable_latency_zero(
+    expected_delay: torch.Tensor,
+    lengths: torch.Tensor,
+) -> torch.Tensor:
+    """Return a graph-connected zero that cannot be poisoned by padding.
+
+    Prefer a zero multiple of the finite VALID operands (``t < lengths`` and
+    finite); if that slice is empty, fall back to a fresh leaf.  Never reduce
+    the raw tensor: ``NaN * 0`` in padded frames would otherwise produce a
+    nonfinite "zero".
+    """
+    B, T = expected_delay.shape
+    arange_t = torch.arange(T, device=expected_delay.device).unsqueeze(0)
+    valid = arange_t < lengths.unsqueeze(1)
+    safe = expected_delay[valid]
+    safe = safe[torch.isfinite(safe)]
+    if safe.numel() > 0:
+        return safe.sum() * 0.0
+    return expected_delay.new_zeros((), requires_grad=True)
+
+
+def _latency_contrast_loss(
+    *,
+    expected_delay: torch.Tensor,
+    anchor_frames: torch.Tensor,
+    target_frames: torch.Tensor,
+    target_mask: torch.Tensor,
+    group_id: torch.Tensor,
+    prefix_id: torch.Tensor,
+    pair_id: Optional[torch.Tensor],
+    target_group: int,
+    reference_group: int,
+    lengths: torch.Tensor,
+) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    """Stimulus-anchored, prefix-level latency contrast (ADR 0012).
+
+    The observed latency decomposes as
+    ``L_obs = L_fixed(g) + L_proc(g) + eps``.  This loss aligns only the
+    CONDITION-RELATIVE difference between the pre-registered target and
+    reference groups, so it identifies ``Delta L_obs = Delta L_fixed +
+    Delta L_proc`` — never ``Delta L_proc`` alone.  The condition-independence
+    of ``L_fixed`` is a declared assumption, not a result.  Processing time
+    is supervised by this term, not emergent.
+
+    Aggregation is prefix-level and unweighted: per-prefix means of the
+    anchor readout ``d_i`` and of the observed target latency, then the
+    unweighted mean over the target / reference prefix sets.  A prefix with
+    many trials therefore gets ONE group weight.  Only the single
+    pre-registered contrast enters the loss; ``visual_only`` /
+    ``no_stimulus`` trials are ignored.  If the optional ``pair_id`` is
+    supplied, the paired variant is used (exactly one target and one
+    reference prefix per pair; incomplete pairs are skipped).
+
+    Args:
+        expected_delay: ``(B, T)`` differentiable per-source expected delay.
+        anchor_frames: ``(B,)`` int64 saved-coordinate stimulus anchors.
+        target_frames: ``(B,)`` observed latency in frames.
+        target_mask: ``(B,)`` bool mask of trials with an observed latency.
+        group_id: ``(B,)`` int64 condition id.
+        prefix_id: ``(B,)`` int64 recording-prefix id.
+        pair_id: Optional ``(B,)`` int64 pair id (paired variant).
+        target_group: Pre-registered target condition id.
+        reference_group: Pre-registered reference condition id.
+        lengths: ``(B,)`` true sequence lengths.
+
+    Returns:
+        ``(loss, stats)``: a scalar loss (differentiable zero when the batch
+        lacks a group/prefix) and a plain-Python stats dict.
+
+    Raises:
+        ValueError: On any shape/dtype/domain violation.  A batch-level
+            missing group is NOT an error (it returns a differentiable zero);
+            only a malformed request fails closed.
+    """
+    if not isinstance(expected_delay, torch.Tensor):
+        raise ValueError("latency_expected_delay must be a torch.Tensor")
+    if expected_delay.dim() != 2:
+        raise ValueError(
+            "latency_expected_delay shape must be (B, T), got "
+            f"{tuple(expected_delay.shape)}"
+        )
+    if not expected_delay.is_floating_point():
+        raise ValueError(
+            "latency_expected_delay must be floating, got "
+            f"{expected_delay.dtype}"
+        )
+    B, T = expected_delay.shape
+    assert expected_delay.shape == (B, T)
+    device = expected_delay.device
+    if torch.is_grad_enabled() and not expected_delay.requires_grad:
+        raise ValueError(
+            "latency_expected_delay must be differentiable (requires_grad); "
+            "refusing a detached delay (a no_grad diagnostic call is exempt)."
+        )
+    if lengths.shape != (B,) or lengths.device != device:
+        raise ValueError(
+            f"lengths shape/device {tuple(lengths.shape)}/{lengths.device} "
+            f"!= (B={B},)/{device}"
+        )
+
+    def _require_tensor(
+        value: Any, name: str, shape: Tuple[int, ...],
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if not isinstance(value, torch.Tensor):
+            raise ValueError(f"{name} must be a torch.Tensor")
+        if value.shape != shape:
+            raise ValueError(
+                f"{name} shape {tuple(value.shape)} != {shape}"
+            )
+        if value.dtype != dtype:
+            raise ValueError(
+                f"{name} dtype {value.dtype} != {dtype}"
+            )
+        if value.device != device:
+            raise ValueError(f"{name} must share the expected_delay device")
+        return value
+
+    anchor_frames = _require_tensor(
+        anchor_frames, "latency_anchor_frames", (B,), torch.long,
+    )
+    if not isinstance(target_frames, torch.Tensor):
+        raise ValueError("latency_target_frames must be a torch.Tensor")
+    if target_frames.shape != (B,):
+        raise ValueError(
+            f"latency_target_frames shape {tuple(target_frames.shape)} "
+            f"!= (B={B},)"
+        )
+    if not target_frames.is_floating_point():
+        raise ValueError(
+            "latency_target_frames must be floating (frames), got "
+            f"{target_frames.dtype}"
+        )
+    if target_frames.device != device:
+        raise ValueError("latency_target_frames must share the device")
+    target_mask = _require_tensor(
+        target_mask, "latency_target_mask", (B,), torch.bool,
+    )
+    group_id = _require_tensor(
+        group_id, "latency_group_id", (B,), torch.long,
+    )
+    prefix_id = _require_tensor(
+        prefix_id, "latency_prefix_id", (B,), torch.long,
+    )
+    if bool((group_id < 0).any()):
+        raise ValueError("latency_group_id must be >= 0")
+    if bool((prefix_id < 0).any()):
+        raise ValueError("latency_prefix_id must be >= 0")
+    if pair_id is not None:
+        pair_id = _require_tensor(
+            pair_id, "latency_pair_id", (B,), torch.long,
+        )
+        if bool((pair_id < 0).any()):
+            raise ValueError("latency_pair_id must be >= 0")
+    if (
+        isinstance(target_group, bool)
+        or not isinstance(target_group, int)
+        or target_group < 0
+    ):
+        raise ValueError(
+            f"latency_target_group must be a non-bool int >= 0, got "
+            f"{target_group!r}"
+        )
+    if (
+        isinstance(reference_group, bool)
+        or not isinstance(reference_group, int)
+        or reference_group < 0
+    ):
+        raise ValueError(
+            f"latency_reference_group must be a non-bool int >= 0, got "
+            f"{reference_group!r}"
+        )
+    if target_group == reference_group:
+        raise ValueError(
+            "latency_target_group and latency_reference_group must be distinct"
+        )
+
+    if bool(((anchor_frames < 0) | (anchor_frames >= T)).any()):
+        raise ValueError(
+            f"latency_anchor_frames must lie in [0, {T}); got "
+            f"{anchor_frames.tolist()}"
+        )
+    arange_t = torch.arange(T, device=device).unsqueeze(0)
+    valid = arange_t < lengths.unsqueeze(1)
+    ed_valid = expected_delay[valid]
+    if ed_valid.numel() > 0:
+        if not bool(torch.isfinite(ed_valid).all()):
+            raise ValueError(
+                "latency_expected_delay must be finite on valid frames"
+            )
+        if bool((ed_valid < 0).any()):
+            raise ValueError(
+                "latency_expected_delay must be non-negative on valid frames"
+            )
+
+    masked_idx = target_mask.nonzero(as_tuple=True)[0]
+    n_masked = int(masked_idx.numel())
+    stats: Dict[str, Any] = {
+        "latency_skipped": 0,
+        "skip_reason": None,
+        "n_masked_trials": n_masked,
+        "n_target_prefixes": 0,
+        "n_reference_prefixes": 0,
+        "n_target_trials": 0,
+        "n_reference_trials": 0,
+        "n_complete_pairs": 0,
+        "delta_d_frames": None,
+        "delta_t_frames": None,
+    }
+
+    def _zero(reason: str) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        stats["latency_skipped"] = 1
+        stats["skip_reason"] = reason
+        stats["latency_loss"] = 0.0
+        return _differentiable_latency_zero(expected_delay, lengths), stats
+
+    if n_masked == 0:
+        return _zero("no_masked_trials")
+    if bool((lengths[masked_idx] == 0).any()):
+        raise ValueError(
+            "a masked latency trial has length 0 (no prediction to align)"
+        )
+    if bool((anchor_frames[masked_idx] >= lengths[masked_idx]).any()):
+        raise ValueError(
+            "latency_anchor_frames must satisfy a_i < lengths_i for masked "
+            "trials"
+        )
+    if not bool(torch.isfinite(target_frames[masked_idx]).all()):
+        raise ValueError(
+            "latency_target_frames must be finite where the mask is True"
+        )
+    if bool((target_frames[masked_idx] < 0).any()):
+        raise ValueError(
+            "latency_target_frames must be non-negative where the mask is True"
+        )
+
+    p_masked = prefix_id[masked_idx]
+    g_masked = group_id[masked_idx]
+    for prefix in torch.unique(p_masked).tolist():
+        groups = torch.unique(g_masked[p_masked == prefix])
+        if groups.numel() != 1:
+            raise ValueError(
+                f"latency_prefix_id={prefix} spans multiple groups "
+                f"{groups.tolist()}; a prefix-level contrast is not "
+                "identifiable (conditions must be nested in prefixes)."
+            )
+
+    in_target = g_masked == target_group
+    in_reference = g_masked == reference_group
+    stats["n_target_trials"] = int(in_target.sum())
+    stats["n_reference_trials"] = int(in_reference.sum())
+    if not bool(in_target.any()):
+        return _zero("no_target_group")
+    if not bool(in_reference.any()):
+        return _zero("no_reference_group")
+    target_prefixes = torch.unique(p_masked[in_target])
+    reference_prefixes = torch.unique(p_masked[in_reference])
+    stats["n_target_prefixes"] = int(target_prefixes.numel())
+    stats["n_reference_prefixes"] = int(reference_prefixes.numel())
+    if target_prefixes.numel() == 0:
+        return _zero("no_target_prefix")
+    if reference_prefixes.numel() == 0:
+        return _zero("no_reference_prefix")
+
+    d = stimulus_anchored_expected_delay(expected_delay, anchor_frames)
+    d_masked = d.double()[masked_idx]
+    t_masked = target_frames.double()[masked_idx]
+
+    def _prefix_mean(
+        values: torch.Tensor, prefixes: torch.Tensor,
+    ) -> torch.Tensor:
+        return torch.stack(
+            [values[p_masked == p].mean() for p in prefixes.tolist()]
+        )
+
+    if pair_id is None:
+        delta_d = (
+            _prefix_mean(d_masked, target_prefixes).mean()
+            - _prefix_mean(d_masked, reference_prefixes).mean()
+        )
+        delta_t = (
+            _prefix_mean(t_masked, target_prefixes).mean()
+            - _prefix_mean(t_masked, reference_prefixes).mean()
+        )
+        loss = (delta_d - delta_t) ** 2
+        stats["delta_d_frames"] = float(delta_d.detach())
+        stats["delta_t_frames"] = float(delta_t.detach())
+    else:
+        pair_masked = pair_id[masked_idx]
+        complete: List[Tuple[int, int]] = []
+        for pair in torch.unique(pair_masked).tolist():
+            in_pair = pair_masked == pair
+            prefixes_in_pair = torch.unique(p_masked[in_pair])
+            target_in_pair = [
+                p for p in prefixes_in_pair.tolist()
+                if int(torch.unique(
+                    g_masked[in_pair & (p_masked == p)]
+                ).item()) == target_group
+            ]
+            reference_in_pair = [
+                p for p in prefixes_in_pair.tolist()
+                if int(torch.unique(
+                    g_masked[in_pair & (p_masked == p)]
+                ).item()) == reference_group
+            ]
+            if len(target_in_pair) == 1 and len(reference_in_pair) == 1:
+                complete.append(
+                    (target_in_pair[0], reference_in_pair[0])
+                )
+        stats["n_complete_pairs"] = len(complete)
+        if not complete:
+            return _zero("no_complete_pairs")
+
+        def _one_prefix_mean(values: torch.Tensor, prefix: int) -> torch.Tensor:
+            return values[p_masked == prefix].mean()
+
+        diffs = []
+        for target_prefix, reference_prefix in complete:
+            diffs.append(
+                (
+                    _one_prefix_mean(d_masked, target_prefix)
+                    - _one_prefix_mean(d_masked, reference_prefix)
+                ) - (
+                    _one_prefix_mean(t_masked, target_prefix)
+                    - _one_prefix_mean(t_masked, reference_prefix)
+                )
+            )
+        loss = torch.stack(diffs).pow(2).mean()
+
+    assert loss.dim() == 0
+    stats["latency_loss"] = float(loss.detach())
+    return loss, stats
+
+
 class BioDecisionLoss(nn.Module):
     """
     Bio-decision loss for Phase 2 of Hybrid Funnel training.
@@ -147,6 +538,13 @@ class BioDecisionLoss(nn.Module):
             )
         self.reduction = reduction
         self.target_rate = target_rate
+        # Last latency-contrast diagnostics (plain Python; never a tensor,
+        # never in state_dict).  Overwritten on every forward call.
+        self.last_latency_stats: Dict[str, Any] = {
+            "latency_loss": 0.0,
+            "latency_skipped": 1,
+            "skip_reason": "disabled",
+        }
 
     def forward(
         self,
@@ -167,6 +565,16 @@ class BioDecisionLoss(nn.Module):
         lambda_compute: float = 0.0,
         refinement_ponder_cost: Optional[torch.Tensor] = None,
         out_valid: Optional[torch.Tensor] = None,
+        lambda_latency: float = 0.0,
+        latency_expected_delay: Optional[torch.Tensor] = None,
+        latency_anchor_frames: Optional[torch.Tensor] = None,
+        latency_target_frames: Optional[torch.Tensor] = None,
+        latency_target_mask: Optional[torch.Tensor] = None,
+        latency_group_id: Optional[torch.Tensor] = None,
+        latency_prefix_id: Optional[torch.Tensor] = None,
+        latency_pair_id: Optional[torch.Tensor] = None,
+        latency_target_group: Optional[int] = None,
+        latency_reference_group: Optional[int] = None,
     ) -> torch.Tensor:
         """
         Compute bio-decision loss (MSE + physics penalties).
@@ -206,6 +614,24 @@ class BioDecisionLoss(nn.Module):
                 so the zero-filled, never-emitted frames — whose target is a
                 real (nonzero) value — cannot inject a constant-bias/truncation
                 contaminant into the reported skill (findings R1-B2 / R2-B2).
+            lambda_latency: Weight on the stimulus-anchored latency contrast
+                (ADR 0012).  ``0.0`` (default) leaves the loss bitwise
+                unchanged and does not touch any latency tensor.  A positive
+                value requires all latency metadata below and a differentiable
+                ``latency_expected_delay``.  NOT warmup-scaled.
+            latency_expected_delay: ``(B, T)`` differentiable per-source
+                expected delay (``time_consuming_expected_delay``).
+            latency_anchor_frames: ``(B,)`` int64 saved-coordinate stimulus
+                anchors.
+            latency_target_frames: ``(B,)`` observed latency in FRAMES.
+            latency_target_mask: ``(B,)`` bool mask of observed latencies.
+            latency_group_id: ``(B,)`` int64 condition ids.
+            latency_prefix_id: ``(B,)`` int64 recording-prefix ids.  A prefix
+                may not span multiple conditions (conditions are nested in
+                prefixes).
+            latency_pair_id: Optional ``(B,)`` int64 pair ids (paired variant).
+            latency_target_group: Pre-registered target condition id.
+            latency_reference_group: Pre-registered reference condition id.
 
         Returns:
             Scalar loss tensor.
@@ -216,6 +642,20 @@ class BioDecisionLoss(nn.Module):
         assert g_gru.dim() == 3 and g_gru.shape[2] == 1
 
         B, T = y_pred.shape
+        # ADR 0012: validate the ORIGINAL weight UNCONDITIONALLY, before the
+        # ``== 0`` fast path, so a boolean / non-finite / negative weight is
+        # refused even when the term is disabled (mirrors lambda_compute).
+        if (
+            isinstance(lambda_latency, bool)
+            or not isinstance(lambda_latency, (int, float))
+            or not math.isfinite(lambda_latency)
+            or lambda_latency < 0.0
+        ):
+            raise ValueError(
+                "lambda_latency must be a finite scalar >= 0, got "
+                f"{lambda_latency!r}"
+            )
+        _latency_active = float(lambda_latency) != 0.0
 
         lambda_energy_eff = lambda_energy * annealing_factor
         lambda_sparse_eff = lambda_sparse * annealing_factor
@@ -368,6 +808,67 @@ class BioDecisionLoss(nn.Module):
                 )
             total_loss = total_loss + lambda_compute * refinement_ponder_cost
 
+        # ── Stimulus-anchored latency contrast (ADR 0012) ──
+        # Default-off: ``lambda_latency == 0.0`` returns the loss bitwise
+        # unchanged and never reads a latency tensor.  A positive weight
+        # requires every metadata tensor and a differentiable expected delay;
+        # the contrast is computed in float64 (prefix/group reductions) and
+        # cast back to the loss dtype.
+        if not _latency_active:
+            self.last_latency_stats = {
+                "latency_loss": 0.0,
+                "latency_skipped": 1,
+                "skip_reason": "disabled",
+            }
+            return total_loss
+        missing = [
+            name for name, value in (
+                ("latency_expected_delay", latency_expected_delay),
+                ("latency_anchor_frames", latency_anchor_frames),
+                ("latency_target_frames", latency_target_frames),
+                ("latency_target_mask", latency_target_mask),
+                ("latency_group_id", latency_group_id),
+                ("latency_prefix_id", latency_prefix_id),
+                ("latency_target_group", latency_target_group),
+                ("latency_reference_group", latency_reference_group),
+            ) if value is None
+        ]
+        if missing:
+            raise ValueError(
+                "lambda_latency > 0 requires " + ", ".join(missing)
+                + "; refusing to silently drop the latency term."
+            )
+        # The expected delay must be aligned frame-for-frame with the
+        # prediction; a (B, T') tensor with a different T would silently
+        # index a different time base (anchor/valid checks are internal to
+        # the passed tensor, so they cannot catch it).
+        if not isinstance(latency_expected_delay, torch.Tensor):
+            raise ValueError(
+                "latency_expected_delay must be a torch.Tensor"
+            )
+        if latency_expected_delay.shape != y_pred.shape:
+            raise ValueError(
+                "latency_expected_delay shape "
+                f"{tuple(latency_expected_delay.shape)} != y_pred shape "
+                f"{tuple(y_pred.shape)}"
+            )
+        latency_loss, latency_stats = _latency_contrast_loss(
+            expected_delay=latency_expected_delay,
+            anchor_frames=latency_anchor_frames,
+            target_frames=latency_target_frames,
+            target_mask=latency_target_mask,
+            group_id=latency_group_id,
+            prefix_id=latency_prefix_id,
+            pair_id=latency_pair_id,
+            target_group=latency_target_group,
+            reference_group=latency_reference_group,
+            lengths=lengths,
+        )
+        self.last_latency_stats = latency_stats
+        total_loss = total_loss + float(lambda_latency) * latency_loss.to(
+            total_loss.dtype,
+        )
+
         return total_loss
 
 
@@ -483,6 +984,16 @@ class BioJointLoss(nn.Module):
         lambda_compute: float = 0.0,
         refinement_ponder_cost: Optional[torch.Tensor] = None,
         out_valid: Optional[torch.Tensor] = None,
+        lambda_latency: float = 0.0,
+        latency_expected_delay: Optional[torch.Tensor] = None,
+        latency_anchor_frames: Optional[torch.Tensor] = None,
+        latency_target_frames: Optional[torch.Tensor] = None,
+        latency_target_mask: Optional[torch.Tensor] = None,
+        latency_group_id: Optional[torch.Tensor] = None,
+        latency_prefix_id: Optional[torch.Tensor] = None,
+        latency_pair_id: Optional[torch.Tensor] = None,
+        latency_target_group: Optional[int] = None,
+        latency_reference_group: Optional[int] = None,
     ) -> torch.Tensor:
         """
         Compute the bio-constrained joint loss.
@@ -514,6 +1025,17 @@ class BioJointLoss(nn.Module):
             out_valid: Optional ``(B, T)`` bool emission mask (time-consuming
                 mode).  ``None`` (default) keeps the historical length-only
                 mask bitwise unchanged.
+            lambda_latency: Stimulus-anchored latency-contrast weight (ADR
+                0012; default ``0.0`` keeps the loss bitwise unchanged).
+            latency_expected_delay: ``(B, T)`` differentiable expected delay.
+            latency_anchor_frames: ``(B,)`` int64 saved-coordinate anchors.
+            latency_target_frames: ``(B,)`` observed latencies in frames.
+            latency_target_mask: ``(B,)`` bool observed-latency mask.
+            latency_group_id: ``(B,)`` int64 condition ids.
+            latency_prefix_id: ``(B,)`` int64 recording-prefix ids.
+            latency_pair_id: Optional ``(B,)`` int64 pair ids.
+            latency_target_group: Pre-registered target condition id.
+            latency_reference_group: Pre-registered reference condition id.
 
         Returns:
             Scalar loss tensor.
@@ -536,7 +1058,22 @@ class BioJointLoss(nn.Module):
             lambda_compute=lambda_compute,
             refinement_ponder_cost=refinement_ponder_cost,
             out_valid=out_valid,
+            lambda_latency=lambda_latency,
+            latency_expected_delay=latency_expected_delay,
+            latency_anchor_frames=latency_anchor_frames,
+            latency_target_frames=latency_target_frames,
+            latency_target_mask=latency_target_mask,
+            latency_group_id=latency_group_id,
+            latency_prefix_id=latency_prefix_id,
+            latency_pair_id=latency_pair_id,
+            latency_target_group=latency_target_group,
+            latency_reference_group=latency_reference_group,
         )
+
+    @property
+    def last_latency_stats(self) -> Dict[str, Any]:
+        """Read-only delegate to the owned :class:`BioDecisionLoss`."""
+        return self.bio_loss.last_latency_stats
 
 
 # ═══════════════════════════════════════════════════════════════

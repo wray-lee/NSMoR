@@ -45,6 +45,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import math
 from contextlib import nullcontext
+from functools import partial
 
 import matplotlib
 matplotlib.use("Agg")
@@ -144,6 +145,29 @@ _PROVENANCE_KEYS = frozenset({
     # additively so a checkpoint names the exact output map (delayed/truncated
     # emission) it was trained under.  Rides the same pop-then-patch seam.
     "time_consuming_mode",
+    # ADR 0012: latency auxiliary loss stamp and script-owned provenance.
+    # ``lambda_latency`` is the top-level legacy-gap stamp; the remaining
+    # keys are NOT config leaves (they do not move ``config_sha256``).
+    "lambda_latency",
+    "eval_mc_samples",
+    "eval_seed_base",
+    "eval_seeds",
+    "eval_single_draw",
+    "latency_target_table_sha256",
+    "latency_target_recipe",
+    "latency_target_timebase",
+    "latency_anchor_recipe",
+    "latency_condition_mapping",
+    "latency_target_group",
+    "latency_reference_group",
+    "latency_pairing",
+    "latency_min_prefixes_per_group",
+    "latency_min_trials_per_group",
+    "latency_skipped_batches",
+    "latency_coverage",
+    "time_consuming_grad_checkpointing",
+    "time_consuming_memory_budget_mb",
+    "time_consuming_memory_estimate",
     # Epoch-boundary recovery state (see the recovery helpers below).  These
     # ride the same pop-then-patch seam so nsmor/checkpoint.py stays untouched.
     "recovery_state_version",
@@ -456,6 +480,104 @@ def _decode_numpy_rng_state(record: Any) -> tuple:
 # share one parameter tree, so a strict ``load_state_dict`` accepts a resume
 # under different flags and silently continues as a DIFFERENT control arm.  The
 # preflight below compares these exact leaves against the active config.
+# ADR 0012 script-owned latency provenance (NOT ExperimentConfig leaves).
+# Latency and MC controls belong to the config/call, never another invocation.
+def _run_latency_settings(config: ExperimentConfig) -> Dict[str, Any]:
+    """Return this config's script metadata, excluded from dataclass to_dict.
+
+    Programmatic configs get fresh defaults; they never inherit CLI state.
+    Copy the condition mapping so a call cannot mutate the stored declaration.
+    """
+    settings: Dict[str, Any] = {
+        "latency_target_table_path": None,
+        "latency_target_table_sha256": None,
+        "latency_target_recipe": "",
+        "latency_anchor_recipe": "",
+        "latency_condition_mapping": {},
+        "latency_target_group": None,
+        "latency_reference_group": None,
+        "latency_pairing": "none",
+        "latency_min_prefixes_per_group": 2,
+        "latency_min_trials_per_group": 4,
+    }
+    settings.update(getattr(config, "_latency_settings", {}))
+    settings["latency_condition_mapping"] = dict(
+        settings["latency_condition_mapping"]
+    )
+    return settings
+
+
+def _resolve_eval_mc_samples(mode: str, declared: Optional[int]) -> int:
+    """Resolve the validation MC sample count for a time-consuming mode.
+
+    ``"stochastic"`` defaults to ``S=5`` fixed eval seeds; the mean is the
+    selection metric and the SD is reported (a single draw is NOT noise-free).
+    ``"hard_depth"`` is deterministic and must use ``S=1``; a larger declared
+    count is refused rather than mislabelled as MC.
+
+    Args:
+        mode: ``time_consuming_mode``.
+        declared: Optional explicit ``eval_mc_samples``.
+
+    Returns:
+        The resolved sample count (>= 1).
+
+    Raises:
+        ValueError: On a non-positive/non-int count, or a hard_depth S > 1.
+    """
+    if declared is not None and (
+        isinstance(declared, bool)
+        or not isinstance(declared, int)
+        or declared < 1
+    ):
+        raise ValueError(
+            f"eval_mc_samples must be an int >= 1, got {declared!r}"
+        )
+    if mode == "hard_depth":
+        if declared is not None and declared != 1:
+            raise ValueError(
+                "hard_depth is deterministic; eval_mc_samples must be 1 "
+                f"(or unset), got {declared!r}"
+            )
+        return 1
+    if mode == "stochastic":
+        return 5 if declared is None else int(declared)
+    if declared is not None and declared != 1:
+        raise ValueError(
+            f"eval_mc_samples > 1 is only valid for time_consuming_mode="
+            f"'stochastic'; got mode={mode!r}, eval_mc_samples={declared!r}"
+        )
+    return 1
+
+
+def _resolve_run_eval_settings(
+    config: ExperimentConfig,
+    *,
+    eval_mc_samples: Optional[int] = None,
+    eval_seed_base: Optional[int] = None,
+) -> Tuple[int, int]:
+    """Resolve call overrides, CLI-bound declarations, then per-mode defaults.
+
+    Script metadata attached by build_config is excluded from the dataclass
+    serialization. A directly constructed config has no CLI declarations and
+    receives the active mode's default, independent of previous invocations.
+    """
+    if eval_mc_samples is None:
+        eval_mc_samples = getattr(config, "_eval_mc_samples", None)
+    samples = _resolve_eval_mc_samples(
+        str(config.model.time_consuming_mode), eval_mc_samples,
+    )
+    if eval_seed_base is None:
+        eval_seed_base = getattr(config, "_eval_seed_base", 0)
+    if (
+        isinstance(eval_seed_base, bool) or not isinstance(eval_seed_base, int)
+        or not 0 <= eval_seed_base < 2**63
+        or eval_seed_base + samples - 1 >= 2**63
+    ):
+        raise ValueError("eval_seed_base and all eval seeds must be in [0, 2**63)")
+    return samples, eval_seed_base
+
+
 _ARCHITECTURE_CONFIG_LEAVES: Tuple[Tuple[str, str], ...] = (
     ("model", "refinement_mode"),
     ("model", "refinement_max_steps"),
@@ -471,6 +593,11 @@ _ARCHITECTURE_CONFIG_LEAVES: Tuple[Tuple[str, str], ...] = (
     ("model", "time_consuming_update_scale"),
     ("model", "time_consuming_delay_scale"),
     ("model", "time_consuming_threshold"),
+    # ADR 0012: the private stochastic seed and the latency-loss weight are
+    # architecture/loss-defining.  A resume that switches either would
+    # silently continue a different arm.
+    ("model", "time_consuming_seed"),
+    ("loss", "lambda_latency"),
 )
 
 
@@ -597,6 +724,36 @@ def _require_architecture_config_match(
             "time_consuming_mode: checkpoint=<legacy default 'off'> vs "
             f"active={active_tc!r}"
         )
+    # ADR 0012: the latency weight is stamped at the top level (same
+    # pop-then-patch seam).  A legacy checkpoint with NEITHER the stamp NOR
+    # the stored leaf predates the option, so its effective weight is 0.0; a
+    # positive ACTIVE weight is refused (never silently enabled on legacy).
+    recorded_ll = ckpt.get("lambda_latency", None)
+    active_ll = float(config.loss.lambda_latency)
+    loss_section = ckpt_cfg.get("loss")
+    ll_leaf_present = (
+        isinstance(loss_section, dict) and "lambda_latency" in loss_section
+    )
+    if recorded_ll is not None:
+        try:
+            recorded_ll_f = float(recorded_ll)
+        except (TypeError, ValueError):
+            recorded_ll_f = None
+        if recorded_ll_f is None or not math.isfinite(recorded_ll_f):
+            mismatches.append(
+                "lambda_latency: checkpoint stamp is not a finite number "
+                f"({recorded_ll!r})"
+            )
+        elif recorded_ll_f != active_ll:
+            mismatches.append(
+                f"lambda_latency: checkpoint={recorded_ll_f!r} vs "
+                f"active={active_ll!r}"
+            )
+    elif not ll_leaf_present and active_ll != 0.0:
+        mismatches.append(
+            "lambda_latency: checkpoint=<legacy default 0.0> vs "
+            f"active={active_ll!r}"
+        )
     if mismatches:
         raise ValueError(
             f"Resume checkpoint {ckpt_path} was trained with a different "
@@ -604,6 +761,78 @@ def _require_architecture_config_match(
             "Fixed and adaptive refinement share one parameter tree, and an "
             "enabled time-consuming mode changes the output map, so a strict "
             "load would silently continue as another control arm. "
+            "Refusing resume (fail closed)."
+        )
+
+
+def _require_latency_provenance_match(
+    ckpt: Dict[str, Any],
+    config: ExperimentConfig,
+    ckpt_path: Path,
+    *,
+    eval_mc_samples: Optional[int] = None,
+    eval_seed_base: Optional[int] = None,
+) -> None:
+    """Fail closed when a resume switches latency/MC script-owned settings.
+
+    These keys are NOT part of the protected config schema; they live in the
+    checkpoint top level.  A resume of a stochastic run (or a run with
+    ``lambda_latency > 0``) must reuse the exact eval-MC sample count, eval
+    seed base, target-table hash, contrast groups, pairing and sampler
+    minima.  A legacy checkpoint that lacks a key is accepted only when the
+    active value equals its documented default; otherwise the resume would
+    silently change the validation/selection or the supervised target.
+
+    Args:
+        ckpt: Loaded checkpoint dict (top-level keys).
+        config: Active experiment config.
+        ckpt_path: Resume source, for diagnostics.
+
+    Raises:
+        ValueError: On any mismatch or an active non-default legacy gap.
+    """
+    active_latency = float(config.loss.lambda_latency)
+    active_mode = str(config.model.time_consuming_mode)
+    if active_latency == 0.0 and active_mode != "stochastic":
+        return
+    samples, seed_base = _resolve_run_eval_settings(
+        config, eval_mc_samples=eval_mc_samples, eval_seed_base=eval_seed_base,
+    )
+    settings = _run_latency_settings(config)
+    active = {
+        "eval_mc_samples": samples,
+        "eval_seed_base": seed_base,
+        **{key: settings[key] for key in (
+            "latency_target_table_sha256", "latency_target_group",
+            "latency_reference_group", "latency_pairing",
+            "latency_min_prefixes_per_group", "latency_min_trials_per_group",
+        )},
+    }
+    defaults = {
+        "eval_mc_samples": 1,
+        "eval_seed_base": 0,
+        "latency_target_table_sha256": None,
+        "latency_target_group": None,
+        "latency_reference_group": None,
+        "latency_pairing": "none",
+        "latency_min_prefixes_per_group": 2,
+        "latency_min_trials_per_group": 4,
+    }
+    mismatches: List[str] = []
+    for key, value in active.items():
+        if key in ckpt:
+            if ckpt[key] != value:
+                mismatches.append(
+                    f"{key}: checkpoint={ckpt[key]!r} vs active={value!r}"
+                )
+        elif value != defaults[key]:
+            mismatches.append(
+                f"{key}: checkpoint=<legacy absent> vs active={value!r}"
+            )
+    if mismatches:
+        raise ValueError(
+            f"Resume checkpoint {ckpt_path} was trained with different "
+            "latency/MC provenance: " + "; ".join(mismatches) + ". "
             "Refusing resume (fail closed)."
         )
 
@@ -2661,10 +2890,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--time_consuming_mode",
         type=str,
         default=None,
-        choices=["off", "depth_delay", "accumulate"],
+        choices=[
+            "off", "depth_delay", "accumulate", "stochastic", "hard_depth",
+        ],
         help="Time-consuming recursion mode: off (default), depth_delay "
-             "(adaptive depth delays emission), or accumulate (learned "
-             "accumulator to a threshold sets the delay). Raw JAX/Flax "
+             "(adaptive depth delays emission), accumulate (learned "
+             "accumulator to a threshold sets the delay), stochastic "
+             "(CAMoR-L-S: sampled integer depth, ADR 0012), or hard_depth "
+             "(CAMoR-L-H: deterministic matched control). Raw JAX/Flax "
              "backends reject an enabled mode.",
     )
     parser.add_argument(
@@ -2697,6 +2930,76 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="accumulate-mode accumulator threshold (> 0). Default 1.0.",
+    )
+    parser.add_argument(
+        "--time_consuming_seed",
+        type=int,
+        default=None,
+        help="Private training-stream seed for the stochastic mode "
+             "(int in [0, 2**63)). Default 0.",
+    )
+    parser.add_argument(
+        "--time_consuming_grad_checkpointing",
+        action="store_true",
+        default=None,
+        help="Opt-in gradient checkpointing for stochastic/hard_depth block "
+             "steps (reduces graph memory; refused for the ADR 0009 modes).",
+    )
+    parser.add_argument(
+        "--time_consuming_memory_budget_mb", type=float, default=8192.0,
+        help="Incremental recursion graph/optimizer budget in MiB (default 8192).",
+    )
+    parser.add_argument(
+        "--lambda_latency",
+        type=float,
+        default=None,
+        help="Stimulus-anchored latency-contrast weight (>= 0; ADR 0012). "
+             "Default 0.0 (disabled, bitwise unchanged).",
+    )
+    parser.add_argument(
+        "--eval_mc_samples",
+        type=int,
+        default=None,
+        help="Validation MC draws for the stochastic mode (default 5). "
+             "hard_depth requires 1.",
+    )
+    parser.add_argument(
+        "--latency_target_table",
+        type=str,
+        default=None,
+        help="Frozen latency target table (.pt) for lambda_latency > 0.",
+    )
+    parser.add_argument(
+        "--latency_target_group",
+        type=int,
+        default=None,
+        help="Pre-registered target condition id (e.g. multisensory).",
+    )
+    parser.add_argument(
+        "--latency_reference_group",
+        type=int,
+        default=None,
+        help="Pre-registered reference condition id (e.g. wind_only).",
+    )
+    parser.add_argument(
+        "--latency_pairing",
+        type=str,
+        default=None,
+        choices=["none", "pair_id"],
+        help="Latency contrast pairing: none (prefix-level, default) or "
+             "pair_id (future within-pair corpus).",
+    )
+    parser.add_argument(
+        "--latency_min_prefixes_per_group",
+        type=int,
+        default=None,
+        help="Minimum target/reference prefixes per batch (default 2).",
+    )
+    parser.add_argument(
+        "--latency_min_trials_per_group",
+        type=int,
+        default=None,
+        help="Minimum target/reference trials per batch (default 4).",
     )
 
     # ── Checkpointing ─────────────────────────────────────────
@@ -2814,14 +3117,14 @@ def build_config(argv: Optional[Sequence[str]] = None) -> Tuple[ExperimentConfig
     _zero_decl = getattr(args, "zero_input_channels", None)
     if _zero_decl is None:
         _zero_decl = phase2.get("zero_input_channels")
-    _ZERO_INPUT_CHANNELS = _parse_zero_input_channels(_zero_decl, config)
+    zero_input_channels = _parse_zero_input_channels(_zero_decl, config)
     _sel_decl = getattr(args, "selection_metric", None)
     if _sel_decl is None:
         _sel_decl = phase2.get("selection_metric")
-    _SELECTION_METRIC = _parse_selection_metric(_sel_decl)
+    selection_metric = _parse_selection_metric(_sel_decl)
     # The launcher's per-invocation resume identity (K2).  Script-owned state,
     # never part of the protected config schema; ``None`` for a bare --resume.
-    _RESUME_ID = getattr(args, "resume_id", None)
+    resume_id = getattr(args, "resume_id", None)
     if getattr(args, "refinement_mode", None) is not None:
         config.model.refinement_mode = args.refinement_mode
     if getattr(args, "refinement_max_steps", None) is not None:
@@ -2844,7 +3147,90 @@ def build_config(argv: Optional[Sequence[str]] = None) -> Tuple[ExperimentConfig
         config.model.time_consuming_delay_scale = args.time_consuming_delay_scale
     if getattr(args, "time_consuming_threshold", None) is not None:
         config.model.time_consuming_threshold = args.time_consuming_threshold
+    if getattr(args, "time_consuming_seed", None) is not None:
+        config.model.time_consuming_seed = args.time_consuming_seed
+    if getattr(args, "lambda_latency", None) is not None:
+        config.loss.lambda_latency = args.lambda_latency
     config.validate()
+    # ── ADR 0012 script-owned controls (NOT config leaves) ──
+    # Stage all settings locally. A rejected invocation must leave the last
+    # successful setup intact, including the default/off recovery settings.
+    time_consuming_grad_checkpointing = bool(
+        getattr(args, "time_consuming_grad_checkpointing", None)
+    )
+    time_consuming_memory_budget_mb = float(
+        getattr(args, "time_consuming_memory_budget_mb", 8192.0)
+    )
+    if (not math.isfinite(time_consuming_memory_budget_mb)
+            or time_consuming_memory_budget_mb <= 0):
+        raise ValueError("time-consuming memory budget must be finite and positive")
+    _resolve_eval_mc_samples(
+        str(config.model.time_consuming_mode),
+        getattr(args, "eval_mc_samples", None),
+    )
+    latency_pairing = getattr(args, "latency_pairing", None) or "none"
+    latency_min_prefixes_per_group = (
+        2 if getattr(args, "latency_min_prefixes_per_group", None) is None
+        else int(args.latency_min_prefixes_per_group)
+    )
+    latency_min_trials_per_group = (
+        4 if getattr(args, "latency_min_trials_per_group", None) is None
+        else int(args.latency_min_trials_per_group)
+    )
+    if (
+        latency_min_prefixes_per_group < 1
+        or latency_min_trials_per_group < 1
+    ):
+        raise ValueError(
+            "latency_min_prefixes_per_group / latency_min_trials_per_group "
+            "must be >= 1"
+        )
+    latency_target_group = getattr(args, "latency_target_group", None)
+    latency_reference_group = getattr(args, "latency_reference_group", None)
+    latency_target_table_path: Optional[str] = None
+    latency_target_table_sha256: Optional[str] = None
+    latency_target_recipe = ""
+    latency_anchor_recipe = ""
+    latency_condition_mapping: Dict[str, Any] = {}
+    if config.loss.lambda_latency > 0.0:
+        _phase1 = getattr(args, "phase1_epochs", None)
+        if _phase1 is not None and _phase1 > 0:
+            raise ValueError(
+                "lambda_latency > 0 is incompatible with phase-1 frontend "
+                "training (the time-consuming module lives in the backend)."
+            )
+        table_path = getattr(args, "latency_target_table", None)
+        if not table_path:
+            raise ValueError(
+                "lambda_latency > 0 requires --latency_target_table (a frozen "
+                "hash-stamped target table); refusing to silently run a zero "
+                "latency term."
+            )
+        if latency_target_group is None or latency_reference_group is None:
+            raise ValueError(
+                "lambda_latency > 0 requires --latency_target_group and "
+                "--latency_reference_group (the pre-registered contrast)."
+            )
+        if latency_target_group == latency_reference_group:
+            raise ValueError(
+                "latency target/reference groups must be distinct."
+            )
+        from nsmor.pipeline.latency_metadata import (
+            load_latency_target_table, validate_latency_target_definition,
+        )
+
+        table = load_latency_target_table(table_path)
+        validate_latency_target_definition(
+            table, target_group=latency_target_group,
+            reference_group=latency_reference_group, dt_ms=config.model.dt_ms,
+        )
+        if latency_pairing == "pair_id" and table.pair_ids is None:
+            raise ValueError("latency_pairing='pair_id' requires table pair_ids")
+        latency_target_table_path = str(table_path)
+        latency_target_table_sha256 = table.sha256
+        latency_target_recipe = table.recipe
+        latency_anchor_recipe = table.anchor_recipe
+        latency_condition_mapping = dict(table.condition_mapping)
     if args.freeze is not None:
         config.finetune.freeze_modules = args.freeze
     if args.resume is not None:
@@ -2860,7 +3246,7 @@ def build_config(argv: Optional[Sequence[str]] = None) -> Tuple[ExperimentConfig
     # by train() (kept out of ExperimentConfig — it is a reporting option,
     # not a training hyperparameter).
     global _SWEEP_BANDS
-    _SWEEP_BANDS = (
+    sweep_bands = (
         [float(b) for b in args.sweep_escape_band.split(",") if b.strip()]
         if args.sweep_escape_band else None
     )
@@ -2869,6 +3255,29 @@ def build_config(argv: Optional[Sequence[str]] = None) -> Tuple[ExperimentConfig
     # The CLI default is None (sentinel), so an unset flag falls through
     # to config.loss.lambda_reg (which the YAML or dataclass populates).
     lambda_reg = args.lambda_reg if args.lambda_reg is not None else config.loss.lambda_reg
+
+    # Publish only after every parsing/validation step has succeeded.
+    _ZERO_INPUT_CHANNELS = zero_input_channels
+    _SELECTION_METRIC = selection_metric
+    _RESUME_ID = resume_id
+    config._time_consuming_grad_checkpointing = time_consuming_grad_checkpointing
+    config._time_consuming_memory_budget_mb = time_consuming_memory_budget_mb
+    # Script-owned invocation metadata: deliberately excluded by to_dict().
+    config._eval_mc_samples = getattr(args, "eval_mc_samples", None)
+    config._eval_seed_base = 0
+    config._latency_settings = {
+        "latency_target_table_path": latency_target_table_path,
+        "latency_target_table_sha256": latency_target_table_sha256,
+        "latency_target_recipe": latency_target_recipe,
+        "latency_anchor_recipe": latency_anchor_recipe,
+        "latency_condition_mapping": dict(latency_condition_mapping),
+        "latency_target_group": latency_target_group,
+        "latency_reference_group": latency_reference_group,
+        "latency_pairing": latency_pairing,
+        "latency_min_prefixes_per_group": latency_min_prefixes_per_group,
+        "latency_min_trials_per_group": latency_min_trials_per_group,
+    }
+    _SWEEP_BANDS = sweep_bands
 
     return config, lambda_reg, args.phase1_epochs
 
@@ -2926,6 +3335,10 @@ def build_model(config: ExperimentConfig) -> NSMoRCore:
         time_consuming_update_scale=config.model.time_consuming_update_scale,
         time_consuming_delay_scale=config.model.time_consuming_delay_scale,
         time_consuming_threshold=config.model.time_consuming_threshold,
+        time_consuming_seed=config.model.time_consuming_seed,
+        time_consuming_grad_checkpointing=(
+            getattr(config, "_time_consuming_grad_checkpointing", False)
+        ),
     )
     param_count = sum(p.numel() for p in model.parameters())
     logger.info("Model initialized — %s parameters", f"{param_count:,}")
@@ -3623,6 +4036,15 @@ def build_dataloaders(
     # sequences.  Applied AFTER construction and BEFORE the loaders, so both
     # splits see the identical ablation and the stored dataset bytes are never
     # modified.  ``zero_input_channels`` is empty unless explicitly set.
+    if zero_input_channels:
+        # Capture canonical physical conditions before sensory ablation. Do not
+        # reuse the corpus stamps, which may disagree with the physical inputs.
+        for split_dataset in (train_dataset, val_dataset):
+            physical = [sequence[0] for sequence in split_dataset.sequences]
+            conditions, _ = derive_stimulus_metadata(
+                physical, [len(values) for values in physical],
+            )
+            split_dataset.latency_physical_conditions = conditions.copy()
     _sensory_dim = getattr(getattr(config, "model", None), "sensory_dim", None)
     zero_input_channels_inplace(
         train_dataset, zero_input_channels, sensory_dim=_sensory_dim,
@@ -3922,6 +4344,195 @@ def compute_warmup_factor(epoch: int, warmup_epochs: int) -> float:
     return 1.0
 
 
+def _check_time_consuming_memory_budget(
+    model: NSMoRCore,
+    loader: torch.utils.data.DataLoader,
+    config: ExperimentConfig,
+) -> Dict[str, Any]:
+    """Estimate new-mode graph memory before consuming a training batch.
+
+    Read in-memory sequence shapes, never dataset items (which may crop or
+    consume RNG). Unknown lazy/custom shapes fail closed for the opt-in modes.
+    The budget covers recursion graph/working tensors and parameter/optimizer
+    slots; it excludes LIF/GRU/frontend activations, full-model backward buffers
+    and allocator/workspace overhead. Baseline RSS is reported separately by
+    the benchmark. Passing this check does not establish full-model fit; the
+    comparison is optimistic for total process/device memory and needs headroom.
+    """
+    module = getattr(model.backend, "time_consuming", None)
+    if module is None or module.mode not in ("stochastic", "hard_depth"):
+        return {}
+    from nsmor.analysis.recursion_resources import require_memory_budget
+
+    dataset = loader.dataset
+    sequences = getattr(dataset, "sequences", None)
+    if sequences is not None:
+        timesteps = max(int(row[0].shape[0]) for row in sequences)
+    elif hasattr(dataset, "tensors"):
+        timesteps = int(dataset.tensors[0].shape[1])
+    else:
+        raise ValueError("Cannot bound time-consuming graph memory from dataset shapes")
+    if config.training.max_seq_len is not None:
+        timesteps = min(timesteps, int(config.training.max_seq_len))
+    batch_size = loader.batch_size or getattr(loader.batch_sampler, "batch_size", None)
+    if batch_size is None:
+        raise ValueError("Cannot bound time-consuming memory without batch size")
+    return require_memory_budget(
+        batch=int(batch_size), timesteps=timesteps, hidden_dim=module.hidden_dim,
+        K=module.max_steps, grad_checkpointing=module.grad_checkpointing,
+        budget_mb=getattr(config, "_time_consuming_memory_budget_mb", 8192.0),
+        parameter_bytes=sum(p.numel() * p.element_size() for p in model.parameters()),
+    )
+
+
+def _prepare_latency_loaders(
+    train_loader: torch.utils.data.DataLoader,
+    val_loader: Optional[torch.utils.data.DataLoader],
+    table: Any,
+    *,
+    target_group: int,
+    reference_group: int,
+    min_prefixes: int,
+    min_trials: int,
+    seed: int,
+    pairing: str,
+) -> Tuple[
+    torch.utils.data.DataLoader,
+    Optional[torch.utils.data.DataLoader],
+    Dict[str, Any],
+]:
+    """Rebuild loaders with aligned sidecars, preserving loading controls.
+
+    Training replaces batching with the exhaustive contrast sampler. Validation
+    retains its exact batch sampler and order. Both retain worker, generator,
+    pinning and multiprocessing options; initialized loaders are never mutated.
+    """
+    from nsmor.pipeline.latency_metadata import (
+        IndexedDataset,
+        LatencyContrastBatchSampler,
+        build_latency_sidecar,
+        collate_with_latency_metadata,
+    )
+
+    if pairing not in ("none", "pair_id"):
+        raise ValueError(f"Unknown latency_pairing={pairing!r}")
+    if pairing == "pair_id" and table.pair_ids is None:
+        raise ValueError("latency_pairing='pair_id' requires table pair_ids")
+    coverage: Dict[str, Any] = {}
+
+    def rebuild(
+        loader: torch.utils.data.DataLoader, *, training: bool,
+    ) -> torch.utils.data.DataLoader:
+        dataset = loader.dataset
+        if not hasattr(dataset, "source_indices"):
+            raise ValueError("Latency sidecar requires dataset source_indices")
+        sidecar = build_latency_sidecar(
+            table, dataset.source_indices, dataset=dataset,
+        )
+        if pairing == "none":
+            sidecar.pop("latency_pair_id", None)
+        sampler = loader.batch_sampler
+        if training:
+            if loader.batch_size is None:
+                raise ValueError("Latency contrast sampler needs explicit batch_size")
+            sampler = LatencyContrastBatchSampler(
+                sidecar["latency_group_id"].tolist(),
+                sidecar["latency_prefix_id"].tolist(),
+                batch_size=int(loader.batch_size), target_group=target_group,
+                reference_group=reference_group,
+                min_prefixes_per_group=min_prefixes,
+                min_trials_per_group=min_trials, seed=seed,
+                mask=sidecar["latency_target_mask"].tolist(),
+            )
+            coverage.update(sampler.coverage)
+        options: Dict[str, Any] = {
+            "batch_sampler": sampler,
+            "collate_fn": partial(
+                collate_with_latency_metadata, base_collate=loader.collate_fn,
+            ),
+            "num_workers": loader.num_workers,
+            "pin_memory": loader.pin_memory,
+            "timeout": loader.timeout,
+            "worker_init_fn": loader.worker_init_fn,
+            "generator": loader.generator,
+            "multiprocessing_context": loader.multiprocessing_context,
+            "persistent_workers": loader.persistent_workers,
+        }
+        if loader.num_workers > 0:
+            options["prefetch_factor"] = loader.prefetch_factor
+        # Version-specific public loading options, when supported by torch.
+        for name in ("pin_memory_device", "in_order"):
+            if hasattr(loader, name):
+                options[name] = getattr(loader, name)
+        return torch.utils.data.DataLoader(
+            IndexedDataset(dataset, sidecar), **options,
+        )
+
+    train = rebuild(train_loader, training=True)
+    val = rebuild(val_loader, training=False) if val_loader is not None else None
+    return train, val, coverage
+
+
+def _latency_loss_kwargs(
+    internals: Dict[str, torch.Tensor],
+    latency_meta: Optional[Dict[str, torch.Tensor]],
+    lambda_latency: float,
+    target_group: Optional[int],
+    reference_group: Optional[int],
+    *,
+    pairing: str = "none",
+) -> Dict[str, Any]:
+    """Build the ADR 0012 latency-loss keyword arguments for one batch.
+
+    Returns ``{}`` when the term is disabled, so the default call path is
+    unchanged.  When active, the differentiable expected delay comes from the
+    model internals and the per-trial metadata from the latency collate.  A
+    missing piece fails closed rather than silently zeroing the supervised
+    target.
+
+    Args:
+        internals: Model internals dict.
+        latency_meta: Per-batch metadata dict (or ``None``).
+        lambda_latency: Configured weight.
+        target_group: Pre-registered target condition id.
+        reference_group: Pre-registered reference condition id.
+        pairing: Explicit estimator choice; ``none`` ignores table pair ids.
+
+    Returns:
+        Keyword arguments for :class:`~nsmor.loss.BioJointLoss`.
+
+    Raises:
+        ValueError: When active but the expected delay / metadata is absent.
+    """
+    if lambda_latency == 0.0:
+        return {}
+    expected = internals.get("time_consuming_expected_delay", None)
+    if expected is None:
+        raise ValueError(
+            "lambda_latency > 0 requires a stochastic/hard_depth model that "
+            "exposes time_consuming_expected_delay; the current forward did "
+            "not."
+        )
+    if latency_meta is None:
+        raise ValueError(
+            "lambda_latency > 0 requires per-batch latency metadata "
+            "(LatencyContrastBatchSampler / collate_with_latency_metadata)."
+        )
+    if pairing not in ("none", "pair_id"):
+        raise ValueError(f"Unknown latency_pairing={pairing!r}")
+    kwargs: Dict[str, Any] = dict(latency_meta)
+    if pairing == "none":
+        kwargs.pop("latency_pair_id", None)
+    elif "latency_pair_id" not in kwargs:
+        raise ValueError("latency_pairing='pair_id' requires latency_pair_id")
+    kwargs["latency_expected_delay"] = expected
+    if target_group is not None:
+        kwargs["latency_target_group"] = int(target_group)
+    if reference_group is not None:
+        kwargs["latency_reference_group"] = int(reference_group)
+    return kwargs
+
+
 def train_one_epoch(
     model: NSMoRCore,
     loader: torch.utils.data.DataLoader,
@@ -3947,6 +4558,10 @@ def train_one_epoch(
     wind_only_mask_full: Optional[np.ndarray] = None,
     routing_aux_margin: float = 0.024,
     lambda_compute: float = 0.0,
+    lambda_latency: float = 0.0,
+    latency_target_group: Optional[int] = None,
+    latency_reference_group: Optional[int] = None,
+    latency_pairing: str = "none",
 ) -> float:
     """
     Run one training epoch.
@@ -3970,6 +4585,9 @@ def train_one_epoch(
         phase: Training phase — ``1`` = frontend-only (FrontendLoss),
             ``2`` = backend-only (BioDecisionLoss), ``0`` = single-phase
             (BioJointLoss, backward compatible).
+        latency_target_group: This call's pre-registered target condition id.
+        latency_reference_group: This call's reference condition id.
+        latency_pairing: ``none`` or explicit ``pair_id`` estimator choice.
 
     Returns:
         Average training loss for this epoch.  Skip counters
@@ -3982,6 +4600,11 @@ def train_one_epoch(
     n_batches = 0
     n_skipped_nonfinite_loss = 0
     n_skipped_nonfinite_grad = 0
+    latency_skipped = 0
+    # ADR 0012: frames whose STE expectation was non-finite (the guard kept
+    # the finite hard value).  A nonzero count means the block/halt head is
+    # producing non-finite iterates and must be surfaced, never hidden.
+    n_nonfinite_expected = 0
 
     # CF9: Per-epoch membrane health accumulators
     _epoch_v_max = 0.0
@@ -3992,9 +4615,21 @@ def train_one_epoch(
 
     pbar = tqdm(loader, desc=f"Epoch {epoch + 1}", leave=False, dynamic_ncols=True)
     for batch_idx, batch in enumerate(pbar):
-        # Ticket #16: Unpack batch — (X, Y, lengths) legacy 3-tuple, or
-        # (X, Y, lengths, wind_only_mask) 4-tuple when metadata present.
-        if len(batch) == 4:
+        # Ticket #16: Unpack batch — (X, Y, lengths) legacy 3-tuple,
+        # (X, Y, lengths, wind_only_mask) 4-tuple, or the ADR 0012
+        # (X, Y, lengths, wind_only_mask, latency_meta) 5-tuple.
+        latency_meta: Optional[Dict[str, torch.Tensor]] = None
+        if len(batch) == 5:
+            x_batch, y_batch, lengths, wind_only_mask, latency_meta = batch
+            wind_only_mask = (
+                wind_only_mask.to(device).contiguous()
+                if wind_only_mask is not None else None
+            )
+            latency_meta = {
+                key: value.to(device).contiguous()
+                for key, value in latency_meta.items()
+            }
+        elif len(batch) == 4:
             x_batch, y_batch, lengths, wind_only_mask = batch
             wind_only_mask = wind_only_mask.to(device).contiguous()
         else:
@@ -4070,7 +4705,31 @@ def train_one_epoch(
                     lambda_compute=lambda_compute,
                     refinement_ponder_cost=_ponder,
                     out_valid=_out_valid,
+                    lambda_latency=lambda_latency,
+                    **_latency_loss_kwargs(
+                        internals, latency_meta, lambda_latency,
+                        latency_target_group, latency_reference_group,
+                        pairing=latency_pairing,
+                    ),
                 )
+
+        # ADR 0012: count batches where the latency term had to skip (a
+        # batch-level missing group).  A high skip rate makes the latency
+        # conclusion unavailable; the training report must surface it.
+        _latency_stats = getattr(criterion, "last_latency_stats", None)
+        if (
+            lambda_latency > 0.0
+            and _latency_stats is not None
+            and int(_latency_stats.get("latency_skipped", 0)) == 1
+        ):
+            latency_skipped += 1
+
+        # ADR 0012: accumulate the per-forward non-finite expectation count.
+        _nf_expected = internals.get(
+            "time_consuming_nonfinite_expected", None,
+        )
+        if _nf_expected is not None:
+            n_nonfinite_expected += int(_nf_expected)
 
         # ── Membrane health monitoring (CF9: per-epoch averages) ──
         # Tracks V_max, spike_rate, and adaptation current across all
@@ -4218,6 +4877,15 @@ def train_one_epoch(
         "n_skipped_nonfinite_loss": n_skipped_nonfinite_loss,
         "n_skipped_nonfinite_grad": n_skipped_nonfinite_grad,
     }
+    train_one_epoch.last_latency_skipped_batches = latency_skipped
+    train_one_epoch.last_nonfinite_expected = n_nonfinite_expected
+    if n_nonfinite_expected:
+        logger.warning(
+            "Epoch %d: %d frame(s) had a non-finite STE expectation; the "
+            "finite hard value was kept and no expectation gradient was "
+            "applied.  Investigate the block/halt head (ADR 0012).",
+            epoch, n_nonfinite_expected,
+        )
     if n_skipped_nonfinite_loss or n_skipped_nonfinite_grad:
         logger.warning(
             "Epoch %d skipped steps: %d non-finite loss, %d non-finite grad",
@@ -4260,6 +4928,12 @@ def validate(
     routing_aux_margin: float = 0.024,
     lambda_compute: float = 0.0,
     selection_metric: str = "total",
+    eval_mc_samples: int = 1,
+    eval_seed_base: int = 0,
+    lambda_latency: float = 0.0,
+    latency_target_group: Optional[int] = None,
+    latency_reference_group: Optional[int] = None,
+    latency_pairing: str = "none",
 ) -> float:
     """
     Run validation (no gradient computation).
@@ -4294,39 +4968,107 @@ def validate(
             quantity the scored primary metric divides by.  The returned float
             is the selected metric, so a caller's checkpoint-selection /
             patience comparison is unchanged in shape.
+        eval_mc_samples: Number of fixed eval seeds averaged per validation
+            pass (ADR 0012). Stochastic evaluation always uses the explicit
+            seeds ``eval_seed_base + s``, including a single draw at S=1.
+            Other modes retain their historical call without ``eval_seed``
+            and require S=1.
+        eval_seed_base: First stateless eval seed.  Must be a non-negative
+            int; the seeds are private to the model's local generator and do
+            not touch the global RNG.
+        lambda_latency: Supervised latency contrast weight, with per-trial
+            sidecars. Included in each MC total objective without warmup;
+            MSE-only checkpoint selection remains the aligned masked MSE.
+        latency_target_group: This call's pre-registered target condition id.
+        latency_reference_group: This call's reference condition id.
+        latency_pairing: ``none`` or explicit ``pair_id`` estimator choice.
 
     Returns:
         Average validation loss under ``selection_metric`` (``"mse"`` returns
-        the pooled masked MSE, or ``inf`` if no aligned frame was seen).  The
-        pooled masked-MSE diagnostic (t >= 1) is additionally exposed as
-        :attr:`validate.last_val_mse` (``None`` when no batch ran), mirroring
-        :attr:`train_one_epoch.last_skip_counts`.
+        the pooled masked MSE, or ``inf`` if no aligned frame was seen).  With
+        ``eval_mc_samples > 1`` this is the MEAN over the fixed eval seeds
+        (selection uses the mean, not a single draw).  The pooled masked-MSE
+        diagnostic (t >= 1) is additionally exposed as
+        :attr:`validate.last_val_mse` (``None`` when no batch ran); the SD
+        across seeds of the returned selection metric is exposed as
+        :attr:`validate.last_val_loss_sd` (``0.0`` for a single pass) and the
+        resolved sample count as :attr:`validate.last_eval_mc_samples`.
     """
     if selection_metric not in ("total", "mse"):
         raise ValueError(
             f"selection_metric must be 'total' or 'mse', got {selection_metric!r}"
         )
+    if isinstance(eval_mc_samples, bool) or not isinstance(eval_mc_samples, int):
+        raise ValueError(
+            f"eval_mc_samples must be an int, got {eval_mc_samples!r}"
+        )
+    if eval_mc_samples < 1:
+        raise ValueError(
+            f"eval_mc_samples must be >= 1, got {eval_mc_samples!r}"
+        )
+    if isinstance(eval_seed_base, bool) or not isinstance(eval_seed_base, int):
+        raise ValueError(f"eval_seed_base must be an int, got {eval_seed_base!r}")
+    if not 0 <= eval_seed_base < 2**63 or (
+        eval_seed_base + eval_mc_samples - 1 >= 2**63
+    ):
+        raise ValueError("eval_seed_base and all eval seeds must be in [0, 2**63)")
+    _tc = getattr(getattr(model, "backend", None), "time_consuming", None)
+    stochastic_eval = getattr(_tc, "mode", None) == "stochastic"
+    if eval_mc_samples > 1:
+        # ``eval_seed`` is refused by the model outside the stochastic mode,
+        # so a larger count here would either raise mid-validation or, worse,
+        # be silently collapsed.  Fail closed up front.
+        _tc = getattr(getattr(model, "backend", None), "time_consuming", None)
+        _tc_mode = getattr(_tc, "mode", None)
+        if _tc_mode != "stochastic":
+            raise ValueError(
+                "eval_mc_samples > 1 requires time_consuming_mode='stochastic'; "
+                f"the executed module mode is {_tc_mode!r}."
+            )
+    validate.last_latency_skipped_batches = 0
     validate.last_val_mse = None
+    validate.last_val_loss_sd = 0.0
+    validate.last_eval_mc_samples = int(eval_mc_samples)
+    validate.last_eval_seeds = (
+        list(range(eval_seed_base, eval_seed_base + eval_mc_samples))
+        if stochastic_eval else []
+    )
+    validate.last_eval_single_draw = stochastic_eval and eval_mc_samples == 1
+    if validate.last_eval_single_draw:
+        logger.info(
+            "Validation single-draw stochastic evaluation: S=1 eval_seed=%d; "
+            "sampling noise remains", eval_seed_base,
+        )
     model.eval()
     total_loss = 0.0
-    # Frame-weighted pooled masked MSE (sum of aligned squared errors / total
-    # aligned frames).  Accumulate the raw sums here and divide once at the end
-    # so the selected metric is the POOLED quantity the scored primary
-    # (``1 - MSE_model/MSE_persist``) divides by, not a per-batch macro-average
-    # (which would over-weight the small last batch).  Only the
-    # ``selection_metric="mse"`` path consumes this; the ``"total"`` default
-    # return is unchanged.
-    total_se_sum = 0.0
-    total_se_frames = 0
+    # Per-seed accumulators (ADR 0012).  The mean is the selection metric; the
+    # SD across seeds is reported so a stochastic run is never presented as a
+    # noise-free number.  With S=1 these reduce to the historical sums.
+    seed_loss_totals = [0.0] * eval_mc_samples
+    seed_se_sums = [0.0] * eval_mc_samples
+    seed_se_frames = [0] * eval_mc_samples
+    n_nonfinite_expected = 0
     n_batches = 0
 
     pbar = tqdm(loader, desc="Validation", leave=False, dynamic_ncols=True)
     for batch_idx, batch in enumerate(pbar):
-        # Ticket #16: Unpack batch — (X, Y, lengths) legacy 3-tuple, or
-        # (X, Y, lengths, wind_only_mask) 4-tuple when metadata present.
-        if len(batch) == 4:
+        latency_meta: Optional[Dict[str, torch.Tensor]] = None
+        if len(batch) == 5:
+            x_batch, y_batch, lengths, wind_only_mask, latency_meta = batch
+            wind_only_mask = (
+                wind_only_mask.to(device).contiguous()
+                if wind_only_mask is not None else None
+            )
+            latency_meta = {
+                key: value.to(device).contiguous()
+                for key, value in latency_meta.items()
+            }
+        elif len(batch) == 4:
             x_batch, y_batch, lengths, wind_only_mask = batch
-            wind_only_mask = wind_only_mask.to(device).contiguous()
+            wind_only_mask = (
+                wind_only_mask.to(device).contiguous()
+                if wind_only_mask is not None else None
+            )
         else:
             x_batch, y_batch, lengths = batch
             # Extract wind_only_mask from full array by batch offset
@@ -4348,102 +5090,173 @@ def validate(
         if target_std != 1.0 or target_mean != 0.0:
             y_batch = (y_batch - target_mean) / target_std
 
-        y_pred, internals = model(x_batch, lengths, return_internals=True)
-
-        # Time-consuming mode (ADR 0009): the alignment mask, present only
-        # when the module ran.  ``None`` for an off model, so the historical
-        # length-only behavior is bitwise unchanged.  Threaded into BOTH the
-        # loss and the checkpoint-selection MSE below so the selected quantity
-        # is the same masked quantity the loss optimizes (finding R2-B2).
-        _out_valid = internals.get("out_valid", None)
-
-        if phase == 1:
-            # Phase 1: FrontendLoss — MSE only.  out_valid (time-consuming
-            # mode) is honored so phase 1 and phase 2 align identically.
-            loss = criterion(
-                y_pred=y_pred,
-                y_true=y_batch,
-                lengths=lengths,
-                out_valid=_out_valid,
-            )
-        else:
-            # Phase 2 / single-phase: full bio loss
-            g_gru = internals["routing_gates"][:, :, 1:2]
-            g_lif = internals["routing_gates"][:, :, 0:1]  # Ticket #16
-            lif_spikes = internals["lif_spikes"]
-            _ponder = internals.get("refinement_ponder_cost", None)
-            loss = criterion(
-                y_pred=y_pred,
-                y_true=y_batch,
-                lengths=lengths,
-                g_gru=g_gru,
-                lambda_reg=lambda_reg,
-                lif_spikes=lif_spikes,
-                lambda_energy=lambda_energy,
-                lambda_sparse=lambda_sparse,
-                lambda_jerk=lambda_jerk,
-                # Ticket #16: condition metadata is optional for legacy
-                # datasets; no metadata means the routing auxiliary term is 0.
-                lambda_routing_aux=lambda_routing_aux,
-                wind_only_mask=wind_only_mask,
-                routing_aux_margin=routing_aux_margin,
-                lambda_compute=lambda_compute,
-                refinement_ponder_cost=_ponder,
-                out_valid=_out_valid,
-            )
-
-        total_loss += loss.item()
-        # Masked-MSE-only selection diagnostic on the ALIGNED eligible frames
-        # (t >= 1, padding excluded) — the phase-2 protocol's checkpoint-
-        # selection metric.  The loss' own MSE term is over t >= 0; the
-        # single t=0 frame per trial has no persistence predecessor, so the
-        # aligned partition is the honest one for selecting weights against the
-        # skill-vs-persistence primary metric.  The t=0 exclusion is exact
-        # (one frame per trial, ~0.04% of frames).  Used when
-        # selection_metric == "mse".
-        with torch.no_grad():
-            B_t, T_t = y_pred.shape
-            assert y_pred.shape == y_batch.shape == (B_t, T_t), (
-                f"selection MSE shape mismatch: y_pred {tuple(y_pred.shape)} "
-                f"vs y_true {tuple(y_batch.shape)}"
-            )
-            assert lengths.shape == (B_t,), (
-                f"lengths shape {tuple(lengths.shape)} != ({B_t},)"
-            )
-            arange_t = torch.arange(T_t, device=y_pred.device).unsqueeze(0)
-            _mask = (
-                (arange_t >= 1) & (arange_t < lengths.unsqueeze(1))
-            ).to(y_pred.dtype)
-            if _out_valid is not None:
-                # Same alignment the loss scores: a never-emitted, zero-filled
-                # trailing frame must not enter the selection MSE either
-                # (finding R2-B2).  ``None`` keeps the historical mask.
-                assert _out_valid.shape == (B_t, T_t), (
-                    f"out_valid shape {tuple(_out_valid.shape)} != "
+        def _score(
+            y_pred: torch.Tensor, internals: Dict[str, torch.Tensor],
+        ) -> Tuple[torch.Tensor, float, int]:
+            """Score one forward pass: loss + aligned masked SE sums."""
+            # Time-consuming mode (ADR 0009): the alignment mask, present only
+            # when the module ran.  ``None`` for an off model, so the
+            # historical length-only behavior is bitwise unchanged.  Threaded
+            # into BOTH the loss and the checkpoint-selection MSE below so the
+            # selected quantity is the same masked quantity the loss optimizes
+            # (finding R2-B2).
+            _out_valid = internals.get("out_valid", None)
+            if phase == 1:
+                # Phase 1: FrontendLoss — MSE only.  out_valid (time-consuming
+                # mode) is honored so phase 1 and phase 2 align identically.
+                _loss = criterion(
+                    y_pred=y_pred,
+                    y_true=y_batch,
+                    lengths=lengths,
+                    out_valid=_out_valid,
+                )
+            else:
+                # Phase 2 / single-phase: full bio loss
+                g_gru = internals["routing_gates"][:, :, 1:2]
+                g_lif = internals["routing_gates"][:, :, 0:1]  # Ticket #16
+                lif_spikes = internals["lif_spikes"]
+                _ponder = internals.get("refinement_ponder_cost", None)
+                _loss = criterion(
+                    y_pred=y_pred,
+                    y_true=y_batch,
+                    lengths=lengths,
+                    g_gru=g_gru,
+                    lambda_reg=lambda_reg,
+                    lif_spikes=lif_spikes,
+                    lambda_energy=lambda_energy,
+                    lambda_sparse=lambda_sparse,
+                    lambda_jerk=lambda_jerk,
+                    # Ticket #16: condition metadata is optional for legacy
+                    # datasets; no metadata means the routing auxiliary term 0.
+                    lambda_routing_aux=lambda_routing_aux,
+                    wind_only_mask=wind_only_mask,
+                    routing_aux_margin=routing_aux_margin,
+                    lambda_compute=lambda_compute,
+                    refinement_ponder_cost=_ponder,
+                    out_valid=_out_valid,
+                    lambda_latency=lambda_latency,
+                    **_latency_loss_kwargs(
+                        internals, latency_meta, lambda_latency,
+                        latency_target_group, latency_reference_group,
+                        pairing=latency_pairing,
+                    ),
+                )
+            # Masked-MSE-only selection diagnostic on the ALIGNED eligible
+            # frames (t >= 1, padding excluded) — the phase-2 protocol's
+            # checkpoint-selection metric.  The loss' own MSE term is over
+            # t >= 0; the single t=0 frame per trial has no persistence
+            # predecessor, so the aligned partition is the honest one for
+            # selecting weights against the skill-vs-persistence primary
+            # metric.  The t=0 exclusion is exact (one frame per trial,
+            # ~0.04% of frames).  Used when selection_metric == "mse".
+            with torch.no_grad():
+                B_t, T_t = y_pred.shape
+                assert y_pred.shape == y_batch.shape == (B_t, T_t), (
+                    f"selection MSE shape mismatch: y_pred {tuple(y_pred.shape)} "
+                    f"vs y_true {tuple(y_batch.shape)}"
+                )
+                assert lengths.shape == (B_t,), (
+                    f"lengths shape {tuple(lengths.shape)} != ({B_t},)"
+                )
+                arange_t = torch.arange(T_t, device=y_pred.device).unsqueeze(0)
+                _mask = (
+                    (arange_t >= 1) & (arange_t < lengths.unsqueeze(1))
+                ).to(y_pred.dtype)
+                if _out_valid is not None:
+                    # Same alignment the loss scores: a never-emitted,
+                    # zero-filled trailing frame must not enter the selection
+                    # MSE either (finding R2-B2).  ``None`` keeps the
+                    # historical mask.
+                    assert _out_valid.shape == (B_t, T_t), (
+                        f"out_valid shape {tuple(_out_valid.shape)} != "
+                        f"({B_t}, {T_t})"
+                    )
+                    _mask = _mask * _out_valid.to(_mask.dtype)
+                assert _mask.shape == (B_t, T_t), (
+                    f"selection mask shape {tuple(_mask.shape)} != "
                     f"({B_t}, {T_t})"
                 )
-                _mask = _mask * _out_valid.to(_mask.dtype)
-            assert _mask.shape == (B_t, T_t), (
-                f"selection mask shape {tuple(_mask.shape)} != ({B_t}, {T_t})"
+                _se = (y_pred - y_batch) ** 2
+                assert _se.shape == (B_t, T_t), (
+                    f"selection squared-error shape {tuple(_se.shape)} != "
+                    f"({B_t}, {T_t})"
+                )
+                _se_sum = float((_se * _mask).sum())
+                _se_frames = int(_mask.sum().item())
+            return _loss, _se_sum, _se_frames
+
+        for _s in range(eval_mc_samples):
+            # Stochastic S=1 uses the same explicit seed source as MC.
+            # Legacy/default modes preserve their forward call without a seed.
+            _seed_kwargs = (
+                {"eval_seed": eval_seed_base + _s}
+                if stochastic_eval else {}
             )
-            _se = (y_pred - y_batch) ** 2
-            assert _se.shape == (B_t, T_t), (
-                f"selection squared-error shape {tuple(_se.shape)} != "
-                f"({B_t}, {T_t})"
+            y_pred, internals = model(
+                x_batch, lengths, return_internals=True, **_seed_kwargs,
             )
-            total_se_sum += float((_se * _mask).sum())
-            total_se_frames += int(_mask.sum().item())
+            loss, _se_sum, _se_frames = _score(y_pred, internals)
+            if lambda_latency > 0.0:
+                stats = getattr(criterion, "last_latency_stats", {})
+                validate.last_latency_skipped_batches += int(
+                    stats.get("latency_skipped", 0)
+                )
+            total_loss += loss.item()
+            seed_loss_totals[_s] += loss.item()
+            seed_se_sums[_s] += _se_sum
+            seed_se_frames[_s] += _se_frames
+            _nf_expected = internals.get(
+                "time_consuming_nonfinite_expected", None,
+            )
+            if _nf_expected is not None:
+                n_nonfinite_expected += int(_nf_expected)
         n_batches += 1
         pbar.set_postfix({"val_loss": f"{loss.item():.4f}"})
 
-    avg_loss = total_loss / max(n_batches, 1)
-    # Frame-weighted pooled masked MSE over the WHOLE split (one divide).
-    pooled_mse = (
-        total_se_sum / total_se_frames if total_se_frames > 0 else None
-    )
+    validate.last_nonfinite_expected = n_nonfinite_expected
+    if n_nonfinite_expected:
+        logger.warning(
+            "Validation: %d frame(s) had a non-finite STE expectation "
+            "(finite hard value kept; ADR 0012).",
+            n_nonfinite_expected,
+        )
+    # Per-seed means; the reported value is their MEAN (selection uses the
+    # mean, never a single stochastic draw) and the SD is reported alongside.
+    per_seed_means = [
+        total / max(n_batches, 1) for total in seed_loss_totals
+    ]
+    avg_loss = float(sum(per_seed_means) / eval_mc_samples)
+    # Frame-weighted pooled masked MSE over the WHOLE split, per seed (one
+    # divide per seed).  A seed with no aligned frame makes the pooled metric
+    # unavailable for that seed; it is not silently dropped from the mean.
+    pooled_per_seed: List[Optional[float]] = [
+        (seed_se_sums[s] / seed_se_frames[s]) if seed_se_frames[s] > 0
+        else None
+        for s in range(eval_mc_samples)
+    ]
+    pooled_mse: Optional[float]
+    if all(p is not None for p in pooled_per_seed):
+        pooled_mse = float(
+            sum(p for p in pooled_per_seed if p is not None)
+            / eval_mc_samples
+        )
+    else:
+        pooled_mse = None
     validate.last_val_mse = pooled_mse
+
+    def _sample_sd(values: List[float]) -> float:
+        if len(values) < 2:
+            return 0.0
+        return float(np.std(np.asarray(values, dtype=np.float64), ddof=1))
+
     if selection_metric == "mse":
+        _mse_sd = (
+            _sample_sd([p for p in pooled_per_seed if p is not None])
+            if pooled_mse is not None else 0.0
+        )
+        validate.last_val_loss_sd = _mse_sd
         return pooled_mse if pooled_mse is not None else float("inf")
+    validate.last_val_loss_sd = _sample_sd(per_seed_means)
     return avg_loss
 
 
@@ -4997,6 +5810,8 @@ def compute_metrics(
     target_clip_cm_s: float = 0.0,
     escape_band_cm_s: float = 10.0,
     persistence_benchmark: bool = False,
+    *,
+    eval_seed_base: int = 0,
 ) -> Dict[str, Any]:
     """
     Compute regression metrics on a dataset using the given model.
@@ -5026,6 +5841,10 @@ def compute_metrics(
         target_clip_cm_s: Robust clip magnitude (cm/s) applied to both
             predictions and targets before computing metrics, mirroring
             the training-time target clip.  ``0.0`` disables.
+        eval_seed_base: Explicit seed for stochastic single-draw metrics,
+            default zero, matching validation's seed base. The returned
+            stochastic_evaluation block distinguishes this draw from the
+            multi-seed validation selection mean. Other modes pass no seed.
         persistence_benchmark: When ``True``, additionally attach a
             supplemental ``"persistence_benchmark"`` sub-object scoring the
             model against a paired lag-one target-history predictor (see
@@ -5061,6 +5880,12 @@ def compute_metrics(
             losing a nonzero value.
     """
     model.eval()
+    module = getattr(getattr(model, "backend", None), "time_consuming", None)
+    stochastic_eval = getattr(module, "mode", None) == "stochastic"
+    if (isinstance(eval_seed_base, bool) or not isinstance(eval_seed_base, int)
+            or not 0 <= eval_seed_base < 2**63):
+        raise ValueError("eval_seed_base must be an int in [0, 2**63)")
+    eval_kwargs = {"eval_seed": eval_seed_base} if stochastic_eval else {}
     all_pred: List[np.ndarray] = []
     all_true: List[np.ndarray] = []
     # Per-trial emission masks (time-consuming mode).  Empty when the mode is
@@ -5069,15 +5894,15 @@ def compute_metrics(
     any_out_valid = False
 
     for batch in loader:
-        if len(batch) == 4:
-            x_batch, y_batch, lengths, _ = batch
-        else:
-            x_batch, y_batch, lengths = batch
+        assert len(batch) in (3, 4, 5), f"Unexpected batch fields: {len(batch)}"
+        x_batch, y_batch, lengths = batch[:3]
         x_batch = x_batch.to(device).contiguous()
         y_batch = y_batch.to(device).contiguous()
         lengths = lengths.to(device).contiguous()
 
-        y_pred, internals = model(x_batch, lengths, return_internals=True)
+        y_pred, internals = model(
+            x_batch, lengths, return_internals=True, **eval_kwargs,
+        )
         out_valid = internals.get("out_valid", None)
         if out_valid is not None:
             any_out_valid = True
@@ -5258,6 +6083,16 @@ def compute_metrics(
             if metrics[key] is None:
                 metrics[f"{key}_unavailable_reason"] = block["rmse_unavailable_reason"]
 
+    if stochastic_eval:
+        metrics["stochastic_evaluation"] = {
+            "eval_mc_samples": 1,
+            "eval_seed_base": eval_seed_base,
+            "eval_seeds": [eval_seed_base],
+            "single_draw": True,
+            "note": (
+                "single hard draw; sampling noise remains; not the MC selection mean"
+            ),
+        }
     return metrics
 
 
@@ -5428,6 +6263,8 @@ def train(
     trusted_historical_checkpoint_sha256=None,
     trusted_historical_artifact_sha256=None,
     expect_device: Optional[str] = None,
+    eval_mc_samples: Optional[int] = None,
+    eval_seed_base: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Full training pipeline.
@@ -5474,6 +6311,10 @@ def train(
         require_nested_validation: Refuse diagnostic global OOF validation.
             The CLI enables this by default; programmatic diagnostic callers
             keep the compatibility default with explicit validation_scope.
+        eval_mc_samples: Per-call validation MC override. Otherwise use this
+            config's CLI declaration, or S=5 for stochastic and S=1 elsewhere.
+        eval_seed_base: First fixed validation seed and the seed for final
+            single-draw metrics. Defaults to this config's declaration or zero.
 
     Returns:
         Dictionary with ``"best_val_loss`` and ``"final_train_loss"``.
@@ -5483,6 +6324,14 @@ def train(
         FileExistsError: If a fresh run would reuse an existing best checkpoint.
     """
     config.validate()
+    eval_mc_samples, eval_seed_base = _resolve_run_eval_settings(
+        config, eval_mc_samples=eval_mc_samples, eval_seed_base=eval_seed_base,
+    )
+    if config.loss.lambda_latency > 0.0 and (phase1_epochs or 0) > 0:
+        raise ValueError("lambda_latency > 0 is incompatible with phase-1 training")
+    latency_settings = _run_latency_settings(config)
+    latency_skipped_batches = 0
+    latency_coverage: Dict[str, Any] = {}
     if require_nested_validation and nested_prior_artifact is None:
         raise ValueError(
             "Scored validation requires a nested prior artifact; global OOF "
@@ -5662,6 +6511,52 @@ def train(
         _require_bitwise_resume_loader_rng(train_loader, val_loader)
     _resolved_workers = _resolved_loader_workers(train_loader, val_loader)
 
+    _tc_memory = _check_time_consuming_memory_budget(model, train_loader, config)
+    if _tc_memory:
+        logger.info("Time-consuming memory budget: %s", _tc_memory)
+
+    # ── ADR 0012: latency contrast sampler (only when the term is active) ──
+    # Startup coverage is checked on the WHOLE training split BEFORE the first
+    # batch (fail closed on a misconfigured contrast); batch-level gaps are
+    # handled by the loss (differentiable zero + skip-and-log).  The sampler
+    # rotates prefixes deterministically from its own private generator and
+    # does not exclude non-contrast trials from the fill slots.
+    if config.loss.lambda_latency > 0.0:
+        if latency_settings["latency_target_table_path"] is None:
+            raise ValueError(
+                "lambda_latency > 0 requires a latency target table resolved "
+                "by build_config (--latency_target_table); refusing to train "
+                "a zero latency term."
+            )
+        from nsmor.pipeline.latency_metadata import (
+            load_latency_target_table, validate_latency_target_definition,
+        )
+
+        _table = load_latency_target_table(
+            latency_settings["latency_target_table_path"]
+        )
+        validate_latency_target_definition(
+            _table, target_group=latency_settings["latency_target_group"],
+            reference_group=latency_settings["latency_reference_group"],
+            dt_ms=config.model.dt_ms,
+        )
+        if _table.sha256 != latency_settings["latency_target_table_sha256"]:
+            raise ValueError(
+                "latency target table changed after config resolution: "
+                f"{_table.sha256} != "
+                f"{latency_settings['latency_target_table_sha256']}"
+            )
+        train_loader, val_loader, latency_coverage = _prepare_latency_loaders(
+            train_loader, val_loader, _table,
+            target_group=latency_settings["latency_target_group"],
+            reference_group=latency_settings["latency_reference_group"],
+            min_prefixes=latency_settings["latency_min_prefixes_per_group"],
+            min_trials=latency_settings["latency_min_trials_per_group"],
+            seed=int(config.model.time_consuming_seed),
+            pairing=latency_settings["latency_pairing"],
+        )
+        logger.info("Latency coverage: %s", latency_coverage)
+
     # Ticket #16: stimulus condition metadata for routing auxiliary loss
     train_is_pure_wind = getattr(getattr(train_loader, "dataset", None), "is_pure_wind", None)
     val_is_pure_wind = (
@@ -5747,6 +6642,42 @@ def train(
         # (newly added) option leaves.  "off" reproduces the historical key
         # value, so legacy checkpoints and the default are unaffected.
         "time_consuming_mode": str(config.model.time_consuming_mode),
+        # ADR 0012 script-owned provenance.  ``lambda_latency`` also has a
+        # top-level stamp consumed by the architecture guard; the remaining
+        # keys describe the validation MC and the supervised latency target
+        # and never move ``config_sha256``.  ``latency_skipped_batches`` is
+        # refreshed in-place at the end of each epoch (it accumulates).
+        "lambda_latency": float(config.loss.lambda_latency),
+        "eval_mc_samples": eval_mc_samples,
+        "eval_seed_base": eval_seed_base,
+        "eval_seeds": (
+            list(range(eval_seed_base, eval_seed_base + eval_mc_samples))
+            if config.model.time_consuming_mode == "stochastic" else []
+        ),
+        "eval_single_draw": (
+            config.model.time_consuming_mode == "stochastic"
+            and eval_mc_samples == 1
+        ),
+        "time_consuming_grad_checkpointing": bool(
+            getattr(config, "_time_consuming_grad_checkpointing", False)
+        ),
+        **{key: value for key, value in latency_settings.items()
+           if key != "latency_target_table_path"},
+        "latency_target_timebase": (
+            {
+                "dt_ms": _table.dt_ms,
+                "target_ms": _table.target_ms.tolist(),
+                "source_indices": list(range(len(_table.target_frames))),
+                "conversion": "target_frames = target_ms / dt_ms",
+            }
+            if config.loss.lambda_latency > 0.0 else None
+        ),
+        "latency_skipped_batches": int(latency_skipped_batches),
+        "latency_coverage": dict(latency_coverage),
+        "time_consuming_memory_budget_mb": getattr(
+            config, "_time_consuming_memory_budget_mb", 8192.0,
+        ),
+        "time_consuming_memory_estimate": _tc_memory,
     }
     active_lineage: Dict[str, Any] = dict(nested_provenance)
     active_lineage["dataset_path"] = str(resolved_dataset_path)
@@ -5949,6 +6880,15 @@ def train(
         # R3: refuse a resume that switches an architecture-defining setting
         # (refinement / activation / lambda_compute) relative to the checkpoint.
         _require_architecture_config_match(ckpt_peek, config, ckpt_path)
+        # ADR 0012: the validation MC sample count / seed base and the
+        # supervised latency target are script-owned, so they live in the
+        # checkpoint top level rather than the config.  A resume must reuse
+        # them exactly; a legacy checkpoint that lacks a key is accepted only
+        # when the active value is the documented default.
+        _require_latency_provenance_match(
+            ckpt_peek, config, ckpt_path, eval_mc_samples=eval_mc_samples,
+            eval_seed_base=eval_seed_base,
+        )
         # ADR 0009: an enabled time-consuming mode re-orders the scored frames
         # via ``out_valid``, and no bitwise resume-equivalence proof exists for
         # it (only for the default ``off`` mode).  Refuse the resume rather than
@@ -6798,6 +7738,10 @@ def train(
             for param in model.parameters():
                 param.requires_grad = True
 
+        # Set sampler epoch BEFORE iteration (epoch zero is not repeated).
+        _bs = getattr(train_loader, "batch_sampler", None)
+        if hasattr(_bs, "set_epoch"):
+            _bs.set_epoch(epoch)
         # ── Train ─────────────────────────────────────────────
         train_loss, health = train_one_epoch(
             model=model,
@@ -6824,7 +7768,31 @@ def train(
             wind_only_mask_full=train_is_pure_wind,
             routing_aux_margin=config.loss.routing_aux_margin,
             lambda_compute=config.loss.lambda_compute,
+            lambda_latency=config.loss.lambda_latency,
+            latency_target_group=latency_settings["latency_target_group"],
+            latency_reference_group=latency_settings["latency_reference_group"],
+            latency_pairing=latency_settings["latency_pairing"],
         )
+        # ADR 0012: accumulate batches where the latency contrast had to skip.
+        _epoch_latency_skipped = int(
+            getattr(train_one_epoch, "last_latency_skipped_batches", 0)
+        )
+        if _epoch_latency_skipped:
+            latency_skipped_batches += _epoch_latency_skipped
+            logger.warning(
+                "Epoch %d: latency term skipped on %d batch(es) "
+                "(missing contrast group); cumulative=%d",
+                epoch, _epoch_latency_skipped, latency_skipped_batches,
+            )
+        # Refresh the accumulating provenance value (the dict is expanded into
+        # every checkpoint save below, so in-place mutation is visible).
+        phase2_provenance["latency_skipped_batches"] = int(
+            latency_skipped_batches
+        )
+        if config.loss.lambda_latency > 0.0:
+            latency_coverage["epoch_sampling"] = dict(_bs.last_epoch_stats)
+            phase2_provenance["latency_coverage"] = dict(latency_coverage)
+            logger.info("Latency epoch sampling: %s", _bs.last_epoch_stats)
         # Advance the cosine.  When lr_warmup_epochs==0 (default), the step is
         # unconditional exactly as in the original pipeline, preserving the
         # byte-identical default LR trajectory (backward-compat invariant).
@@ -6867,9 +7835,24 @@ def train(
                 routing_aux_margin=config.loss.routing_aux_margin,
                 lambda_compute=config.loss.lambda_compute,
                 selection_metric=_SELECTION_METRIC,
+                eval_mc_samples=eval_mc_samples,
+                eval_seed_base=eval_seed_base,
+                lambda_latency=config.loss.lambda_latency,
+                latency_target_group=latency_settings["latency_target_group"],
+                latency_reference_group=latency_settings["latency_reference_group"],
+                latency_pairing=latency_settings["latency_pairing"],
             )
             history["val_loss"].append(val_loss)
             val_mse_history.append(getattr(validate, "last_val_mse", None))
+            _val_sd = float(getattr(validate, "last_val_loss_sd", 0.0))
+            if eval_mc_samples > 1:
+                logger.info(
+                    "Validation MC: S=%d fixed eval seeds [%d..%d], "
+                    "mean=%.6f sd=%.6f",
+                    eval_mc_samples, eval_seed_base,
+                    eval_seed_base + eval_mc_samples - 1,
+                    val_loss, _val_sd,
+                )
         else:
             # No validation loader: the epoch was still EXECUTED, so its
             # position on the shared epoch axis must exist.  ``None`` records
@@ -7120,6 +8103,7 @@ def train(
             target_clip_cm_s=config.training.target_clip_cm_s,
             escape_band_cm_s=config.training.escape_band_cm_s,
             persistence_benchmark=True,
+            eval_seed_base=eval_seed_base,
         )
         _log_best_metrics(metrics)
         metrics["eval_provenance"] = eval_provenance
@@ -7145,12 +8129,18 @@ def train(
             all_valid_sweep: List[np.ndarray] = []
             any_valid_sweep = False
             for batch in val_loader:
-                assert len(batch) in (3, 4), f"Expected 3 or 4 batch fields, got {len(batch)}"
+                assert len(batch) in (3, 4, 5), f"Unexpected batch fields: {len(batch)}"
                 x_batch, y_batch, lengths = batch[:3]
                 x_batch = x_batch.to(device).contiguous()
                 lengths = lengths.to(device).contiguous()
                 with torch.no_grad():
-                    y_pred, internals = model(x_batch, lengths, return_internals=True)
+                    eval_kwargs = (
+                        {"eval_seed": eval_seed_base}
+                        if config.model.time_consuming_mode == "stochastic" else {}
+                    )
+                    y_pred, internals = model(
+                        x_batch, lengths, return_internals=True, **eval_kwargs,
+                    )
                     _ov = internals.get("out_valid", None)
                     if _ov is not None:
                         any_valid_sweep = True

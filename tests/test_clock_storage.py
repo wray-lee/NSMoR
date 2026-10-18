@@ -342,6 +342,7 @@ def test_shared_loader_consumers_keep_clock_provenance_compact() -> None:
                 assert isinstance(restore, ast.Constant) and restore.value is False, (
                     f"{relative}:{node.lineno} must request restore_provenance=False"
                 )
+    assert "scripts/analyze_latency.py" in consumers
     assert "scripts/evaluate_nested_prior.py" in consumers
     assert "scripts/make_subset_dataset.py" in consumers
     assert "nsmor/jax/dataloader.py" in consumers
